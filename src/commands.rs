@@ -351,6 +351,45 @@ impl Session {
         }
     }
 
+    /// Numeric bounds assertion over the visible parts: the model's world
+    /// bounds must sit within `tol` of `min`/`max` per axis (compare only the
+    /// axes you care about by passing `None`). This is the deterministic form
+    /// of the eyeball checks — "it sits on the ground" is `min` y ≈ 0, "it is
+    /// centered" is symmetric min/max x/z, "nothing floats" is a max y near
+    /// the design height. Hidden parts are not counted (they are not
+    /// rendered or exported).
+    pub fn expect_bounds(
+        &self,
+        min: [Option<f32>; 3],
+        max: [Option<f32>; 3],
+        tol: f32,
+    ) -> CmdResult {
+        let Some((amin, amax)) = self.model.bounds() else {
+            return Err("no visible parts to bound".into());
+        };
+        let mut issues = Vec::new();
+        for (axis, name) in [(0, "x"), (1, "y"), (2, "z")] {
+            for (want, got, lo) in [
+                (min[axis], amin[axis], true),
+                (max[axis], amax[axis], false),
+            ] {
+                let Some(want) = want else { continue };
+                if (want - got).abs() > tol {
+                    issues.push(format!(
+                        "{} {} (expected {want:.4} ±{tol}, got {got:.4})",
+                        if lo { "min" } else { "max" },
+                        name
+                    ));
+                }
+            }
+        }
+        if issues.is_empty() {
+            Ok(format!("bounds within ±{tol}: min {amin:?}, max {amax:?}"))
+        } else {
+            Err(format!("bounds off: {}", issues.join("; ")))
+        }
+    }
+
     /// Mesh-level checks per part: edge/face manifoldness and winding (signed
     /// volume must be positive for an outward-wound closed mesh). Pure mesh
     /// math — no renderer needed — so it catches inverted or torn geometry
@@ -1235,5 +1274,29 @@ mod tests {
             panic!("extra part should be reported")
         };
         assert!(err.contains("unexpected"), "{err}");
+    }
+
+    #[test]
+    fn expect_bounds_checks_axes_with_tolerance() {
+        let mut s = Session::default();
+        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Sits on the ground, 1 unit tall, centered in x (spans x -0.5..0.5).
+        s.expect_bounds(
+            [Some(-0.5), Some(0.0), None],
+            [Some(0.5), Some(1.0), None],
+            0.01,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Off-by-more-than-tolerance expectations fail, naming the axis:
+        // demanding min y 0.5 on a ground-sitting box = "the model floats".
+        let Err(err) = s.expect_bounds([None, Some(0.5), None], [None, Some(1.0), None], 0.01)
+        else {
+            panic!("floating model should be reported")
+        };
+        assert!(err.contains("min y"), "{err}");
+        // Skipped axes (None) never fail.
+        s.expect_bounds([None, None, None], [None, None, None], 0.01)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 }

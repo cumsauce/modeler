@@ -87,6 +87,10 @@ tweak path):
   reporting missing and unexpected names. The deterministic replacement for
   counting parts in a screenshot; use it after arrays/booleans to catch
   missing copies, duplicated radial sources, or stray intermediates.
+- `expect_bounds(min, max, tol)` — numeric world-bounds assertion over
+  visible parts, per axis (`null` skips). This is "sits on the ground"
+  (min y ≈ 0), "centered" (symmetric x/z), "roof peaks at ~2.2" (max y) as
+  a checkable call instead of a squint at a render.
 - `set_camera(yaw, pitch, dist)` — point the orbit camera (degrees, metres)
   before a `screenshot` so the verification shot actually shows the part in
   question. Windowed preview only.

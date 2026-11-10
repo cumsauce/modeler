@@ -1375,6 +1375,21 @@ struct ExpectPartsArgs {
     parts: Vec<String>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ExpectBoundsArgs {
+    /// Expected world-bounds minimum per axis; `null` skips that axis.
+    min: [Option<f32>; 3],
+    /// Expected world-bounds maximum per axis; `null` skips that axis.
+    max: [Option<f32>; 3],
+    /// Allowed deviation per checked axis. Default 0.01.
+    #[serde(default = "default_tol")]
+    tol: f32,
+}
+
+fn default_tol() -> f32 {
+    0.01
+}
+
 #[tool_router(server_handler)]
 impl Tools {
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
@@ -1854,6 +1869,17 @@ impl Tools {
         Parameters(ExpectPartsArgs { parts }): Parameters<ExpectPartsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.expect_parts(&parts)).await
+    }
+
+    /// Assert the model's world bounds numerically — the deterministic form of
+    /// "it sits on the ground", "it is centered", "the roof peaks at ~2.2".
+    /// Per-axis expectations; `null` skips an axis. Over visible parts only.
+    #[tool]
+    async fn expect_bounds(
+        &self,
+        Parameters(ExpectBoundsArgs { min, max, tol }): Parameters<ExpectBoundsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.expect_bounds(min, max, tol)).await
     }
 
     /// Add a human-readable comment pinned to the model. Face, vertex and position are
