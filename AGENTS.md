@@ -123,9 +123,14 @@ then screenshot last as the final once-over):
   visible parts, per axis (`null` skips). This is "sits on the ground"
   (min y ≈ 0), "centered" (symmetric x/z), "roof peaks at ~2.2" (max y) as
   a checkable call instead of a squint at a render.
-- `set_camera(yaw, pitch, dist)` — point the orbit camera (degrees, metres)
-  before a `screenshot` so the verification shot actually shows the part in
-  question. Windowed preview only.
+- `set_camera(yaw, pitch, dist)` — point the human's orbit camera (degrees,
+  metres) before a `screenshot`. Windowed preview only.
+- `agent_shot(view, width?, height?)` / `agent_views([views])` — render from
+  the agent's own offscreen camera, independent of the human's window: six
+  orthographic views (`front`/`back`/`left`/`right`/`top`/`bottom`, true
+  proportions, auto-framed to the bounds) plus `iso` (perspective
+  three-quarter). Returns PNGs; `agent_views(["front", "right", "top"])` is
+  the three-pane check, `["iso"]` the looks-right shot.
 
 State:
 

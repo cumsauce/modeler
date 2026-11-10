@@ -87,7 +87,8 @@ class ModelerSession:
             out = {"ok": not result.get("isError", False), "text": texts,
                    "n_images": len(images)}
             if images:
-                if save_shot:
+                out["images_b64"] = [i.get("data", "") for i in images]
+                if save_shot and images:
                     with open(save_shot, "wb") as f:
                         f.write(base64.b64decode(images[0]["data"]))
                     out["saved_shot"] = save_shot
