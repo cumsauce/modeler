@@ -31,7 +31,7 @@ use bevy::window::{PrimaryWindow, WindowPlugin};
 use modeler::catalog::{self, CatalogEntry};
 use modeler::commands::{PendingPin, Session};
 use modeler::gltf;
-use modeler::{Model, Part};
+use modeler::{Model, Op, Part};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use rmcp::{ServiceExt, schemars, tool, tool_router};
@@ -44,6 +44,12 @@ type ShotReply = oneshot::Sender<Result<Vec<u8>, String>>;
 enum Cmd {
     Exec(Box<dyn FnOnce(&mut Session) -> CmdResult + Send>),
     Screenshot(ShotReply),
+    SetCamera {
+        yaw: f32,
+        pitch: f32,
+        dist: f32,
+        reply: ShotReply,
+    },
 }
 
 /// Shared between the MCP thread and the Bevy world (the receiver sits behind a mutex,
@@ -276,6 +282,7 @@ fn drain_commands(
     headless: Res<Headless>,
     mut modeler: ResMut<Modeler>,
     mut pending: ResMut<PendingShots>,
+    mut orbit: ResMut<Orbit>,
 ) {
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
@@ -292,6 +299,22 @@ fn drain_commands(
                     let _ = reply.send(Err("headless: no renderer, no screenshot".into()));
                 } else {
                     pending.0.push(Mutex::new(Some(reply)));
+                }
+            }
+            Cmd::SetCamera {
+                yaw,
+                pitch,
+                dist,
+                reply,
+            } => {
+                if headless.0 {
+                    let _ = reply.send(Err("headless: no camera to move".into()));
+                } else {
+                    orbit.yaw = yaw.to_radians();
+                    orbit.pitch = pitch.clamp(-89.0, 89.0).to_radians();
+                    orbit.dist = dist.clamp(0.2, 200.0);
+                    orbit.user = true;
+                    let _ = reply.send(Ok(vec![]));
                 }
             }
         }
@@ -341,7 +364,7 @@ fn rebuild_scene(
     modeler.session.pending_pin = None;
     typing.text.clear();
     for part in &modeler.session.model.parts {
-        if part.verts.is_empty() || part.indices.is_empty() {
+        if part.verts.is_empty() || part.indices.is_empty() || !part.visible {
             continue;
         }
         commands.spawn((part_bundle(part, &mut meshes, &mut materials), PreviewPart));
@@ -1161,6 +1184,175 @@ struct CatalogNameArgs {
     name: String,
 }
 
+/// One op in an `apply_ops` batch, tagged by "type" (e.g.
+/// {"type": "primitive", "name": "leg", "kind": "cylinder", ...}). Same
+/// parameters as the individual op tools.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpSpec {
+    Primitive {
+        /// Unique output part name; re-using a name replaces that op.
+        name: String,
+        /// Primitive kind: box, sphere, cylinder, cone, capsule, torus, plane, wedge, disc, washer.
+        kind: String,
+        /// Full extents for box/plane/wedge; radius for sphere; [radius, height, _] for cylinder/cone/capsule.
+        size: [f32; 3],
+        translation: [f32; 3],
+    },
+    Transform {
+        name: String,
+        input: String,
+        #[serde(default)]
+        translation: Option<[f32; 3]>,
+        /// Quaternion [x, y, z, w].
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+    },
+    Boolean {
+        name: String,
+        /// union, difference or intersection.
+        op: String,
+        a: String,
+        b: String,
+    },
+    RadialArray {
+        name: String,
+        input: String,
+        count: u32,
+        #[serde(default)]
+        center: [f32; 3],
+        #[serde(default = "default_tool_degrees")]
+        degrees: f32,
+        #[serde(default)]
+        start_degrees: f32,
+    },
+    LinearArray {
+        name: String,
+        input: String,
+        count: u32,
+        #[serde(default)]
+        offset: [f32; 3],
+    },
+    Mirror {
+        name: String,
+        input: String,
+        /// "x", "y" or "z".
+        axis: String,
+        #[serde(default)]
+        offset: [f32; 3],
+    },
+    Material {
+        name: String,
+        input: String,
+        #[serde(default)]
+        base_color: Option<[f32; 4]>,
+        #[serde(default)]
+        roughness: Option<f32>,
+        #[serde(default)]
+        metalness: Option<f32>,
+    },
+}
+
+impl From<OpSpec> for Op {
+    fn from(spec: OpSpec) -> Self {
+        match spec {
+            OpSpec::Primitive {
+                name,
+                kind,
+                size,
+                translation,
+            } => Op::Primitive {
+                name,
+                kind,
+                size,
+                translation,
+            },
+            OpSpec::Transform {
+                name,
+                input,
+                translation,
+                rotation,
+                scale,
+            } => Op::Transform {
+                name,
+                input,
+                translation,
+                rotation,
+                scale,
+            },
+            OpSpec::Boolean { name, op, a, b } => Op::Boolean { name, op, a, b },
+            OpSpec::RadialArray {
+                name,
+                input,
+                count,
+                center,
+                degrees,
+                start_degrees,
+            } => Op::RadialArray {
+                name,
+                input,
+                count,
+                center,
+                degrees,
+                start_degrees,
+            },
+            OpSpec::LinearArray {
+                name,
+                input,
+                count,
+                offset,
+            } => Op::LinearArray {
+                name,
+                input,
+                count,
+                offset,
+            },
+            OpSpec::Mirror {
+                name,
+                input,
+                axis,
+                offset,
+            } => Op::Mirror {
+                name,
+                input,
+                axis,
+                offset,
+            },
+            OpSpec::Material {
+                name,
+                input,
+                base_color,
+                roughness,
+                metalness,
+            } => Op::Material {
+                name,
+                input,
+                base_color,
+                roughness,
+                metalness,
+            },
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ApplyOpsArgs {
+    /// Ops to apply in order, each tagged with its "type".
+    ops: Vec<OpSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SetCameraArgs {
+    /// Horizontal angle in degrees (0 looks down -z).
+    yaw: f32,
+    /// Vertical angle in degrees, -89..89.
+    pitch: f32,
+    /// Distance from the orbit target.
+    dist: f32,
+}
+
 #[tool_router(server_handler)]
 impl Tools {
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
@@ -1528,6 +1720,98 @@ impl Tools {
     #[tool]
     async fn ops(&self) -> Result<CallToolResult, ErrorData> {
         self.run(|s| Ok(s.describe_ops())).await
+    }
+
+    /// The full parameters of one op (size, translation, colors, counts...),
+    /// looked up by output part name. Use before an upsert tweak to see what
+    /// the op currently looks like.
+    #[tool]
+    async fn op_get(
+        &self,
+        Parameters(OpNameArgs { name }): Parameters<OpNameArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.describe_op(&name)).await
+    }
+
+    /// Replace the session with a fresh empty model. The old model stays one
+    /// undo away (recorded in the history tree), so this is the clean way to
+    /// start the next model without restarting the server.
+    #[tool]
+    async fn new_model(
+        &self,
+        Parameters(NameArgs { name }): Parameters<NameArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.new_model(&name)).await
+    }
+
+    /// Apply a whole batch of ops in one call: an array of objects, each
+    /// tagged with a "type" field ("primitive", "transform", "boolean",
+    /// "radial_array", "linear_array", "mirror", "material") and carrying the
+    /// same parameters as the individual op tools. Applied in order with the
+    /// usual upsert/rollback semantics; stops at the first error. The result
+    /// ends with the full scene summary.
+    #[tool]
+    async fn apply_ops(
+        &self,
+        Parameters(ApplyOpsArgs { ops }): Parameters<ApplyOpsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ops: Vec<Op> = ops.into_iter().map(Op::from).collect();
+        self.run(move |s| s.apply_ops(ops)).await
+    }
+
+    /// Move the orbit camera: yaw/pitch in degrees and the distance from the
+    /// model center. Marks the camera user-steered (auto-drift stops). Windowed
+    /// preview only.
+    #[tool]
+    async fn set_camera(
+        &self,
+        Parameters(SetCameraArgs { yaw, pitch, dist }): Parameters<SetCameraArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::SetCamera {
+                yaw,
+                pitch,
+                dist,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
+        reply_rx
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app dropped the camera move", None))?
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "camera set to yaw {yaw}°, pitch {pitch}°, dist {dist}"
+        ))]))
+    }
+
+    /// Hide a part: it stays in the model and keeps deriving from ops, but the
+    /// preview and the glTF export skip it. The clean way to get boolean
+    /// intermediates out of an export without breaking the graph.
+    #[tool]
+    async fn hide_part(
+        &self,
+        Parameters(PartArgs { part }): Parameters<PartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.set_visible(&part, false)).await
+    }
+
+    /// Un-hide a previously hidden part.
+    #[tool]
+    async fn show_part(
+        &self,
+        Parameters(PartArgs { part }): Parameters<PartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.set_visible(&part, true)).await
+    }
+
+    /// Mesh-level validation, no renderer needed: per-part edge manifoldness
+    /// and winding (signed volume must be positive). Catches inverted normals
+    /// and torn geometry that a screenshot only hints at.
+    #[tool]
+    async fn validate(&self) -> Result<CallToolResult, ErrorData> {
+        self.run(|s| Ok(s.validate())).await
     }
 
     /// Add a human-readable comment pinned to the model. Face, vertex and position are

@@ -174,3 +174,22 @@ fn empty_model_and_bad_indices_are_rejected() {
     model.parts[0].indices.push(99);
     assert!(modeler::gltf::export_gltf(&model, &dir.join("bad.gltf")).is_err());
 }
+
+#[test]
+fn hidden_parts_are_not_exported() {
+    let dir = temp_dir("hidden");
+    let mut model = test_model();
+    model.parts[0].visible = false;
+    let path = dir.join("hidden.glb");
+    modeler::gltf::export_glb(&model, &path).unwrap();
+    let doc = gltf::Gltf::open(&path).unwrap();
+    let roots: Vec<_> = doc.default_scene().expect("scene").nodes().collect();
+    assert_eq!(roots.len(), 1, "only the visible part is exported");
+
+    // All-hidden exports are rejected rather than writing an empty scene.
+    let mut model = test_model();
+    for p in &mut model.parts {
+        p.visible = false;
+    }
+    assert!(modeler::gltf::export_glb(&model, &dir.join("none.glb")).is_err());
+}

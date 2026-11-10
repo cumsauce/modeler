@@ -43,6 +43,20 @@ pub struct Part {
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
     pub material: Material,
+    /// Hidden parts stay in the model (and derive from ops as before) but are
+    /// skipped by the preview render and the glTF export — useful for boolean
+    /// intermediates that later ops still reference. Absent in JSON when true,
+    /// so older prefabs load as visible.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub visible: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 impl Part {
@@ -52,6 +66,7 @@ impl Part {
             translation: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0; 3],
+            visible: true,
             ..Default::default()
         }
     }
@@ -171,10 +186,12 @@ impl Model {
         Some(c.to_array())
     }
 
+    /// World bounds over the visible parts only (hidden parts are not rendered
+    /// or exported, so they should not frame the camera either).
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
         let mut acc: Option<(Vec3, Vec3)> = None;
         for p in &self.parts {
-            if p.verts.is_empty() {
+            if p.verts.is_empty() || !p.visible {
                 continue;
             }
             let (min, max) = p.bounds();

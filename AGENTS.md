@@ -61,7 +61,27 @@ tweak path):
   winding flips, normals rebuilt (negative scale would render inside-out).
 - `op_material(name, input, base_color?, roughness?, metalness?)` — color in
   place or into a new output.
-- `op_delete(name)` / `ops` — remove a step / list the graph one line per op.
+- `op_delete(name)` / `ops` — remove a step / list the graph one line per op
+  **with full parameters** (sizes, translations, colors — enough to tweak
+  without remembering what you sent). `op_get(name)` dumps a single op.
+- `apply_ops(ops)` — a whole batch in one call: array of objects, each tagged
+  `"type"` (`primitive`, `transform`, `boolean`, `radial_array`,
+  `linear_array`, `mirror`, `material`) plus that op's usual parameters.
+  Applied in order with the same upsert/rollback semantics; stops at the
+  first error (earlier ops stay). The result ends with the scene summary —
+  this is the fast path for building a model.
+- `new_model(name)` — fresh empty session model without restarting the
+  server; the old model is recorded in history, so one `undo` restores it.
+- `hide_part(name)` / `show_part(name)` — hidden parts stay in the model and
+  keep deriving, but the preview and glTF export skip them. The clean way to
+  keep boolean intermediates out of an export (a later graph re-evaluation
+  resets visibility, same as baked-part material edits).
+- `validate` — per-part mesh checks without a renderer: edge manifoldness
+  (welded by position) and winding via signed volume. Catches inverted
+  normals and torn geometry that a screenshot only hints at.
+- `set_camera(yaw, pitch, dist)` — point the orbit camera (degrees, metres)
+  before a `screenshot` so the verification shot actually shows the part in
+  question. Windowed preview only.
 
 State:
 
@@ -69,7 +89,7 @@ State:
   line per node (id, parent, label, version, `<-` cursor); jump by id, then
   the next edit branches. Use jump to try an alternative and keep both.
 - `scene_summary` — call this FIRST and after anything confusing: parts,
-  bounds, ops, annotations.
+  bounds, ops, annotations, plus deterministic **warnings** (see below).
 - `set_material` / `transform_part` / `delete_part` / `rename_part` / `set_uvs`
   — baked-part edits (record history like everything else).
 - `add_annotation(part, text, face?, vertex?, position?)` /
@@ -92,12 +112,25 @@ State:
 - **History snapshots are history-less**: each node stores a model with an
   empty tree (the live tree on the session model is the single source of
   truth); undo/redo/jump graft the live tree onto whatever they land on.
+- **Jump restores the snapshot's op list exactly.** After `jump`, every op
+  created after that node no longer exists — re-issue all of them in the new
+  branch. "no part `x` earlier in the graph" right after a jump means this.
 - **Prefab format is non-destructive**: when every part re-derives from ops
   (`parts_derive_from_ops()`), `parts` are NOT written — just ops, history
   tree, annotations — and load re-evaluates. Mixed baked+ops models keep
   their parts. Writes are `.tmp` + rename. Old/plain prefabs load unchanged.
 - **Primitive sphere radius gotcha** (above) and **winding**: never mirror via
   negative scale; use `op_mirror`.
+- **Material before copies.** Array/mirror/transform ops clone their input at
+  eval time, so a material op that runs *after* the copy colors only the
+  source — the copies stay default-gray. Always `op_material` before the ops
+  that duplicate the part. `scene_summary` warns when it sees this ordering.
+
+`scene_summary` appends a warnings section for exactly the traps above:
+uncolored copies (material after the copying op), full-ring radial arrays
+whose copy 0 overlaps the source, parts still wearing the default material,
+and parts with identical world bounds (z-fighting). An empty warnings list
+means none of these fired — checking it is cheaper than eyeballing a render.
 
 ## Preview window (human side)
 

@@ -45,14 +45,20 @@ fn le_f32s<'a, const N: usize>(src: impl IntoIterator<Item = &'a [f32; N]>) -> V
 }
 
 /// Validate the model and lay out every part's chunks in one flat binary buffer.
+/// Hidden parts are skipped: they stay in the model (ops may still derive from
+/// them) but are not exported.
 fn layout(model: &Model) -> Result<(Vec<Chunks>, Vec<u8>), String> {
-    if model.parts.is_empty() {
-        return Err(format!("model '{}' has no parts to export", model.name));
+    let exported: Vec<&crate::Part> = model.parts.iter().filter(|p| p.visible).collect();
+    if exported.is_empty() {
+        return Err(format!(
+            "model '{}' has no visible parts to export",
+            model.name
+        ));
     }
-    let mut parts = Vec::with_capacity(model.parts.len());
+    let mut parts = Vec::with_capacity(exported.len());
     let mut bin: Vec<u8> = Vec::new();
     let mut view = 0u32;
-    for (i, part) in model.parts.iter().enumerate() {
+    for (i, part) in exported.iter().enumerate() {
         if part.verts.is_empty() {
             return Err(format!("part {} ('{}') has no vertices", i, part.name));
         }

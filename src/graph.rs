@@ -243,7 +243,8 @@ pub fn inputs(op: &Op) -> Vec<&str> {
     }
 }
 
-/// One line per op, for summaries and the `ops` tool.
+/// One line per op with its full parameters, for summaries and the `ops`
+/// tool — so an agent can tweak an op without remembering what it sent.
 pub fn describe(ops: &[Op]) -> String {
     if ops.is_empty() {
         return "ops: none (baked parts)".into();
@@ -251,8 +252,31 @@ pub fn describe(ops: &[Op]) -> String {
     let mut lines = vec![format!("ops ({})", ops.len())];
     for (i, op) in ops.iter().enumerate() {
         lines.push(match op {
-            Op::Primitive { name, kind, .. } => format!("#{i} primitive `{name}` ({kind})"),
-            Op::Transform { name, input, .. } => format!("#{i} transform `{name}` <- `{input}`"),
+            Op::Primitive {
+                name,
+                kind,
+                size,
+                translation,
+            } => format!("#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}"),
+            Op::Transform {
+                name,
+                input,
+                translation,
+                rotation,
+                scale,
+            } => {
+                let mut s = format!("#{i} transform `{name}` <- `{input}`");
+                if let Some(t) = translation {
+                    s += &format!(" t={t:?}");
+                }
+                if let Some(r) = rotation {
+                    s += &format!(" rot={r:?}");
+                }
+                if let Some(sc) = scale {
+                    s += &format!(" scale={sc:?}");
+                }
+                s
+            }
             Op::Boolean { name, op, a, b } => {
                 format!("#{i} boolean `{name}` = {op}(`{a}`, `{b}`)")
             }
@@ -260,23 +284,42 @@ pub fn describe(ops: &[Op]) -> String {
                 name,
                 input,
                 count,
+                center,
                 degrees,
-                ..
-            } => format!("#{i} radial `{name}` = {count} x `{input}` over {degrees}°"),
-            Op::Material { name, input, .. } => format!("#{i} material `{name}` <- `{input}`"),
+                start_degrees,
+            } => format!(
+                "#{i} radial `{name}` = {count} x `{input}` over {degrees}° from {start_degrees}° center={center:?}"
+            ),
+            Op::Material {
+                name,
+                input,
+                base_color,
+                roughness,
+                metalness,
+            } => {
+                let mut s = format!("#{i} material `{name}` <- `{input}`");
+                if let Some(c) = base_color {
+                    s += &format!(" color={c:?}");
+                }
+                if let Some(r) = roughness {
+                    s += &format!(" roughness={r}");
+                }
+                if let Some(m) = metalness {
+                    s += &format!(" metalness={m}");
+                }
+                s
+            }
             Op::LinearArray {
                 name,
                 input,
                 count,
                 offset,
-                ..
             } => format!("#{i} linear `{name}` = {count} x `{input}` stepping {offset:?}"),
             Op::Mirror {
                 name,
                 input,
                 axis,
                 offset,
-                ..
             } => format!(
                 "#{i} mirror `{name}` = `{input}` across {} = {}",
                 axis,
@@ -285,6 +328,18 @@ pub fn describe(ops: &[Op]) -> String {
         });
     }
     lines.join("\n")
+}
+
+/// The full describe line for a single op, looked up by output part name (the
+/// newest op wins, matching upsert semantics). For the `op_get` tool.
+pub fn describe_one(ops: &[Op], name: &str) -> Option<String> {
+    ops.iter().rev().find(|op| output(op) == name).map(|op| {
+        let d = describe(std::slice::from_ref(op));
+        d.lines()
+            .nth(1)
+            .map(|l| l.replacen("#0 ", "", 1).to_string())
+            .unwrap_or(d)
+    })
 }
 
 #[cfg(test)]
