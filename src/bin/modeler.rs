@@ -179,10 +179,20 @@ fn main() -> AppExit {
             .and_then(|s| serde_json::from_str::<Model>(&s).map_err(|e| e.to_string()));
         match loaded {
             Ok(model) => {
-                println!("loaded model `{}` from {}", model.name, path.display());
+                eprintln!("loaded model `{}` from {}", model.name, path.display());
                 session.model = model;
             }
             Err(e) => eprintln!("could not load {}: {e}", path.display()),
+        }
+    } else {
+        // No explicit model: restore the last session's autosave so unnamed
+        // WIP (ops, parts, history tree, annotations) survives a restart.
+        if let Some(model) = catalog::load_session_state() {
+            eprintln!(
+                "restored session model `{}` (v{}) from autosave",
+                model.name, model.version
+            );
+            session.model = model;
         }
     }
 
@@ -899,6 +909,12 @@ impl Tools {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = Cmd::Exec(Box::new(move |session: &mut Session| {
             let reply = f(session);
+            // Autosave after every mutation so unnamed WIP survives a restart.
+            if reply.is_ok()
+                && let Err(e) = catalog::save_session_state(&session.model)
+            {
+                eprintln!("session autosave failed: {e}");
+            }
             let _ = reply_tx.send(reply.clone());
             reply
         }));

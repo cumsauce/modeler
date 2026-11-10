@@ -166,9 +166,14 @@ read-only ops + history panel. Click a part then type to annotate
   space character.
 - **Restart flow** (after code changes): `cargo build`, then
   `pkill -f target/debug/modeler` — the MCP client respawns the server from
-  the binary on disk on the next tool call. The respawned session is EMPTY;
-  restore via `load_prefab`. The MCP tool list is fixed per connection, so
-  newly added tools only appear in a NEW session.
+  the binary on disk on the next tool call. The respawned session AUTOSAVES
+  and RESTORES: every successful mutation writes the whole session model
+  (parts, ops, history tree, annotations) to `session.json` in the catalog
+  dir, and a server without an explicit `--model` restores it on startup, so
+  unnamed WIP survives restarts. `new_model` starts clean (the old model
+  stays one undo away, also in the autosave). `--model <path>` skips the
+  restore and loads that file instead. The MCP tool list is fixed per
+  connection, so newly added tools only appear in a NEW session.
 
 ## Conventions
 

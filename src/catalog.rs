@@ -121,6 +121,35 @@ fn save_catalog(catalog: &Catalog) -> Result<(), String> {
     fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// Where the session autosave lives: `session.json` next to the prefabs.
+fn session_state_path() -> Result<PathBuf, String> {
+    Ok(catalog_dir()?.join("session.json"))
+}
+
+/// Autosaves the whole session model — parts, ops, history tree, annotations,
+/// everything — so an agent's unnamed work-in-progress survives a server
+/// restart without an explicit `save_prefab`. Atomic like prefab saves.
+/// Failures are reported but never fatal: losing an autosave must not break
+/// the tool call that triggered it.
+pub fn save_session_state(model: &Model) -> Result<(), String> {
+    let path = session_state_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(model).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("renaming {}: {e}", tmp.display()))
+}
+
+/// The last autosaved session model, if one exists and parses. Missing or
+/// corrupt state just means a fresh session.
+pub fn load_session_state() -> Option<Model> {
+    let path = session_state_path().ok()?;
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Serialize the model into the catalog dir and upsert its index entry (matched by name).
 /// Returns the sanitized model name.
 /// Saves a model non-destructively: procedural parts are not written (they are
@@ -221,6 +250,37 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn session_state_roundtrip_and_missing_file() {
+        // SAFETY: test-only, single-threaded; edition 2024 makes set_var unsafe.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("state")) };
+        assert!(
+            load_session_state().is_none(),
+            "no autosave yet -> fresh session"
+        );
+        let mut model = Model {
+            name: "wip".to_string(),
+            ..Default::default()
+        };
+        model.ops.push(crate::Op::Primitive {
+            name: "leg".into(),
+            kind: "box".into(),
+            size: [1.0, 1.0, 1.0],
+            translation: [0.0, 0.5, 0.0],
+        });
+        model.refresh().unwrap();
+        save_session_state(&model).unwrap();
+
+        let restored = load_session_state().unwrap();
+        assert_eq!(restored.name, "wip");
+        assert_eq!(restored.ops.len(), 1);
+        assert_eq!(restored.parts.len(), 1, "parts are kept, not re-derived");
+        // Overwrite works (atomic tmp+rename).
+        model.name = "wip2".into();
+        save_session_state(&model).unwrap();
+        assert_eq!(load_session_state().unwrap().name, "wip2");
     }
 
     #[test]
