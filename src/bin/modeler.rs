@@ -1224,22 +1224,33 @@ impl Tools {
         }
     }
 
+    /// Waits for a Bevy-side reply with a hard timeout: a stuck frame (or any
+    /// hang in the render loop) surfaces as an error to the calling tool
+    /// instead of wedging the MCP server forever.
+    async fn await_reply(
+        reply_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
+    ) -> Result<Vec<u8>, String> {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(inner)) => inner,
+            Ok(Err(_)) => Err("preview app dropped the request".into()),
+            Err(_) => Err(
+                "timed out after 15s waiting for the preview app - the render may be stuck; retry or restart the daemon".into(),
+            ),
+        }
+    }
+
     async fn grab_screenshot(&self) -> Result<CallToolResult, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::Screenshot(reply_tx))
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        match reply_rx.await {
-            Ok(Ok(png)) => Ok(CallToolResult::success(vec![
+        match Self::await_reply(reply_rx).await {
+            Ok(png) => Ok(CallToolResult::success(vec![
                 Content::image(B64.encode(png), "image/png"),
                 Content::text("current preview render"),
             ])),
-            Ok(Err(message)) => Ok(err_result(message)),
-            Err(_) => Err(ErrorData::internal_error(
-                "preview app dropped the screenshot",
-                None,
-            )),
+            Err(message) => Ok(err_result(message)),
         }
     }
 
@@ -1261,9 +1272,8 @@ impl Tools {
             })
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        let png = reply_rx
+        let png = Self::await_reply(reply_rx)
             .await
-            .map_err(|_| ErrorData::internal_error("preview app dropped the agent shot", None))?
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok((png, format!("{view:?} {width}x{height}")))
     }
@@ -1415,6 +1425,9 @@ struct OpPrimitiveArgs {
     /// cylinder/cone/capsule; [ring, tube, _] for torus.
     size: [f32; 3],
     translation: [f32; 3],
+    /// Optional rotation, quaternion [x, y, z, w].
+    #[serde(default)]
+    rotation: Option<[f32; 4]>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1531,6 +1544,9 @@ enum OpSpec {
         /// Full extents for box/plane/wedge; radius for sphere; [radius, height, _] for cylinder/cone/capsule.
         size: [f32; 3],
         translation: [f32; 3],
+        /// Optional rotation, quaternion [x, y, z, w].
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
     },
     Transform {
         name: String,
@@ -1596,11 +1612,13 @@ impl From<OpSpec> for Op {
                 kind,
                 size,
                 translation,
+                rotation,
             } => Op::Primitive {
                 name,
                 kind,
                 size,
                 translation,
+                rotation,
             },
             OpSpec::Transform {
                 name,
@@ -2006,9 +2024,10 @@ impl Tools {
             kind,
             size,
             translation,
+            rotation,
         }): Parameters<OpPrimitiveArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_primitive(&name, &kind, size, translation))
+        self.run(move |s| s.op_primitive(&name, &kind, size, translation, rotation))
             .await
     }
 
@@ -2173,10 +2192,10 @@ impl Tools {
             })
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        reply_rx
-            .await
-            .map_err(|_| ErrorData::internal_error("preview app dropped the camera move", None))?
-            .map_err(|e| ErrorData::internal_error(e, None))?;
+        match Self::await_reply(reply_rx).await {
+            Ok(_) => {}
+            Err(e) => return Err(ErrorData::internal_error(e, None)),
+        }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "camera set to yaw {yaw}°, pitch {pitch}°, dist {dist}"
         ))]))
@@ -2259,10 +2278,22 @@ impl Tools {
             })
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        let text = reply_rx
-            .await
-            .map_err(|_| ErrorData::internal_error("preview app dropped the probe", None))?
-            .map_err(|e| ErrorData::internal_error(e, None))?;
+        let text = match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
+            Ok(Ok(Ok(text))) => text,
+            Ok(Ok(Err(e))) => return Err(ErrorData::internal_error(e, None)),
+            Ok(Err(_)) => {
+                return Err(ErrorData::internal_error(
+                    "preview app dropped the probe",
+                    None,
+                ));
+            }
+            Err(_) => {
+                return Err(ErrorData::internal_error(
+                    "timed out after 15s waiting for the preview app - the render may be stuck; retry or restart the daemon",
+                    None,
+                ));
+            }
+        };
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
@@ -2365,13 +2396,17 @@ impl rmcp::ServerHandler for Tools {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - Call scene_summary first (and after anything confusing): it shows parts, bounds, ops, annotations, plus warnings for known traps. An empty warnings list means none fired.
-- Build with apply_ops (a whole model in one call), not one op per call. Ops are upserts: re-issuing the same name and kind tweaks parameters and re-derives.
+- Build with apply_ops (a whole model in one call), not one op per call. Ops are upserts: re-issuing the same name and kind tweaks parameters and re-derives. Evaluation is dependency-ordered, so op positions don't matter.
+- Wire shapes are strict: size is ALWAYS [f32;3] (sphere radius = size[0], cylinder/cone/capsule radius = size[0] height = size[1]); base_color is ALWAYS RGBA [f32;4]. Wrong shapes fail deserialization with no field name.
+- op_transform values are ABSOLUTE, not additive: a part at y=0.375 transformed with translation y=0 lands at y=0. Restate the full position in every copy. op_primitive also takes an optional rotation quat [x,y,z,w].
+- hide_part/show_part take an argument named part; expect_parts takes parts; save_prefab requires prompt.
 - Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
 - Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.
 - undo/redo/jump move a history tree cursor; jump restores that snapshot's op list exactly, so re-issue every op created after the jump point. Editing after a jump branches.
-- Verify deterministically before screenshots: validate (manifold/winding), expect_parts (exact part list), expect_bounds (numeric bounds), check_rebuild (stale-cache diff), probe_ray (openings/occlusion; windowed preview only). Then screenshot (aim with set_camera).
+- Verify deterministically before screenshots: validate (manifold/winding), expect_parts (visible parts only), expect_bounds (visible bounds), check_rebuild (stale-cache diff), probe_ray (openings/occlusion; windowed preview only). Then screenshot or agent_shot/agent_views (independent offscreen camera; front/right/top/iso need no camera setup).
 - Every mutation autosaves the session (parts, ops, history) and it is restored on restart; save_prefab only names and indexes it. Prefab names come from set_model_name.
 - export_model skips hidden parts; hide boolean intermediates instead of deleting them (later ops may still derive from them).
+- Render waits time out after 15s with an error; a stuck frame can't wedge the server.
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()

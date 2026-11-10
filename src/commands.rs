@@ -101,6 +101,7 @@ impl Session {
         kind: &str,
         size: [f32; 3],
         translation: [f32; 3],
+        rotation: Option<[f32; 4]>,
     ) -> CmdResult {
         self.apply_op(
             Op::Primitive {
@@ -108,6 +109,7 @@ impl Session {
                 kind: kind.into(),
                 size,
                 translation,
+                rotation,
             },
             &format!("op primitive `{name}` ({kind})"),
         )
@@ -344,15 +346,34 @@ impl Session {
     /// intermediates — the "7 cylinders where I designed 6" class of bug —
     /// without a screenshot.
     pub fn expect_parts(&self, expected: &[String]) -> CmdResult {
-        let actual: std::collections::BTreeSet<&str> =
-            self.model.parts.iter().map(|p| p.name.as_str()).collect();
+        // Hidden parts are not counted: they do not render or export, so an
+        // assertion about "what the model is" should not trip over them.
+        let actual: std::collections::BTreeSet<&str> = self
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| p.name.as_str())
+            .collect();
+        let hidden: Vec<&str> = self
+            .model
+            .parts
+            .iter()
+            .filter(|p| !p.visible)
+            .map(|p| p.name.as_str())
+            .collect();
         let expected: std::collections::BTreeSet<&str> =
             expected.iter().map(String::as_str).collect();
         let missing: Vec<_> = expected.difference(&actual).collect();
         let extra: Vec<_> = actual.difference(&expected).collect();
         if missing.is_empty() && extra.is_empty() {
+            let suffix = if hidden.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} hidden parts not counted)", hidden.len())
+            };
             Ok(format!(
-                "all {} expected parts present, no extras",
+                "all {} expected parts present, no extras{suffix}",
                 expected.len()
             ))
         } else {
@@ -546,15 +567,20 @@ impl Session {
             }
         }
         // Full-ring radial array with the source on the first copy's angle.
+        // Skipped when the source part is hidden: an invisible overlap is
+        // harmless (nothing renders there).
+        let part_by_name = |n: &str| self.model.parts.iter().find(|p| p.name == n);
         for op in &self.model.ops {
             if let Op::RadialArray {
                 name,
+                input,
                 count,
                 degrees,
                 start_degrees,
                 ..
             } = op
                 && *count > 1
+                && !part_by_name(input).is_some_and(|p| !p.visible)
                 && degrees.rem_euclid(360.0) == 0.0
                 && start_degrees.rem_euclid(360.0) == 0.0
             {
@@ -563,8 +589,12 @@ impl Session {
                 ));
             }
         }
-        // Parts still wearing the default material.
+        // Parts still wearing the default material. Hidden parts are skipped:
+        // they are not rendered, so their color is irrelevant noise.
         for p in &self.model.parts {
+            if !p.visible {
+                continue;
+            }
             let m = &p.material;
             if m.base_color == [0.7, 0.7, 0.7, 1.0] && m.roughness == 0.6 && m.metalness == 0.0 {
                 out.push(format!(
@@ -1040,9 +1070,9 @@ mod tests {
     fn procedural_snapshots_serialize_without_parts_but_with_the_tree() {
         use crate::History;
         let mut s = Session::default();
-        s.op_primitive("leg", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+        s.op_primitive("leg", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("ball", "sphere", [0.5, 0.0, 0.0], [0.0, 2.0, 0.0])
+        s.op_primitive("ball", "sphere", [0.5, 0.0, 0.0], [0.0, 2.0, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         let json = serde_json::to_string(&s.model.history).unwrap_or_else(|e| panic!("{e}"));
         assert!(json.contains("ball"), "{json}");
@@ -1067,9 +1097,9 @@ mod tests {
     #[test]
     fn ops_derive_parts_and_tweak_in_place() {
         let mut s = Session::default();
-        s.op_primitive("stem", "cylinder", [0.05, 1.0, 0.0], [0.0, 0.5, 0.0])
+        s.op_primitive("stem", "cylinder", [0.05, 1.0, 0.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("petal", "sphere", [0.2, 0.0, 0.0], [0.0, 1.0, 0.3])
+        s.op_primitive("petal", "sphere", [0.2, 0.0, 0.0], [0.0, 1.0, 0.3], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_radial_array("ring", "petal", 6, [0.0, 1.0, 0.0], 360.0, 0.0)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1090,7 +1120,7 @@ mod tests {
     #[test]
     fn bad_op_is_rejected_and_leaves_graph_intact() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
+        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         let v = s.model.version;
         assert!(s.op_boolean("cut", "difference", "a", "ghost").is_err());
@@ -1102,9 +1132,9 @@ mod tests {
     #[test]
     fn op_delete_rederives() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
+        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("b", "box", [1.0, 1.0, 1.0], [1.0, 0.0, 0.0])
+        s.op_primitive("b", "box", [1.0, 1.0, 1.0], [1.0, 0.0, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_delete("a").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts.len(), 1);
@@ -1117,6 +1147,7 @@ mod tests {
             kind: "box".into(),
             size: [1.0, 1.0, 1.0],
             translation,
+            rotation: None,
         }
     }
 
@@ -1204,7 +1235,7 @@ mod tests {
     #[test]
     fn op_get_returns_full_parameters() {
         let mut s = Session::default();
-        s.op_primitive("leg", "cylinder", [0.1, 0.5, 0.0], [0.2, 0.25, 0.0])
+        s.op_primitive("leg", "cylinder", [0.1, 0.5, 0.0], [0.2, 0.25, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         let d = s.describe_op("leg").unwrap_or_else(|e| panic!("{e}"));
         assert!(d.contains("cylinder"), "{d}");
@@ -1216,7 +1247,7 @@ mod tests {
     #[test]
     fn lint_material_after_copy() {
         let mut s = Session::default();
-        s.op_primitive("arm", "box", [0.1, 0.5, 0.1], [0.4, 1.0, 0.0])
+        s.op_primitive("arm", "box", [0.1, 0.5, 0.1], [0.4, 1.0, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_mirror("arm_r", "arm", "x", [0.0, 0.0, 0.0])
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1239,7 +1270,7 @@ mod tests {
     #[test]
     fn lint_full_ring_radial_duplicate() {
         let mut s = Session::default();
-        s.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0])
+        s.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_radial_array("posts", "post", 6, [0.0, 0.25, 0.0], 360.0, 0.0)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1252,7 +1283,7 @@ mod tests {
         );
         // The even variant (count-1 copies starting one step in) is clean.
         let mut s2 = Session::default();
-        s2.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0])
+        s2.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s2.op_radial_array("posts", "post", 5, [0.0, 0.25, 0.0], 360.0, 60.0)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1399,7 +1430,7 @@ mod tests {
     #[test]
     fn validate_flags_inverted_mesh_and_passes_primitives() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.validate().contains("all parts: manifold, outward-wound"));
 
@@ -1423,7 +1454,7 @@ mod tests {
     #[test]
     fn check_rebuild_detects_stale_cache() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.check_rebuild().unwrap_or_else(|e| panic!("{e}"));
         // Simulate drift: nudge the cached part without touching the ops.
@@ -1435,9 +1466,23 @@ mod tests {
     }
 
     #[test]
+    fn op_primitive_rotation_is_absolute() {
+        let mut s = Session::default();
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let z90 = crate::quat_of([0.0, 0.0, h, h]).to_array();
+        s.op_primitive("beam", "box", [2.0, 0.2, 0.2], [0.0, 0.1, 0.0], Some(z90))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.model.parts[0].rotation, z90);
+        // And the upsert path accepts a changed rotation.
+        s.op_primitive("beam", "box", [2.0, 0.2, 0.2], [0.0, 0.1, 0.0], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.model.parts[0].rotation, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
     fn expect_parts_reports_missing_and_extra() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         s.expect_parts(&["a".into()])
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1454,7 +1499,7 @@ mod tests {
     #[test]
     fn expect_bounds_checks_axes_with_tolerance() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
         // Sits on the ground, 1 unit tall, centered in x (spans x -0.5..0.5).
         s.expect_bounds(

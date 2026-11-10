@@ -58,14 +58,18 @@ tweak path):
 - `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
   parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
   may tweak.
-- `op_primitive(name, kind, size, translation)` — kinds: `box` (full extents),
-  `sphere` (**radius only — size[1]/[2] are ignored**; flatten with a
-  transform's scale), `cylinder`/`cone`/`capsule` (radius, height),
-  `torus` (ring, tube; needs tube < ring), `plane` (x/z extents), `wedge`
-  (triangular prism, full extents), `disc` / `washer` (flat, in XY plane;
-  washer = inner < outer radius).
+- `op_primitive(name, kind, size, translation, rotation?)` — `size` is
+  **always exactly `[f32; 3]`**: `box`/`plane`/`wedge` (full extents),
+  `sphere` (**radius = size[0]; [1]/[2] ignored** — flatten with a transform's
+  scale), `cylinder`/`cone`/`capsule` (size[0] = radius, size[1] = height),
+  `torus` (ring, tube; needs tube < ring), `disc`/`washer` (flat, in XY
+  plane; washer = inner < outer radius). `rotation` is an optional quaternion
+  `[x, y, z, w]`, so rotated primitives need no separate transform.
 - `op_transform(name, input, translation?, rotation? [quat xyzw], scale?)` —
-  place/rotate/scale an earlier part into a new output.
+  place/rotate/scale an earlier part into a new output. The values are
+  **absolute, not additive**: a part at y=0.375 transformed with
+  `translation [0.4, 0, 0]` lands at y=0. Restate the template's full
+  position/rotation in every copy.
 - `op_boolean(name, op, a, b)` — `union`/`difference`/`intersection`; bakes
   transforms into verts. Panics inside csgrs on degenerate triangles, so keep
   inputs sane. Errors (e.g. no overlap) roll the graph back — it never stays
@@ -81,7 +85,9 @@ tweak path):
   `axis = offset[axis]`. **Baked**: verts go to world space, are reflected,
   winding flips, normals rebuilt (negative scale would render inside-out).
 - `op_material(name, input, base_color?, roughness?, metalness?)` — color in
-  place or into a new output.
+  place or into a new output. `base_color` is **always RGBA `[f32; 4]`** (in
+  `op_material` and in `apply_ops` material specs alike); a 3-component RGB
+  fails deserialization.
 - `op_delete(name)` / `ops` — remove a step / list the graph one line per op
   **with full parameters** (sizes, translations, colors — enough to tweak
   without remembering what you sent). `op_get(name)` dumps a single op.
@@ -95,7 +101,8 @@ tweak path):
   this is the fast path for building a model.
 - `new_model(name)` — fresh empty session model without restarting the
   server; the old model is recorded in history, so one `undo` restores it.
-- `hide_part(name)` / `show_part(name)` — hidden parts stay in the model and
+- `hide_part(part)` / `show_part(part)` — the argument is named `part`. Hidden
+  parts stay in the model and
   keep deriving, but the preview and glTF export skip them. The clean way to
   keep boolean intermediates out of an export (a later graph re-evaluation
   resets visibility, same as baked-part material edits).
@@ -115,12 +122,13 @@ then screenshot last as the final once-over):
   geometry against the cached parts; fails on a stale cache or
   non-deterministic op (baked material/visibility edits are not compared —
   a refresh legitimately resets those).
-- `expect_parts([names])` — exact part-list assertion (order-insensitive),
+- `expect_parts(parts)` — exact part-list assertion over **visible parts
+  only** (the argument is named `parts`); hidden templates are not counted. (order-insensitive),
   reporting missing and unexpected names. The deterministic replacement for
   counting parts in a screenshot; use it after arrays/booleans to catch
   missing copies, duplicated radial sources, or stray intermediates.
 - `expect_bounds(min, max, tol)` — numeric world-bounds assertion over
-  visible parts, per axis (`null` skips). This is "sits on the ground"
+  visible parts only, per axis (`null` skips). This is "sits on the ground"
   (min y ≈ 0), "centered" (symmetric x/z), "roof peaks at ~2.2" (max y) as
   a checkable call instead of a squint at a render.
 - `set_camera(yaw, pitch, dist)` — point the human's orbit camera (degrees,
@@ -145,14 +153,17 @@ State:
   `list_annotations` / `delete_annotation(id)` — human comments pinned to
   parts. If the human clicked a spot in the preview, omit all optional args
   and the pending pin is consumed. Annotations ride in prefabs.
-- `save_prefab(description, tags, prompt)` / `load_prefab(name)` /
+- `save_prefab(description, tags, prompt)` — all three required, including
+  `prompt` — / `load_prefab(name)` /
   `catalog_list` / `catalog_describe` — persistence.
 - **Session autosave**: every successful mutation also writes the whole
   session model (parts, ops, history tree, annotations) to `session.json`
   in the catalog dir, and a server started without `--model` restores it.
   Unnamed WIP therefore survives restarts and crashes without any explicit
   save; `save_prefab` is only for naming and indexing it.
-- `export_model(path, "glb"|"gltf")`, `screenshot` — output. **Always
+- `export_model(path, "glb"|"gltf")`, `screenshot` — output. Render-dependent
+  tools (`screenshot`, `agent_shot(s)`, `probe_ray`, `set_camera`) time out
+  after 15s with a retry hint instead of hanging the server. **Always
   screenshot and actually look at the image** after building something; the
   scene data can be right while the render is wrong.
 
@@ -161,8 +172,12 @@ State:
 - **In-place ops**: `op_material("petal", "petal")` (output == input) is
   legal — upsert never replaces an op the new op reads from (`graph::kind` +
   `graph::inputs`). Repeated in-place ops accumulate; last wins.
-- **Op evaluation is sequential by name**: an op can only reference outputs of
-  *earlier* ops. Errors name the missing input.
+- **Op evaluation is dependency-ordered.** Each op runs after the op
+  producing its inputs; where that is already consistent, written order is
+  preserved. This heals graphs where an upsert left an op positioned before
+  an input it gained later — no naming tricks needed. A true cycle fails with
+  "ops form a dependency cycle involving ...". Ops can only reference op
+  outputs, never baked parts.
 - **History snapshots are history-less**: each node stores a model with an
   empty tree (the live tree on the session model is the single source of
   truth); undo/redo/jump graft the live tree onto whatever they land on.
@@ -182,11 +197,13 @@ State:
 
 `scene_summary` appends a warnings section for exactly the traps above:
 uncolored copies (material after the copying op), full-ring radial arrays
-whose copy 0 overlaps the source, parts still wearing the default material,
-parts with identical world bounds (z-fighting), and boolean volume sanity
-(a difference that didn't shrink its input = the cutter misses; a union
-whose volume exactly sums its inputs = no overlap). An empty warnings list
-means none of these fired — checking it is cheaper than eyeballing a render.
+whose copy 0 overlaps the source, visible parts still wearing the default
+material, parts with identical world bounds (z-fighting), and boolean
+volume sanity (a difference that didn't shrink its input = the cutter
+misses; a union whose volume exactly sums its inputs = no overlap). Hidden
+parts are excluded from all of these, so template clutter doesn't drown
+real signals. An empty warnings list means none of these fired — checking
+it is cheaper than eyeballing a render.
 
 ## Preview window (human side)
 

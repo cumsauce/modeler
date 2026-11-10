@@ -355,6 +355,10 @@ pub enum Op {
         kind: String,
         size: [f32; 3],
         translation: [f32; 3],
+        /// Optional rotation, quaternion [x, y, z, w]. Saves a
+        /// primitive + transform pair for rotated primitives.
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
     },
     /// Places/rotates/scales an earlier part into a new output.
     Transform {

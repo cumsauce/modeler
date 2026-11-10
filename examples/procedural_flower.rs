@@ -11,9 +11,9 @@ fn main() {
 
     // Stem, then one petal flattened in place, fanned by the radial op. The
     // source petal fills the 0 degree slot; 7 copies start a step later.
-    s.op_primitive("stem", "cylinder", [0.03, 0.9, 0.0], [0.0, 0.45, 0.0])
+    s.op_primitive("stem", "cylinder", [0.03, 0.9, 0.0], [0.0, 0.45, 0.0], None)
         .unwrap_or_else(|e| panic!("{e}"));
-    s.op_primitive("petal", "sphere", [0.16, 0.0, 0.0], [0.0, 0.95, 0.28])
+    s.op_primitive("petal", "sphere", [0.16, 0.0, 0.0], [0.0, 0.95, 0.28], None)
         .unwrap_or_else(|e| panic!("{e}"));
     s.op_transform("petal", "petal", None, None, Some([0.5, 0.22, 1.0]))
         .unwrap_or_else(|e| panic!("{e}"));
@@ -29,7 +29,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("{e}"));
 
     // Center button.
-    s.op_primitive("center", "sphere", [0.1, 0.0, 0.0], [0.0, 0.95, 0.0])
+    s.op_primitive("center", "sphere", [0.1, 0.0, 0.0], [0.0, 0.95, 0.0], None)
         .unwrap_or_else(|e| panic!("{e}"));
     s.op_material(
         "center",
@@ -41,7 +41,7 @@ fn main() {
     .unwrap_or_else(|e| panic!("{e}"));
 
     // Leaves: primitives squashed and angled in place.
-    s.op_primitive("leaf_a", "sphere", [0.1, 0.0, 0.0], [0.1, 0.45, 0.06])
+    s.op_primitive("leaf_a", "sphere", [0.1, 0.0, 0.0], [0.1, 0.45, 0.06], None)
         .unwrap_or_else(|e| panic!("{e}"));
     s.op_transform(
         "leaf_a",

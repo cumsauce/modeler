@@ -6,181 +6,241 @@
 use crate::{Op, Part, primitives, quat_of, uv};
 use bevy::math::{Quat, Vec3};
 
-/// Evaluates every op in order and returns the derived parts, in op order.
-/// Errors name the offending step so the caller can point at the graph.
+/// Evaluates every op and returns the derived parts. Ops run in dependency
+/// order (each op after the op that produces its inputs), falling back to
+/// list order wherever that is already consistent — so fresh graphs behave
+/// exactly as written, while upserts that left an op positioned before an
+/// input it gained later still evaluate correctly.
 pub fn evaluate(ops: &[Op]) -> Result<Vec<Part>, String> {
+    let order = eval_order(ops)?;
     let mut named: Vec<(String, Part)> = Vec::new();
-    for op in ops {
-        match op {
-            Op::Primitive {
-                name,
-                kind,
-                size,
-                translation,
-            } => {
-                let mut part =
-                    primitives::primitive(kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
-                part.translation = *translation;
-                upsert(&mut named, name, part)?;
-            }
-            Op::Transform {
-                name,
-                input,
-                translation,
-                rotation,
-                scale,
-            } => {
-                let mut part = lookup(&named, input)?;
-                part.name = name.clone();
-                if let Some(t) = translation {
-                    part.translation = *t;
-                }
-                if let Some(r) = rotation {
-                    part.rotation = *r;
-                }
-                if let Some(s) = scale {
-                    part.scale = *s;
-                }
-                upsert(&mut named, name, part)?;
-            }
-            Op::Boolean { name, op, a, b } => {
-                // `csg::boolean` looks parts up on a model and bakes their
-                // transforms into the verts, so hand it a scratch pair.
-                let mut scratch = crate::Model::named("scratch");
-                scratch.parts = vec![lookup(&named, a)?, lookup(&named, b)?];
-                let part = crate::csg::boolean(&scratch, op, a, b, Some(name))?;
-                upsert(&mut named, name, part)?;
-            }
-            Op::RadialArray {
-                name,
-                input,
-                count,
-                center,
-                degrees,
-                start_degrees,
-            } => {
-                let source = lookup(&named, input)?;
-                if *count == 0 {
-                    return Err(format!("{name}: count must be at least 1"));
-                }
-                let step = degrees / *count as f32;
-                for i in 0..*count {
-                    let yaw = start_degrees + i as f32 * step;
-                    let mut part = source.clone();
-                    part.name = format!("{name}_{i}");
-                    let offset = Vec3::from(part.translation) - Vec3::from(*center);
-                    part.translation = (Quat::from_rotation_y(yaw.to_radians()) * offset
-                        + Vec3::from(*center))
-                    .to_array();
-                    part.rotation = (Quat::from_rotation_y(yaw.to_radians())
-                        * quat_of(part.rotation))
-                    .to_array();
-                    uv::ensure_uvs(&mut part, Some("box"))
-                        .map_err(|e| format!("{name}_{i}: {e}"))?;
-                    upsert(&mut named, &format!("{name}_{i}"), part)?;
-                }
-            }
-            Op::Material {
-                name,
-                input,
-                base_color,
-                roughness,
-                metalness,
-            } => {
-                let mut part = lookup(&named, input)?;
-                part.name = name.clone();
-                if let Some(c) = base_color {
-                    part.material.base_color = *c;
-                }
-                if let Some(r) = roughness {
-                    part.material.roughness = *r;
-                }
-                if let Some(m) = metalness {
-                    part.material.metalness = *m;
-                }
-                upsert(&mut named, name, part)?;
-            }
-            Op::LinearArray {
-                name,
-                input,
-                count,
-                offset,
-            } => {
-                let source = lookup(&named, input)?;
-                if *count == 0 {
-                    return Err(format!("{name}: count must be at least 1"));
-                }
-                // The source is copy 0; copies 1..count step away from it,
-                // so nothing overlaps the input.
-                for i in 1..*count {
-                    let mut part = source.clone();
-                    part.name = format!("{name}_{i}");
-                    let i = i as f32;
-                    part.translation = [
-                        part.translation[0] + offset[0] * i,
-                        part.translation[1] + offset[1] * i,
-                        part.translation[2] + offset[2] * i,
-                    ];
-                    let part_name = part.name.clone();
-                    upsert(&mut named, &part_name, part)?;
-                }
-            }
-            Op::Mirror {
-                name,
-                input,
-                axis,
-                offset,
-            } => {
-                let ax = match axis.as_str() {
-                    "x" => 0,
-                    "y" => 1,
-                    "z" => 2,
-                    other => return Err(format!("{name}: unknown axis `{other}` (x, y, z)")),
-                };
-                let source = lookup(&named, input)?;
-                let plane = offset[ax];
-                let mut part = source.clone();
-                part.name = name.clone();
-                // Bake: world verts, reflect across the plane, flip winding.
-                let rot = quat_of(part.rotation);
-                let scale = Vec3::from(part.scale);
-                let translation = Vec3::from(part.translation);
-                let mut tris = Vec::with_capacity(part.tri_count() as usize);
-                for t in part.indices.as_chunks::<3>().0 {
-                    let world: Vec<Vec3> = t
-                        .iter()
-                        .map(|&i| {
-                            let mut v =
-                                rot * (Vec3::from(part.verts[i as usize]) * scale) + translation;
-                            v[ax] = 2.0 * plane - v[ax];
-                            v
-                        })
-                        .collect();
-                    tris.push([world[0], world[1], world[2]]);
-                }
-                let mut verts = Vec::with_capacity(tris.len() * 3);
-                let mut indices = Vec::with_capacity(tris.len() * 3);
-                for (i, t) in tris.iter().enumerate() {
-                    for v in t {
-                        verts.push(v.to_array());
-                    }
-                    // Mirrored faces wind the other way.
-                    let b = (i * 3) as u32;
-                    indices.extend([b, b + 2, b + 1]);
-                }
-                part.verts = verts;
-                part.indices = indices;
-                part.normals.clear();
-                crate::uv::ensure_normals(&mut part);
-                crate::uv::ensure_uvs(&mut part, Some("box"))?;
-                part.translation = [0.0; 3];
-                part.rotation = Quat::IDENTITY.to_array();
-                part.scale = [1.0; 3];
-                upsert(&mut named, name, part)?;
+    for i in order {
+        run_op(&ops[i], &mut named)?;
+    }
+    Ok(named.into_iter().map(|(_, part)| part).collect())
+}
+
+/// Computes a run order for `ops`. Each op depends on the nearest earlier op
+/// producing each of its inputs (matching lookup semantics); when no earlier
+/// producer exists, it depends on the nearest producer anywhere, healing
+/// graphs where an upsert left an op before an input it now reads. Ties are
+/// broken by list index, so already-consistent graphs keep their written
+/// order. Remaining ops after the loop form a dependency cycle.
+fn eval_order(ops: &[Op]) -> Result<Vec<usize>, String> {
+    let n = ops.len();
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, op) in ops.iter().enumerate() {
+        for input in inputs(op) {
+            let earlier = (0..i).rev().find(|&j| output(&ops[j]) == input);
+            let dep = match earlier {
+                Some(j) => Some(j),
+                None => (i + 1..n).find(|&j| output(&ops[j]) == input),
+            };
+            if let Some(j) = dep {
+                deps[i].push(j);
             }
         }
     }
-    Ok(named.into_iter().map(|(_, part)| part).collect())
+    let mut order = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    let mut remaining = n;
+    while remaining > 0 {
+        let mut progressed = false;
+        for i in 0..n {
+            if !done[i] && deps[i].iter().all(|&d| done[d]) {
+                done[i] = true;
+                order.push(i);
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            let stuck: Vec<String> = (0..n)
+                .filter(|&i| !done[i])
+                .map(|i| format!("`{}`", output(&ops[i])))
+                .collect();
+            return Err(format!(
+                "ops form a dependency cycle involving {}",
+                stuck.join(", ")
+            ));
+        }
+    }
+    Ok(order)
+}
+
+/// Runs one op against the named-part map, upserting its output.
+fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
+    match op {
+        Op::Primitive {
+            name,
+            kind,
+            size,
+            translation,
+            rotation,
+        } => {
+            let mut part =
+                primitives::primitive(kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
+            part.translation = *translation;
+            if let Some(r) = rotation {
+                part.rotation = *r;
+            }
+            upsert(named, name, part)?;
+        }
+        Op::Transform {
+            name,
+            input,
+            translation,
+            rotation,
+            scale,
+        } => {
+            let mut part = lookup(named, input)?;
+            part.name = name.clone();
+            if let Some(t) = translation {
+                part.translation = *t;
+            }
+            if let Some(r) = rotation {
+                part.rotation = *r;
+            }
+            if let Some(s) = scale {
+                part.scale = *s;
+            }
+            upsert(named, name, part)?;
+        }
+        Op::Boolean { name, op, a, b } => {
+            // `csg::boolean` looks parts up on a model and bakes their
+            // transforms into the verts, so hand it a scratch pair.
+            let mut scratch = crate::Model::named("scratch");
+            scratch.parts = vec![lookup(named, a)?, lookup(named, b)?];
+            let part = crate::csg::boolean(&scratch, op, a, b, Some(name))?;
+            upsert(named, name, part)?;
+        }
+        Op::RadialArray {
+            name,
+            input,
+            count,
+            center,
+            degrees,
+            start_degrees,
+        } => {
+            let source = lookup(named, input)?;
+            if *count == 0 {
+                return Err(format!("{name}: count must be at least 1"));
+            }
+            let step = degrees / *count as f32;
+            for i in 0..*count {
+                let yaw = start_degrees + i as f32 * step;
+                let mut part = source.clone();
+                part.name = format!("{name}_{i}");
+                let offset = Vec3::from(part.translation) - Vec3::from(*center);
+                part.translation = (Quat::from_rotation_y(yaw.to_radians()) * offset
+                    + Vec3::from(*center))
+                .to_array();
+                part.rotation =
+                    (Quat::from_rotation_y(yaw.to_radians()) * quat_of(part.rotation)).to_array();
+                uv::ensure_uvs(&mut part, Some("box")).map_err(|e| format!("{name}_{i}: {e}"))?;
+                upsert(named, &format!("{name}_{i}"), part)?;
+            }
+        }
+        Op::Material {
+            name,
+            input,
+            base_color,
+            roughness,
+            metalness,
+        } => {
+            let mut part = lookup(named, input)?;
+            part.name = name.clone();
+            if let Some(c) = base_color {
+                part.material.base_color = *c;
+            }
+            if let Some(r) = roughness {
+                part.material.roughness = *r;
+            }
+            if let Some(m) = metalness {
+                part.material.metalness = *m;
+            }
+            upsert(named, name, part)?;
+        }
+        Op::LinearArray {
+            name,
+            input,
+            count,
+            offset,
+        } => {
+            let source = lookup(named, input)?;
+            if *count == 0 {
+                return Err(format!("{name}: count must be at least 1"));
+            }
+            // The source is copy 0; copies 1..count step away from it,
+            // so nothing overlaps the input.
+            for i in 1..*count {
+                let mut part = source.clone();
+                part.name = format!("{name}_{i}");
+                let i = i as f32;
+                part.translation = [
+                    part.translation[0] + offset[0] * i,
+                    part.translation[1] + offset[1] * i,
+                    part.translation[2] + offset[2] * i,
+                ];
+                let part_name = part.name.clone();
+                upsert(named, &part_name, part)?;
+            }
+        }
+        Op::Mirror {
+            name,
+            input,
+            axis,
+            offset,
+        } => {
+            let ax = match axis.as_str() {
+                "x" => 0,
+                "y" => 1,
+                "z" => 2,
+                other => return Err(format!("{name}: unknown axis `{other}` (x, y, z)")),
+            };
+            let source = lookup(named, input)?;
+            let plane = offset[ax];
+            let mut part = source.clone();
+            part.name = name.clone();
+            // Bake: world verts, reflect across the plane, flip winding.
+            let rot = quat_of(part.rotation);
+            let scale = Vec3::from(part.scale);
+            let translation = Vec3::from(part.translation);
+            let mut tris = Vec::with_capacity(part.tri_count() as usize);
+            for t in part.indices.as_chunks::<3>().0 {
+                let world: Vec<Vec3> = t
+                    .iter()
+                    .map(|&i| {
+                        let mut v =
+                            rot * (Vec3::from(part.verts[i as usize]) * scale) + translation;
+                        v[ax] = 2.0 * plane - v[ax];
+                        v
+                    })
+                    .collect();
+                tris.push([world[0], world[1], world[2]]);
+            }
+            let mut verts = Vec::with_capacity(tris.len() * 3);
+            let mut indices = Vec::with_capacity(tris.len() * 3);
+            for (i, t) in tris.iter().enumerate() {
+                for v in t {
+                    verts.push(v.to_array());
+                }
+                // Mirrored faces wind the other way.
+                let b = (i * 3) as u32;
+                indices.extend([b, b + 2, b + 1]);
+            }
+            part.verts = verts;
+            part.indices = indices;
+            part.normals.clear();
+            crate::uv::ensure_normals(&mut part);
+            crate::uv::ensure_uvs(&mut part, Some("box"))?;
+            part.translation = [0.0; 3];
+            part.rotation = Quat::IDENTITY.to_array();
+            part.scale = [1.0; 3];
+            upsert(named, name, part)?;
+        }
+    }
+    Ok(())
 }
 
 fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, String> {
@@ -257,7 +317,11 @@ pub fn describe(ops: &[Op]) -> String {
                 kind,
                 size,
                 translation,
-            } => format!("#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}"),
+                rotation,
+            } => format!(
+                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}",
+                rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+            ),
             Op::Transform {
                 name,
                 input,
@@ -354,6 +418,7 @@ mod tests {
                 kind: "box".into(),
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
+                rotation: None,
             },
             Op::Transform {
                 name: "lifted".into(),
@@ -371,6 +436,68 @@ mod tests {
     }
 
     #[test]
+    fn eval_order_heals_upsert_positions() {
+        // From a real session: a copy op named before its input (an upsert had
+        // left the input later in the list). Dependency order must run the
+        // producer first regardless of list position.
+        let parts = evaluate(&[
+            Op::RadialArray {
+                name: "leg".into(),
+                input: "leg_s".into(),
+                count: 2,
+                center: [0.0, 0.0, 0.0],
+                degrees: 360.0,
+                start_degrees: 0.0,
+            },
+            Op::Transform {
+                name: "leg_s".into(),
+                input: "leg_template".into(),
+                translation: Some([0.4, 0.375, 0.0]),
+                rotation: None,
+                scale: None,
+            },
+            Op::Primitive {
+                name: "leg_template".into(),
+                kind: "box".into(),
+                size: [0.08, 0.75, 0.08],
+                translation: [0.0, 0.0, 0.0],
+                rotation: None,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(parts.len(), 4, "template + leg_s + 2 radial copies");
+        let leg_s = parts
+            .iter()
+            .find(|p| p.name == "leg_s")
+            .unwrap_or_else(|| panic!("leg_s missing"));
+        assert_eq!(leg_s.translation, [0.4, 0.375, 0.0]);
+    }
+
+    #[test]
+    fn dependency_cycle_errors_and_names_the_ops() {
+        let Err(err) = evaluate(&[
+            Op::Transform {
+                name: "a".into(),
+                input: "b".into(),
+                translation: None,
+                rotation: None,
+                scale: None,
+            },
+            Op::Transform {
+                name: "b".into(),
+                input: "a".into(),
+                translation: None,
+                rotation: None,
+                scale: None,
+            },
+        ]) else {
+            panic!("a true cycle must fail")
+        };
+        assert!(err.contains("dependency cycle"), "{err}");
+        assert!(err.contains("`a`") && err.contains("`b`"), "{err}");
+    }
+
+    #[test]
     fn reissued_op_replaces_its_output_in_place() {
         let ops = [
             Op::Primitive {
@@ -378,18 +505,21 @@ mod tests {
                 kind: "box".into(),
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
+                rotation: None,
             },
             Op::Primitive {
                 name: "b".into(),
                 kind: "sphere".into(),
                 size: [0.5, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
+                rotation: None,
             },
             Op::Primitive {
                 name: "a".into(),
                 kind: "cylinder".into(),
                 size: [0.1, 2.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
+                rotation: None,
             },
         ];
         let parts = evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
@@ -406,6 +536,7 @@ mod tests {
                 kind: "sphere".into(),
                 size: [0.1, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.5],
+                rotation: None,
             },
             Op::RadialArray {
                 name: "ring".into(),
@@ -435,6 +566,7 @@ mod tests {
                 kind: "cylinder".into(),
                 size: [0.05, 1.0, 0.0],
                 translation: [0.0, 0.5, 0.0],
+                rotation: None,
             },
             Op::LinearArray {
                 name: "fence".into(),
@@ -458,6 +590,7 @@ mod tests {
                 kind: "box".into(),
                 size: [0.2, 0.2, 0.6],
                 translation: [0.5, 0.0, 0.0],
+                rotation: None,
             },
             Op::Mirror {
                 name: "arm_m".into(),

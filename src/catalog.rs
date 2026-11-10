@@ -243,6 +243,10 @@ pub fn describe(name: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// FRIENDSLOP_DATA_DIR is process-global, so tests that set it must not
+    /// run in parallel with each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "friendslop-modeler-catalog-{tag}-{}",
@@ -254,6 +258,7 @@ mod tests {
 
     #[test]
     fn session_state_roundtrip_and_missing_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: test-only, single-threaded; edition 2024 makes set_var unsafe.
         unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("state")) };
         assert!(
@@ -269,6 +274,7 @@ mod tests {
             kind: "box".into(),
             size: [1.0, 1.0, 1.0],
             translation: [0.0, 0.5, 0.0],
+            rotation: None,
         });
         model.refresh().unwrap();
         save_session_state(&model).unwrap();
@@ -285,6 +291,7 @@ mod tests {
 
     #[test]
     fn save_list_load_describe_roundtrip() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: test-only, single-threaded; edition 2024 makes set_var unsafe.
         unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("roundtrip")) };
         let mut model = Model {
