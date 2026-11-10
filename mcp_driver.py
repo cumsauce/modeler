@@ -1,76 +1,77 @@
 #!/usr/bin/env python3
 """Drive the modeler MCP server over stdio (fallback while the session's
-MCP tool list is frozen without mcp__modeler__* tools). Spawns the server,
-runs a JSON-RPC tool-call sequence, saves screenshot results as PNGs, and
-prints results as JSON lines.
+MCP tool list is frozen without mcp__modeler__* tools).
 
-Usage: mcp_driver.py <binary> [--save-shot <png-path>] [--calls <calls.json>]
-Calls JSON: [{"name": "op_primitive", "args": {...}}, ...]
-Without --calls, runs an interactive newline-delimited protocol:
-  {"name": ..., "args": {...}}  per line on stdin
-  -> {"ok": true, "text": [...]} / {"ok": false, "error": ...} per line on stdout
-  "quit" exits.
+Two modes:
+
+Daemon (keeps ONE modeler process — and its preview window — alive across
+many driver invocations):
+    mcp_driver.py --daemon [--windowed] [--socket PATH]
+        spawns the modeler server, listens on a unix socket, executes tool
+        calls from any connecting client (one at a time). Stays up when
+        clients disconnect; `quit` as a call shuts it down.
+
+Client (connects to the daemon, or spawns a throwaway server):
+    mcp_driver.py --connect [--socket PATH] --calls calls.json [--save-shot p]
+    mcp_driver.py --calls calls.json ...          # throwaway mode, as before
+Calls JSON: [{"name": "...", "args": {...}}, ...]
+Without --calls in client/throwaway mode, reads calls line-by-line on stdin;
+"quit" in daemon mode stops the daemon.
+
+Results print as JSON lines: {"ok":..., "text": [...], "n_images": ...,
+"saved_shot": path}.
 """
-import json, subprocess, sys, base64, threading, os
+import json, subprocess, sys, base64, os, socket, threading
 
-BINARY = sys.argv[1] if len(sys.argv) > 1 else "/Users/lume/modeler/target/debug/modeler"
+BINARY = "/Users/lume/modeler/target/debug/modeler"
+SOCKET = "/tmp/modeler-mcp.sock"
 
-def parse_args(argv):
-    save_shot = None
-    calls_path = None
-    windowed = False
-    i = 2
-    while i < len(argv):
-        if argv[i] == "--save-shot":
-            i += 1; save_shot = argv[i]
-        elif argv[i] == "--calls":
-            i += 1; calls_path = argv[i]
-        elif argv[i] == "--windowed":
-            windowed = True
-        i += 1
-    return save_shot, calls_path, windowed
 
-def main():
-    save_shot, calls_path, windowed = parse_args(sys.argv)
-    cmd = [BINARY] + ([] if windowed else ["--headless"])
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, bufsize=0)
-    next_id = [0]
+class ModelerSession:
+    """Owns the modeler process and the JSON-RPC conversation."""
 
-    def send(obj):
-        proc.stdin.write((json.dumps(obj) + "\n").encode())
-        proc.stdin.flush()
+    def __init__(self, windowed=False):
+        cmd = [BINARY] + ([] if windowed else ["--headless"])
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
+        self.next_id = 0
+        self._handshake()
 
-    def recv():
-        line = proc.stdout.readline()
+    def _send(self, obj):
+        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def _recv(self):
+        line = self.proc.stdout.readline()
         if not line:
             raise RuntimeError("server closed stdout")
         return json.loads(line)
 
-    # MCP initialize handshake
-    send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-        "protocolVersion": "2024-11-05", "capabilities": {},
-        "clientInfo": {"name": "mcp-driver", "version": "0"}}})
-    recv()
-    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-    next_id[0] = 1
+    def _handshake(self):
+        self._send({"jsonrpc": "2.0", "id": self.next_id, "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                               "clientInfo": {"name": "mcp-driver", "version": "0"}}})
+        self._recv()
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.next_id += 1
 
-    # Confirm tool list once.
-    send({"jsonrpc": "2.0", "id": next_id[0], "method": "tools/list", "params": {}})
-    resp = recv()
-    tool_names = sorted(t["name"] for t in resp["result"]["tools"])
-    print(json.dumps({"tools": tool_names}), flush=True)
-    next_id[0] += 1
-
-    def call(name, args=None):
-        rid = next_id[0]; next_id[0] += 1
-        send({"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {
-            "name": name, "arguments": args or {}}})
+    def tool_names(self):
+        rid = self.next_id; self.next_id += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}})
         while True:
-            resp = recv()
+            resp = self._recv()
+            if resp.get("id") == rid:
+                return sorted(t["name"] for t in resp["result"]["tools"])
+
+    def call(self, name, args=None, save_shot=None):
+        rid = self.next_id; self.next_id += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                    "params": {"name": name, "arguments": args or {}}})
+        while True:
+            resp = self._recv()
             if resp.get("id") != rid:
-                continue  # skip notifications
+                continue  # notifications
             result = resp.get("result", {})
             texts, images = [], []
             for c in result.get("content", []):
@@ -78,32 +79,121 @@ def main():
                     texts.append(c.get("text", ""))
                 elif c.get("type") == "image":
                     images.append(c)
-            out = {"isError": result.get("isError", False), "text": texts,
+            out = {"ok": not result.get("isError", False), "text": texts,
                    "n_images": len(images)}
-            if images and save_shot:
-                with open(save_shot, "wb") as f:
-                    f.write(base64.b64decode(images[0]["data"]))
-                out["saved_shot"] = save_shot
-            elif images:
-                out["b64"] = images[0]["data"]
-            print(json.dumps(out), flush=True)
+            if images:
+                if save_shot:
+                    with open(save_shot, "wb") as f:
+                        f.write(base64.b64decode(images[0]["data"]))
+                    out["saved_shot"] = save_shot
             return out
 
-    if calls_path:
-        calls = json.load(open(calls_path))
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        self.proc.terminate()
+
+
+def run_calls(session, calls, save_shot=None):
+    for c in calls:
+        if isinstance(c, str):
+            print(json.dumps({"ok": True, "text": [c], "n_images": 0}), flush=True)
+            continue
+        print(json.dumps(session.call(c["name"], c.get("args", {}), save_shot)),
+              flush=True)
+
+
+def daemon_mode(socket_path, windowed):
+    session = ModelerSession(windowed=windowed)
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(socket_path)
+    srv.listen(1)
+    print(f"modeler daemon ready on {socket_path}", flush=True)
+    try:
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                f = conn.makefile("r")
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        c = json.loads(line)
+                        is_quit = line == "quit" or c.get("name") == "quit"
+                        if is_quit:
+                            conn.sendall((json.dumps(
+                                {"ok": True, "text": ["daemon stopping"],
+                                 "n_images": 0}) + "\n").encode())
+                            return
+                        out = session.call(c["name"], c.get("args", {}),
+                                           c.get("save_shot"))
+                    except Exception as e:  # bad line or dead server
+                        out = {"ok": False, "text": [f"daemon error: {e}"],
+                               "n_images": 0}
+                    conn.sendall((json.dumps(out) + "\n").encode())
+            # client disconnected: keep the modeler (and window) alive
+    finally:
+        session.close()
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+
+
+def client_mode(socket_path, calls_path, save_shot):
+    calls = json.load(open(calls_path)) if calls_path != "/dev/stdin" else json.load(sys.stdin)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(socket_path)
+    with s:
+        f = s.makefile("r")
         for c in calls:
-            call(c["name"], c.get("args", {}))
+            payload = dict(c)
+            if save_shot:
+                payload["save_shot"] = save_shot
+            s.sendall((json.dumps(payload) + "\n").encode())
+            print(f.readline().strip(), flush=True)
+
+
+def main():
+    argv = sys.argv
+    daemon = "--daemon" in argv
+    connect = "--connect" in argv
+    windowed = "--windowed" in argv
+    socket_path = SOCKET
+    if "--socket" in argv:
+        socket_path = argv[argv.index("--socket") + 1]
+    save_shot = None
+    if "--save-shot" in argv:
+        save_shot = argv[argv.index("--save-shot") + 1]
+    calls_path = None
+    if "--calls" in argv:
+        calls_path = argv[argv.index("--calls") + 1]
+
+    if daemon:
+        daemon_mode(socket_path, windowed)
+    elif connect:
+        client_mode(socket_path, calls_path, save_shot)
     else:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            if line == "quit":
-                break
-            c = json.loads(line)
-            call(c["name"], c.get("args", {}))
-    proc.stdin.close()
-    proc.terminate()
+        # Throwaway mode: own server, dies with this invocation.
+        session = ModelerSession(windowed=windowed)
+        print(json.dumps({"tools": session.tool_names()}), flush=True)
+        try:
+            if calls_path:
+                run_calls(session, json.load(open(calls_path)), save_shot)
+            else:
+                for line in sys.stdin:
+                    line = line.strip()
+                    if not line or line == "quit":
+                        break
+                    c = json.loads(line)
+                    print(json.dumps(session.call(c["name"], c.get("args", {}),
+                                                  save_shot)), flush=True)
+        finally:
+            session.close()
+
 
 if __name__ == "__main__":
     main()

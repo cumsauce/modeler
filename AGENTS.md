@@ -155,6 +155,14 @@ read-only ops + history panel. Click a part then type to annotate
 
 ## Dev notes / gotchas
 
+- Agents driving the server over stdio (frozen MCP tool list) should run
+  `python3 mcp_driver.py --daemon --windowed` once in the background and then
+  `python3 mcp_driver.py --connect --calls <file>` per batch: one long-lived
+  server means the preview window stays open and state is live between
+  invocations (autosave covers even a daemon restart). `{"name": "quit"}`
+  stops it. The default throwaway mode spawns and kills a server per
+  invocation — window flashes open/closed, state restored from autosave.
+
 - rmcp 1.8 server runs a tokio current-thread on a spawned thread; the Bevy
   app owns the main thread (winit on macOS). Bridge = tokio mpsc + oneshot.
 - `--headless` uses MinimalPlugins — don't add ScheduleRunnerPlugin again.
