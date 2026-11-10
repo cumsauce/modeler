@@ -1,0 +1,31 @@
+[package]
+name = "modeler"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "MCP-driven mesh modeling tool: primitives, CSG booleans, UVs, op graph, glTF export. No game code"
+
+[dependencies]
+bevy = { version = "=0.20.0", features = ["picking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csgrs = "0.3"
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+png = "0.18"
+base64 = "0.22"
+thiserror = "2"
+
+[dev-dependencies]
+gltf = "1"
+
+[lints.clippy]
+unwrap_used = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
