@@ -132,6 +132,11 @@ whose copy 0 overlaps the source, parts still wearing the default material,
 and parts with identical world bounds (z-fighting). An empty warnings list
 means none of these fired — checking it is cheaper than eyeballing a render.
 
+Future verification work (deemed too heavy for now): a `probe_ray(origin,
+dir)` tool reusing the preview's `MeshRayCast` to check openings/occlusion
+numerically, and boolean volume-sanity asserts (a difference must shrink the
+input, a union needs overlap).
+
 ## Preview window (human side)
 
 Left/middle/right-drag = orbit/pan, scroll = zoom, arrows + PageUp/Down too.
