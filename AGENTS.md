@@ -58,10 +58,12 @@ tweak path):
 - `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
   parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
   may tweak.
-- **Booleans on curved surfaces** (cylinder−cylinder, torus anything)
-  produce non-manifold meshes that render as corrupted noise — `validate`
-  catches them. Compose or fake instead (the catalog's mug does). Box-on-
-  anything and cylinder-on-box are fine with small seams.
+- **Booleans** output welded meshes (1e-4 grid), but curved cuts can still
+  carry seam edges — `validate` reports them honestly; they render fine in
+  practice. Curved-on-curved (cylinder−cylinder, torus anything) can produce
+  corrupted noise — compose or fake instead (the catalog's mug does).
+  Boolean math comes from csgrs, which only exports polygon soup, so the
+  weld is the glue; don't expect guaranteed manifoldness.
 - `op_primitive(name, kind, size, translation, rotation?)` — `size` is
   **always exactly `[f32; 3]`**: `box`/`plane`/`wedge` (full extents),
   `sphere` (**radius = size[0]; [1]/[2] ignored** — flatten with a transform's
@@ -78,8 +80,10 @@ tweak path):
   transforms into verts. Panics inside csgrs on degenerate triangles, so keep
   inputs sane. Errors (e.g. no overlap) roll the graph back — it never stays
   broken.
-- `op_radial_array(name, input, count, center, degrees, start_degrees)` —
-  ring of copies about +Y. **The source part stays at its own spot**; with
+- `op_radial_array(name, input, count, center, degrees, start_degrees,
+  axis?)` — ring of copies about `axis` (`"y"` default; `"x"`/`"z"` make
+  horizontal rings — windmill blades, fan spokes — no manual rotation
+  needed). **The source part stays at its own spot**; with
   `start_degrees = degrees/count` and `count-1` copies the source fills the
   0° slot evenly with no overlap. Outputs `name_0..{n-1}`.
 - `op_linear_array(name, input, count, offset)` — line of copies. **The source
@@ -103,10 +107,12 @@ tweak path):
   name on `save_prefab`, so set it before saving.
 - `apply_ops(ops)` — a whole batch in one call: array of objects, each tagged
   `"type"` (`primitive`, `transform`, `boolean`, `radial_array`,
-  `linear_array`, `mirror`, `material`) plus that op's usual parameters.
-  Applied in order with the same upsert/rollback semantics; stops at the
-  first error (earlier ops stay). The result ends with the scene summary —
-  this is the fast path for building a model.
+  `linear_array`, `mirror`, `material` plus the baked edits `hide_part`
+  `{"part"}`, `show_part` `{"part"}`, `rename` `{"part", "to"}`) with that
+  op's usual parameters. Applied in order with the same upsert/rollback
+  semantics; stops at the first error with per-item context (earlier items
+  stay). The result ends with the scene summary — this is the fast path for
+  building a model.
 - `new_model(name)` — fresh empty session model without restarting the
   server; the old model is recorded in history, so one `undo` restores it.
 - `hide_part(part)` / `show_part(part)` — the argument is named `part`. Hidden
@@ -164,6 +170,11 @@ State:
 - `save_prefab(description, tags, prompt)` — all three required, including
   `prompt` — / `load_prefab(name)` /
   `catalog_list` / `catalog_describe` — persistence.
+- `save_prefab` reports whether it overwrote an existing catalog entry
+  ("saved `x` — overwrote an existing catalog entry") — if you didn't mean
+  to, the old JSON is gone; check `catalog_list` and the model name first.
+- `session_log(limit?)` — the recent per-call record (tool, ok/error, ms).
+  Self-audit a build: what failed, what was slow.
 - **Session autosave**: every successful mutation also writes the whole
   session model (parts, ops, history tree, annotations) to `session.json`
   in the catalog dir, and a server started without `--model` restores it.

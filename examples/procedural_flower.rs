@@ -25,7 +25,7 @@ fn main() {
         None,
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    s.op_radial_array("ring", "petal", 7, [0.0, 0.95, 0.0], 315.0, 45.0)
+    s.op_radial_array("ring", "petal", 7, [0.0, 0.95, 0.0], 315.0, 45.0, "y")
         .unwrap_or_else(|e| panic!("{e}"));
 
     // Center button.

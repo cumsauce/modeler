@@ -156,13 +156,18 @@ pub fn load_session_state() -> Option<Model> {
 /// the cached evaluation of the ops and re-derive on load), the history tree
 /// rides along inside the model, and the file is replaced atomically so a
 /// crash mid-save can't corrupt the prefab.
+/// Saves a model non-destructively. Returns the sanitized entry name and
+/// whether an existing entry was overwritten.
 pub fn save_prefab(
     model: &Model,
     description: &str,
     tags: &[&str],
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let name = sanitize(&model.name);
+    let overwrote = load_catalog()
+        .map(|c| c.entries.iter().any(|e| e.name == name))
+        .unwrap_or(false);
     let mut saved = model.clone();
     saved.name = name.clone();
     if saved.parts_derive_from_ops() {
@@ -191,7 +196,7 @@ pub fn save_prefab(
         None => catalog.entries.push(entry),
     }
     save_catalog(&catalog)?;
-    Ok(name)
+    Ok((name, overwrote))
 }
 
 /// Load a saved model by name. Procedural prefabs store no parts; they are
@@ -303,8 +308,10 @@ mod tests {
         part.indices = vec![0, 1, 2];
         model.parts.push(part);
 
-        let saved = save_prefab(&model, "A red box", &["box", "red"], "make a red box").unwrap();
+        let (saved, overwrote) =
+            save_prefab(&model, "A red box", &["box", "red"], "make a red box").unwrap();
         assert_eq!(saved, "red-box");
+        assert!(!overwrote, "first save is not an overwrite");
 
         let entries = list().unwrap();
         assert_eq!(entries.len(), 1);
@@ -320,7 +327,8 @@ mod tests {
         assert!(text.contains("tags: box, red"));
 
         // Upsert: saving again doesn't grow the catalog.
-        save_prefab(&model, "Still a red box", &["box"], "again").unwrap();
+        let (_, overwrote) = save_prefab(&model, "Still a red box", &["box"], "again").unwrap();
+        assert!(overwrote, "second save overwrites");
         assert_eq!(list().unwrap().len(), 1);
         assert_eq!(list().unwrap()[0].description, "Still a red box");
     }

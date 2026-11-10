@@ -121,22 +121,27 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             center,
             degrees,
             start_degrees,
+            axis,
         } => {
             let source = lookup(named, input)?;
             if *count == 0 {
                 return Err(format!("{name}: count must be at least 1"));
             }
+            let axis_vec = match axis.as_str() {
+                "x" => Vec3::X,
+                "y" => Vec3::Y,
+                "z" => Vec3::Z,
+                other => return Err(format!("{name}: unknown axis `{other}` (x, y, z)")),
+            };
             let step = degrees / *count as f32;
             for i in 0..*count {
                 let yaw = start_degrees + i as f32 * step;
                 let mut part = source.clone();
                 part.name = format!("{name}_{i}");
+                let rot = Quat::from_axis_angle(axis_vec, yaw.to_radians());
                 let offset = Vec3::from(part.translation) - Vec3::from(*center);
-                part.translation = (Quat::from_rotation_y(yaw.to_radians()) * offset
-                    + Vec3::from(*center))
-                .to_array();
-                part.rotation =
-                    (Quat::from_rotation_y(yaw.to_radians()) * quat_of(part.rotation)).to_array();
+                part.translation = (rot * offset + Vec3::from(*center)).to_array();
+                part.rotation = (rot * quat_of(part.rotation)).to_array();
                 uv::ensure_uvs(&mut part, Some("box")).map_err(|e| format!("{name}_{i}: {e}"))?;
                 upsert(named, &format!("{name}_{i}"), part)?;
             }
@@ -351,8 +356,9 @@ pub fn describe(ops: &[Op]) -> String {
                 center,
                 degrees,
                 start_degrees,
+                axis,
             } => format!(
-                "#{i} radial `{name}` = {count} x `{input}` over {degrees}° from {start_degrees}° center={center:?}"
+                "#{i} radial `{name}` = {count} x `{input}` over {degrees}° from {start_degrees}° about {axis} center={center:?}"
             ),
             Op::Material {
                 name,
@@ -448,6 +454,7 @@ mod tests {
                 center: [0.0, 0.0, 0.0],
                 degrees: 360.0,
                 start_degrees: 0.0,
+                axis: "y".into(),
             },
             Op::Transform {
                 name: "leg_s".into(),
@@ -545,6 +552,7 @@ mod tests {
                 center: [0.0, 0.0, 0.0],
                 degrees: 360.0,
                 start_degrees: 0.0,
+                axis: "y".into(),
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -652,6 +660,7 @@ mod tests {
             center: [0.0; 3],
             degrees: 360.0,
             start_degrees: 45.0,
+            axis: "y".into(),
         }]);
         assert!(text.contains("8 x `petal`"), "{text}");
     }

@@ -5,6 +5,16 @@ use crate::{Annotation, Model, Op, Part, Vec3, graph, quat_of};
 
 pub type CmdResult = Result<String, String>;
 
+/// One item in an `apply_batch` call: either a graph op or a baked edit
+/// (hide/show/rename) that runs in batch position.
+#[derive(Debug)]
+pub enum BatchItem {
+    Op(Op),
+    Hide { part: String },
+    Show { part: String },
+    Rename { part: String, to: String },
+}
+
 /// Signed volume of a part's mesh in world space (transform applied). Positive
 /// for outward-wound closed meshes; reliable only as a sanity signal for
 /// boolean outputs, which csgrs produces closed and welded.
@@ -157,6 +167,7 @@ impl Session {
         center: [f32; 3],
         degrees: f32,
         start_degrees: f32,
+        axis: &str,
     ) -> CmdResult {
         self.apply_op(
             Op::RadialArray {
@@ -166,8 +177,9 @@ impl Session {
                 center,
                 degrees,
                 start_degrees,
+                axis: axis.into(),
             },
-            &format!("op radial `{name}` = {count} x `{input}` over {degrees}°"),
+            &format!("op radial `{name}` = {count} x `{input}` over {degrees}° about {axis}"),
         )
     }
 
@@ -278,12 +290,33 @@ impl Session {
     /// upsert/rollback semantics as the individual op tools). Stops at the
     /// first error with its index; the ops before it stay applied.
     pub fn apply_ops(&mut self, ops: Vec<Op>) -> CmdResult {
-        let mut lines = Vec::with_capacity(ops.len());
-        for (i, op) in ops.into_iter().enumerate() {
-            let label = Self::op_label(&op);
-            self.apply_op(op, &label)
-                .map_err(|e| format!("op #{i} (`{label}`) failed: {e}"))?;
-            lines.push(format!("#{i} {label} ok"));
+        self.apply_batch(ops.into_iter().map(BatchItem::Op).collect())
+    }
+
+    /// Applies a mixed batch: graph ops and baked edits (hide/show/rename),
+    /// each running in its listed position with per-item error reporting.
+    /// Graph ops keep the upsert/rollback semantics of `apply_op`.
+    pub fn apply_batch(&mut self, items: Vec<BatchItem>) -> CmdResult {
+        let mut lines = Vec::with_capacity(items.len());
+        for (i, item) in items.into_iter().enumerate() {
+            let msg = match item {
+                BatchItem::Op(op) => {
+                    let label = Self::op_label(&op);
+                    self.apply_op(op, &label)
+                        .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
+                    format!("{label} ok")
+                }
+                BatchItem::Hide { part } => self
+                    .set_visible(&part, false)
+                    .map_err(|e| format!("batch item #{i} failed: {e}"))?,
+                BatchItem::Show { part } => self
+                    .set_visible(&part, true)
+                    .map_err(|e| format!("batch item #{i} failed: {e}"))?,
+                BatchItem::Rename { part, to } => self
+                    .rename_part(&part, &to)
+                    .map_err(|e| format!("batch item #{i} failed: {e}"))?,
+            };
+            lines.push(format!("#{i} {msg}"));
         }
         lines.push(self.summary());
         Ok(lines.join("\n"))
@@ -645,6 +678,7 @@ impl Session {
         let mut part = crate::primitives::primitive(kind, size, name).map_err(|e| e.to_string())?;
         part.translation = translation;
         self.model.parts.push(part);
+        self.model.mark_baked();
         self.bump();
         self.commit(&format!("add {kind} `{name}`"));
         Ok(format!("added {kind} `{name}` at {translation:?}"))
@@ -712,6 +746,7 @@ impl Session {
         if let Some(s) = scale {
             p.scale = s;
         }
+        self.model.mark_baked();
         self.bump();
         self.commit(&format!("transform `{part}`"));
         Ok(format!("transformed `{part}`"))
@@ -723,6 +758,7 @@ impl Session {
         if self.model.parts.len() == before {
             Err(format!("no part `{part}`"))
         } else {
+            self.model.mark_baked();
             self.bump();
             self.commit(&format!("delete `{part}`"));
             Ok(format!("deleted `{part}`"))
@@ -735,6 +771,7 @@ impl Session {
             .part_mut(part)
             .ok_or_else(|| format!("no part `{part}`"))?;
         p.name = to.to_string();
+        self.model.mark_baked();
         self.bump();
         self.commit(&format!("rename `{part}` -> `{to}`"));
         Ok(format!("renamed `{part}` -> `{to}`"))
@@ -760,6 +797,7 @@ impl Session {
         if let Some(m) = metalness {
             p.material.metalness = m;
         }
+        self.model.mark_baked();
         self.bump();
         self.commit(&format!("material on `{part}`"));
         Ok(format!("material on `{part}` updated"))
@@ -771,6 +809,7 @@ impl Session {
             .part_mut(part)
             .ok_or_else(|| format!("no part `{part}`"))?;
         crate::uv::project(p, projection).map_err(|e| e.to_string())?;
+        self.model.mark_baked();
         self.bump();
         self.commit(&format!("uvs on `{part}`"));
         Ok(format!("uvs on `{part}` set to {projection}"))
@@ -1104,7 +1143,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_primitive("petal", "sphere", [0.2, 0.0, 0.0], [0.0, 1.0, 0.3], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("ring", "petal", 6, [0.0, 1.0, 0.0], 360.0, 0.0)
+        s.op_radial_array("ring", "petal", 6, [0.0, 1.0, 0.0], 360.0, 0.0, "y")
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.model.procedural());
         // stem + petal + 6 ring copies
@@ -1113,7 +1152,7 @@ mod tests {
 
         // Re-issuing the radial op with another count is the tweak path.
         let v = s.model.version;
-        s.op_radial_array("ring", "petal", 8, [0.0, 1.0, 0.0], 360.0, 0.0)
+        s.op_radial_array("ring", "petal", 8, [0.0, 1.0, 0.0], 360.0, 0.0, "y")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts.len(), 10);
         assert_eq!(s.model.ops.len(), 3);
@@ -1204,7 +1243,7 @@ mod tests {
             panic!("expected the batch to fail")
         };
         assert!(
-            err.contains("op #1"),
+            err.contains("batch item #1"),
             "error names the failing index: {err}"
         );
         assert_eq!(s.model.parts.len(), 1, "op #0 stayed applied");
@@ -1275,7 +1314,7 @@ mod tests {
         let mut s = Session::default();
         s.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("posts", "post", 6, [0.0, 0.25, 0.0], 360.0, 0.0)
+        s.op_radial_array("posts", "post", 6, [0.0, 0.25, 0.0], 360.0, 0.0, "y")
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             s.lints()
@@ -1288,7 +1327,7 @@ mod tests {
         let mut s2 = Session::default();
         s2.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s2.op_radial_array("posts", "post", 5, [0.0, 0.25, 0.0], 360.0, 60.0)
+        s2.op_radial_array("posts", "post", 5, [0.0, 0.25, 0.0], 360.0, 60.0, "y")
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!s2.lints().iter().any(|l| l.contains("overlap")));
     }

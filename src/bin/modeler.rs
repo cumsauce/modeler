@@ -30,7 +30,7 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::window::{PrimaryWindow, WindowPlugin};
 use modeler::catalog::{self, CatalogEntry};
-use modeler::commands::{PendingPin, Session};
+use modeler::commands::{BatchItem, PendingPin, Session};
 use modeler::gltf;
 use modeler::{Model, Op, Part};
 use rmcp::handler::server::wrapper::Parameters;
@@ -506,7 +506,23 @@ fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>)
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
         ))
         .with_children(|c| {
-            c.spawn(DirectionalLight::default());
+            // Key + fill: dimmer than the scene's sun so low-roughness parts
+            // don't blow out to white in agent views (a hot highlight reads
+            // as solid geometry to an agent that cannot orbit to check).
+            c.spawn((
+                DirectionalLight {
+                    illuminance: 350.0,
+                    ..default()
+                },
+                Transform::default(),
+            ));
+            c.spawn((
+                DirectionalLight {
+                    illuminance: 150.0,
+                    ..default()
+                },
+                Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::PI)),
+            ));
         })
         .insert(RenderTarget::Image(image.clone().into()))
         .id();
@@ -1248,12 +1264,19 @@ impl Tools {
             .send(Cmd::Screenshot(reply_tx))
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
+        let started = std::time::Instant::now();
         match Self::await_reply(reply_rx).await {
-            Ok(png) => Ok(CallToolResult::success(vec![
-                Content::image(B64.encode(png), "image/png"),
-                Content::text("current preview render"),
-            ])),
-            Err(message) => Ok(err_result(message)),
+            Ok(png) => {
+                log_call("screenshot", true, started.elapsed().as_millis());
+                Ok(CallToolResult::success(vec![
+                    Content::image(B64.encode(png), "image/png"),
+                    Content::text("current preview render"),
+                ]))
+            }
+            Err(message) => {
+                log_call("screenshot", false, started.elapsed().as_millis());
+                Ok(err_result(message))
+            }
         }
     }
 
@@ -1265,6 +1288,7 @@ impl Tools {
         width: u32,
         height: u32,
     ) -> Result<(Vec<u8>, String), ErrorData> {
+        let started = std::time::Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::AgentShot {
@@ -1278,7 +1302,21 @@ impl Tools {
         let png = Self::await_reply(reply_rx)
             .await
             .map_err(|e| ErrorData::internal_error(e, None))?;
+        log_call("agent_shot", true, started.elapsed().as_millis());
         Ok((png, format!("{view:?} {width}x{height}")))
+    }
+}
+
+/// Per-call session log: (tool, ok, milliseconds). Capped; the `session_log`
+/// tool surfaces it so an agent can self-audit a build (failures, latency).
+static CALL_LOG: Mutex<Vec<(String, bool, u128)>> = Mutex::new(Vec::new());
+
+fn log_call(tool: &str, ok: bool, ms: u128) {
+    if let Ok(mut log) = CALL_LOG.lock() {
+        log.push((tool.to_string(), ok, ms));
+        if log.len() > 500 {
+            log.remove(0);
+        }
     }
 }
 
@@ -1475,6 +1513,14 @@ struct OpRadialArrayArgs {
     /// copies when the source part itself should fill the 0° slot evenly.
     #[serde(default)]
     start_degrees: f32,
+    /// Rotation axis: "y" (default), "x" or "z". "x"/"z" make horizontal
+    /// rings (windmill blades, fan spokes).
+    #[serde(default = "default_axis")]
+    axis: String,
+}
+
+fn default_axis() -> String {
+    "y".to_string()
 }
 
 fn default_tool_degrees() -> f32 {
@@ -1579,6 +1625,8 @@ enum OpSpec {
         degrees: f32,
         #[serde(default)]
         start_degrees: f32,
+        #[serde(default = "default_axis")]
+        axis: String,
     },
     LinearArray {
         name: String,
@@ -1605,9 +1653,19 @@ enum OpSpec {
         #[serde(default)]
         metalness: Option<f32>,
     },
+    /// Baked edit (not an op): hide a part. Runs in batch position.
+    HidePart { part: String },
+    /// Baked edit (not an op): un-hide a part. Runs in batch position.
+    ShowPart { part: String },
+    /// Baked edit (not an op): rename a part. Runs in batch position.
+    Rename {
+        part: String,
+        /// The new name.
+        to: String,
+    },
 }
 
-impl From<OpSpec> for Op {
+impl From<OpSpec> for BatchItem {
     fn from(spec: OpSpec) -> Self {
         match spec {
             OpSpec::Primitive {
@@ -1616,27 +1674,27 @@ impl From<OpSpec> for Op {
                 size,
                 translation,
                 rotation,
-            } => Op::Primitive {
+            } => BatchItem::Op(Op::Primitive {
                 name,
                 kind,
                 size,
                 translation,
                 rotation,
-            },
+            }),
             OpSpec::Transform {
                 name,
                 input,
                 translation,
                 rotation,
                 scale,
-            } => Op::Transform {
+            } => BatchItem::Op(Op::Transform {
                 name,
                 input,
                 translation,
                 rotation,
                 scale,
-            },
-            OpSpec::Boolean { name, op, a, b } => Op::Boolean { name, op, a, b },
+            }),
+            OpSpec::Boolean { name, op, a, b } => BatchItem::Op(Op::Boolean { name, op, a, b }),
             OpSpec::RadialArray {
                 name,
                 input,
@@ -1644,49 +1702,54 @@ impl From<OpSpec> for Op {
                 center,
                 degrees,
                 start_degrees,
-            } => Op::RadialArray {
+                axis,
+            } => BatchItem::Op(Op::RadialArray {
                 name,
                 input,
                 count,
                 center,
                 degrees,
                 start_degrees,
-            },
+                axis,
+            }),
             OpSpec::LinearArray {
                 name,
                 input,
                 count,
                 offset,
-            } => Op::LinearArray {
+            } => BatchItem::Op(Op::LinearArray {
                 name,
                 input,
                 count,
                 offset,
-            },
+            }),
             OpSpec::Mirror {
                 name,
                 input,
                 axis,
                 offset,
-            } => Op::Mirror {
+            } => BatchItem::Op(Op::Mirror {
                 name,
                 input,
                 axis,
                 offset,
-            },
+            }),
             OpSpec::Material {
                 name,
                 input,
                 base_color,
                 roughness,
                 metalness,
-            } => Op::Material {
+            } => BatchItem::Op(Op::Material {
                 name,
                 input,
                 base_color,
                 roughness,
                 metalness,
-            },
+            }),
+            OpSpec::HidePart { part } => BatchItem::Hide { part },
+            OpSpec::ShowPart { part } => BatchItem::Show { part },
+            OpSpec::Rename { part, to } => BatchItem::Rename { part, to },
         }
     }
 }
@@ -1760,6 +1823,12 @@ struct AgentViewsArgs {
     /// Pixel height per view. Default 720.
     #[serde(default = "default_shot_height")]
     height: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SessionLogArgs {
+    /// How many recent calls to show. Default 30, max 500.
+    limit: Option<u32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1922,7 +1991,15 @@ impl Tools {
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-            catalog::save_prefab(&s.model, &description, &tag_refs, &prompt)
+            catalog::save_prefab(&s.model, &description, &tag_refs, &prompt).map(
+                |(name, overwrote)| {
+                    if overwrote {
+                        format!("saved `{name}` — overwrote an existing catalog entry")
+                    } else {
+                        format!("saved `{name}`")
+                    }
+                },
+            )
         })
         .await
     }
@@ -2071,10 +2148,13 @@ impl Tools {
             center,
             degrees,
             start_degrees,
+            axis,
         }): Parameters<OpRadialArrayArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_radial_array(&name, &input, count, center, degrees, start_degrees))
-            .await
+        self.run(move |s| {
+            s.op_radial_array(&name, &input, count, center, degrees, start_degrees, &axis)
+        })
+        .await
     }
 
     /// Re-material an earlier part as a graph step.
@@ -2162,19 +2242,21 @@ impl Tools {
         self.run(move |s| s.new_model(&name)).await
     }
 
-    /// Apply a whole batch of ops in one call: an array of objects, each
-    /// tagged with a "type" field ("primitive", "transform", "boolean",
-    /// "radial_array", "linear_array", "mirror", "material") and carrying the
-    /// same parameters as the individual op tools. Applied in order with the
-    /// usual upsert/rollback semantics; stops at the first error. The result
+    /// Apply a whole batch in one call: an array of objects, each tagged
+    /// with a "type" field — the graph ops ("primitive", "transform",
+    /// "boolean", "radial_array", "linear_array", "mirror", "material")
+    /// carrying the same parameters as the individual tools, plus the baked
+    /// edits "hide_part" {"part"}, "show_part" {"part"} and "rename"
+    /// {"part", "to"}. Applied in order with the usual upsert/rollback
+    /// semantics; stops at the first error with per-item context. The result
     /// ends with the full scene summary.
     #[tool]
     async fn apply_ops(
         &self,
         Parameters(ApplyOpsArgs { ops }): Parameters<ApplyOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ops: Vec<Op> = ops.into_iter().map(Op::from).collect();
-        self.run(move |s| s.apply_ops(ops)).await
+        let items: Vec<BatchItem> = ops.into_iter().map(BatchItem::from).collect();
+        self.run(move |s| s.apply_batch(items)).await
     }
 
     /// Move the orbit camera: yaw/pitch in degrees and the distance from the
@@ -2388,6 +2470,40 @@ impl Tools {
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.delete_annotation(id)).await
     }
+
+    /// The recent call log: tool name, ok/error, duration in ms — so you can
+    /// self-audit a build (what failed, what was slow) without leaving the
+    /// server. Covers the last ~500 calls in this server process.
+    #[tool]
+    async fn session_log(
+        &self,
+        Parameters(SessionLogArgs { limit }): Parameters<SessionLogArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = limit.unwrap_or(30).min(500) as usize;
+        let log = CALL_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let start = log.len().saturating_sub(limit);
+        let lines: Vec<String> = log[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, (tool, ok, ms))| {
+                format!(
+                    "#{} {} {} ({}ms)",
+                    start + i + 1,
+                    tool,
+                    if *ok { "ok" } else { "ERROR" },
+                    ms
+                )
+            })
+            .collect();
+        if lines.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "session log is empty",
+            )]));
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
+    }
 }
 
 /// The server-handler wiring: tool calls go through the generated router, and
@@ -2402,7 +2518,10 @@ impl rmcp::ServerHandler for Tools {
 - Build with apply_ops (a whole model in one call), not one op per call. Ops are upserts: re-issuing the same name and kind tweaks parameters and re-derives. Evaluation is dependency-ordered, so op positions don't matter.
 - Wire shapes are strict: size is ALWAYS [f32;3] (sphere radius = size[0], cylinder/cone/capsule radius = size[0] height = size[1]); base_color is ALWAYS RGBA [f32;4]. Wrong shapes fail deserialization with no field name.
 - op_transform values are ABSOLUTE, not additive: a part at y=0.375 transformed with translation y=0 lands at y=0. Restate the full position in every copy. op_primitive also takes an optional rotation quat [x,y,z,w].
-- hide_part/show_part take an argument named part; expect_parts takes parts; save_prefab requires prompt.
+- hide_part/show_part take an argument named part; expect_parts takes parts; save_prefab requires prompt and warns when it overwrites an existing entry.
+- apply_ops batches can also include baked edits: type hide_part/show_part with part, or rename with part and to - they run in batch position.
+- radial_array takes an optional axis (y default, x or z for horizontal rings like windmill blades - no manual rotation needed).
+- session_log shows the recent per-call record (tool, ok/error, ms) for self-auditing.
 - Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
 - Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.
 - undo/redo/jump move a history tree cursor; jump restores that snapshot's op list exactly, so re-issue every op created after the jump point. Editing after a jump branches.

@@ -5,6 +5,7 @@
 use crate::{Model, Part, quat_of};
 use bevy::math::{Quat, Vec3};
 use csgrs::CSG;
+use std::collections::HashMap;
 
 /// The supported ops: "union", "difference"/"subtract", "intersect".
 fn run_op(op: &str, a: &CSG<()>, b: &CSG<()>) -> Result<CSG<()>, String> {
@@ -57,27 +58,104 @@ fn part_to_csg(part: &Part) -> CSG<()> {
     CSG::polyhedron(&points, &faces)
 }
 
-/// A csgrs polygon soup back into a flat triangle part (three verts per triangle).
+/// csgrs emits polygon soup; the weld merges cut-boundary duplicates. Remaining seams
+/// are possible and are reported by validate — acceptable.
+/// Returns a flat triangle part (three verts per triangle), welded and sliver-free.
 fn csg_to_part(csg: &CSG<()>, name: &str, material: crate::Material) -> Part {
+    let mut part = triangle_soup(csg, name, material);
+    weld_and_drop_slivers(&mut part);
+    part
+}
+
+/// The unwelded csgrs output: one vertex triple per triangle.
+fn triangle_soup(csg: &CSG<()>, name: &str, material: crate::Material) -> Part {
     let mut part = Part::new(name);
     part.material = material;
     for poly in csg.to_polygons() {
         for tri in poly.triangulate() {
             let base = part.verts.len() as u32;
             for v in &tri {
-                let (p, n) = (&v.pos, &v.normal);
+                let p = &v.pos;
                 part.verts.push([p.x as f32, p.y as f32, p.z as f32]);
-                let n = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
-                part.normals.push(if n.length_squared() > 1e-12 {
-                    n.normalize().to_array()
-                } else {
-                    [0.0; 3]
-                });
             }
             part.indices.extend([base, base + 1, base + 2]);
         }
     }
     part
+}
+
+/// Quantise a position onto the 1e-4 weld grid (the tolerance `validate` uses).
+fn grid_key(v: &[f32; 3]) -> [i64; 3] {
+    [
+        (v[0] as f64 * 1e4).round() as i64,
+        (v[1] as f64 * 1e4).round() as i64,
+        (v[2] as f64 * 1e4).round() as i64,
+    ]
+}
+
+/// Snap a quantised position back to its grid-cell centre as f32, so a vertex's
+/// position agrees exactly with its key.
+fn snap_to_grid(v: &[f32; 3]) -> [f32; 3] {
+    let k = grid_key(v);
+    [
+        (k[0] as f32) / 1e4,
+        (k[1] as f32) / 1e4,
+        (k[2] as f32) / 1e4,
+    ]
+}
+
+/// Weld near-duplicate vertices left behind by csgrs's triangle-soup output and drop
+/// degenerate triangles. Vertices are merged on a 1e-4 quantisation grid (the
+/// tolerance `validate` uses) and snapped to its centres, so a vertex's position
+/// agrees exactly with its key. Normals and UVs are cleared — callers must
+/// regenerate them (see `boolean`). O(n); cannot hang.
+fn weld_and_drop_slivers(part: &mut Part) {
+    let mut remap: HashMap<[i64; 3], u32> = HashMap::with_capacity(part.verts.len());
+    let mut welded = Vec::with_capacity(part.verts.len());
+    let mut to_welded = vec![0u32; part.verts.len()];
+    for (i, v) in part.verts.iter().enumerate() {
+        match remap.entry(grid_key(v)) {
+            std::collections::hash_map::Entry::Occupied(e) => to_welded[i] = *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                to_welded[i] = welded.len() as u32;
+                e.insert(welded.len() as u32);
+                welded.push(snap_to_grid(v));
+            }
+        }
+    }
+    let mut seen: HashMap<[u32; 3], ()> = HashMap::with_capacity(part.indices.len());
+    let mut indices = Vec::with_capacity(part.indices.len());
+    for tri in part.indices.as_chunks::<3>().0 {
+        let i = [
+            to_welded[tri[0] as usize],
+            to_welded[tri[1] as usize],
+            to_welded[tri[2] as usize],
+        ];
+        // Drop triangles collapsed by welding, exact duplicates, and slivers
+        // (near-zero area, computed on world-scale coords: verts are already in
+        // local/model space).
+        if i[0] == i[1] || i[1] == i[2] || i[0] == i[2] {
+            continue;
+        }
+        let mut sorted = i;
+        sorted.sort_unstable();
+        if seen.insert(sorted, ()).is_some() {
+            continue;
+        }
+        let (va, vb, vc) = (
+            Vec3::from(welded[i[0] as usize]),
+            Vec3::from(welded[i[1] as usize]),
+            Vec3::from(welded[i[2] as usize]),
+        );
+        if (vb - va).cross(vc - va).length() < 1e-9 {
+            continue;
+        }
+        indices.extend(i);
+    }
+    part.verts = welded;
+    part.indices = indices;
+    part.normals = vec![[0.0; 3]; part.verts.len()];
+    part.uvs.clear();
 }
 
 /// Boolean `op` on the named parts of `model`, returning a new part named
@@ -107,6 +185,9 @@ pub fn boolean(
     part.translation = [0.0; 3];
     part.rotation = Quat::IDENTITY.to_array();
     part.scale = [1.0; 3];
+    // Welding invalidated per-vertex data: rebuild normals first (the box UV
+    // projection reads them), then re-project the UVs.
+    crate::uv::ensure_normals(&mut part);
     let _ = crate::uv::ensure_uvs(&mut part, Some("box"));
     Ok(part)
 }
@@ -196,6 +277,70 @@ mod tests {
         let model = model_with_box("a", 1.0);
         assert!(boolean(&model, "union", "a", "ghost", None).is_err());
         assert!(boolean(&model, "xor", "a", "a", None).is_err());
+    }
+
+    #[test]
+    fn weld_dedupes_verts_and_drops_degenerates() {
+        // A partial overlap difference produces cut-boundary duplicates in the raw
+        // soup; the weld must merge them and leave a clean indexed mesh.
+        let mut model = model_with_box("big", 2.0);
+        let mut cutter = crate::primitives::primitive("box", [2.0, 1.0, 1.0], "cutter")
+            .unwrap_or_else(|_| panic!("cutter failed"));
+        cutter.translation = [1.0, 0.0, 1.5]; // bites a corner off the big box
+        model.parts.push(cutter);
+        let out = match boolean(&model, "difference", "big", "cutter", None) {
+            Ok(out) => out,
+            Err(e) => panic!("partial difference failed: {e}"),
+        };
+        let soup = triangle_soup(
+            &run_op(
+                "difference",
+                &part_to_csg(model.part("big").unwrap_or_else(|| panic!("big missing"))),
+                &part_to_csg(
+                    model
+                        .part("cutter")
+                        .unwrap_or_else(|| panic!("cutter missing")),
+                ),
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+            "soup",
+            out.material.clone(),
+        );
+        // Welding dedupes: strictly fewer verts than the per-triangle soup.
+        assert!(
+            out.verts.len() < soup.verts.len(),
+            "welded {} verts vs unwelded {}",
+            out.verts.len(),
+            soup.verts.len()
+        );
+        // No two verts share a quantized key.
+        let mut keys: Vec<[i64; 3]> = out.verts.iter().map(grid_key).collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "duplicate quantized verts");
+        // No degenerate triangles: distinct indices and real area.
+        assert!(out.tri_count() > 0, "result must be non-empty");
+        for tri in out.indices.as_chunks::<3>().0 {
+            assert_ne!(tri[0], tri[1]);
+            assert_ne!(tri[1], tri[2]);
+            assert_ne!(tri[0], tri[2]);
+            let (va, vb, vc) = (
+                Vec3::from(out.verts[tri[0] as usize]),
+                Vec3::from(out.verts[tri[1] as usize]),
+                Vec3::from(out.verts[tri[2] as usize]),
+            );
+            assert!(
+                (vb - va).cross(vc - va).length() >= 1e-9,
+                "degenerate triangle {tri:?}"
+            );
+        }
+        // Bounds: the corner bite stays within the big box's original extents.
+        let (min, max) = out.bounds();
+        assert!(min.x > -2.0 - 1e-5 && max.x < 2.0 + 1e-5);
+        assert!(min.y > -2.0 - 1e-5 && max.y < 2.0 + 1e-5);
+        assert!(min.z > -2.0 - 1e-5 && max.z < 2.0 + 1e-5);
+        validate(&out, "partial-difference");
     }
 
     fn validate(part: &Part, what: &str) {

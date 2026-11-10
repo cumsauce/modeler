@@ -115,6 +115,14 @@ pub struct Model {
     /// recursion.
     #[serde(default, skip_serializing_if = "History::is_empty")]
     pub history: History,
+    /// Set by a successful `refresh` on an op-driven model: the cached parts
+    /// are exactly the graph's derivation, so saves can omit them. Baked-part
+    /// edits clear it (the cache then carries information the ops don't).
+    /// A stored flag instead of a re-evaluation: serialization walks every
+    /// history snapshot, and re-deriving each one re-runs booleans (csgrs
+    /// repairs can take minutes) — that was the daemon hang.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub derived_from_ops: bool,
 }
 
 impl Model {
@@ -137,9 +145,11 @@ impl Model {
     /// Re-derives `parts` from the op graph. A no-op for baked models.
     pub fn refresh(&mut self) -> Result<(), String> {
         if self.ops.is_empty() {
+            self.derived_from_ops = false;
             return Ok(());
         }
         self.parts = crate::graph::evaluate(&self.ops)?;
+        self.derived_from_ops = true;
         Ok(())
     }
 
@@ -147,19 +157,13 @@ impl Model {
     /// from a save loses nothing. Mixed models (baked parts plus ops) keep
     /// their parts on disk.
     pub fn parts_derive_from_ops(&self) -> bool {
-        if !self.procedural() {
-            return false;
-        }
-        match crate::graph::evaluate(&self.ops) {
-            Ok(derived) => {
-                derived.len() == self.parts.len()
-                    && derived
-                        .iter()
-                        .zip(&self.parts)
-                        .all(|(d, p)| d.name == p.name)
-            }
-            Err(_) => false,
-        }
+        self.procedural() && self.derived_from_ops
+    }
+
+    /// Marks the cached parts as carrying information beyond the graph (a
+    /// baked edit), so saves keep them instead of re-deriving.
+    pub fn mark_baked(&mut self) {
+        self.derived_from_ops = false;
     }
 
     pub fn part_mut(&mut self, name: &str) -> Option<&mut Part> {
@@ -379,9 +383,10 @@ pub enum Op {
         b: String,
     },
     /// Copies an earlier part around a circle: `count` copies spread over
-    /// `degrees` starting at `start_degrees`, rotating about the +Y axis
-    /// through `center`. With start = step and degrees = 360 - step, the
-    /// source part fills the 0° slot evenly.
+    /// `degrees` starting at `start_degrees`, rotating about `axis` (default
+    /// "y"; "x" and "z" make horizontal rings like windmill blades) through
+    /// `center`. With start = step and degrees = 360 - step, the source part
+    /// fills the 0° slot evenly.
     RadialArray {
         name: String,
         input: String,
@@ -392,6 +397,8 @@ pub enum Op {
         degrees: f32,
         #[serde(default)]
         start_degrees: f32,
+        #[serde(default = "default_axis")]
+        axis: String,
     },
     /// Re-materials an earlier part into a new output.
     Material {
@@ -424,6 +431,10 @@ pub enum Op {
         #[serde(default)]
         offset: [f32; 3],
     },
+}
+
+fn default_axis() -> String {
+    "y".to_string()
 }
 
 fn default_degrees() -> f32 {

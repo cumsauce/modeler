@@ -92,7 +92,45 @@ pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String>
     if part.verts.is_empty() || part.tri_count() == 0 {
         return Err(format!("primitive `{kind}` produced an empty mesh"));
     }
+    // Open surfaces are double-sided: append a reversed copy so neither
+    // orientation back-face-culls (and welded edges pair up in `validate`).
+    if matches!(kind, "plane" | "disc" | "washer") {
+        make_double_sided(&mut part);
+    }
     Ok(part)
+}
+
+/// Append a second, reversed copy of the triangle set so the surface renders
+/// from both sides. Triangles are first split into per-triangle verts: the
+/// generated fan/quad sheets share interior edges, and after doubling every
+/// welded edge must be incident to exactly 2 triangles (the front face and its
+/// reversed twin) for `Session::validate` to call the mesh manifold. Original
+/// triangle geometry (positions, normals, uvs, winding) is unchanged.
+fn make_double_sided(part: &mut Part) {
+    let base_verts = std::mem::take(&mut part.verts);
+    let base_normals = std::mem::take(&mut part.normals);
+    let base_uvs = std::mem::take(&mut part.uvs);
+    let base_tris: Vec<[u32; 3]> = part.indices.as_chunks::<3>().0.to_vec();
+    part.indices.clear();
+    let emit = |part: &mut Part, t: &[u32; 3], reversed: bool| {
+        let order: [usize; 3] = if reversed { [0, 2, 1] } else { [0, 1, 2] };
+        let start = part.verts.len() as u32;
+        for k in order {
+            let i = t[k] as usize;
+            part.verts.push(base_verts[i]);
+            let n = base_normals[i];
+            part.normals
+                .push(if reversed { [-n[0], -n[1], -n[2]] } else { n });
+            part.uvs.push(base_uvs[i]);
+        }
+        part.indices.extend([start, start + 1, start + 2]);
+    };
+    for t in &base_tris {
+        emit(part, t, false);
+    }
+    for t in &base_tris {
+        emit(part, t, true);
+    }
 }
 
 /// Pull POSITION/NORMAL/UV_0 and the index buffer out of a bevy mesh into a [`Part`].
@@ -217,6 +255,61 @@ mod tests {
     #[test]
     fn torus_rejects_bad_tube() {
         assert!(primitive("torus", [1.0, 2.0, 0.0], "x").is_err());
+    }
+
+    /// Open surfaces are double-sided: a reversed copy of every triangle rides
+    /// along, so no welded edge (positions quantized to i64, per the `validate`
+    /// convention in commands.rs) is "naked" — each appears an even number of
+    /// times, at least twice (interior edges 4: two per sheet), and every
+    /// front triangle has an exact reversed positional twin. (Interior edges
+    /// cannot be exactly 2: a connected sheet already shares them between two
+    /// front triangles.)
+    #[test]
+    fn open_primitives_are_double_sided() {
+        for (kind, size) in [
+            ("disc", [1.0, 0.0, 0.0]),
+            ("washer", [0.5, 1.0, 0.0]),
+            ("plane", [4.0, 6.0, 0.0]),
+        ] {
+            let part = build(kind, size);
+            let quantize = |i: u32| -> (i64, i64, i64) {
+                let v = part.verts[i as usize];
+                (
+                    (v[0] * 1e5).round() as i64,
+                    (v[1] * 1e5).round() as i64,
+                    (v[2] * 1e5).round() as i64,
+                )
+            };
+            let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), u32> =
+                std::collections::HashMap::new();
+            let tris: Vec<[(i64, i64, i64); 3]> = part
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|t| [quantize(t[0]), quantize(t[1]), quantize(t[2])])
+                .collect();
+            for q in &tris {
+                for e in 0..3 {
+                    let (a, b) = (q[e], q[(e + 1) % 3]);
+                    *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+                }
+            }
+            assert_eq!(tris.len() % 2, 0, "{kind} triangle count must be even");
+            assert!(
+                edges.values().all(|&c| c % 2 == 0 && c >= 2),
+                "{kind} has naked boundary edges: {edges:?}"
+            );
+            // Each front triangle pairs with a reversed twin over the same
+            // welded positions, so the surface renders from both sides.
+            for q in &tris {
+                let twin = [q[0], q[2], q[1]];
+                assert!(
+                    tris.contains(&twin),
+                    "{kind} triangle {q:?} has no reversed twin"
+                );
+            }
+        }
     }
 
     #[test]

@@ -116,6 +116,19 @@ arch-bridge.
 
 ## Improvement queue (priority order)
 
+UPDATE 2026-11-10, later the same day: items 1-5 are done (batchable baked
+edits with per-item errors, double-sided open primitives, boolean weld-only
+cleanup replacing the hang-prone repair pipeline, radial `axis` param,
+save_prefab overwrite warning), plus: dependency-order op evaluation, an
+agent offscreen camera rig (`agent_shot`/`agent_views`), 15s timeouts on all
+render waits, a `session_log` tool, flag-based `parts_derive_from_ops`
+(serialization no longer re-evaluates snapshots — the daemon hang's root
+cause: the same boolean-heavy batch that hung now completes in ~1s), and the
+agent camera background/lighting fixes. Remaining from the queue: op-level
+rename (batch rename is baked and refresh-visible names revert — wait, no:
+baked renames persist but ops re-derive the original name alongside), ground
+grid, and the session-log could grow per-call timings for renders only.
+
 1. Batch-able baked edits (hide/show/material/rename in apply_ops) or
    per-item deserialization errors.
 2. Double-sided open primitives (disc/washer/plane).
