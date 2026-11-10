@@ -2,18 +2,16 @@
 //! (translation/rotation/scale baked in), the op runs on triangle soup, and the result
 //! comes back as a plain triangle `Part` with box-projected UVs and part `a`'s material.
 
-use crate::{Model, Part, quat_of};
+use crate::{BoolOp, Model, ModelerError, Part, quat_of};
 use bevy::math::{Quat, Vec3};
 use csgrs::CSG;
 use std::collections::HashMap;
 
-/// The supported ops: "union", "difference"/"subtract", "intersect".
-fn run_op(op: &str, a: &CSG<()>, b: &CSG<()>) -> Result<CSG<()>, String> {
+fn run_op(op: BoolOp, a: &CSG<()>, b: &CSG<()>) -> CSG<()> {
     match op {
-        "union" => Ok(a.union(b)),
-        "difference" | "subtract" => Ok(a.subtract(b)),
-        "intersect" => Ok(a.intersect(b)),
-        other => Err(format!("unknown boolean op `{other}`")),
+        BoolOp::Union => a.union(b),
+        BoolOp::Difference => a.subtract(b),
+        BoolOp::Intersect => a.intersect(b),
     }
 }
 
@@ -48,7 +46,7 @@ fn part_to_csg(part: &Part) -> CSG<()> {
             Vec3::from(part.verts[i[2]]),
         );
         let n = (vb - va).cross(vc - va);
-        if n.length_squared() < 1e-12 {
+        if !n.is_finite() || n.length_squared() < 1e-12 {
             continue;
         }
         faces.push(i.to_vec());
@@ -163,23 +161,33 @@ fn weld_and_drop_slivers(part: &mut Part) {
 /// and on empty results (no overlap, coincident faces, ...).
 pub fn boolean(
     model: &Model,
-    op: &str,
+    op: BoolOp,
     a: &str,
     b: &str,
     name: Option<&str>,
-) -> Result<Part, String> {
-    let pa = model.part(a).ok_or_else(|| format!("no part `{a}`"))?;
-    let pb = model.part(b).ok_or_else(|| format!("no part `{b}`"))?;
+) -> Result<Part, ModelerError> {
+    let pa = model
+        .part(a)
+        .ok_or_else(|| ModelerError::NoPart(a.to_string()))?;
+    let pb = model
+        .part(b)
+        .ok_or_else(|| ModelerError::NoPart(b.to_string()))?;
     let csg_a = part_to_csg(pa);
     let csg_b = part_to_csg(pb);
-    let result = run_op(op, &csg_a, &csg_b)?;
+    // csgrs panics on some degenerate inputs; surface that as an error instead
+    // of taking the whole server down.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_op(op, &csg_a, &csg_b)))
+            .map_err(|_| {
+                ModelerError::Csg(format!("csg panicked on {op}({a},{b}): degenerate input"))
+            })?;
     let default_name = format!("{a}-{op}-{b}");
     let out_name = name.unwrap_or(&default_name);
     let mut part = csg_to_part(&result, out_name, pa.material.clone());
     if part.verts.is_empty() || part.tri_count() == 0 {
-        return Err(format!(
+        return Err(ModelerError::Csg(format!(
             "{op}({a}, {b}) produced an empty mesh (no overlap?)"
-        ));
+        )));
     }
     // The transform is baked into the verts, so the part sits at the model root.
     part.translation = [0.0; 3];
@@ -201,20 +209,20 @@ mod tests {
             name: "m".into(),
             ..Default::default()
         };
-        let part = crate::primitives::primitive("box", [half * 2.0; 3], name)
+        let part = crate::primitives::primitive(crate::PrimitiveKind::Box, [half * 2.0; 3], name)
             .unwrap_or_else(|_| panic!("{name} failed"));
-        model.parts.push(part);
+        model.parts.push(part.into());
         model
     }
 
     #[test]
     fn box_minus_smaller_box_has_more_triangles() {
         let mut model = model_with_box("big", 2.0);
-        let small = crate::primitives::primitive("box", [1.0; 3], "small")
+        let small = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "small")
             .unwrap_or_else(|_| panic!("small failed"));
-        model.parts.push(small);
+        model.parts.push(small.into());
         let before = model.part("big").map_or(0, |p| p.tri_count());
-        let out = match boolean(&model, "difference", "big", "small", None) {
+        let out = match boolean(&model, crate::BoolOp::Difference, "big", "small", None) {
             Ok(out) => out,
             Err(e) => panic!("difference failed: {e}"),
         };
@@ -234,37 +242,49 @@ mod tests {
     fn union_and_intersect_smoke() {
         let mut model = model_with_box("a", 2.0);
         model.parts.push(
-            crate::primitives::primitive("sphere", [1.0; 3], "b")
-                .unwrap_or_else(|_| panic!("b failed")),
+            crate::primitives::primitive(crate::PrimitiveKind::Sphere, [1.0; 3], "b")
+                .unwrap_or_else(|_| panic!("b failed"))
+                .into(),
         );
-        for op in ["union", "intersect", "subtract"] {
+        for op in [
+            crate::BoolOp::Union,
+            crate::BoolOp::Intersect,
+            crate::BoolOp::Difference,
+        ] {
             let out = match boolean(&model, op, "a", "b", None) {
                 Ok(out) => out,
                 Err(e) => panic!("{op} failed: {e}"),
             };
-            validate(&out, op);
+            validate(&out, op.as_str());
         }
     }
 
     #[test]
     fn disjoint_difference_errs() {
         let mut model = model_with_box("a", 1.0);
-        let mut far = crate::primitives::primitive("box", [1.0; 3], "b")
+        let mut far = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "b")
             .unwrap_or_else(|_| panic!("b failed"));
         far.translation = [100.0, 0.0, 0.0];
-        model.parts.push(far);
-        assert!(boolean(&model, "intersect", "a", "b", None).is_err());
+        model.parts.push(far.into());
+        assert!(boolean(&model, crate::BoolOp::Intersect, "a", "b", None).is_err());
     }
 
     #[test]
     fn transform_is_applied_before_the_boolean() {
         // A small box rotated 45° cutting a bigger box still carves a hole.
         let mut model = model_with_box("big", 2.0);
-        let mut cutter = crate::primitives::primitive("box", [1.0; 3], "cutter")
-            .unwrap_or_else(|_| panic!("cutter failed"));
+        let mut cutter =
+            crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "cutter")
+                .unwrap_or_else(|_| panic!("cutter failed"));
         cutter.rotation = [0.0, 0.0, 0.3826834, 0.9238795]; // 45° around z
-        model.parts.push(cutter);
-        let out = match boolean(&model, "subtract", "big", "cutter", Some("hole")) {
+        model.parts.push(cutter.into());
+        let out = match boolean(
+            &model,
+            crate::BoolOp::Difference,
+            "big",
+            "cutter",
+            Some("hole"),
+        ) {
             Ok(out) => out,
             Err(e) => panic!("rotated subtract failed: {e}"),
         };
@@ -275,8 +295,8 @@ mod tests {
     #[test]
     fn unknown_part_and_op_err() {
         let model = model_with_box("a", 1.0);
-        assert!(boolean(&model, "union", "a", "ghost", None).is_err());
-        assert!(boolean(&model, "xor", "a", "a", None).is_err());
+        assert!(boolean(&model, crate::BoolOp::Union, "a", "ghost", None).is_err());
+        assert!("xor".parse::<crate::BoolOp>().is_err());
     }
 
     #[test]
@@ -284,25 +304,25 @@ mod tests {
         // A partial overlap difference produces cut-boundary duplicates in the raw
         // soup; the weld must merge them and leave a clean indexed mesh.
         let mut model = model_with_box("big", 2.0);
-        let mut cutter = crate::primitives::primitive("box", [2.0, 1.0, 1.0], "cutter")
-            .unwrap_or_else(|_| panic!("cutter failed"));
+        let mut cutter =
+            crate::primitives::primitive(crate::PrimitiveKind::Box, [2.0, 1.0, 1.0], "cutter")
+                .unwrap_or_else(|_| panic!("cutter failed"));
         cutter.translation = [1.0, 0.0, 1.5]; // bites a corner off the big box
-        model.parts.push(cutter);
-        let out = match boolean(&model, "difference", "big", "cutter", None) {
+        model.parts.push(cutter.into());
+        let out = match boolean(&model, crate::BoolOp::Difference, "big", "cutter", None) {
             Ok(out) => out,
             Err(e) => panic!("partial difference failed: {e}"),
         };
         let soup = triangle_soup(
             &run_op(
-                "difference",
+                crate::BoolOp::Difference,
                 &part_to_csg(model.part("big").unwrap_or_else(|| panic!("big missing"))),
                 &part_to_csg(
                     model
                         .part("cutter")
                         .unwrap_or_else(|| panic!("cutter missing")),
                 ),
-            )
-            .unwrap_or_else(|e| panic!("{e}")),
+            ),
             "soup",
             out.material.clone(),
         );

@@ -18,12 +18,12 @@ Architecture (details in AGENTS.md):
 - **Prefab catalog** (`src/catalog.rs`) — non-destructive JSON saves
   (ops + history tree + annotations; parts omitted when fully procedural)
   with atomic writes.
-- **MCP server** (`src/bin/modeler.rs`, rmcp 1.8 on stdio) — plus a Bevy
+- **MCP server** (`src/bin/modeler/` (`server/` = MCP, `preview/` = Bevy), rmcp 1.8 on stdio) — plus a Bevy
   preview window, an offscreen agent camera rig, and a stdio driver
   (`mcp_driver.py`, with daemon mode) for agents whose MCP tool list is
   frozen.
 
-## Agent-facing capability (46 tools)
+## Agent-facing capability
 
 Build: `apply_ops` (whole models in one call, graph ops + baked edits with
 per-item errors), `op_primitive` (with optional rotation quat),
@@ -56,7 +56,7 @@ which is the long-form reference.
   `findings-agent-shakedown.md`, and this file. MODELS.md documents the
   original 6 models op-by-op with history trees.
 
-## Hard-won correctness (all regression-tested, 63 lib + 4 export tests)
+## Hard-won correctness (all regression-tested)
 
 - Dependency-order evaluation — upsert-position staleness is healed
   automatically; true cycles fail naming the ops.
@@ -87,7 +87,7 @@ which is the long-form reference.
 
 ## Hygiene
 
-- 63 lib + 4 export tests green; `cargo clippy --all-targets -- -D
+- Tests green; `cargo clippy --all-targets -- -D
   warnings` clean; `cargo fmt` applied.
 - `.zcode/` gitignored. `mcp_driver.py` committed (daemon + client modes).
 - Everything pushed to origin/main as of this writing.

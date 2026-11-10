@@ -3,19 +3,128 @@
 //! earlier outputs by name; re-issuing an op with the same output name replaces
 //! it (that is how parameters are "tweaked"). No game code.
 
-use crate::{Op, Part, primitives, quat_of, uv};
+use crate::{ModelerError, Op, Part, primitives, quat_of, uv};
 use bevy::math::{Quat, Vec3};
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 /// Evaluates every op and returns the derived parts. Ops run in dependency
 /// order (each op after the op that produces its inputs), falling back to
 /// list order wherever that is already consistent — so fresh graphs behave
 /// exactly as written, while upserts that left an op positioned before an
 /// input it gained later still evaluate correctly.
-pub fn evaluate(ops: &[Op]) -> Result<Vec<Part>, String> {
+///
+/// Each op's outputs are memoized in a process-wide, content-addressed cache
+/// keyed by (op parameters, the content hashes of its input parts), so tweaking
+/// one op re-runs only it and what depends on it; booleans upstream of the
+/// change are free. See [`evaluate_uncached`] for verification.
+pub fn evaluate(ops: &[Op]) -> Result<Vec<Part>, ModelerError> {
+    evaluate_with(ops, true)
+}
+
+/// Like [`evaluate`] but ignores and never fills the cache: always a fresh
+/// derivation, for `check_rebuild` (a cached result would hide
+/// non-determinism and stale-cache bugs).
+pub fn evaluate_uncached(ops: &[Op]) -> Result<Vec<Part>, ModelerError> {
+    evaluate_with(ops, false)
+}
+
+/// Cap on cached op results; the cache is dropped wholesale when exceeded
+/// (cheap, and the working set re-fills as the graph is re-evaluated).
+const CACHE_MAX_ENTRIES: usize = 2048;
+
+type OpCache = HashMap<u64, Vec<(String, Part)>>;
+
+thread_local! {
+    /// Ops actually executed (cache misses) on this thread; lets tests prove
+    /// what was reused.
+    static RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Ops executed (not served from the cache) on the calling thread so far.
+pub fn ops_run_on_thread() -> u64 {
+    RUNS.with(|r| r.get())
+}
+
+static OP_CACHE: Mutex<Option<OpCache>> = Mutex::new(None);
+
+/// Number of memoized op results (for tests and diagnostics).
+pub fn cache_len() -> usize {
+    OP_CACHE
+        .lock()
+        .map(|c| c.as_ref().map_or(0, HashMap::len))
+        .unwrap_or(0)
+}
+
+fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    inputs.hash(&mut h);
+    h.finish()
+}
+
+fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Part>, ModelerError> {
     let order = eval_order(ops)?;
     let mut named: Vec<(String, Part)> = Vec::new();
+    // Content hash of each named part: the key of the op run that wrote it,
+    // combined with the output name.
+    let mut hashes: HashMap<String, u64> = HashMap::new();
     for i in order {
-        run_op(&ops[i], &mut named)?;
+        let op = &ops[i];
+        let input_hashes: Vec<u64> = inputs(op)
+            .iter()
+            .map(|n| hashes.get(*n).copied().unwrap_or(0))
+            .collect();
+        let key = hash_of(
+            &serde_json::to_vec(op).map_err(|e| e.to_string())?,
+            &input_hashes,
+        );
+        let hit = if use_cache && !matches!(op, Op::Rename { .. }) {
+            OP_CACHE
+                .lock()
+                .ok()
+                .and_then(|c| c.as_ref().and_then(|m| m.get(&key).cloned()))
+        } else {
+            None
+        };
+        let outs = outputs(op);
+        match hit {
+            Some(parts) => {
+                for (name, part) in parts {
+                    upsert(&mut named, &name, part);
+                }
+            }
+            None => {
+                RUNS.with(|r| r.set(r.get() + 1));
+                run_op(op, &mut named)?;
+                if use_cache && !matches!(op, Op::Rename { .. }) {
+                    let produced: Vec<(String, Part)> = outs
+                        .iter()
+                        .filter_map(|n| {
+                            named
+                                .iter()
+                                .find(|(m, _)| m == n)
+                                .map(|(m, p)| (m.clone(), p.clone()))
+                        })
+                        .collect();
+                    if let Ok(mut c) = OP_CACHE.lock() {
+                        let map = c.get_or_insert_with(HashMap::new);
+                        if map.len() >= CACHE_MAX_ENTRIES {
+                            map.clear();
+                        }
+                        map.insert(key, produced);
+                    }
+                }
+            }
+        }
+        if let Op::Rename { input, .. } = op {
+            hashes.remove(input);
+        }
+        for n in outs {
+            hashes.insert(n.clone(), hash_of(n.as_bytes(), &[key]));
+        }
     }
     Ok(named.into_iter().map(|(_, part)| part).collect())
 }
@@ -26,18 +135,49 @@ pub fn evaluate(ops: &[Op]) -> Result<Vec<Part>, String> {
 /// graphs where an upsert left an op before an input it now reads. Ties are
 /// broken by list index, so already-consistent graphs keep their written
 /// order. Remaining ops after the loop form a dependency cycle.
-fn eval_order(ops: &[Op]) -> Result<Vec<usize>, String> {
+fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
     let n = ops.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Indexes built once: part name -> ops producing it (ascending), and
+    // part name -> ops reading it, so dependency lookup is not O(n) per input.
+    let mut producers: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut readers: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (j, op) in ops.iter().enumerate() {
+        for name in outputs(op) {
+            producers.entry(name).or_default().push(j);
+        }
+        for input in inputs(op) {
+            let list = readers.entry(input).or_default();
+            if list.last() != Some(&j) {
+                list.push(j);
+            }
+        }
+    }
     for (i, op) in ops.iter().enumerate() {
         for input in inputs(op) {
-            let earlier = (0..i).rev().find(|&j| output(&ops[j]) == input);
-            let dep = match earlier {
-                Some(j) => Some(j),
-                None => (i + 1..n).find(|&j| output(&ops[j]) == input),
+            let Some(list) = producers.get(input) else {
+                continue;
+            };
+            // Nearest earlier producer, else the nearest later one.
+            let split = list.partition_point(|&j| j < i);
+            let dep = if split > 0 {
+                Some(list[split - 1])
+            } else {
+                list.iter().copied().find(|&j| j > i)
             };
             if let Some(j) = dep {
                 deps[i].push(j);
+            }
+        }
+    }
+    // A rename removes the old name, so it must run after every other op
+    // that reads that name.
+    for (i, op) in ops.iter().enumerate() {
+        if let Op::Rename { input, .. } = op {
+            for &j in readers.get(input.as_str()).into_iter().flatten() {
+                if j != i {
+                    deps[i].push(j);
+                }
             }
         }
     }
@@ -59,17 +199,14 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, String> {
                 .filter(|&i| !done[i])
                 .map(|i| format!("`{}`", output(&ops[i])))
                 .collect();
-            return Err(format!(
-                "ops form a dependency cycle involving {}",
-                stuck.join(", ")
-            ));
+            return Err(ModelerError::Cycle(stuck.join(", ")));
         }
     }
     Ok(order)
 }
 
 /// Runs one op against the named-part map, upserting its output.
-fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
+fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> {
     match op {
         Op::Primitive {
             name,
@@ -79,12 +216,12 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             rotation,
         } => {
             let mut part =
-                primitives::primitive(kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
+                primitives::primitive(*kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
             part.translation = *translation;
             if let Some(r) = rotation {
                 part.rotation = *r;
             }
-            upsert(named, name, part)?;
+            upsert(named, name, part);
         }
         Op::Transform {
             name,
@@ -95,6 +232,9 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
+            if name != input {
+                part.visible = true;
+            }
             if let Some(t) = translation {
                 part.translation = *t;
             }
@@ -104,15 +244,18 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             if let Some(s) = scale {
                 part.scale = *s;
             }
-            upsert(named, name, part)?;
+            upsert(named, name, part);
         }
         Op::Boolean { name, op, a, b } => {
             // `csg::boolean` looks parts up on a model and bakes their
             // transforms into the verts, so hand it a scratch pair.
             let mut scratch = crate::Model::named("scratch");
-            scratch.parts = vec![lookup(named, a)?, lookup(named, b)?];
-            let part = crate::csg::boolean(&scratch, op, a, b, Some(name))?;
-            upsert(named, name, part)?;
+            scratch.parts = vec![
+                std::sync::Arc::new(lookup(named, a)?),
+                std::sync::Arc::new(lookup(named, b)?),
+            ];
+            let part = crate::csg::boolean(&scratch, *op, a, b, Some(name))?;
+            upsert(named, name, part);
         }
         Op::RadialArray {
             name,
@@ -123,27 +266,26 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             start_degrees,
             axis,
         } => {
-            let source = lookup(named, input)?;
+            let mut source = lookup(named, input)?;
             if *count == 0 {
-                return Err(format!("{name}: count must be at least 1"));
+                return Err(format!("{name}: count must be at least 1").into());
             }
-            let axis_vec = match axis.as_str() {
-                "x" => Vec3::X,
-                "y" => Vec3::Y,
-                "z" => Vec3::Z,
-                other => return Err(format!("{name}: unknown axis `{other}` (x, y, z)")),
-            };
+            // Copies inherit the source's UVs; project once only if it has none.
+            if source.uvs.len() != source.verts.len() {
+                uv::ensure_uvs(&mut source, Some("box")).map_err(|e| format!("{name}: {e}"))?;
+            }
+            let axis_vec = axis.unit();
             let step = degrees / *count as f32;
             for i in 0..*count {
                 let yaw = start_degrees + i as f32 * step;
                 let mut part = source.clone();
                 part.name = format!("{name}_{i}");
+                part.visible = true;
                 let rot = Quat::from_axis_angle(axis_vec, yaw.to_radians());
                 let offset = Vec3::from(part.translation) - Vec3::from(*center);
                 part.translation = (rot * offset + Vec3::from(*center)).to_array();
                 part.rotation = (rot * quat_of(part.rotation)).to_array();
-                uv::ensure_uvs(&mut part, Some("box")).map_err(|e| format!("{name}_{i}: {e}"))?;
-                upsert(named, &format!("{name}_{i}"), part)?;
+                upsert(named, &format!("{name}_{i}"), part);
             }
         }
         Op::Material {
@@ -155,6 +297,9 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
+            if name != input {
+                part.visible = true;
+            }
             if let Some(c) = base_color {
                 part.material.base_color = *c;
             }
@@ -164,7 +309,7 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             if let Some(m) = metalness {
                 part.material.metalness = *m;
             }
-            upsert(named, name, part)?;
+            upsert(named, name, part);
         }
         Op::LinearArray {
             name,
@@ -174,13 +319,14 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
         } => {
             let source = lookup(named, input)?;
             if *count == 0 {
-                return Err(format!("{name}: count must be at least 1"));
+                return Err(format!("{name}: count must be at least 1").into());
             }
             // The source is copy 0; copies 1..count step away from it,
             // so nothing overlaps the input.
             for i in 1..*count {
                 let mut part = source.clone();
                 part.name = format!("{name}_{i}");
+                part.visible = true;
                 let i = i as f32;
                 part.translation = [
                     part.translation[0] + offset[0] * i,
@@ -188,7 +334,7 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
                     part.translation[2] + offset[2] * i,
                 ];
                 let part_name = part.name.clone();
-                upsert(named, &part_name, part)?;
+                upsert(named, &part_name, part);
             }
         }
         Op::Mirror {
@@ -197,16 +343,12 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             axis,
             offset,
         } => {
-            let ax = match axis.as_str() {
-                "x" => 0,
-                "y" => 1,
-                "z" => 2,
-                other => return Err(format!("{name}: unknown axis `{other}` (x, y, z)")),
-            };
+            let ax = axis.index();
             let source = lookup(named, input)?;
             let plane = offset[ax];
             let mut part = source.clone();
             part.name = name.clone();
+            part.visible = name != input || part.visible;
             // Bake: world verts, reflect across the plane, flip winding.
             let rot = quat_of(part.rotation);
             let scale = Vec3::from(part.scale);
@@ -242,28 +384,48 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), String> {
             part.translation = [0.0; 3];
             part.rotation = Quat::IDENTITY.to_array();
             part.scale = [1.0; 3];
-            upsert(named, name, part)?;
+            upsert(named, name, part);
+        }
+        Op::Visibility {
+            name,
+            input,
+            visible,
+        } => {
+            let mut part = lookup(named, input)?;
+            part.name = name.clone();
+            part.visible = *visible;
+            upsert(named, name, part);
+        }
+        Op::Rename { name, input } => {
+            let mut part = lookup(named, input)?;
+            part.name = name.clone();
+            // Take the old name out (keeping its slot) before inserting.
+            if let Some(slot) = named.iter().position(|(n, _)| n == input) {
+                named.remove(slot);
+                named.insert(slot.min(named.len()), (name.clone(), part));
+            } else {
+                upsert(named, name, part);
+            }
         }
     }
     Ok(())
 }
 
-fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, String> {
+fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, ModelerError> {
     named
         .iter()
         .find(|(n, _)| n == name)
         .map(|(_, p)| p.clone())
-        .ok_or_else(|| format!("no part `{name}` earlier in the graph"))
+        .ok_or_else(|| ModelerError::MissingInput(name.to_string()))
 }
 
 /// Inserts `part` under `name`, replacing an earlier op's output of the same
 /// name in place (so output order stays stable across re-issues).
-fn upsert(named: &mut Vec<(String, Part)>, name: &str, part: Part) -> Result<(), String> {
+fn upsert(named: &mut Vec<(String, Part)>, name: &str, part: Part) {
     match named.iter_mut().find(|(n, _)| n == name) {
         Some(slot) => slot.1 = part,
         None => named.push((name.to_string(), part)),
     }
-    Ok(())
 }
 
 /// The output part name an op writes, used for upsert matching.
@@ -275,7 +437,20 @@ pub fn output(op: &Op) -> &str {
         | Op::RadialArray { name, .. }
         | Op::Material { name, .. }
         | Op::LinearArray { name, .. }
-        | Op::Mirror { name, .. } => name,
+        | Op::Mirror { name, .. }
+        | Op::Visibility { name, .. }
+        | Op::Rename { name, .. } => name,
+    }
+}
+
+/// Every part name an op writes: the array ops expand to `name_0..` (radial)
+/// or `name_1..` (linear, the source being copy 0); everything else writes
+/// just `name`. [`output`] stays the op's identity key for upsert matching.
+pub fn outputs(op: &Op) -> Vec<String> {
+    match op {
+        Op::RadialArray { name, count, .. } => (0..*count).map(|i| format!("{name}_{i}")).collect(),
+        Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
+        other => vec![output(other).to_string()],
     }
 }
 
@@ -290,6 +465,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Material { .. } => "material",
         Op::LinearArray { .. } => "linear",
         Op::Mirror { .. } => "mirror",
+        Op::Visibility { .. } => "visibility",
+        Op::Rename { .. } => "rename",
     }
 }
 
@@ -301,7 +478,9 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
         | Op::LinearArray { input, .. }
-        | Op::Mirror { input, .. } => {
+        | Op::Mirror { input, .. }
+        | Op::Visibility { input, .. }
+        | Op::Rename { input, .. } => {
             vec![input]
         }
         Op::Boolean { a, b, .. } => vec![a, b],
@@ -393,8 +572,17 @@ pub fn describe(ops: &[Op]) -> String {
             } => format!(
                 "#{i} mirror `{name}` = `{input}` across {} = {}",
                 axis,
-                offset["xyz".find(axis).unwrap_or(0)]
+                offset[axis.index()]
             ),
+            Op::Visibility {
+                name,
+                input,
+                visible,
+            } => format!(
+                "#{i} visibility `{name}` = `{input}` {}",
+                if *visible { "shown" } else { "hidden" }
+            ),
+            Op::Rename { name, input } => format!("#{i} rename `{input}` -> `{name}`"),
         });
     }
     lines.join("\n")
@@ -421,7 +609,7 @@ mod tests {
         let parts = evaluate(&[
             Op::Primitive {
                 name: "box".into(),
-                kind: "box".into(),
+                kind: crate::PrimitiveKind::Box,
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
@@ -454,7 +642,7 @@ mod tests {
                 center: [0.0, 0.0, 0.0],
                 degrees: 360.0,
                 start_degrees: 0.0,
-                axis: "y".into(),
+                axis: crate::Axis::Y,
             },
             Op::Transform {
                 name: "leg_s".into(),
@@ -465,7 +653,7 @@ mod tests {
             },
             Op::Primitive {
                 name: "leg_template".into(),
-                kind: "box".into(),
+                kind: crate::PrimitiveKind::Box,
                 size: [0.08, 0.75, 0.08],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
@@ -500,8 +688,11 @@ mod tests {
         ]) else {
             panic!("a true cycle must fail")
         };
-        assert!(err.contains("dependency cycle"), "{err}");
-        assert!(err.contains("`a`") && err.contains("`b`"), "{err}");
+        assert!(err.to_string().contains("dependency cycle"), "{err}");
+        assert!(
+            err.to_string().contains("`a`") && err.to_string().contains("`b`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -509,21 +700,21 @@ mod tests {
         let ops = [
             Op::Primitive {
                 name: "a".into(),
-                kind: "box".into(),
+                kind: crate::PrimitiveKind::Box,
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
             },
             Op::Primitive {
                 name: "b".into(),
-                kind: "sphere".into(),
+                kind: crate::PrimitiveKind::Sphere,
                 size: [0.5, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
             },
             Op::Primitive {
                 name: "a".into(),
-                kind: "cylinder".into(),
+                kind: crate::PrimitiveKind::Cylinder,
                 size: [0.1, 2.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
@@ -540,7 +731,7 @@ mod tests {
         let parts = evaluate(&[
             Op::Primitive {
                 name: "petal".into(),
-                kind: "sphere".into(),
+                kind: crate::PrimitiveKind::Sphere,
                 size: [0.1, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.5],
                 rotation: None,
@@ -552,7 +743,7 @@ mod tests {
                 center: [0.0, 0.0, 0.0],
                 degrees: 360.0,
                 start_degrees: 0.0,
-                axis: "y".into(),
+                axis: crate::Axis::Y,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -571,7 +762,7 @@ mod tests {
         let parts = evaluate(&[
             Op::Primitive {
                 name: "post".into(),
-                kind: "cylinder".into(),
+                kind: crate::PrimitiveKind::Cylinder,
                 size: [0.05, 1.0, 0.0],
                 translation: [0.0, 0.5, 0.0],
                 rotation: None,
@@ -595,7 +786,7 @@ mod tests {
         let parts = evaluate(&[
             Op::Primitive {
                 name: "arm".into(),
-                kind: "box".into(),
+                kind: crate::PrimitiveKind::Box,
                 size: [0.2, 0.2, 0.6],
                 translation: [0.5, 0.0, 0.0],
                 rotation: None,
@@ -603,7 +794,7 @@ mod tests {
             Op::Mirror {
                 name: "arm_m".into(),
                 input: "arm".into(),
-                axis: "x".into(),
+                axis: crate::Axis::X,
                 offset: [0.0, 0.0, 0.0],
             },
         ])
@@ -623,17 +814,15 @@ mod tests {
     }
 
     #[test]
-    fn mirror_rejects_unknown_axis() {
-        let err = match evaluate(&[Op::Mirror {
-            name: "m".into(),
-            input: "ghost".into(),
-            axis: "w".into(),
-            offset: [0.0; 3],
-        }]) {
-            Err(e) => e,
-            Ok(_) => panic!("bad axis must fail"),
-        };
-        assert!(err.contains('w'), "{err}");
+    fn unknown_axis_is_rejected_at_deserialization() {
+        let bad = r#"{"mirror":{"name":"m","input":"p","axis":"w"}}"#;
+        let err = serde_json::from_str::<Op>(bad).err().map(|e| e.to_string());
+        assert!(err.is_some_and(|e| e.contains("axis") || e.contains("variant")));
+        let good = r#"{"mirror":{"name":"m","input":"p","axis":"x"}}"#;
+        assert!(serde_json::from_str::<Op>(good).is_ok());
+        // Old spellings of boolean ops still load.
+        let old = r#"{"boolean":{"name":"c","op":"subtract","a":"a","b":"b"}}"#;
+        assert!(serde_json::from_str::<Op>(old).is_ok());
     }
 
     #[test]
@@ -648,7 +837,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("missing input must fail"),
         };
-        assert!(err.contains("ghost"), "{err}");
+        assert!(err.to_string().contains("ghost"), "{err}");
     }
 
     #[test]
@@ -660,8 +849,100 @@ mod tests {
             center: [0.0; 3],
             degrees: 360.0,
             start_degrees: 45.0,
-            axis: "y".into(),
+            axis: crate::Axis::Y,
         }]);
         assert!(text.contains("8 x `petal`"), "{text}");
+    }
+
+    fn prim(name: &str) -> Op {
+        Op::Primitive {
+            name: name.into(),
+            kind: crate::PrimitiveKind::Box,
+            size: [1.0; 3],
+            translation: [0.0; 3],
+            rotation: None,
+        }
+    }
+
+    #[test]
+    fn outputs_expand_array_names() {
+        let radial = Op::RadialArray {
+            name: "r".into(),
+            input: "p".into(),
+            count: 3,
+            center: [0.0; 3],
+            degrees: 360.0,
+            start_degrees: 0.0,
+            axis: crate::Axis::Y,
+        };
+        assert_eq!(outputs(&radial), ["r_0", "r_1", "r_2"]);
+        let linear = Op::LinearArray {
+            name: "l".into(),
+            input: "p".into(),
+            count: 3,
+            offset: [1.0, 0.0, 0.0],
+        };
+        assert_eq!(outputs(&linear), ["l_1", "l_2"]);
+    }
+
+    #[test]
+    fn op_reading_array_output_is_ordered_after_the_array() {
+        let parts = evaluate(&[
+            Op::Transform {
+                name: "moved".into(),
+                input: "arr_1".into(),
+                translation: Some([0.0, 5.0, 0.0]),
+                rotation: None,
+                scale: None,
+            },
+            prim("p"),
+            Op::LinearArray {
+                name: "arr".into(),
+                input: "p".into(),
+                count: 3,
+                offset: [2.0, 0.0, 0.0],
+            },
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(parts.iter().any(|p| p.name == "moved"));
+    }
+
+    #[test]
+    fn cache_reuses_unchanged_ops_and_invalidates_downstream() {
+        let make = |size: f32| {
+            vec![
+                prim("cache_a"),
+                Op::Transform {
+                    name: "cache_b".into(),
+                    input: "cache_a".into(),
+                    translation: Some([0.0, size, 0.0]),
+                    rotation: None,
+                    scale: None,
+                },
+                Op::Material {
+                    name: "cache_c".into(),
+                    input: "cache_b".into(),
+                    base_color: Some([1.0, 0.0, 0.0, 1.0]),
+                    roughness: None,
+                    metalness: None,
+                },
+            ]
+        };
+        let before = ops_run_on_thread();
+        let first = evaluate(&make(7.25)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ops_run_on_thread() - before, 3);
+        // Identical graph: everything is served from the cache.
+        let again = evaluate(&make(7.25)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ops_run_on_thread() - before, 3, "second eval re-ran ops");
+        assert_eq!(first.len(), again.len());
+        assert_eq!(first[2].material.base_color, again[2].material.base_color);
+        // Tweak the middle op: the primitive is reused, the other two re-run.
+        let tweaked = evaluate(&make(8.5)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ops_run_on_thread() - before, 5);
+        assert_eq!(tweaked[1].translation, [0.0, 8.5, 0.0]);
+        // The uncached path always re-derives and matches.
+        let fresh = evaluate_uncached(&make(8.5)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ops_run_on_thread() - before, 8, "uncached re-runs every op");
+        assert_eq!(fresh[1].translation, tweaked[1].translation);
     }
 }

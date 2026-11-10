@@ -8,10 +8,10 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Model;
+use crate::{Model, ModelerError};
 
 /// Where prefabs live: `<data>/friendslop/modeler/prefabs (kept from the friendslop days so existing catalogs carry over)`.
-pub fn catalog_dir() -> Result<PathBuf, String> {
+pub fn catalog_dir() -> Result<PathBuf, ModelerError> {
     let base = if let Ok(dir) = std::env::var("FRIENDSLOP_DATA_DIR") {
         if !dir.is_empty() {
             PathBuf::from(dir)
@@ -24,9 +24,9 @@ pub fn catalog_dir() -> Result<PathBuf, String> {
     Ok(base.join("friendslop").join("modeler").join("prefabs"))
 }
 
-fn native_data_dir() -> Result<PathBuf, String> {
+fn native_data_dir() -> Result<PathBuf, ModelerError> {
     if cfg!(target_os = "macos") {
-        let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+        let home = std::env::var("HOME").map_err(|_| ModelerError::Io("HOME is not set".into()))?;
         return Ok(PathBuf::from(home)
             .join("Library")
             .join("Application Support"));
@@ -36,7 +36,7 @@ fn native_data_dir() -> Result<PathBuf, String> {
     {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let home = std::env::var("HOME").map_err(|_| ModelerError::Io("HOME is not set".into()))?;
     Ok(PathBuf::from(home).join(".local").join("share"))
 }
 
@@ -100,29 +100,43 @@ pub struct Catalog {
     pub entries: Vec<CatalogEntry>,
 }
 
-fn catalog_path() -> Result<PathBuf, String> {
+fn catalog_path() -> Result<PathBuf, ModelerError> {
     Ok(catalog_dir()?.join("catalog.json"))
 }
 
-fn load_catalog() -> Result<Catalog, String> {
+fn load_catalog() -> Result<Catalog, ModelerError> {
     let path = catalog_path()?;
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(Catalog::default());
     };
-    serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
+    serde_json::from_str(&text)
+        .map_err(|e| ModelerError::Parse(format!("parsing {}: {e}", path.display())))
 }
 
-fn save_catalog(catalog: &Catalog) -> Result<(), String> {
+fn save_catalog(catalog: &Catalog) -> Result<(), ModelerError> {
     let path = catalog_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
     }
-    let text = serde_json::to_string_pretty(catalog).map_err(|e| e.to_string())?;
-    fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))
+    let text =
+        serde_json::to_string_pretty(catalog).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&path, text.as_bytes())
+}
+
+/// Writes `bytes` to a sibling `.tmp` file and renames it over `path`, so a
+/// crash mid-write never leaves a torn file behind.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ModelerError> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes)
+        .map_err(|e| ModelerError::Io(format!("writing {}: {e}", tmp.display())))?;
+    fs::rename(&tmp, path).map_err(|e| ModelerError::Io(format!("renaming {}: {e}", tmp.display())))
 }
 
 /// Where the session autosave lives: `session.json` next to the prefabs.
-fn session_state_path() -> Result<PathBuf, String> {
+fn session_state_path() -> Result<PathBuf, ModelerError> {
     Ok(catalog_dir()?.join("session.json"))
 }
 
@@ -131,15 +145,16 @@ fn session_state_path() -> Result<PathBuf, String> {
 /// restart without an explicit `save_prefab`. Atomic like prefab saves.
 /// Failures are reported but never fatal: losing an autosave must not break
 /// the tool call that triggered it.
-pub fn save_session_state(model: &Model) -> Result<(), String> {
+pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
     let path = session_state_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
     }
-    let text = serde_json::to_string_pretty(model).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("renaming {}: {e}", tmp.display()))
+    // Compact: the autosave carries every history snapshot, so pretty
+    // printing would multiply its size for nobody's benefit.
+    let text = serde_json::to_string(model).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&path, text.as_bytes())
 }
 
 /// The last autosaved session model, if one exists and parses. Missing or
@@ -147,7 +162,12 @@ pub fn save_session_state(model: &Model) -> Result<(), String> {
 pub fn load_session_state() -> Option<Model> {
     let path = session_state_path().ok()?;
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let model: Model = serde_json::from_str(&text).ok()?;
+    if let Err(e) = model.check_format() {
+        eprintln!("ignoring session autosave: {e}");
+        return None;
+    }
+    Some(model)
 }
 
 /// Serialize the model into the catalog dir and upsert its index entry (matched by name).
@@ -163,26 +183,24 @@ pub fn save_prefab(
     description: &str,
     tags: &[&str],
     prompt: &str,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), ModelerError> {
     let name = sanitize(&model.name);
-    let overwrote = load_catalog()
-        .map(|c| c.entries.iter().any(|e| e.name == name))
-        .unwrap_or(false);
+    let mut catalog = load_catalog()?;
+    let overwrote = catalog.entries.iter().any(|e| e.name == name);
     let mut saved = model.clone();
     saved.name = name.clone();
     if saved.parts_derive_from_ops() {
         saved.parts.clear();
     }
     let dir = catalog_dir()?;
-    fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
     let file = format!("{name}.json");
-    let text = serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?;
+    let text =
+        serde_json::to_string_pretty(&saved).map_err(|e| ModelerError::Parse(e.to_string()))?;
     let path = dir.join(&file);
-    let tmp = dir.join(format!("{file}.tmp"));
-    fs::write(&tmp, &text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("renaming {}: {e}", tmp.display()))?;
+    atomic_write(&path, text.as_bytes())?;
 
-    let mut catalog = load_catalog()?;
     let entry = CatalogEntry {
         name: name.clone(),
         description: description.to_string(),
@@ -202,29 +220,33 @@ pub fn save_prefab(
 /// Load a saved model by name. Procedural prefabs store no parts; they are
 /// re-derived from the ops here, so a graph prefab is small on disk and still
 /// opens fully evaluated.
-pub fn load_prefab(name: &str) -> Result<Model, String> {
+pub fn load_prefab(name: &str) -> Result<Model, ModelerError> {
     let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
-    let text = fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let mut model: Model =
-        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
-    model.refresh()?;
+    let text = fs::read_to_string(&path)
+        .map_err(|e| ModelerError::Io(format!("reading {}: {e}", path.display())))?;
+    let mut model: Model = serde_json::from_str(&text)
+        .map_err(|e| ModelerError::Parse(format!("parsing {}: {e}", path.display())))?;
+    model.check_format()?;
+    // Only re-derive what was saved without parts; models that kept their
+    // parts (baked edits on top of ops) must not lose those edits.
+    model.restore_parts()?;
     // Saved snapshots store no nested history, but their ops are intact, so
     // bring each one's parts back too.
     for node in &mut model.history.nodes {
-        node.model.refresh()?;
+        node.model.restore_parts()?;
     }
     Ok(model)
 }
 
 /// List all catalog entries, most recent last.
-pub fn list() -> Result<Vec<CatalogEntry>, String> {
+pub fn list() -> Result<Vec<CatalogEntry>, ModelerError> {
     let mut entries = load_catalog()?.entries;
     entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(entries)
 }
 
 /// A compact human/LLM-readable description of one entry.
-pub fn describe(name: &str) -> Result<String, String> {
+pub fn describe(name: &str) -> Result<String, ModelerError> {
     let catalog = load_catalog()?;
     let wanted = sanitize(name);
     let entry = catalog
@@ -276,7 +298,7 @@ mod tests {
         };
         model.ops.push(crate::Op::Primitive {
             name: "leg".into(),
-            kind: "box".into(),
+            kind: crate::PrimitiveKind::Box,
             size: [1.0, 1.0, 1.0],
             translation: [0.0, 0.5, 0.0],
             rotation: None,
@@ -306,7 +328,7 @@ mod tests {
         let mut part = crate::Part::new("box");
         part.verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         part.indices = vec![0, 1, 2];
-        model.parts.push(part);
+        model.parts.push(part.into());
 
         let (saved, overwrote) =
             save_prefab(&model, "A red box", &["box", "red"], "make a red box").unwrap();

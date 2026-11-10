@@ -48,7 +48,12 @@ fn le_f32s<'a, const N: usize>(src: impl IntoIterator<Item = &'a [f32; N]>) -> V
 /// Hidden parts are skipped: they stay in the model (ops may still derive from
 /// them) but are not exported.
 fn layout(model: &Model) -> Result<(Vec<Chunks>, Vec<u8>), String> {
-    let exported: Vec<&crate::Part> = model.parts.iter().filter(|p| p.visible).collect();
+    let exported: Vec<&crate::Part> = model
+        .parts
+        .iter()
+        .map(|p| &**p)
+        .filter(|p| p.visible)
+        .collect();
     if exported.is_empty() {
         return Err(format!(
             "model '{}' has no visible parts to export",

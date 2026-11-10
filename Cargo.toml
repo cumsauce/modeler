@@ -7,7 +7,7 @@ description = "MCP-driven mesh modeling tool: primitives, CSG booleans, UVs, op 
 
 [dependencies]
 bevy = { version = "=0.20.0", features = ["picking"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 csgrs = "0.3"
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
@@ -15,12 +15,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 png = "0.18"
 base64 = "0.22"
 thiserror = "2"
+schemars = "1"
 
 [dev-dependencies]
 gltf = "1"
 
 [lints.clippy]
-unwrap_used = "warn"
+unwrap_used = "deny"
 too_many_arguments = "allow"
 type_complexity = "allow"
 

@@ -1,7 +1,7 @@
 //! Primitive mesh generators. Built on bevy's `Meshable` primitives (their UVs and normals
 //! are well-tested), extracted back into a flat [`Part`] (verts/normals/uvs/indices).
 
-use crate::Part;
+use crate::{Part, PrimitiveKind};
 use bevy::math::Vec3;
 use bevy::mesh::{
     Indices, Mesh, VertexAttributeValues,
@@ -15,19 +15,19 @@ const STACKS: u32 = 16;
 /// A named primitive. `size` is full extents for "box" (and the plane's x/z extents), and
 /// `[radius, height, 0]` for everything else (torus: `[ring radius, tube radius, 0]`;
 /// washer: `[inner radius, outer radius, 0]`).
-pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String> {
+pub fn primitive(kind: PrimitiveKind, size: [f32; 3], name: &str) -> Result<Part, String> {
     let mesh = match kind {
-        "box" => Cuboid::new(size[0], size[1], size[2]).mesh().build(),
-        "sphere" => Sphere { radius: size[0] }
+        PrimitiveKind::Box => Cuboid::new(size[0], size[1], size[2]).mesh().build(),
+        PrimitiveKind::Sphere => Sphere { radius: size[0] }
             .mesh()
             .kind(SphereKind::Uv {
                 sectors: SECTORS,
                 stacks: STACKS,
             })
             .build(),
-        "cylinder" => Cylinder::new(size[0], size[1]).mesh().build(),
-        "cone" => Cone::new(size[0], size[1]).mesh().build(),
-        "torus" => {
+        PrimitiveKind::Cylinder => Cylinder::new(size[0], size[1]).mesh().build(),
+        PrimitiveKind::Cone => Cone::new(size[0], size[1]).mesh().build(),
+        PrimitiveKind::Torus => {
             let ring = size[0];
             let tube = size[1];
             if tube <= 0.0 || tube >= ring {
@@ -37,10 +37,10 @@ pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String>
             }
             Torus::new(ring - tube, ring + tube).mesh().build()
         }
-        "capsule" => Capsule3d::new(size[0], size[1]).mesh().build(),
-        "plane" => Plane3d::default().mesh().size(size[0], size[1]).build(),
-        "disc" => Circle { radius: size[0] }.mesh().build(),
-        "washer" => {
+        PrimitiveKind::Capsule => Capsule3d::new(size[0], size[1]).mesh().build(),
+        PrimitiveKind::Plane => Plane3d::default().mesh().size(size[0], size[1]).build(),
+        PrimitiveKind::Disc => Circle { radius: size[0] }.mesh().build(),
+        PrimitiveKind::Washer => {
             let (inner, outer) = (size[0], size[1]);
             if inner <= 0.0 || outer <= inner {
                 return Err(format!(
@@ -56,7 +56,7 @@ pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String>
         }
         // A triangular prism: a ramp/roof profile (triangle in XY) extruded
         // along Z. Hand-built; bevy has no primitive for it.
-        "wedge" => {
+        PrimitiveKind::Wedge => {
             let (w, h, d) = (size[0], size[1], size[2]);
             if w <= 0.0 || h <= 0.0 || d <= 0.0 {
                 return Err("wedge size must be positive".into());
@@ -85,7 +85,6 @@ pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String>
             crate::uv::ensure_uvs(&mut part, Some("box"))?;
             return Ok(part);
         }
-        other => return Err(format!("unknown primitive kind `{other}`")),
     };
     let mut part = Part::new(name);
     extract(&mesh, &mut part)?;
@@ -94,7 +93,7 @@ pub fn primitive(kind: &str, size: [f32; 3], name: &str) -> Result<Part, String>
     }
     // Open surfaces are double-sided: append a reversed copy so neither
     // orientation back-face-culls (and welded edges pair up in `validate`).
-    if matches!(kind, "plane" | "disc" | "washer") {
+    if kind.is_open_sheet() {
         make_double_sided(&mut part);
     }
     Ok(part)
@@ -174,7 +173,11 @@ mod tests {
 
     /// Build `kind`, failing the test with the builder's message if it errors.
     fn build(kind: &str, size: [f32; 3]) -> Part {
-        let Ok(part) = primitive(kind, size, kind) else {
+        let Ok(part) = kind
+            .parse()
+            .map_err(|e: String| e)
+            .and_then(|k| primitive(k, size, kind))
+        else {
             panic!("{kind} failed to build");
         };
         part
@@ -219,7 +222,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_errors() {
-        assert!(primitive("dodecahedron", [1.0; 3], "x").is_err());
+        assert!("dodecahedron".parse::<PrimitiveKind>().is_err());
     }
 
     #[test]
@@ -248,13 +251,13 @@ mod tests {
 
     #[test]
     fn washer_rejects_bad_radii() {
-        assert!(primitive("washer", [1.0, 0.5, 0.0], "x").is_err());
-        assert!(primitive("washer", [0.0, 1.0, 0.0], "x").is_err());
+        assert!(primitive(PrimitiveKind::Washer, [1.0, 0.5, 0.0], "x").is_err());
+        assert!(primitive(PrimitiveKind::Washer, [0.0, 1.0, 0.0], "x").is_err());
     }
 
     #[test]
     fn torus_rejects_bad_tube() {
-        assert!(primitive("torus", [1.0, 2.0, 0.0], "x").is_err());
+        assert!(primitive(PrimitiveKind::Torus, [1.0, 2.0, 0.0], "x").is_err());
     }
 
     /// Open surfaces are double-sided: a reversed copy of every triangle rides

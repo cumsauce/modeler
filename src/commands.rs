@@ -1,9 +1,9 @@
 //! The tool operations as plain functions on a [`Session`] (model + undo history). Pure,
 //! unit-testable, wiring-free API used by both the MCP tools and tests.
 
-use crate::{Annotation, Model, Op, Part, Vec3, graph, quat_of};
+use crate::{Annotation, Axis, BoolOp, Model, ModelerError, Op, Part, PrimitiveKind, graph};
 
-pub type CmdResult = Result<String, String>;
+pub type CmdResult = Result<String, ModelerError>;
 
 /// One item in an `apply_batch` call: either a graph op or a baked edit
 /// (hide/show/rename) that runs in batch position.
@@ -13,22 +13,6 @@ pub enum BatchItem {
     Hide { part: String },
     Show { part: String },
     Rename { part: String, to: String },
-}
-
-/// Signed volume of a part's mesh in world space (transform applied). Positive
-/// for outward-wound closed meshes; reliable only as a sanity signal for
-/// boolean outputs, which csgrs produces closed and welded.
-fn world_signed_volume(p: &Part) -> f64 {
-    let rot = quat_of(p.rotation);
-    let scale = Vec3::from(p.scale);
-    let t = Vec3::from(p.translation);
-    let mut vol = 0.0f64;
-    for tri in p.indices.as_chunks::<3>().0 {
-        let world = |i: u32| -> Vec3 { rot * (Vec3::from(p.verts[i as usize]) * scale) + t };
-        let (a, b, c) = (world(tri[0]), world(tri[1]), world(tri[2]));
-        vol += a.dot(b.cross(c)) as f64 / 6.0;
-    }
-    vol
 }
 
 /// A spot in the live view a human clicked on, waiting for its comment text. Set by
@@ -58,13 +42,23 @@ impl Default for Session {
 }
 
 impl Session {
-    fn bump(&mut self) {
-        self.model.version += 1;
+    /// Cheap summary of everything the autosave persists; if it is unchanged
+    /// across a call, nothing needs writing.
+    pub fn persist_fingerprint(&self) -> (u64, usize, Option<usize>, usize, u32, String) {
+        (
+            self.model.version,
+            self.model.history.nodes.len(),
+            self.model.history.current,
+            self.model.annotations.len(),
+            self.model.next_annotation_id,
+            self.model.name.clone(),
+        )
     }
 
     /// Records the just-mutated model in the history tree under `label`. The
     /// tree lives on the model, so it travels with saves and prefab loads.
     fn commit(&mut self, label: &str) {
+        self.model.version += 1;
         // The snapshot carries no tree of its own: the live history on the
         // session model is the single source of truth for the tree shape.
         let mut snapshot = self.model.clone();
@@ -80,9 +74,36 @@ impl Session {
         let out = graph::output(&op).to_string();
         let kind = graph::kind(&op);
         let reads = graph::inputs(&op);
+        // A visibility edit is in place by nature (reads and writes the same
+        // name), yet re-issuing it must replace the previous one, not stack.
+        let replace_in_place = kind == "visibility";
         let prev = self.model.ops.iter().rposition(|o| {
-            graph::output(o) == out && graph::kind(o) == kind && !reads.contains(&graph::output(o))
+            graph::output(o) == out
+                && graph::kind(o) == kind
+                && (replace_in_place || !reads.contains(&graph::output(o)))
         });
+        // Reject outputs that collide with another op's outputs (e.g. a
+        // primitive `ring_0` vs a radial array `ring`); in-place chains (an op
+        // that reads the name it writes) are legitimate and exempt.
+        let mine = graph::outputs(&op);
+        for (i, other) in self.model.ops.iter().enumerate() {
+            if Some(i) == prev {
+                continue;
+            }
+            let other_reads = graph::inputs(other);
+            for n in graph::outputs(other) {
+                if mine.contains(&n)
+                    && !reads.contains(&n.as_str())
+                    && !other_reads.contains(&n.as_str())
+                {
+                    return Err(format!(
+                        "`{n}` is already produced by another op ({}); choose a different name",
+                        graph::output(other)
+                    )
+                    .into());
+                }
+            }
+        }
         let old = prev.map(|i| self.model.ops[i].clone());
         match prev {
             Some(i) => self.model.ops[i] = op,
@@ -99,7 +120,6 @@ impl Session {
             }
             return Err(e);
         }
-        self.bump();
         self.commit(label);
         Ok(format!("{label} ok"))
     }
@@ -108,7 +128,7 @@ impl Session {
     pub fn op_primitive(
         &mut self,
         name: &str,
-        kind: &str,
+        kind: PrimitiveKind,
         size: [f32; 3],
         translation: [f32; 3],
         rotation: Option<[f32; 4]>,
@@ -116,7 +136,7 @@ impl Session {
         self.apply_op(
             Op::Primitive {
                 name: name.into(),
-                kind: kind.into(),
+                kind,
                 size,
                 translation,
                 rotation,
@@ -146,11 +166,11 @@ impl Session {
         )
     }
 
-    pub fn op_boolean(&mut self, name: &str, op: &str, a: &str, b: &str) -> CmdResult {
+    pub fn op_boolean(&mut self, name: &str, op: BoolOp, a: &str, b: &str) -> CmdResult {
         self.apply_op(
             Op::Boolean {
                 name: name.into(),
-                op: op.into(),
+                op,
                 a: a.into(),
                 b: b.into(),
             },
@@ -167,7 +187,7 @@ impl Session {
         center: [f32; 3],
         degrees: f32,
         start_degrees: f32,
-        axis: &str,
+        axis: Axis,
     ) -> CmdResult {
         self.apply_op(
             Op::RadialArray {
@@ -177,7 +197,7 @@ impl Session {
                 center,
                 degrees,
                 start_degrees,
-                axis: axis.into(),
+                axis,
             },
             &format!("op radial `{name}` = {count} x `{input}` over {degrees}° about {axis}"),
         )
@@ -227,14 +247,14 @@ impl Session {
         &mut self,
         name: &str,
         input: &str,
-        axis: &str,
+        axis: Axis,
         offset: [f32; 3],
     ) -> CmdResult {
         self.apply_op(
             Op::Mirror {
                 name: name.into(),
                 input: input.into(),
-                axis: axis.into(),
+                axis,
                 offset,
             },
             &format!("op mirror `{name}` = `{input}` across {axis}"),
@@ -243,13 +263,32 @@ impl Session {
 
     /// Removes the op whose output is `name` and re-derives.
     pub fn op_delete(&mut self, name: &str) -> CmdResult {
-        let before = self.model.ops.len();
-        self.model.ops.retain(|o| graph::output(o) != name);
-        if self.model.ops.len() == before {
-            return Err(format!("no op with output `{name}`"));
+        let Some(idx) = self.model.ops.iter().position(|o| graph::output(o) == name) else {
+            return Err(format!("no op with output `{name}`").into());
+        };
+        let produced = graph::outputs(&self.model.ops[idx]);
+        let dependents: Vec<String> = self
+            .model
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|&(i, o)| {
+                i != idx
+                    && graph::inputs(o)
+                        .iter()
+                        .any(|inp| produced.iter().any(|p| p == inp))
+            })
+            .map(|(_, o)| format!("`{}`", graph::output(o)))
+            .collect();
+        if !dependents.is_empty() {
+            return Err(format!(
+                "can't delete `{name}`: still read by {}; delete or repoint those first",
+                dependents.join(", ")
+            )
+            .into());
         }
+        self.model.ops.retain(|o| graph::output(o) != name);
         self.model.refresh()?;
-        self.bump();
         self.commit(&format!("op delete `{name}`"));
         Ok(format!("deleted op `{name}`"))
     }
@@ -322,17 +361,40 @@ impl Session {
         Ok(lines.join("\n"))
     }
 
+    /// True when some op in the graph writes a part called `name`. Edits to
+    /// such parts are recorded as graph ops (so they survive re-derivation);
+    /// anything else is a baked part and is edited directly.
+    fn derived_by_ops(&self, name: &str) -> bool {
+        self.model.derived_from_ops
+            && self
+                .model
+                .ops
+                .iter()
+                .any(|o| graph::outputs(o).iter().any(|n| n == name))
+    }
+
     /// Shows or hides a part. Hidden parts stay in the model and keep
     /// deriving from ops — they are just skipped by the render and the glTF
-    /// export. Like the other baked-part edits, a later graph re-evaluation
-    /// (an op tweak) restores the derived default (visible).
+    /// export. For op-derived parts this records a `Visibility` op, so the hide
+    /// survives re-derivation; baked parts are edited directly.
     pub fn set_visible(&mut self, name: &str, visible: bool) -> CmdResult {
-        let Some(p) = self.model.parts.iter_mut().find(|p| p.name == name) else {
-            return Err(format!("no part `{name}`"));
+        if self.derived_by_ops(name) {
+            let verb = if visible { "shown" } else { "hidden" };
+            self.apply_op(
+                Op::Visibility {
+                    name: name.into(),
+                    input: name.into(),
+                    visible,
+                },
+                &format!("{verb} `{name}`"),
+            )?;
+            return Ok(format!("part `{name}` {verb}"));
+        }
+        let Some(p) = self.model.part_mut(name) else {
+            return Err(ModelerError::NoPart(name.to_string()));
         };
         p.visible = visible;
         let verb = if visible { "shown" } else { "hidden" };
-        self.bump();
         self.commit(&format!("{verb} `{name}`"));
         Ok(format!("part `{name}` {verb}"))
     }
@@ -340,346 +402,51 @@ impl Session {
     /// The full parameter dump of one op, by output part name.
     pub fn describe_op(&self, name: &str) -> CmdResult {
         graph::describe_one(&self.model.ops, name)
-            .ok_or_else(|| format!("no op with output `{name}`"))
+            .ok_or_else(|| ModelerError::Invalid(format!("no op with output `{name}`")))
     }
 
-    /// Re-derives the whole graph into a scratch copy and compares the
-    /// geometry against the cached parts (names, verts, indices, transforms).
-    /// Catches a stale parts cache or a non-deterministic op. Baked edits
-    /// (set_material / visibility) are intentionally not compared: a refresh
-    /// legitimately resets those.
+    /// Re-derives the graph and diffs it against the cached parts (see
+    /// []).
     pub fn check_rebuild(&self) -> CmdResult {
-        let canon = |m: &Model| {
-            m.parts
-                .iter()
-                .map(|p| {
-                    format!(
-                        "{} {:?} {:?} {:?} {:?} {:?}",
-                        p.name, p.verts, p.indices, p.translation, p.rotation, p.scale
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let mut clone = self.model.clone();
-        clone.refresh().map_err(|e| e.to_string())?;
-        if canon(&self.model) == canon(&clone) {
-            Ok(format!(
-                "cached parts match a fresh re-derivation ({} parts)",
-                self.model.parts.len()
-            ))
-        } else {
-            Err("cached parts differ from a fresh re-derivation — the parts cache is stale or an op is non-deterministic".into())
-        }
+        crate::verify::check_rebuild(&self.model)
     }
 
-    /// Deterministic part-list assertion: compares the model's actual part
-    /// names against `expected` exactly (order-insensitive). Catches missing
-    /// array copies, duplicated radial sources, and stray boolean
-    /// intermediates — the "7 cylinders where I designed 6" class of bug —
-    /// without a screenshot.
+    /// Exact visible-part-list assertion (see []).
     pub fn expect_parts(&self, expected: &[String]) -> CmdResult {
-        // Hidden parts are not counted: they do not render or export, so an
-        // assertion about "what the model is" should not trip over them.
-        let actual: std::collections::BTreeSet<&str> = self
-            .model
-            .parts
-            .iter()
-            .filter(|p| p.visible)
-            .map(|p| p.name.as_str())
-            .collect();
-        let hidden: Vec<&str> = self
-            .model
-            .parts
-            .iter()
-            .filter(|p| !p.visible)
-            .map(|p| p.name.as_str())
-            .collect();
-        let expected: std::collections::BTreeSet<&str> =
-            expected.iter().map(String::as_str).collect();
-        let missing: Vec<_> = expected.difference(&actual).collect();
-        let extra: Vec<_> = actual.difference(&expected).collect();
-        if missing.is_empty() && extra.is_empty() {
-            let suffix = if hidden.is_empty() {
-                String::new()
-            } else {
-                format!(" ({} hidden parts not counted)", hidden.len())
-            };
-            Ok(format!(
-                "all {} expected parts present, no extras{suffix}",
-                expected.len()
-            ))
-        } else {
-            let mut msg = Vec::new();
-            if !missing.is_empty() {
-                msg.push(format!("missing: {missing:?}"));
-            }
-            if !extra.is_empty() {
-                msg.push(format!("unexpected: {extra:?}"));
-            }
-            Err(msg.join("; "))
-        }
+        crate::verify::expect_parts(&self.model, expected)
     }
 
-    /// Numeric bounds assertion over the visible parts: the model's world
-    /// bounds must sit within `tol` of `min`/`max` per axis (compare only the
-    /// axes you care about by passing `None`). This is the deterministic form
-    /// of the eyeball checks — "it sits on the ground" is `min` y ≈ 0, "it is
-    /// centered" is symmetric min/max x/z, "nothing floats" is a max y near
-    /// the design height. Hidden parts are not counted (they are not
-    /// rendered or exported).
+    /// World-bounds assertion (see []).
     pub fn expect_bounds(
         &self,
         min: [Option<f32>; 3],
         max: [Option<f32>; 3],
         tol: f32,
     ) -> CmdResult {
-        let Some((amin, amax)) = self.model.bounds() else {
-            return Err("no visible parts to bound".into());
-        };
-        let mut issues = Vec::new();
-        for (axis, name) in [(0, "x"), (1, "y"), (2, "z")] {
-            for (want, got, lo) in [
-                (min[axis], amin[axis], true),
-                (max[axis], amax[axis], false),
-            ] {
-                let Some(want) = want else { continue };
-                if (want - got).abs() > tol {
-                    issues.push(format!(
-                        "{} {} (expected {want:.4} ±{tol}, got {got:.4})",
-                        if lo { "min" } else { "max" },
-                        name
-                    ));
-                }
-            }
-        }
-        if issues.is_empty() {
-            Ok(format!("bounds within ±{tol}: min {amin:?}, max {amax:?}"))
-        } else {
-            Err(format!("bounds off: {}", issues.join("; ")))
-        }
+        crate::verify::expect_bounds(&self.model, min, max, tol)
     }
 
-    /// Mesh-level checks per part: edge/face manifoldness and winding (signed
-    /// volume must be positive for an outward-wound closed mesh). Pure mesh
-    /// math — no renderer needed — so it catches inverted or torn geometry
-    /// that a screenshot only suggests. Edges are welded by quantized vertex
-    /// position, since primitives emit per-face vertices that share a point.
+    /// Per-part mesh validation (see []).
     pub fn validate(&self) -> String {
-        let mut lines = Vec::new();
-        if self.model.parts.is_empty() {
-            return "no parts to validate".into();
-        }
-        for p in &self.model.parts {
-            if p.verts.is_empty() {
-                continue;
-            }
-            // Weld vertices by position: primitives emit per-face verts, and
-            // near-equal recomputed positions must land in one bucket.
-            let mut ids: std::collections::HashMap<[i64; 3], u32> =
-                std::collections::HashMap::new();
-            let mut welded = Vec::with_capacity(p.verts.len());
-            for v in &p.verts {
-                let key = [
-                    (v[0] * 1e5).round() as i64,
-                    (v[1] * 1e5).round() as i64,
-                    (v[2] * 1e5).round() as i64,
-                ];
-                let next = ids.len() as u32;
-                welded.push(*ids.entry(key).or_insert(next));
-            }
-            let mut edges: std::collections::HashMap<(u32, u32), u32> =
-                std::collections::HashMap::new();
-            for t in p.indices.as_chunks::<3>().0 {
-                for e in 0..3 {
-                    let (a, b) = (welded[t[e] as usize], welded[t[(e + 1) % 3] as usize]);
-                    *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
-                }
-            }
-            let open = edges.values().filter(|c| **c != 2).count();
-            if open > 0 {
-                lines.push(format!(
-                    "- `{}`: not manifold ({open} edges not shared by exactly 2 triangles)",
-                    p.name
-                ));
-            }
-            // Signed volume: positive for outward-wound closed meshes.
-            let mut vol = 0.0f64;
-            for t in p.indices.as_chunks::<3>().0 {
-                let (a, b, c) = (
-                    Vec3::from(p.verts[t[0] as usize]),
-                    Vec3::from(p.verts[t[1] as usize]),
-                    Vec3::from(p.verts[t[2] as usize]),
-                );
-                vol += a.dot(b.cross(c)) as f64 / 6.0;
-            }
-            if open == 0 && vol < 0.0 {
-                lines.push(format!(
-                    "- `{}`: inverted winding (signed volume {vol:.3} < 0)",
-                    p.name
-                ));
-            }
-        }
-        if lines.is_empty() {
-            "all parts: manifold, outward-wound".into()
-        } else {
-            lines.join("\n")
-        }
+        crate::verify::validate(&self.model)
     }
 
-    /// Cheap deterministic warnings about the current graph/parts, appended to
-    /// `scene_summary`. These encode the ordering and overlap traps that are
-    /// easy to hit and expensive to spot in a render.
+    /// Deterministic scene warnings (see []).
     pub fn lints(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        // Boolean volume sanity: a difference must shrink its input, a union
-        // must not fall below its larger input, and a union that exactly sums
-        // its inputs had no overlap at all.
-        for op in &self.model.ops {
-            let Op::Boolean {
-                name,
-                op: kind,
-                a,
-                b,
-            } = op
-            else {
-                continue;
-            };
-            let part = |n: &str| self.model.parts.iter().find(|p| p.name == n);
-            let out_name = graph::output(op);
-            let (Some(pa), Some(pb), Some(po)) = (part(a), part(b), part(out_name)) else {
-                continue;
-            };
-            let (va, vb, vo) = (
-                world_signed_volume(pa),
-                world_signed_volume(pb),
-                world_signed_volume(po),
-            );
-            let tol = (va.abs().max(vb.abs()).max(vo.abs()) * 1e-3).max(1e-6);
-            match kind.as_str() {
-                "difference" => {
-                    if vo > va - tol {
-                        out.push(format!(
-                            "difference `{name}` left `{a}` at its original volume ({vo:.4} vs {va:.4}) — the cutter `{b}` probably misses it"
-                        ));
-                    }
-                }
-                "union" => {
-                    if vo < va.abs().max(vb.abs()) - tol {
-                        out.push(format!(
-                            "union `{name}` is smaller than its larger input ({vo:.4}) — inverted or torn result"
-                        ));
-                    } else if (vo - (va + vb)).abs() <= tol {
-                        out.push(format!(
-                            "union `{name}` volume is exactly `{a}` + `{b}` ({vo:.4}) — the inputs have no overlap"
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Material-after-copy: array/mirror/transform ops earlier in the list
-        // cloned the (still uncolored) source, so the copies stay default-gray.
-        for (i, op) in self.model.ops.iter().enumerate() {
-            if let Op::Material { input, .. } = op {
-                for earlier in &self.model.ops[..i] {
-                    let copies = matches!(
-                        earlier,
-                        Op::Transform { .. }
-                            | Op::RadialArray { .. }
-                            | Op::LinearArray { .. }
-                            | Op::Mirror { .. }
-                    );
-                    if copies
-                        && graph::inputs(earlier).contains(&input.as_str())
-                        && graph::output(earlier) != input.as_str()
-                    {
-                        out.push(format!(
-                            "`{}` (made before the material op) copies `{input}`, so it kept the default material. Re-order: op_material first, then the copying op.",
-                            graph::output(earlier)
-                        ));
-                    }
-                }
-            }
-        }
-        // Full-ring radial array with the source on the first copy's angle.
-        // Skipped when the source part is hidden: an invisible overlap is
-        // harmless (nothing renders there).
-        let part_by_name = |n: &str| self.model.parts.iter().find(|p| p.name == n);
-        for op in &self.model.ops {
-            if let Op::RadialArray {
-                name,
-                input,
-                count,
-                degrees,
-                start_degrees,
-                ..
-            } = op
-                && *count > 1
-                && !part_by_name(input).is_some_and(|p| !p.visible)
-                && degrees.rem_euclid(360.0) == 0.0
-                && start_degrees.rem_euclid(360.0) == 0.0
-            {
-                out.push(format!(
-                    "radial `{name}`: full ring with the source at the first copy's angle — the source and copy 0 overlap. Use count-1 copies with start_degrees = degrees/count."
-                ));
-            }
-        }
-        // Parts still wearing the default material. Hidden parts are skipped:
-        // they are not rendered, so their color is irrelevant noise.
-        for p in &self.model.parts {
-            if !p.visible {
-                continue;
-            }
-            let m = &p.material;
-            if m.base_color == [0.7, 0.7, 0.7, 1.0] && m.roughness == 0.6 && m.metalness == 0.0 {
-                out.push(format!(
-                    "part `{}` still has the default material (forgot an op_material?)",
-                    p.name
-                ));
-            }
-        }
-        // Coincident world bounds → z-fighting.
-        for (i, a) in self.model.parts.iter().enumerate() {
-            if !a.visible {
-                continue;
-            }
-            for b in &self.model.parts[i + 1..] {
-                if !b.visible {
-                    continue;
-                }
-                let (amin, amax) = a.bounds();
-                let (bmin, bmax) = b.bounds();
-                let near = |x: f32, y: f32| (x - y).abs() < 1e-4;
-                if near(amin.x, bmin.x)
-                    && near(amin.y, bmin.y)
-                    && near(amin.z, bmin.z)
-                    && near(amax.x, bmax.x)
-                    && near(amax.y, bmax.y)
-                    && near(amax.z, bmax.z)
-                {
-                    out.push(format!(
-                        "parts `{}` and `{}` occupy identical bounds — their faces will z-fight",
-                        a.name, b.name
-                    ));
-                }
-            }
-        }
-        out
+        crate::verify::lints(&self.model)
     }
 
     pub fn add_primitive(
         &mut self,
-        kind: &str,
+        kind: PrimitiveKind,
         size: [f32; 3],
         translation: [f32; 3],
         name: &str,
     ) -> CmdResult {
         let mut part = crate::primitives::primitive(kind, size, name).map_err(|e| e.to_string())?;
         part.translation = translation;
-        self.model.parts.push(part);
+        self.model.parts.push(std::sync::Arc::new(part));
         self.model.mark_baked();
-        self.bump();
         self.commit(&format!("add {kind} `{name}`"));
         Ok(format!("added {kind} `{name}` at {translation:?}"))
     }
@@ -711,17 +478,15 @@ impl Session {
             part.uvs = u;
         }
         let tris = part.tri_count();
-        self.model.parts.push(part);
-        self.bump();
+        self.model.parts.push(std::sync::Arc::new(part));
         self.commit(&format!("add tri mesh `{name}`"));
         Ok(format!("added tri mesh `{name}` ({tris} tris)"))
     }
 
-    pub fn boolean(&mut self, op: &str, a: &str, b: &str, name: Option<&str>) -> CmdResult {
+    pub fn boolean(&mut self, op: BoolOp, a: &str, b: &str, name: Option<&str>) -> CmdResult {
         let out = crate::csg::boolean(&self.model, op, a, b, name)?;
         self.model.parts.retain(|p| p.name != a && p.name != b);
-        self.model.parts.push(out);
-        self.bump();
+        self.model.parts.push(std::sync::Arc::new(out));
         self.commit(&format!("{op}({a}, {b})"));
         Ok(format!("{op}({a}, {b}) ok"))
     }
@@ -733,10 +498,14 @@ impl Session {
         rotation: Option<[f32; 4]>,
         scale: Option<[f32; 3]>,
     ) -> CmdResult {
+        if self.derived_by_ops(part) {
+            self.op_transform(part, part, translation, rotation, scale)?;
+            return Ok(format!("transformed `{part}`"));
+        }
         let p = self
             .model
             .part_mut(part)
-            .ok_or_else(|| format!("no part `{part}`"))?;
+            .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
         if let Some(t) = translation {
             p.translation = t;
         }
@@ -747,7 +516,6 @@ impl Session {
             p.scale = s;
         }
         self.model.mark_baked();
-        self.bump();
         self.commit(&format!("transform `{part}`"));
         Ok(format!("transformed `{part}`"))
     }
@@ -756,23 +524,31 @@ impl Session {
         let before = self.model.parts.len();
         self.model.parts.retain(|p| p.name != part);
         if self.model.parts.len() == before {
-            Err(format!("no part `{part}`"))
+            Err(ModelerError::NoPart(part.to_string()))
         } else {
             self.model.mark_baked();
-            self.bump();
             self.commit(&format!("delete `{part}`"));
             Ok(format!("deleted `{part}`"))
         }
     }
 
     pub fn rename_part(&mut self, part: &str, to: &str) -> CmdResult {
+        if self.derived_by_ops(part) {
+            self.apply_op(
+                Op::Rename {
+                    name: to.into(),
+                    input: part.into(),
+                },
+                &format!("rename `{part}` -> `{to}`"),
+            )?;
+            return Ok(format!("renamed `{part}` -> `{to}`"));
+        }
         let p = self
             .model
             .part_mut(part)
-            .ok_or_else(|| format!("no part `{part}`"))?;
+            .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
         p.name = to.to_string();
         self.model.mark_baked();
-        self.bump();
         self.commit(&format!("rename `{part}` -> `{to}`"));
         Ok(format!("renamed `{part}` -> `{to}`"))
     }
@@ -784,10 +560,14 @@ impl Session {
         roughness: Option<f32>,
         metalness: Option<f32>,
     ) -> CmdResult {
+        if self.derived_by_ops(part) {
+            self.op_material(part, part, base_color, roughness, metalness)?;
+            return Ok(format!("material on `{part}` updated"));
+        }
         let p = self
             .model
             .part_mut(part)
-            .ok_or_else(|| format!("no part `{part}`"))?;
+            .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
         if let Some(c) = base_color {
             p.material.base_color = c;
         }
@@ -798,7 +578,6 @@ impl Session {
             p.material.metalness = m;
         }
         self.model.mark_baked();
-        self.bump();
         self.commit(&format!("material on `{part}`"));
         Ok(format!("material on `{part}` updated"))
     }
@@ -807,17 +586,16 @@ impl Session {
         let p = self
             .model
             .part_mut(part)
-            .ok_or_else(|| format!("no part `{part}`"))?;
+            .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
         crate::uv::project(p, projection).map_err(|e| e.to_string())?;
         self.model.mark_baked();
-        self.bump();
         self.commit(&format!("uvs on `{part}`"));
         Ok(format!("uvs on `{part}` set to {projection}"))
     }
 
     pub fn undo(&mut self) -> CmdResult {
         let (id, mut model) = self.model.history.undo().ok_or("nothing to undo")?;
-        model.refresh()?;
+        model.restore_parts()?;
         model.history = std::mem::take(&mut self.model.history);
         self.model = model;
         Ok(format!("undone to #{id}, model at v{}", self.model.version))
@@ -825,7 +603,7 @@ impl Session {
 
     pub fn redo(&mut self) -> CmdResult {
         let (id, mut model) = self.model.history.redo().ok_or("nothing to redo")?;
-        model.refresh()?;
+        model.restore_parts()?;
         model.history = std::mem::take(&mut self.model.history);
         self.model = model;
         Ok(format!("redone to #{id}, model at v{}", self.model.version))
@@ -835,12 +613,23 @@ impl Session {
     /// branches: the old future stays reachable as a sibling subtree.
     pub fn jump(&mut self, id: usize) -> CmdResult {
         let (_, mut model) = self.model.history.jump(id)?;
-        model.refresh()?;
+        model.restore_parts()?;
         model.history = std::mem::take(&mut self.model.history);
         self.model = model;
         Ok(format!(
             "jumped to #{id}, model at v{} (editing here branches)",
             self.model.version
+        ))
+    }
+
+    /// Prunes old history, keeping the newest `keep` snapshots, the cursor,
+    /// the root and every branch point. Ids are renumbered.
+    pub fn history_prune(&mut self, keep: usize) -> CmdResult {
+        let removed = self.model.history.prune(keep);
+        Ok(format!(
+            "pruned {removed} history node(s); {} remain (ids renumbered)\n{}",
+            self.model.history.nodes.len(),
+            self.model.history.describe()
         ))
     }
 
@@ -871,7 +660,7 @@ impl Session {
             let centroid = self
                 .model
                 .part_centroid(part)
-                .ok_or_else(|| format!("no part `{part}`"))?;
+                .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
             (part.to_string(), face, vertex, position.unwrap_or(centroid))
         };
         let id = self.model.next_annotation_id;
@@ -917,7 +706,7 @@ impl Session {
         let before = self.model.annotations.len();
         self.model.annotations.retain(|a| a.id != id);
         if self.model.annotations.len() == before {
-            Err(format!("no annotation #{id}"))
+            Err(format!("no annotation #{id}").into())
         } else {
             Ok(format!("deleted annotation #{id}"))
         }
@@ -987,8 +776,13 @@ mod tests {
 
     fn session_with_part() -> Session {
         let mut s = Session::default();
-        s.add_primitive("box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], "leg")
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.add_primitive(
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            "leg",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         s
     }
 
@@ -1112,10 +906,22 @@ mod tests {
     fn procedural_snapshots_serialize_without_parts_but_with_the_tree() {
         use crate::History;
         let mut s = Session::default();
-        s.op_primitive("leg", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("ball", "sphere", [0.5, 0.0, 0.0], [0.0, 2.0, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "leg",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "ball",
+            crate::PrimitiveKind::Sphere,
+            [0.5, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let json = serde_json::to_string(&s.model.history).unwrap_or_else(|e| panic!("{e}"));
         assert!(json.contains("ball"), "{json}");
         let back: History = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}"));
@@ -1139,12 +945,32 @@ mod tests {
     #[test]
     fn ops_derive_parts_and_tweak_in_place() {
         let mut s = Session::default();
-        s.op_primitive("stem", "cylinder", [0.05, 1.0, 0.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("petal", "sphere", [0.2, 0.0, 0.0], [0.0, 1.0, 0.3], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("ring", "petal", 6, [0.0, 1.0, 0.0], 360.0, 0.0, "y")
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "stem",
+            crate::PrimitiveKind::Cylinder,
+            [0.05, 1.0, 0.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "petal",
+            crate::PrimitiveKind::Sphere,
+            [0.2, 0.0, 0.0],
+            [0.0, 1.0, 0.3],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array(
+            "ring",
+            "petal",
+            6,
+            [0.0, 1.0, 0.0],
+            360.0,
+            0.0,
+            crate::Axis::Y,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.model.procedural());
         // stem + petal + 6 ring copies
         assert_eq!(s.model.parts.len(), 8);
@@ -1152,8 +978,16 @@ mod tests {
 
         // Re-issuing the radial op with another count is the tweak path.
         let v = s.model.version;
-        s.op_radial_array("ring", "petal", 8, [0.0, 1.0, 0.0], 360.0, 0.0, "y")
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array(
+            "ring",
+            "petal",
+            8,
+            [0.0, 1.0, 0.0],
+            360.0,
+            0.0,
+            crate::Axis::Y,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts.len(), 10);
         assert_eq!(s.model.ops.len(), 3);
         assert!(s.model.version > v);
@@ -1162,10 +996,19 @@ mod tests {
     #[test]
     fn bad_op_is_rejected_and_leaves_graph_intact() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "a",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let v = s.model.version;
-        assert!(s.op_boolean("cut", "difference", "a", "ghost").is_err());
+        assert!(
+            s.op_boolean("cut", crate::BoolOp::Difference, "a", "ghost")
+                .is_err()
+        );
         assert_eq!(s.model.ops.len(), 1);
         assert_eq!(s.model.version, v);
         assert_eq!(s.model.parts.len(), 1);
@@ -1174,10 +1017,22 @@ mod tests {
     #[test]
     fn op_delete_rederives() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_primitive("b", "box", [1.0, 1.0, 1.0], [1.0, 0.0, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "a",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "b",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         s.op_delete("a").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts.len(), 1);
         assert!(s.op_delete("a").is_err());
@@ -1186,7 +1041,7 @@ mod tests {
     fn box_op(name: &str, translation: [f32; 3]) -> Op {
         Op::Primitive {
             name: name.into(),
-            kind: "box".into(),
+            kind: crate::PrimitiveKind::Box,
             size: [1.0, 1.0, 1.0],
             translation,
             rotation: None,
@@ -1233,7 +1088,7 @@ mod tests {
             box_op("a", [0.0, 0.5, 0.0]),
             Op::Boolean {
                 name: "c".into(),
-                op: "union".into(),
+                op: crate::BoolOp::Union,
                 a: "a".into(),
                 b: "ghost".into(),
             },
@@ -1243,7 +1098,7 @@ mod tests {
             panic!("expected the batch to fail")
         };
         assert!(
-            err.contains("batch item #1"),
+            err.to_string().contains("batch item #1"),
             "error names the failing index: {err}"
         );
         assert_eq!(s.model.parts.len(), 1, "op #0 stayed applied");
@@ -1277,8 +1132,14 @@ mod tests {
     #[test]
     fn op_get_returns_full_parameters() {
         let mut s = Session::default();
-        s.op_primitive("leg", "cylinder", [0.1, 0.5, 0.0], [0.2, 0.25, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "leg",
+            crate::PrimitiveKind::Cylinder,
+            [0.1, 0.5, 0.0],
+            [0.2, 0.25, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let d = s.describe_op("leg").unwrap_or_else(|e| panic!("{e}"));
         assert!(d.contains("cylinder"), "{d}");
         assert!(d.contains("size=[0.1, 0.5, 0.0]"), "{d}");
@@ -1289,9 +1150,15 @@ mod tests {
     #[test]
     fn lint_material_after_copy() {
         let mut s = Session::default();
-        s.op_primitive("arm", "box", [0.1, 0.5, 0.1], [0.4, 1.0, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_mirror("arm_r", "arm", "x", [0.0, 0.0, 0.0])
+        s.op_primitive(
+            "arm",
+            crate::PrimitiveKind::Box,
+            [0.1, 0.5, 0.1],
+            [0.4, 1.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_mirror("arm_r", "arm", crate::Axis::X, [0.0, 0.0, 0.0])
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_material("arm", "arm", Some([1.0, 0.0, 0.0, 1.0]), None, None)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1312,10 +1179,24 @@ mod tests {
     #[test]
     fn lint_full_ring_radial_duplicate() {
         let mut s = Session::default();
-        s.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("posts", "post", 6, [0.0, 0.25, 0.0], 360.0, 0.0, "y")
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "post",
+            crate::PrimitiveKind::Cylinder,
+            [0.05, 0.5, 0.0],
+            [0.6, 0.25, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array(
+            "posts",
+            "post",
+            6,
+            [0.0, 0.25, 0.0],
+            360.0,
+            0.0,
+            crate::Axis::Y,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             s.lints()
                 .iter()
@@ -1325,10 +1206,24 @@ mod tests {
         );
         // The even variant (count-1 copies starting one step in) is clean.
         let mut s2 = Session::default();
-        s2.op_primitive("post", "cylinder", [0.05, 0.5, 0.0], [0.6, 0.25, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
-        s2.op_radial_array("posts", "post", 5, [0.0, 0.25, 0.0], 360.0, 60.0, "y")
-            .unwrap_or_else(|e| panic!("{e}"));
+        s2.op_primitive(
+            "post",
+            crate::PrimitiveKind::Cylinder,
+            [0.05, 0.5, 0.0],
+            [0.6, 0.25, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s2.op_radial_array(
+            "posts",
+            "post",
+            5,
+            [0.0, 0.25, 0.0],
+            360.0,
+            60.0,
+            crate::Axis::Y,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert!(!s2.lints().iter().any(|l| l.contains("overlap")));
     }
 
@@ -1393,18 +1288,18 @@ mod tests {
         ];
         cutter.indices = a.indices.clone();
         crate::uv::ensure_normals(&mut cutter);
-        s.model.parts = vec![a, cutter, hollow];
+        s.model.parts = vec![a.into(), cutter.into(), hollow.into()];
         s.model.ops = vec![
             box_op("a", [0.0, 0.0, 0.0]),
             box_op("b", [0.0, 0.0, 0.0]),
             Op::Boolean {
                 name: "hollow".into(),
-                op: "difference".into(),
+                op: crate::BoolOp::Difference,
                 a: "a".into(),
                 b: "b".into(),
             },
         ];
-        s.bump();
+        s.model.version += 1;
         let lints = s.lints();
         assert!(
             lints
@@ -1447,18 +1342,18 @@ mod tests {
         crate::uv::ensure_normals(&mut slab_a);
         crate::uv::ensure_normals(&mut slab_b);
         crate::uv::ensure_normals(&mut joined);
-        s2.model.parts = vec![slab_a, slab_b, joined];
+        s2.model.parts = vec![slab_a.into(), slab_b.into(), joined.into()];
         s2.model.ops = vec![
             box_op("sa", [0.0, 0.5, 0.0]),
             box_op("sb", [5.5, 0.5, 0.0]),
             Op::Boolean {
                 name: "joined".into(),
-                op: "union".into(),
+                op: crate::BoolOp::Union,
                 a: "sa".into(),
                 b: "sb".into(),
             },
         ];
-        s2.bump();
+        s2.model.version += 1;
         let lints = s2.lints();
         assert!(
             lints
@@ -1472,8 +1367,14 @@ mod tests {
     #[test]
     fn validate_flags_inverted_mesh_and_passes_primitives() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "box",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.validate().contains("all parts: manifold, outward-wound"));
 
         // An inward-wound closed tetrahedron flips the signed volume negative.
@@ -1486,8 +1387,8 @@ mod tests {
         ];
         p.indices = vec![0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2];
         crate::uv::ensure_normals(&mut p);
-        s.model.parts.push(p);
-        s.bump();
+        s.model.parts.push(p.into());
+        s.model.version += 1;
         let v = s.validate();
         assert!(v.contains("`tetra`: inverted winding"), "{v}");
         assert!(!v.contains("`box`"), "the good part is not reported: {v}");
@@ -1496,15 +1397,21 @@ mod tests {
     #[test]
     fn check_rebuild_detects_stale_cache() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "box",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         s.check_rebuild().unwrap_or_else(|e| panic!("{e}"));
         // Simulate drift: nudge the cached part without touching the ops.
-        s.model.parts[0].translation = [9.0, 0.5, 0.0];
+        std::sync::Arc::make_mut(&mut s.model.parts[0]).translation = [9.0, 0.5, 0.0];
         let Err(err) = s.check_rebuild() else {
             panic!("stale cache should be reported")
         };
-        assert!(err.contains("stale"), "{err}");
+        assert!(err.to_string().contains("stale"), "{err}");
     }
 
     #[test]
@@ -1512,37 +1419,61 @@ mod tests {
         let mut s = Session::default();
         let h = std::f32::consts::FRAC_1_SQRT_2;
         let z90 = crate::quat_of([0.0, 0.0, h, h]).to_array();
-        s.op_primitive("beam", "box", [2.0, 0.2, 0.2], [0.0, 0.1, 0.0], Some(z90))
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "beam",
+            crate::PrimitiveKind::Box,
+            [2.0, 0.2, 0.2],
+            [0.0, 0.1, 0.0],
+            Some(z90),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts[0].rotation, z90);
         // And the upsert path accepts a changed rotation.
-        s.op_primitive("beam", "box", [2.0, 0.2, 0.2], [0.0, 0.1, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "beam",
+            crate::PrimitiveKind::Box,
+            [2.0, 0.2, 0.2],
+            [0.0, 0.1, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts[0].rotation, [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
     fn expect_parts_reports_missing_and_extra() {
         let mut s = Session::default();
-        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "a",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         s.expect_parts(&["a".into()])
             .unwrap_or_else(|e| panic!("{e}"));
         let Err(err) = s.expect_parts(&["a".into(), "b".into()]) else {
             panic!("missing part should be reported")
         };
-        assert!(err.contains("missing"), "{err}");
+        assert!(err.to_string().contains("missing"), "{err}");
         let Err(err) = s.expect_parts(&[]) else {
             panic!("extra part should be reported")
         };
-        assert!(err.contains("unexpected"), "{err}");
+        assert!(err.to_string().contains("unexpected"), "{err}");
     }
 
     #[test]
     fn expect_bounds_checks_axes_with_tolerance() {
         let mut s = Session::default();
-        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0], None)
-            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "box",
+            crate::PrimitiveKind::Box,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.5, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         // Sits on the ground, 1 unit tall, centered in x (spans x -0.5..0.5).
         s.expect_bounds(
             [Some(-0.5), Some(0.0), None],
@@ -1556,9 +1487,244 @@ mod tests {
         else {
             panic!("floating model should be reported")
         };
-        assert!(err.contains("min y"), "{err}");
+        assert!(err.to_string().contains("min y"), "{err}");
         // Skipped axes (None) never fail.
         s.expect_bounds([None, None, None], [None, None, None], 0.01)
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn colliding_output_names_are_rejected() {
+        let mut s = Session::default();
+        s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let err = s.op_primitive(
+            "ring_0",
+            crate::PrimitiveKind::Box,
+            [1.0; 3],
+            [0.0; 3],
+            None,
+        );
+        assert!(err.is_err(), "ring_0 is already a radial output");
+        assert_eq!(s.model.ops.len(), 2);
+    }
+
+    #[test]
+    fn op_delete_reports_array_dependents() {
+        let mut s = Session::default();
+        s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_transform("moved", "ring_1", Some([0.0, 3.0, 0.0]), None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let err = s
+            .op_delete("ring")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.to_string().contains("moved"), "{err}");
+        assert_eq!(s.model.ops.len(), 3);
+    }
+
+    #[test]
+    fn undo_keeps_baked_hide_on_op_models() {
+        let mut s = Session::default();
+        s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.set_visible("p", false).unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "q",
+            crate::PrimitiveKind::Box,
+            [1.0; 3],
+            [3.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            s.model.part("p").is_some_and(|p| !p.visible),
+            "hide lost on undo"
+        );
+    }
+
+    fn op_session() -> Session {
+        let mut s = Session::default();
+        s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s
+    }
+
+    #[test]
+    fn hide_on_op_models_is_a_graph_op_that_survives_tweaks() {
+        let mut s = op_session();
+        s.set_visible("p", false).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            s.model
+                .ops
+                .iter()
+                .any(|o| matches!(o, Op::Visibility { .. }))
+        );
+        // Tweaking an upstream op re-derives, but the hide is part of the graph.
+        s.op_primitive("p", crate::PrimitiveKind::Box, [2.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("p").is_some_and(|p| !p.visible));
+        // Copies made from the hidden template are visible.
+        assert!(s.model.part("ring_1").is_some_and(|p| p.visible));
+        // Re-issuing replaces (no stacking), and show works.
+        s.set_visible("p", true).unwrap_or_else(|e| panic!("{e}"));
+        s.set_visible("p", false).unwrap_or_else(|e| panic!("{e}"));
+        s.set_visible("p", true).unwrap_or_else(|e| panic!("{e}"));
+        let n = s
+            .model
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::Visibility { .. }))
+            .count();
+        assert_eq!(n, 1);
+        assert!(s.model.part("p").is_some_and(|p| p.visible));
+    }
+
+    #[test]
+    fn rename_on_op_models_survives_tweaks_and_keeps_readers_working() {
+        let mut s = op_session();
+        s.rename_part("p", "seed").unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("seed").is_some());
+        assert!(s.model.part("p").is_none());
+        // The radial op still reads the old name and runs before the rename.
+        assert!(s.model.part("ring_0").is_some());
+        s.op_primitive("p", crate::PrimitiveKind::Box, [3.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("seed").is_some(), "rename lost after a tweak");
+        s.check_rebuild().unwrap_or_else(|e| panic!("{e}"));
+        // Undo returns to the pre-rename names.
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("p").is_some());
+    }
+
+    #[test]
+    fn material_and_transform_on_op_models_are_graph_ops() {
+        let mut s = op_session();
+        s.set_material("p", Some([0.0, 1.0, 0.0, 1.0]), None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.transform_part("p", Some([0.0, 5.0, 0.0]), None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive("p", crate::PrimitiveKind::Box, [2.0; 3], [0.0; 3], None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let p = s.model.part("p").unwrap_or_else(|| panic!("no p"));
+        assert_eq!(p.material.base_color, [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(p.translation, [0.0, 5.0, 0.0]);
+    }
+
+    #[test]
+    fn op_snapshots_store_no_parts_and_undo_rederives() {
+        let mut s = op_session();
+        s.op_primitive(
+            "q",
+            crate::PrimitiveKind::Box,
+            [1.0; 3],
+            [4.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            s.model
+                .history
+                .nodes
+                .iter()
+                .all(|n| n.model.parts.is_empty())
+        );
+        let live = s.model.parts.len();
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("q").is_none());
+        assert!(!s.model.parts.is_empty());
+        s.redo().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.model.parts.len(), live);
+    }
+
+    #[test]
+    fn history_prune_keeps_newest_branch_points_and_cursor() {
+        let mut s = op_session();
+        for i in 0..10 {
+            s.op_primitive(
+                "q",
+                crate::PrimitiveKind::Box,
+                [1.0 + i as f32; 3],
+                [0.0; 3],
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let total = s.model.history.nodes.len();
+        let out = s.history_prune(3).unwrap_or_else(|e| panic!("{e}"));
+        let h = &s.model.history;
+        assert!(h.nodes.len() < total, "{out}");
+        assert_eq!(h.current, Some(h.nodes.len() - 1));
+        // Tree stays consistent: every parent link has the matching child link.
+        for (i, n) in h.nodes.iter().enumerate() {
+            if let Some(p) = n.parent {
+                assert!(h.nodes[p].children.contains(&i));
+            }
+        }
+        // Still navigable.
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        s.redo().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.history_prune(1000).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn errors_are_typed_so_tests_can_match_variants() {
+        use crate::ModelerError;
+        let mut s = op_session();
+        assert_eq!(
+            s.set_uvs("ghost", "box"),
+            Err(ModelerError::NoPart("ghost".into()))
+        );
+        // A dangling input surfaces as MissingInput, not a stringly error.
+        let err = s.op_transform("t", "ghost", None, None, None).err();
+        assert_eq!(err, Some(ModelerError::MissingInput("ghost".into())));
+        assert!(matches!(
+            crate::graph::evaluate(&[
+                Op::Transform {
+                    name: "a".into(),
+                    input: "b".into(),
+                    translation: None,
+                    rotation: None,
+                    scale: None
+                },
+                Op::Transform {
+                    name: "b".into(),
+                    input: "a".into(),
+                    translation: None,
+                    rotation: None,
+                    scale: None
+                },
+            ]),
+            Err(ModelerError::Cycle(_))
+        ));
+    }
+
+    #[test]
+    fn baked_history_snapshots_share_unchanged_parts() {
+        let mut s = session_with_part();
+        s.add_primitive(
+            crate::PrimitiveKind::Box,
+            [1.0; 3],
+            [5.0, 0.0, 0.0],
+            "other",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.transform_part("other", Some([6.0, 0.0, 0.0]), None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let nodes = &s.model.history.nodes;
+        let (a, b) = (&nodes[nodes.len() - 2].model, &nodes[nodes.len() - 1].model);
+        // `leg` was untouched by the last edit: both snapshots point at one mesh.
+        assert!(std::sync::Arc::ptr_eq(&a.parts[0], &b.parts[0]));
+        assert!(!std::sync::Arc::ptr_eq(&a.parts[1], &b.parts[1]));
     }
 }

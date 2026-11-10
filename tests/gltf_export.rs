@@ -52,10 +52,10 @@ fn test_model() -> Model {
     };
     model
         .parts
-        .push(cube_part("base", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]));
+        .push(cube_part("base", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]).into());
     model
         .parts
-        .push(cube_part("top", [0.0, 2.0, 0.0], [0.0, 0.0, 1.0, 1.0]));
+        .push(cube_part("top", [0.0, 2.0, 0.0], [0.0, 0.0, 1.0, 1.0]).into());
     model.version = 3;
     model
 }
@@ -171,7 +171,9 @@ fn empty_model_and_bad_indices_are_rejected() {
     assert!(modeler::gltf::export_glb(&empty, &dir.join("e.glb")).is_err());
 
     let mut model = test_model();
-    model.parts[0].indices.push(99);
+    std::sync::Arc::make_mut(&mut model.parts[0])
+        .indices
+        .push(99);
     assert!(modeler::gltf::export_gltf(&model, &dir.join("bad.gltf")).is_err());
 }
 
@@ -179,7 +181,7 @@ fn empty_model_and_bad_indices_are_rejected() {
 fn hidden_parts_are_not_exported() {
     let dir = temp_dir("hidden");
     let mut model = test_model();
-    model.parts[0].visible = false;
+    std::sync::Arc::make_mut(&mut model.parts[0]).visible = false;
     let path = dir.join("hidden.glb");
     modeler::gltf::export_glb(&model, &path).unwrap();
     let doc = gltf::Gltf::open(&path).unwrap();
@@ -189,7 +191,7 @@ fn hidden_parts_are_not_exported() {
     // All-hidden exports are rejected rather than writing an empty scene.
     let mut model = test_model();
     for p in &mut model.parts {
-        p.visible = false;
+        std::sync::Arc::make_mut(p).visible = false;
     }
     assert!(modeler::gltf::export_glb(&model, &dir.join("none.glb")).is_err());
 }

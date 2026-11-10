@@ -4,12 +4,15 @@
 pub mod catalog;
 pub mod commands;
 pub mod csg;
+pub mod error;
 pub mod gltf;
 pub mod graph;
 pub mod primitives;
 pub mod uv;
+pub mod verify;
 
 use bevy::math::{Quat, Vec3};
+pub use error::ModelerError;
 use serde::{Deserialize, Serialize};
 
 /// A named material. Placeholder art is fine: base color + a couple of knobs.
@@ -76,13 +79,17 @@ impl Part {
     }
 
     /// World-space bounds: the mesh bounds through this part's transform.
+    /// Vertex `i` in world space (scale, then rotation, then translation).
+    pub fn world_vert(&self, i: usize) -> Vec3 {
+        quat_of(self.rotation) * (Vec3::from(self.verts[i]) * Vec3::from(self.scale))
+            + Vec3::from(self.translation)
+    }
+
     pub fn bounds(&self) -> (Vec3, Vec3) {
-        let rot = quat_of(self.rotation);
-        let scale = Vec3::from(self.scale);
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
-        for v in &self.verts {
-            let v = rot * (Vec3::from(*v) * scale) + Vec3::from(self.translation);
+        for i in 0..self.verts.len() {
+            let v = self.world_vert(i);
             min = min.min(v);
             max = max.max(v);
         }
@@ -90,12 +97,22 @@ impl Part {
     }
 }
 
+/// Current save-format version, written into every prefab and the autosave.
+/// Bump it when the serialized shape changes incompatibly.
+pub const FORMAT_VERSION: u32 = 1;
+
 /// The whole model document: a flat list of parts, each its own node for now.
 /// Joints/skin hang off this later; nothing here knows about the game.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Model {
+    /// On-disk schema version (see [`FORMAT_VERSION`]). Files written before
+    /// it existed read as 0 and load unchanged.
+    #[serde(default)]
+    pub format_version: u32,
     pub name: String,
-    pub parts: Vec<Part>,
+    /// Shared so history snapshots reuse unchanged parts instead of cloning
+    /// their meshes; mutate through `Arc::make_mut` (copy-on-write).
+    pub parts: Vec<std::sync::Arc<Part>>,
     /// Bumped on every mutation so observers (the preview app) know to rebuild.
     pub version: u64,
     /// The procedural graph the parts derive from, when the model is built
@@ -129,12 +146,24 @@ impl Model {
     /// A fresh model with a sensible display name.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
+            format_version: FORMAT_VERSION,
             name: name.into(),
             ..Default::default()
         }
     }
+
+    /// Rejects models saved by a newer build than this one understands.
+    pub fn check_format(&self) -> Result<(), ModelerError> {
+        if self.format_version > FORMAT_VERSION {
+            return Err(ModelerError::Parse(format!(
+                "model `{}` has format_version {} but this build only understands up to {FORMAT_VERSION}; upgrade modeler",
+                self.name, self.format_version
+            )));
+        }
+        Ok(())
+    }
     pub fn part(&self, name: &str) -> Option<&Part> {
-        self.parts.iter().find(|p| p.name == name)
+        self.parts.iter().map(|p| &**p).find(|p| p.name == name)
     }
 
     /// True when the parts derive from the op graph; `parts` is then a cache.
@@ -143,13 +172,40 @@ impl Model {
     }
 
     /// Re-derives `parts` from the op graph. A no-op for baked models.
-    pub fn refresh(&mut self) -> Result<(), String> {
+    pub fn refresh(&mut self) -> Result<(), ModelerError> {
         if self.ops.is_empty() {
             self.derived_from_ops = false;
             return Ok(());
         }
-        self.parts = crate::graph::evaluate(&self.ops)?;
+        self.parts = crate::graph::evaluate(&self.ops)?
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
         self.derived_from_ops = true;
+        Ok(())
+    }
+
+    /// Like [`Model::refresh`] but bypasses the eval cache, for verification.
+    pub fn refresh_uncached(&mut self) -> Result<(), ModelerError> {
+        if self.ops.is_empty() {
+            self.derived_from_ops = false;
+            return Ok(());
+        }
+        self.parts = crate::graph::evaluate_uncached(&self.ops)?
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect();
+        self.derived_from_ops = true;
+        Ok(())
+    }
+
+    /// Re-derives the parts only when they are missing from an op-driven model
+    /// (it was serialized without them). Models that carry their parts keep
+    /// them, so baked edits (hide, rename, material...) survive undo/redo/load.
+    pub fn restore_parts(&mut self) -> Result<(), ModelerError> {
+        if self.procedural() && self.parts.is_empty() {
+            self.refresh()?;
+        }
         Ok(())
     }
 
@@ -167,14 +223,17 @@ impl Model {
     }
 
     pub fn part_mut(&mut self, name: &str) -> Option<&mut Part> {
-        self.parts.iter_mut().find(|p| p.name == name)
+        // Find first, then copy-on-write only the matched part (mapping
+        // `make_mut` over the iterator would un-share every part before it).
+        let slot = self.parts.iter_mut().find(|p| p.name == name)?;
+        Some(std::sync::Arc::make_mut(slot))
     }
 
     pub fn annotation_at(&self, id: u32) -> Option<&Annotation> {
         self.annotations.iter().find(|a| a.id == id)
     }
 
-    /// Mean of a part's vertices, offset by the part's translation. A rough
+    /// Mean of a part's world-space vertices. A rough
     /// "middle of the part" for pinning annotations without a clicked spot.
     pub fn part_centroid(&self, name: &str) -> Option<[f32; 3]> {
         let p = self.part(name)?;
@@ -182,12 +241,8 @@ impl Model {
             return Some(p.translation);
         }
         let n = p.verts.len() as f32;
-        let mut sum = Vec3::ZERO;
-        for v in &p.verts {
-            sum += Vec3::from(*v);
-        }
-        let c = Vec3::from(p.translation) + sum / n;
-        Some(c.to_array())
+        let sum: Vec3 = (0..p.verts.len()).map(|i| p.world_vert(i)).sum();
+        Some((sum / n).to_array())
     }
 
     /// World bounds over the visible parts only (hidden parts are not rendered
@@ -282,7 +337,15 @@ impl History {
 
     /// Records `model` as a child of the current node, makes it current and
     /// returns its id.
-    pub fn record(&mut self, model: Model, label: impl Into<String>) -> usize {
+    ///
+    /// A snapshot whose parts are the pure derivation of its ops stores no
+    /// parts: they are re-derived on navigation (`Model::restore_parts`),
+    /// which the eval cache makes cheap. Memory then grows with the ops, not
+    /// with edits x mesh size.
+    pub fn record(&mut self, mut model: Model, label: impl Into<String>) -> usize {
+        if model.parts_derive_from_ops() {
+            model.parts.clear();
+        }
         let id = self.nodes.len();
         self.nodes.push(Snapshot {
             model,
@@ -313,12 +376,79 @@ impl History {
     }
 
     /// Moves the cursor to any node in the tree and returns its id and model.
-    pub fn jump(&mut self, id: usize) -> Result<(usize, Model), String> {
+    pub fn jump(&mut self, id: usize) -> Result<(usize, Model), ModelerError> {
         let Some(node) = self.nodes.get(id) else {
-            return Err(format!("no history node #{id} (0..{})", self.nodes.len()));
+            return Err(format!("no history node #{id} (0..{})", self.nodes.len()).into());
         };
         self.current = Some(id);
         Ok((id, node.model.clone()))
+    }
+
+    /// Drops old history: keeps the newest `keep` nodes, plus the cursor, the
+    /// root and every branch point (a node with 2+ children), and relinks each
+    /// survivor to its nearest surviving ancestor. Node ids are renumbered
+    /// (oldest first). Returns how many nodes were removed.
+    pub fn prune(&mut self, keep: usize) -> usize {
+        let n = self.nodes.len();
+        if n <= keep {
+            return 0;
+        }
+        let mut kept = vec![false; n];
+        for flag in kept.iter_mut().skip(n - keep) {
+            *flag = true;
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.children.len() > 1 || node.parent.is_none() {
+                kept[i] = true;
+            }
+        }
+        if let Some(c) = self.current {
+            kept[c] = true;
+        }
+        // New index for each survivor.
+        let mut remap = vec![usize::MAX; n];
+        let mut next = 0;
+        for i in 0..n {
+            if kept[i] {
+                remap[i] = next;
+                next += 1;
+            }
+        }
+        let nearest_kept = |mut i: usize, nodes: &[Snapshot]| -> Option<usize> {
+            while let Some(p) = nodes[i].parent {
+                if kept[p] {
+                    return Some(remap[p]);
+                }
+                i = p;
+            }
+            None
+        };
+        let parents: Vec<Option<usize>> = (0..n)
+            .map(|i| {
+                if kept[i] {
+                    nearest_kept(i, &self.nodes)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let old = std::mem::take(&mut self.nodes);
+        let mut nodes: Vec<Snapshot> = Vec::with_capacity(next);
+        for (i, mut node) in old.into_iter().enumerate() {
+            if kept[i] {
+                node.parent = parents[i];
+                node.children.clear();
+                nodes.push(node);
+            }
+        }
+        for i in 0..nodes.len() {
+            if let Some(p) = nodes[i].parent {
+                nodes[p].children.push(i);
+            }
+        }
+        self.current = self.current.map(|c| remap[c]);
+        self.nodes = nodes;
+        n - next
     }
 
     /// One line per node: id, parent, label, model version and the cursor.
@@ -347,6 +477,97 @@ impl History {
     }
 }
 
+/// Defines a closed string-valued enum with `as_str`, `Display` and `FromStr`
+/// (the wire format is the snake_case name; serde aliases keep old spellings).
+macro_rules! wire_enum {
+    ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $var:ident = $s:literal),+ $(,)? }) => {
+        $(#[$m])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($(#[$vm])* $var),+ }
+        impl $name {
+            pub const ALL: &'static [$name] = &[$($name::$var),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $($name::$var => $s),+ }
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+        impl std::str::FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, String> {
+                match s {
+                    $($s => Ok($name::$var),)+
+                    other => Err(format!(
+                        "unknown {} `{other}` (expected one of: {})",
+                        stringify!($name),
+                        [$($s),+].join(", ")
+                    ).into()),
+                }
+            }
+        }
+    };
+}
+
+wire_enum!(
+    /// The built-in primitive shapes.
+    PrimitiveKind {
+        Box = "box",
+        Sphere = "sphere",
+        Cylinder = "cylinder",
+        Cone = "cone",
+        Capsule = "capsule",
+        Torus = "torus",
+        Plane = "plane",
+        Wedge = "wedge",
+        Disc = "disc",
+        Washer = "washer",
+    }
+);
+
+impl PrimitiveKind {
+    /// Open single sheets, built double-sided.
+    pub fn is_open_sheet(self) -> bool {
+        matches!(self, Self::Plane | Self::Disc | Self::Washer)
+    }
+}
+
+wire_enum!(
+    /// CSG operations.
+    BoolOp {
+        Union = "union",
+        #[serde(alias = "subtract")]
+        Difference = "difference",
+        #[serde(alias = "intersection")]
+        Intersect = "intersect",
+    }
+);
+
+wire_enum!(
+    /// A coordinate axis.
+    Axis {
+        X = "x",
+        Y = "y",
+        Z = "z",
+    }
+);
+
+impl Axis {
+    pub fn index(self) -> usize {
+        self as usize
+    }
+    pub fn unit(self) -> Vec3 {
+        match self {
+            Axis::X => Vec3::X,
+            Axis::Y => Vec3::Y,
+            Axis::Z => Vec3::Z,
+        }
+    }
+}
+
 /// One step of the procedural graph behind the parts. Ops are upserted by
 /// output name: re-issuing an op with the same `name` replaces it, which is
 /// how a parameter gets tweaked without rebuilding the whole graph.
@@ -356,7 +577,7 @@ pub enum Op {
     /// A primitive from [`crate::primitives`] at a fixed spot.
     Primitive {
         name: String,
-        kind: String,
+        kind: PrimitiveKind,
         size: [f32; 3],
         translation: [f32; 3],
         /// Optional rotation, quaternion [x, y, z, w]. Saves a
@@ -378,7 +599,7 @@ pub enum Op {
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {
         name: String,
-        op: String,
+        op: BoolOp,
         a: String,
         b: String,
     },
@@ -398,7 +619,7 @@ pub enum Op {
         #[serde(default)]
         start_degrees: f32,
         #[serde(default = "default_axis")]
-        axis: String,
+        axis: Axis,
     },
     /// Re-materials an earlier part into a new output.
     Material {
@@ -427,14 +648,27 @@ pub enum Op {
     Mirror {
         name: String,
         input: String,
-        axis: String,
+        axis: Axis,
         #[serde(default)]
         offset: [f32; 3],
     },
+    /// Shows or hides `input` as output `name` (use the same name for an
+    /// in-place edit). Hidden parts keep deriving but are skipped by the
+    /// preview and glTF export. Survives graph re-evaluation, unlike a baked
+    /// hide.
+    Visibility {
+        name: String,
+        input: String,
+        visible: bool,
+    },
+    /// Renames the part `input` to `name`: the old name stops existing, and
+    /// every op that reads the old name still sees it (the rename runs after
+    /// them).
+    Rename { name: String, input: String },
 }
 
-fn default_axis() -> String {
-    "y".to_string()
+fn default_axis() -> Axis {
+    Axis::Y
 }
 
 fn default_degrees() -> f32 {
@@ -456,4 +690,27 @@ pub struct Annotation {
     pub vertex: Option<u32>,
     pub position: [f32; 3],
     pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centroid_honors_rotation_and_scale() {
+        let mut p = Part::new("p");
+        p.verts = vec![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        p.scale = [2.0, 1.0, 1.0];
+        // 90 degrees about Z: +X maps to +Y.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        p.rotation = [0.0, 0.0, h, h];
+        p.translation = [0.0, 0.0, 5.0];
+        let mut m = Model::named("m");
+        m.parts.push(p.into());
+        let c = m.part_centroid("p").unwrap_or_default();
+        assert!(
+            (c[0]).abs() < 1e-5 && (c[1] - 2.0).abs() < 1e-5 && (c[2] - 5.0).abs() < 1e-5,
+            "{c:?}"
+        );
+    }
 }

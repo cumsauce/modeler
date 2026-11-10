@@ -8,7 +8,7 @@ annotate in the window. No game code.
 cargo run                # MCP server + preview window (what the MCP config runs)
 cargo run -- --headless  # no window/render — for piping JSON-RPC lines in tests
 cargo run --example procedural_flower   # reference for the op-graph workflow
-cargo test               # 58 lib tests + 4 gltf round-trip tests (fast loop)
+cargo test               # lib tests + gltf round-trip tests (fast loop)
 cargo clippy --all-targets -- -D warnings && cargo fmt
 ```
 
@@ -96,10 +96,11 @@ tweak path):
   place or into a new output. `base_color` is **always RGBA `[f32; 4]`** (in
   `op_material` and in `apply_ops` material specs alike); a 3-component RGB
   fails deserialization.
-- **disc/washer/plane are single-sided**, flat in the XY plane (vertical!).
-  Laying one flat takes a −90° X rotation (`[-0.707, 0, 0, 0.707]`) so its
-  normal faces up — flipped, it back-face-culls to invisible with no error.
-  They also always flag as non-manifold in `validate` (open by design).
+- **disc/washer/plane are double-sided** (a reversed twin of every triangle is
+  appended, so neither orientation culls), flat in the XY plane (vertical!).
+  Laying one flat still takes a −90° X rotation (`[-0.707, 0, 0, 0.707]`) so
+  it lies horizontally. They are two coincident sheets, so avoid placing
+  another surface exactly on one (z-fighting).
 - `op_delete(name)` / `ops` — remove a step / list the graph one line per op
   **with full parameters** (sizes, translations, colors — enough to tweak
   without remembering what you sent). `op_get(name)` dumps a single op.
@@ -118,8 +119,11 @@ tweak path):
 - `hide_part(part)` / `show_part(part)` — the argument is named `part`. Hidden
   parts stay in the model and
   keep deriving, but the preview and glTF export skip them. The clean way to
-  keep boolean intermediates out of an export (a later graph re-evaluation
-  resets visibility, same as baked-part material edits).
+  keep boolean intermediates out of an export. On op-driven models the edit
+  is recorded as a graph op (`Visibility`), so it survives later tweaks; the
+  same goes for `rename_part`, `set_material` and `transform_part` (emitted as
+  `Rename`/`Material`/`Transform` ops). Only parts that no op produces (baked
+  parts), `set_uvs` and `delete_part` stay baked and are lost on re-derivation.
 
 Verification (all deterministic — prefer these over eyeballing renders,
 then screenshot last as the final once-over):
@@ -191,18 +195,28 @@ State:
 - **In-place ops**: `op_material("petal", "petal")` (output == input) is
   legal — upsert never replaces an op the new op reads from (`graph::kind` +
   `graph::inputs`). Repeated in-place ops accumulate; last wins.
+- **Op results are memoized** (`graph::evaluate`): a process-wide cache keyed by
+  op parameters + input content hashes, so tweaking one op re-runs only it and
+  its dependents. `check_rebuild` bypasses it (`evaluate_uncached`).
 - **Op evaluation is dependency-ordered.** Each op runs after the op
   producing its inputs; where that is already consistent, written order is
   preserved. This heals graphs where an upsert left an op positioned before
   an input it gained later — no naming tricks needed. A true cycle fails with
   "ops form a dependency cycle involving ...". Ops can only reference op
   outputs, never baked parts.
+- **Op-driven snapshots store no parts** (`History::record` strips them when
+  they derive from ops); undo/redo/jump re-derive via the eval cache.
+  `history_prune(keep)` bounds long sessions (keeps newest N, cursor, root,
+  branch points; renumbers ids).
 - **History snapshots are history-less**: each node stores a model with an
   empty tree (the live tree on the session model is the single source of
   truth); undo/redo/jump graft the live tree onto whatever they land on.
 - **Jump restores the snapshot's op list exactly.** After `jump`, every op
   created after that node no longer exists — re-issue all of them in the new
   branch. "no part `x` earlier in the graph" right after a jump means this.
+- **Save format is versioned** (`Model::format_version`, `FORMAT_VERSION`):
+  old files (no field) read as 0 and load; files from a newer build are
+  rejected with a clear error. Bump it when the serialized shape changes.
 - **Prefab format is non-destructive**: when every part re-derives from ops
   (`parts_derive_from_ops()`), `parts` are NOT written — just ops, history
   tree, annotations — and load re-evaluates. Mixed baked+ops models keep
@@ -275,7 +289,7 @@ read-only ops + history panel. Click a part then type to annotate
 - New ops: add the variant in `lib.rs` (`Op`), an eval arm + `output`/`kind`/
   `inputs`/`describe` arms in `graph.rs`, a session fn in `commands.rs`
   (goes through `apply_op`, which handles upsert/rollback/history), args
-  struct + `#[tool]` fn in `src/bin/modeler.rs`, and a test. Validate op
+  struct + `#[tool]` fn in `src/bin/modeler/` (`server/` = MCP, `preview/` = Bevy), and a test. Validate op
   params BEFORE the input lookup so errors report the right cause.
 - Examples in `examples/` double as executable documentation of the intended
   workflow — and as the fallback for authoring procedural prefabs when the
