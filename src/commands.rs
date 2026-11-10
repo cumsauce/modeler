@@ -292,6 +292,65 @@ impl Session {
             .ok_or_else(|| format!("no op with output `{name}`"))
     }
 
+    /// Re-derives the whole graph into a scratch copy and compares the
+    /// geometry against the cached parts (names, verts, indices, transforms).
+    /// Catches a stale parts cache or a non-deterministic op. Baked edits
+    /// (set_material / visibility) are intentionally not compared: a refresh
+    /// legitimately resets those.
+    pub fn check_rebuild(&self) -> CmdResult {
+        let canon = |m: &Model| {
+            m.parts
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{} {:?} {:?} {:?} {:?} {:?}",
+                        p.name, p.verts, p.indices, p.translation, p.rotation, p.scale
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut clone = self.model.clone();
+        clone.refresh().map_err(|e| e.to_string())?;
+        if canon(&self.model) == canon(&clone) {
+            Ok(format!(
+                "cached parts match a fresh re-derivation ({} parts)",
+                self.model.parts.len()
+            ))
+        } else {
+            Err("cached parts differ from a fresh re-derivation — the parts cache is stale or an op is non-deterministic".into())
+        }
+    }
+
+    /// Deterministic part-list assertion: compares the model's actual part
+    /// names against `expected` exactly (order-insensitive). Catches missing
+    /// array copies, duplicated radial sources, and stray boolean
+    /// intermediates — the "7 cylinders where I designed 6" class of bug —
+    /// without a screenshot.
+    pub fn expect_parts(&self, expected: &[String]) -> CmdResult {
+        let actual: std::collections::BTreeSet<&str> =
+            self.model.parts.iter().map(|p| p.name.as_str()).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            expected.iter().map(String::as_str).collect();
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let extra: Vec<_> = actual.difference(&expected).collect();
+        if missing.is_empty() && extra.is_empty() {
+            Ok(format!(
+                "all {} expected parts present, no extras",
+                expected.len()
+            ))
+        } else {
+            let mut msg = Vec::new();
+            if !missing.is_empty() {
+                msg.push(format!("missing: {missing:?}"));
+            }
+            if !extra.is_empty() {
+                msg.push(format!("unexpected: {extra:?}"));
+            }
+            Err(msg.join("; "))
+        }
+    }
+
     /// Mesh-level checks per part: edge/face manifoldness and winding (signed
     /// volume must be positive for an outward-wound closed mesh). Pure mesh
     /// math — no renderer needed — so it catches inverted or torn geometry
@@ -1145,5 +1204,36 @@ mod tests {
         let v = s.validate();
         assert!(v.contains("`tetra`: inverted winding"), "{v}");
         assert!(!v.contains("`box`"), "the good part is not reported: {v}");
+    }
+
+    #[test]
+    fn check_rebuild_detects_stale_cache() {
+        let mut s = Session::default();
+        s.op_primitive("box", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.check_rebuild().unwrap_or_else(|e| panic!("{e}"));
+        // Simulate drift: nudge the cached part without touching the ops.
+        s.model.parts[0].translation = [9.0, 0.5, 0.0];
+        let Err(err) = s.check_rebuild() else {
+            panic!("stale cache should be reported")
+        };
+        assert!(err.contains("stale"), "{err}");
+    }
+
+    #[test]
+    fn expect_parts_reports_missing_and_extra() {
+        let mut s = Session::default();
+        s.op_primitive("a", "box", [1.0, 1.0, 1.0], [0.0, 0.5, 0.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.expect_parts(&["a".into()])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let Err(err) = s.expect_parts(&["a".into(), "b".into()]) else {
+            panic!("missing part should be reported")
+        };
+        assert!(err.contains("missing"), "{err}");
+        let Err(err) = s.expect_parts(&[]) else {
+            panic!("extra part should be reported")
+        };
+        assert!(err.contains("unexpected"), "{err}");
     }
 }

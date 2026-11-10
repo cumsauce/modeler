@@ -79,6 +79,14 @@ tweak path):
 - `validate` — per-part mesh checks without a renderer: edge manifoldness
   (welded by position) and winding via signed volume. Catches inverted
   normals and torn geometry that a screenshot only hints at.
+- `check_rebuild` — re-derives the graph into a scratch copy and diffs the
+  geometry against the cached parts; fails on a stale cache or
+  non-deterministic op (baked material/visibility edits are not compared —
+  a refresh legitimately resets those).
+- `expect_parts([names])` — exact part-list assertion (order-insensitive),
+  reporting missing and unexpected names. The deterministic replacement for
+  counting parts in a screenshot; use it after arrays/booleans to catch
+  missing copies, duplicated radial sources, or stray intermediates.
 - `set_camera(yaw, pitch, dist)` — point the orbit camera (degrees, metres)
   before a `screenshot` so the verification shot actually shows the part in
   question. Windowed preview only.

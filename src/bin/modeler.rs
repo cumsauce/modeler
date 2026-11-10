@@ -1369,6 +1369,12 @@ struct SetCameraArgs {
     dist: f32,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ExpectPartsArgs {
+    /// The exact part names the model should have.
+    parts: Vec<String>,
+}
+
 #[tool_router(server_handler)]
 impl Tools {
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
@@ -1828,6 +1834,26 @@ impl Tools {
     #[tool]
     async fn validate(&self) -> Result<CallToolResult, ErrorData> {
         self.run(|s| Ok(s.validate())).await
+    }
+
+    /// Re-derives the op graph into a scratch copy and compares the geometry
+    /// against the cached parts. Catches a stale parts cache or a
+    /// non-deterministic op. Baked edits (set_material, visibility) are not
+    /// compared — a refresh legitimately resets those.
+    #[tool]
+    async fn check_rebuild(&self) -> Result<CallToolResult, ErrorData> {
+        self.run(|s| s.check_rebuild()).await
+    }
+
+    /// Assert the model's part names exactly (order-insensitive). Fails with
+    /// the missing and unexpected names, so you can deterministically verify
+    /// "my gate is 14 parts named X..." instead of eyeballing a render.
+    #[tool]
+    async fn expect_parts(
+        &self,
+        Parameters(ExpectPartsArgs { parts }): Parameters<ExpectPartsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.expect_parts(&parts)).await
     }
 
     /// Add a human-readable comment pinned to the model. Face, vertex and position are
