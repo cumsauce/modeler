@@ -8,9 +8,25 @@ annotate in the window. No game code.
 cargo run                # MCP server + preview window (what the MCP config runs)
 cargo run -- --headless  # no window/render — for piping JSON-RPC lines in tests
 cargo run --example procedural_flower   # reference for the op-graph workflow
-cargo test               # 42 lib tests + gltf round-trip (fast loop)
+cargo test               # 58 lib tests + 4 gltf round-trip tests (fast loop)
 cargo clippy --all-targets -- -D warnings && cargo fmt
 ```
+
+## Getting started (agent)
+
+```sh
+cargo build                # or skip if target/debug/modeler is current
+python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
+```
+
+Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
+array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when
+done. Typical first calls: `scene_summary` (also shows the autosaved session,
+if any), `catalog_list`, then `new_model` + `apply_ops` to build. If your
+session's MCP tool list has no `mcp__modeler__*` tools, this driver is the
+documented fallback — it speaks the same tool surface over stdio. The daemon
+keeps the preview window open; check it with `screenshot` (aim first with
+`set_camera`) and verify numerically with the Verification tools below.
 
 ## The mental model
 
@@ -64,6 +80,8 @@ tweak path):
 - `op_delete(name)` / `ops` — remove a step / list the graph one line per op
   **with full parameters** (sizes, translations, colors — enough to tweak
   without remembering what you sent). `op_get(name)` dumps a single op.
+- `set_model_name(name)` — names the whole model; used as the prefab entry
+  name on `save_prefab`, so set it before saving.
 - `apply_ops(ops)` — a whole batch in one call: array of objects, each tagged
   `"type"` (`primitive`, `transform`, `boolean`, `radial_array`,
   `linear_array`, `mirror`, `material`) plus that op's usual parameters.
@@ -76,6 +94,10 @@ tweak path):
   keep deriving, but the preview and glTF export skip them. The clean way to
   keep boolean intermediates out of an export (a later graph re-evaluation
   resets visibility, same as baked-part material edits).
+
+Verification (all deterministic — prefer these over eyeballing renders,
+then screenshot last as the final once-over):
+
 - `validate` — per-part mesh checks without a renderer: edge manifoldness
   (welded by position) and winding via signed volume. Catches inverted
   normals and torn geometry that a screenshot only hints at.
@@ -115,6 +137,11 @@ State:
   and the pending pin is consumed. Annotations ride in prefabs.
 - `save_prefab(description, tags, prompt)` / `load_prefab(name)` /
   `catalog_list` / `catalog_describe` — persistence.
+- **Session autosave**: every successful mutation also writes the whole
+  session model (parts, ops, history tree, annotations) to `session.json`
+  in the catalog dir, and a server started without `--model` restores it.
+  Unnamed WIP therefore survives restarts and crashes without any explicit
+  save; `save_prefab` is only for naming and indexing it.
 - `export_model(path, "glb"|"gltf")`, `screenshot` — output. **Always
   screenshot and actually look at the image** after building something; the
   scene data can be right while the render is wrong.
