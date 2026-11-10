@@ -12,6 +12,11 @@ cargo test               # 58 lib tests + 4 gltf round-trip tests (fast loop)
 cargo clippy --all-targets -- -D warnings && cargo fmt
 ```
 
+This file is the long-form reference. The critical operating rules are also
+served in the MCP `initialize` response (`instructions`), so MCP-connected
+agents get them in context automatically; keep the two in sync when semantics
+change.
+
 ## Getting started (agent)
 
 ```sh

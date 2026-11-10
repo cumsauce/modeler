@@ -34,7 +34,7 @@ use modeler::gltf;
 use modeler::{Model, Op, Part};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData};
-use rmcp::{ServiceExt, schemars, tool, tool_router};
+use rmcp::{ServiceExt, schemars, tool, tool_handler, tool_router};
 use tokio::sync::{mpsc, oneshot};
 
 type CmdResult = Result<String, String>;
@@ -1460,7 +1460,7 @@ struct ProbeRayArgs {
     dir: [f32; 3],
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl Tools {
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
     /// Call this first (and after any confusing result) to ground yourself in the model.
@@ -2011,6 +2011,33 @@ impl Tools {
         Parameters(AnnotationIdArgs { id }): Parameters<AnnotationIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.delete_annotation(id)).await
+    }
+}
+
+/// The server-handler wiring: tool calls go through the generated router, and
+/// `get_info` serves operating guidance in the MCP `initialize` response — the
+/// standard slot for "how to drive this server", so every client lands it in
+/// the model's context without anyone having to read AGENTS.md first.
+#[tool_handler]
+impl rmcp::ServerHandler for Tools {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
+- Call scene_summary first (and after anything confusing): it shows parts, bounds, ops, annotations, plus warnings for known traps. An empty warnings list means none fired.
+- Build with apply_ops (a whole model in one call), not one op per call. Ops are upserts: re-issuing the same name and kind tweaks parameters and re-derives.
+- Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
+- Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.
+- undo/redo/jump move a history tree cursor; jump restores that snapshot's op list exactly, so re-issue every op created after the jump point. Editing after a jump branches.
+- Verify deterministically before screenshots: validate (manifold/winding), expect_parts (exact part list), expect_bounds (numeric bounds), check_rebuild (stale-cache diff), probe_ray (openings/occlusion; windowed preview only). Then screenshot (aim with set_camera).
+- Every mutation autosaves the session (parts, ops, history) and it is restored on restart; save_prefab only names and indexes it. Prefab names come from set_model_name.
+- export_model skips hidden parts; hide boolean intermediates instead of deleting them (later ops may still derive from them).
+Full details live in AGENTS.md next to the source.";
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new("modeler", "0.1.0"))
+        .with_instructions(INSTRUCTIONS)
     }
 }
 
