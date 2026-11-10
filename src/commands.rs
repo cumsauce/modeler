@@ -434,6 +434,9 @@ impl Session {
     /// position, since primitives emit per-face vertices that share a point.
     pub fn validate(&self) -> String {
         let mut lines = Vec::new();
+        if self.model.parts.is_empty() {
+            return "no parts to validate".into();
+        }
         for p in &self.model.parts {
             if p.verts.is_empty() {
                 continue;

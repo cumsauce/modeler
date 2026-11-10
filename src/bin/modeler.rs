@@ -494,18 +494,21 @@ fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>)
         TextureFormat::Rgba8UnormSrgb,
         None,
     ));
+    // Camera3d requires RenderTarget, so it cannot also appear in the spawn
+    // bundle; insert the image target after the spawn instead. ClearColor
+    // follows the world default, matching the human window's background.
     let camera = commands
         .spawn((
             Name::new("agent camera"),
             AgentCamera,
             Camera3d::default(),
-            RenderTarget::Image(image.clone().into()),
             Projection::from(PerspectiveProjection::default()),
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
         ))
         .with_children(|c| {
             c.spawn(DirectionalLight::default());
         })
+        .insert(RenderTarget::Image(image.clone().into()))
         .id();
     commands.insert_resource(AgentRig {
         camera: Some(camera),

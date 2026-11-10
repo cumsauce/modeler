@@ -58,6 +58,10 @@ tweak path):
 - `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
   parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
   may tweak.
+- **Booleans on curved surfaces** (cylinder−cylinder, torus anything)
+  produce non-manifold meshes that render as corrupted noise — `validate`
+  catches them. Compose or fake instead (the catalog's mug does). Box-on-
+  anything and cylinder-on-box are fine with small seams.
 - `op_primitive(name, kind, size, translation, rotation?)` — `size` is
   **always exactly `[f32; 3]`**: `box`/`plane`/`wedge` (full extents),
   `sphere` (**radius = size[0]; [1]/[2] ignored** — flatten with a transform's
@@ -88,6 +92,10 @@ tweak path):
   place or into a new output. `base_color` is **always RGBA `[f32; 4]`** (in
   `op_material` and in `apply_ops` material specs alike); a 3-component RGB
   fails deserialization.
+- **disc/washer/plane are single-sided**, flat in the XY plane (vertical!).
+  Laying one flat takes a −90° X rotation (`[-0.707, 0, 0, 0.707]`) so its
+  normal faces up — flipped, it back-face-culls to invisible with no error.
+  They also always flag as non-manifold in `validate` (open by design).
 - `op_delete(name)` / `ops` — remove a step / list the graph one line per op
   **with full parameters** (sizes, translations, colors — enough to tweak
   without remembering what you sent). `op_get(name)` dumps a single op.
