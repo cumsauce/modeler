@@ -79,6 +79,11 @@ tweak path):
 - `validate` — per-part mesh checks without a renderer: edge manifoldness
   (welded by position) and winding via signed volume. Catches inverted
   normals and torn geometry that a screenshot only hints at.
+- `probe_ray(origin, dir)` — cast a ray through the live scene and report the
+  first part hit (name, distance, point) or that it passes clean through.
+  The numeric check for openings and occlusion: cast through a window hole
+  to prove it is open, cast at a door fill to prove it is solid. Windowed
+  preview only.
 - `check_rebuild` — re-derives the graph into a scratch copy and diffs the
   geometry against the cached parts; fails on a stale cache or
   non-deterministic op (baked material/visibility edits are not compared —
@@ -141,13 +146,10 @@ State:
 `scene_summary` appends a warnings section for exactly the traps above:
 uncolored copies (material after the copying op), full-ring radial arrays
 whose copy 0 overlaps the source, parts still wearing the default material,
-and parts with identical world bounds (z-fighting). An empty warnings list
+parts with identical world bounds (z-fighting), and boolean volume sanity
+(a difference that didn't shrink its input = the cutter misses; a union
+whose volume exactly sums its inputs = no overlap). An empty warnings list
 means none of these fired — checking it is cheaper than eyeballing a render.
-
-Future verification work (deemed too heavy for now): a `probe_ray(origin,
-dir)` tool reusing the preview's `MeshRayCast` to check openings/occlusion
-numerically, and boolean volume-sanity asserts (a difference must shrink the
-input, a union needs overlap).
 
 ## Preview window (human side)
 

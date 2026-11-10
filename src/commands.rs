@@ -1,9 +1,25 @@
 //! The tool operations as plain functions on a [`Session`] (model + undo history). Pure,
 //! unit-testable, wiring-free API used by both the MCP tools and tests.
 
-use crate::{Annotation, Model, Op, Part, Vec3, graph};
+use crate::{Annotation, Model, Op, Part, Vec3, graph, quat_of};
 
 pub type CmdResult = Result<String, String>;
+
+/// Signed volume of a part's mesh in world space (transform applied). Positive
+/// for outward-wound closed meshes; reliable only as a sanity signal for
+/// boolean outputs, which csgrs produces closed and welded.
+fn world_signed_volume(p: &Part) -> f64 {
+    let rot = quat_of(p.rotation);
+    let scale = Vec3::from(p.scale);
+    let t = Vec3::from(p.translation);
+    let mut vol = 0.0f64;
+    for tri in p.indices.as_chunks::<3>().0 {
+        let world = |i: u32| -> Vec3 { rot * (Vec3::from(p.verts[i as usize]) * scale) + t };
+        let (a, b, c) = (world(tri[0]), world(tri[1]), world(tri[2]));
+        vol += a.dot(b.cross(c)) as f64 / 6.0;
+    }
+    vol
+}
 
 /// A spot in the live view a human clicked on, waiting for its comment text. Set by
 /// the preview app; the next all-optional `add_annotation` consumes it.
@@ -459,6 +475,52 @@ impl Session {
     /// easy to hit and expensive to spot in a render.
     pub fn lints(&self) -> Vec<String> {
         let mut out = Vec::new();
+        // Boolean volume sanity: a difference must shrink its input, a union
+        // must not fall below its larger input, and a union that exactly sums
+        // its inputs had no overlap at all.
+        for op in &self.model.ops {
+            let Op::Boolean {
+                name,
+                op: kind,
+                a,
+                b,
+            } = op
+            else {
+                continue;
+            };
+            let part = |n: &str| self.model.parts.iter().find(|p| p.name == n);
+            let out_name = graph::output(op);
+            let (Some(pa), Some(pb), Some(po)) = (part(a), part(b), part(out_name)) else {
+                continue;
+            };
+            let (va, vb, vo) = (
+                world_signed_volume(pa),
+                world_signed_volume(pb),
+                world_signed_volume(po),
+            );
+            let tol = (va.abs().max(vb.abs()).max(vo.abs()) * 1e-3).max(1e-6);
+            match kind.as_str() {
+                "difference" => {
+                    if vo > va - tol {
+                        out.push(format!(
+                            "difference `{name}` left `{a}` at its original volume ({vo:.4} vs {va:.4}) — the cutter `{b}` probably misses it"
+                        ));
+                    }
+                }
+                "union" => {
+                    if vo < va.abs().max(vb.abs()) - tol {
+                        out.push(format!(
+                            "union `{name}` is smaller than its larger input ({vo:.4}) — inverted or torn result"
+                        ));
+                    } else if (vo - (va + vb)).abs() <= tol {
+                        out.push(format!(
+                            "union `{name}` volume is exactly `{a}` + `{b}` ({vo:.4}) — the inputs have no overlap"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         // Material-after-copy: array/mirror/transform ops earlier in the list
         // cloned the (still uncolored) source, so the copies stay default-gray.
         for (i, op) in self.model.ops.iter().enumerate() {
@@ -1218,6 +1280,119 @@ mod tests {
             s.lints().iter().any(|l| l.contains("identical bounds")),
             "lints: {:?}",
             s.lints()
+        );
+    }
+
+    #[test]
+    fn lint_boolean_volume_sanity() {
+        // A difference whose output kept the input's full volume: the cutter
+        // misses. Built by hand (ops + matching parts) so the volumes are
+        // exact — a real csgrs difference with an overlapping cutter shrinks.
+        let mut s = Session::default();
+        let mut a = Part::new("a");
+        a.verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        a.indices = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7,
+            6, 3, 0, 4, 3, 4, 7,
+        ];
+        crate::uv::ensure_normals(&mut a);
+        let mut hollow = a.clone();
+        hollow.name = "hollow".into();
+        let mut cutter = Part::new("b");
+        cutter.verts = vec![
+            [0.1, 0.1, 0.1],
+            [0.9, 0.1, 0.1],
+            [0.9, 0.9, 0.1],
+            [0.1, 0.9, 0.1],
+            [0.1, 0.1, 0.9],
+            [0.9, 0.1, 0.9],
+            [0.9, 0.9, 0.9],
+            [0.1, 0.9, 0.9],
+        ];
+        cutter.indices = a.indices.clone();
+        crate::uv::ensure_normals(&mut cutter);
+        s.model.parts = vec![a, cutter, hollow];
+        s.model.ops = vec![
+            box_op("a", [0.0, 0.0, 0.0]),
+            box_op("b", [0.0, 0.0, 0.0]),
+            Op::Boolean {
+                name: "hollow".into(),
+                op: "difference".into(),
+                a: "a".into(),
+                b: "b".into(),
+            },
+        ];
+        s.bump();
+        let lints = s.lints();
+        assert!(
+            lints
+                .iter()
+                .any(|l| l.contains("difference `hollow` left `a` at its original volume")),
+            "lints: {:?}",
+            lints
+        );
+
+        // A union whose output volume exactly equals a + b: the inputs
+        // never overlapped. Two disjoint slabs, hand-welded union mesh.
+        let mut s2 = Session::default();
+        let mut slab_a = Part::new("sa");
+        slab_a.verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        slab_a.indices = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7,
+            6, 3, 0, 4, 3, 4, 7,
+        ];
+        let mut slab_b = slab_a.clone();
+        slab_b.name = "sb".into();
+        for v in &mut slab_b.verts {
+            v[0] += 5.0;
+        }
+        let mut joined = Part::new("joined");
+        joined.verts = [slab_a.verts.as_slice(), slab_b.verts.as_slice()].concat();
+        joined.indices = slab_a.indices.clone();
+        let off = slab_a.verts.len() as u32;
+        joined
+            .indices
+            .extend(slab_b.indices.iter().map(|i| i + off));
+        crate::uv::ensure_normals(&mut slab_a);
+        crate::uv::ensure_normals(&mut slab_b);
+        crate::uv::ensure_normals(&mut joined);
+        s2.model.parts = vec![slab_a, slab_b, joined];
+        s2.model.ops = vec![
+            box_op("sa", [0.0, 0.5, 0.0]),
+            box_op("sb", [5.5, 0.5, 0.0]),
+            Op::Boolean {
+                name: "joined".into(),
+                op: "union".into(),
+                a: "sa".into(),
+                b: "sb".into(),
+            },
+        ];
+        s2.bump();
+        let lints = s2.lints();
+        assert!(
+            lints
+                .iter()
+                .any(|l| l.contains("the inputs have no overlap")),
+            "lints: {:?}",
+            lints
         );
     }
 

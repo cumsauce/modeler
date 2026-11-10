@@ -39,6 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 
 type CmdResult = Result<String, String>;
 type ShotReply = oneshot::Sender<Result<Vec<u8>, String>>;
+type TextReply = oneshot::Sender<Result<String, String>>;
 
 /// A unit of work for the Bevy main loop: mutate the session, or grab a picture.
 enum Cmd {
@@ -49,6 +50,11 @@ enum Cmd {
         pitch: f32,
         dist: f32,
         reply: ShotReply,
+    },
+    ProbeRay {
+        origin: [f32; 3],
+        dir: [f32; 3],
+        reply: TextReply,
     },
 }
 
@@ -81,6 +87,12 @@ fn windowed(headless: Option<Res<Headless>>) -> bool {
 /// Screenshot requests waiting for the renderer to capture a frame.
 #[derive(Resource, Default)]
 struct PendingShots(Vec<Mutex<Option<ShotReply>>>);
+
+/// Ray-cast probes waiting for a frame with the current meshes: origin, dir,
+/// reply. Deferred to its own system because `MeshRayCast` borrows
+/// `Assets<Mesh>` immutably.
+#[derive(Resource, Default)]
+struct PendingProbes(Vec<Option<([f32; 3], [f32; 3], TextReply)>>);
 
 /// The orbit camera: angles in a resource, mouse drag / arrow keys to steer.
 /// `user` is set once the human takes over, which stops the slow auto-drift.
@@ -241,6 +253,7 @@ fn main() -> AppExit {
     })
     .insert_resource(Headless(headless))
     .insert_resource(PendingShots::default())
+    .insert_resource(PendingProbes::default())
     .insert_resource(Orbit::default())
     .init_resource::<CameraDrag>()
     .init_resource::<GraphHudVisible>()
@@ -253,6 +266,7 @@ fn main() -> AppExit {
             drain_commands,
             quit_when_server_done(headless),
             take_screenshot.run_if(windowed),
+            run_probe.run_if(windowed),
             rebuild_scene.run_if(windowed),
             orbit_camera.run_if(windowed),
             pin_on_click.run_if(windowed),
@@ -292,6 +306,7 @@ fn drain_commands(
     headless: Res<Headless>,
     mut modeler: ResMut<Modeler>,
     mut pending: ResMut<PendingShots>,
+    mut probes: ResMut<PendingProbes>,
     mut orbit: ResMut<Orbit>,
 ) {
     let bridge = Arc::clone(&modeler.bridge);
@@ -327,6 +342,13 @@ fn drain_commands(
                     let _ = reply.send(Ok(vec![]));
                 }
             }
+            Cmd::ProbeRay { origin, dir, reply } => {
+                if headless.0 {
+                    let _ = reply.send(Err("headless: no scene to ray-cast".into()));
+                } else {
+                    probes.0.push(Some((origin, dir, reply)));
+                }
+            }
         }
     }
 }
@@ -347,6 +369,46 @@ fn take_screenshot(mut commands: Commands, mut pending: ResMut<PendingShots>) {
             }
         })
         .insert(Name::new("mcp screenshot"));
+}
+
+/// Answers a pending `probe_ray` with the first part the ray hits: name,
+/// distance along the ray and the world hit point. The deterministic check
+/// for openings and occlusion — cast through a window hole to prove it is
+/// open, cast at a door fill to prove it is solid.
+fn run_probe(
+    mut probes: ResMut<PendingProbes>,
+    mut ray_cast: MeshRayCast,
+    parts: Query<(Entity, &Name), With<PreviewPart>>,
+) {
+    let Some(Some((origin, dir, reply))) = probes.0.pop() else {
+        return;
+    };
+    let Ok(direction) = Dir3::new(Vec3::from(dir).normalize_or_zero()) else {
+        let _ = reply.send(Err("ray direction is zero".into()));
+        return;
+    };
+    let ray = Ray3d {
+        origin: Vec3::from(origin),
+        direction,
+    };
+    let filter = |e| parts.contains(e);
+    let settings = MeshRayCastSettings::default().with_filter(&filter);
+    match ray_cast.cast_ray(ray, &settings).first() {
+        Some((entity, hit)) => {
+            let name = parts
+                .get(*entity)
+                .map(|(_, n)| n.as_str().to_string())
+                .unwrap_or_else(|_| "<unknown>".into());
+            let p = hit.point;
+            let _ = reply.send(Ok(format!(
+                "hit `{name}` at t={:.4}, point [{:.4}, {:.4}, {:.4}]",
+                hit.distance, p.x, p.y, p.z
+            )));
+        }
+        None => {
+            let _ = reply.send(Ok("no hit — the ray passes clean through".into()));
+        }
+    }
 }
 
 /// Rebuilds one entity per part whenever the model version moves, and re-frames the
@@ -1390,6 +1452,14 @@ fn default_tol() -> f32 {
     0.01
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ProbeRayArgs {
+    /// Ray origin, world space [x, y, z].
+    origin: [f32; 3],
+    /// Ray direction (normalized internally).
+    dir: [f32; 3],
+}
+
 #[tool_router(server_handler)]
 impl Tools {
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
@@ -1880,6 +1950,31 @@ impl Tools {
         Parameters(ExpectBoundsArgs { min, max, tol }): Parameters<ExpectBoundsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.expect_bounds(min, max, tol)).await
+    }
+
+    /// Cast a ray through the scene and report the first part it hits (name,
+    /// distance, point) or that it passes clean through. The numeric check for
+    /// openings and occlusion: cast through a window hole to prove it is open,
+    /// cast at a door fill to prove it is solid. Windowed preview only.
+    #[tool]
+    async fn probe_ray(
+        &self,
+        Parameters(ProbeRayArgs { origin, dir }): Parameters<ProbeRayArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::ProbeRay {
+                origin,
+                dir,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
+        let text = reply_rx
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app dropped the probe", None))?
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     /// Add a human-readable comment pinned to the model. Face, vertex and position are

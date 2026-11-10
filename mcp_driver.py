@@ -72,6 +72,11 @@ class ModelerSession:
             resp = self._recv()
             if resp.get("id") != rid:
                 continue  # notifications
+            if "error" in resp:  # JSON-RPC protocol error (bad args, unknown tool, ...)
+                err = resp["error"]
+                return {"ok": False,
+                        "text": [f"{err.get('message', 'error')}: {err.get('data', '')}"],
+                        "n_images": 0}
             result = resp.get("result", {})
             texts, images = [], []
             for c in result.get("content", []):
