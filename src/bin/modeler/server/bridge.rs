@@ -17,12 +17,14 @@ pub(crate) enum Cmd {
     ProbeRay {
         origin: [f32; 3],
         dir: [f32; 3],
+        all_hits: bool,
         reply: TextReply,
     },
     AgentShot {
         view: AgentView,
         width: u32,
         height: u32,
+        focus: Option<Vec<String>>,
         reply: ShotReply,
     },
 }

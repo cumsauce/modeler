@@ -58,7 +58,10 @@ tweak path):
 - `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
   parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
   may tweak.
-- **Booleans** output welded meshes (1e-4 grid), but curved cuts can still
+- **Booleans** nudge the second operand ~2 mm when one of its faces shares a
+  plane with a face of the first (csgrs drops faces on coplanar-but-disjoint
+  planes, e.g. two equal-depth cutters). `scene_summary` warns when a visible
+  boolean output has open edges. Booleans output welded meshes (1e-4 grid), but curved cuts can still
   carry seam edges — `validate` reports them honestly; they render fine in
   practice. Curved-on-curved (cylinder−cylinder, torus anything) can produce
   corrupted noise — compose or fake instead (the catalog's mug does).
@@ -81,9 +84,11 @@ tweak path):
   inputs sane. Errors (e.g. no overlap) roll the graph back — it never stays
   broken.
 - `op_radial_array(name, input, count, center, degrees, start_degrees,
-  axis?)` — ring of copies about `axis` (`"y"` default; `"x"`/`"z"` make
+  axis?, include_source?)` — ring of copies about `axis` (`"y"` default; `"x"`/`"z"` make
   horizontal rings — windmill blades, fan spokes — no manual rotation
-  needed). **The source part stays at its own spot**; with
+  needed). `include_source: true` is the easy mode: the source is copy 0 and `count`
+  items spread evenly over `degrees` (copies `name_1..name_{count-1}`).
+  Otherwise **the source part stays at its own spot**; with
   `start_degrees = degrees/count` and `count-1` copies the source fills the
   0° slot evenly with no overlap. Outputs `name_0..{n-1}`.
 - `op_linear_array(name, input, count, offset)` — line of copies. **The source
@@ -131,8 +136,10 @@ then screenshot last as the final once-over):
 - `validate` — per-part mesh checks without a renderer: edge manifoldness
   (welded by position) and winding via signed volume. Catches inverted
   normals and torn geometry that a screenshot only hints at.
-- `probe_ray(origin, dir)` — cast a ray through the live scene and report the
-  first part hit (name, distance, point) or that it passes clean through.
+- `probe_ray(origin, dir, all_hits?)` — cast a ray through the live scene and report the
+  first part hit (name, distance, point) or that it passes clean through;
+  `all_hits: true` lists every part along the ray, nearest first (what is
+  behind an opening).
   The numeric check for openings and occlusion: cast through a window hole
   to prove it is open, cast at a door fill to prove it is solid. Windowed
   preview only.
@@ -151,11 +158,11 @@ then screenshot last as the final once-over):
   a checkable call instead of a squint at a render.
 - `set_camera(yaw, pitch, dist)` — point the human's orbit camera (degrees,
   metres) before a `screenshot`. Windowed preview only.
-- `agent_shot(view, width?, height?)` / `agent_views([views])` — render from
+- `agent_shot(view, width?, height?, focus?)` / `agent_views([views], ...)` — render from
   the agent's own offscreen camera, independent of the human's window: six
   orthographic views (`front`/`back`/`left`/`right`/`top`/`bottom`, true
   proportions, auto-framed to the bounds) plus `iso` (perspective
-  three-quarter). Returns PNGs; `agent_views(["front", "right", "top"])` is
+  three-quarter). `focus: [part names]` frames just those parts. Returns PNGs; `agent_views(["front", "right", "top"])` is
   the three-pane check, `["iso"]` the looks-right shot.
 
 State:
@@ -177,7 +184,7 @@ State:
 - `save_prefab` reports whether it overwrote an existing catalog entry
   ("saved `x` — overwrote an existing catalog entry") — if you didn't mean
   to, the old JSON is gone; check `catalog_list` and the model name first.
-- `session_log(limit?)` — the recent per-call record (tool, ok/error, ms).
+- `session_log(limit?)` — the recent per-call record of every tool call (tool, ok/error, ms).
   Self-audit a build: what failed, what was slow.
 - **Session autosave**: every successful mutation also writes the whole
   session model (parts, ops, history tree, annotations) to `session.json`

@@ -16,7 +16,9 @@ pub(crate) struct AgentCamera;
 
 /// One offscreen shot waiting for a frame: view, pixel size, reply.
 #[derive(Resource, Default)]
-pub(crate) struct PendingAgentShots(pub(crate) Vec<(AgentView, u32, u32, ShotReply)>);
+pub(crate) struct PendingAgentShots(
+    pub(crate) Vec<(AgentView, u32, u32, Option<Vec<String>>, ShotReply)>,
+);
 
 /// Named agent camera views. The six cardinal views are orthographic (true
 /// proportions, auto-framed to the model bounds); `iso` is a perspective
@@ -177,7 +179,7 @@ pub(crate) fn process_agent_shot(
     modeler: Res<Modeler>,
     mut commands: Commands,
 ) {
-    let Some((view, width, height, reply)) = agent_shots.0.pop() else {
+    let Some((view, width, height, focus, reply)) = agent_shots.0.pop() else {
         return;
     };
     let (Some(camera_entity), Some(image_handle)) = (rig.camera, rig.image.clone()) else {
@@ -186,8 +188,17 @@ pub(crate) fn process_agent_shot(
     };
     let mut image_handle = image_handle;
     let aspect = width as f32 / height.max(1) as f32;
-    let (eye, target, up, new_projection) =
-        agent_view_projection(view, modeler.session.model.bounds(), aspect);
+    let bounds = match &focus {
+        Some(names) => match modeler.session.model.bounds_of(names) {
+            Some(b) => Some(b),
+            None => {
+                let _ = reply.send(Err(format!("focus: none of {names:?} exist as parts")));
+                return;
+            }
+        },
+        None => modeler.session.model.bounds(),
+    };
+    let (eye, target, up, new_projection) = agent_view_projection(view, bounds, aspect);
     let Ok((mut projection, mut render_target, mut transform)) = cameras.get_mut(camera_entity)
     else {
         let _ = reply.send(Err("agent camera missing".into()));

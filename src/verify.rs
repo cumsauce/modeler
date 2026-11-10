@@ -120,8 +120,23 @@ pub fn expect_bounds(
         ] {
             let Some(want) = want else { continue };
             if (want - got).abs() > tol {
+                // Name the visible part that sets this extreme.
+                let setter = model
+                    .parts
+                    .iter()
+                    .filter(|p| p.visible && !p.verts.is_empty())
+                    .map(|p| {
+                        let (pmin, pmax) = p.bounds();
+                        (p.name.as_str(), if lo { pmin[axis] } else { pmax[axis] })
+                    })
+                    .min_by(|a, b| {
+                        let (x, y) = if lo { (a.1, b.1) } else { (b.1, a.1) };
+                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(n, _)| format!(", set by `{n}`"))
+                    .unwrap_or_default();
                 issues.push(format!(
-                    "{} {} (expected {want:.4} ±{tol}, got {got:.4})",
+                    "{} {} (expected {want:.4} ±{tol}, got {got:.4}{setter})",
                     if lo { "min" } else { "max" },
                     name
                 ));
@@ -133,6 +148,44 @@ pub fn expect_bounds(
     } else {
         Err(format!("bounds off: {}", issues.join("; ")).into())
     }
+}
+
+/// Edges of a part that are not shared by exactly two triangles, welding
+/// vertices by (1e-5) position first: primitives emit per-face vertices that
+/// share a point.
+pub fn open_edge_count(p: &Part) -> usize {
+    let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
+    let mut welded = Vec::with_capacity(p.verts.len());
+    for v in &p.verts {
+        let key = [
+            (v[0] * 1e5).round() as i64,
+            (v[1] * 1e5).round() as i64,
+            (v[2] * 1e5).round() as i64,
+        ];
+        let next = ids.len() as u32;
+        welded.push(*ids.entry(key).or_insert(next));
+    }
+    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in p.indices.as_chunks::<3>().0 {
+        for e in 0..3 {
+            let (a, b) = (welded[t[e] as usize], welded[t[(e + 1) % 3] as usize]);
+            *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    edges.values().filter(|c| **c != 2).count()
+}
+
+/// The name a part ends up with after any `Rename` ops that follow it.
+fn final_name_after_renames(ops: &[Op], name: &str) -> String {
+    let mut cur = name.to_string();
+    for op in ops {
+        if let Op::Rename { name: to, input } = op
+            && *input == cur
+        {
+            cur = to.clone();
+        }
+    }
+    cur
 }
 
 /// Mesh-level checks per part: edge/face manifoldness and winding (signed
@@ -149,28 +202,7 @@ pub fn validate(model: &Model) -> String {
         if p.verts.is_empty() {
             continue;
         }
-        // Weld vertices by position: primitives emit per-face verts, and
-        // near-equal recomputed positions must land in one bucket.
-        let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
-        let mut welded = Vec::with_capacity(p.verts.len());
-        for v in &p.verts {
-            let key = [
-                (v[0] * 1e5).round() as i64,
-                (v[1] * 1e5).round() as i64,
-                (v[2] * 1e5).round() as i64,
-            ];
-            let next = ids.len() as u32;
-            welded.push(*ids.entry(key).or_insert(next));
-        }
-        let mut edges: std::collections::HashMap<(u32, u32), u32> =
-            std::collections::HashMap::new();
-        for t in p.indices.as_chunks::<3>().0 {
-            for e in 0..3 {
-                let (a, b) = (welded[t[e] as usize], welded[t[(e + 1) % 3] as usize]);
-                *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
-            }
-        }
-        let open = edges.values().filter(|c| **c != 2).count();
+        let open = open_edge_count(p);
         if open > 0 {
             lines.push(format!(
                 "- `{}`: not manifold ({open} edges not shared by exactly 2 triangles)",
@@ -252,6 +284,26 @@ pub fn lints(model: &Model) -> Vec<String> {
             _ => {}
         }
     }
+    // Boolean outputs with open edges: csgrs seams or missing faces. Curved
+    // cuts often carry a few harmlessly; a large count can mean see-through
+    // geometry, so point at the deterministic checks.
+    for op in &model.ops {
+        if let Op::Boolean { name, .. } = op
+            && let final_name = final_name_after_renames(&model.ops, name)
+            && let Some(p) = model
+                .parts
+                .iter()
+                .find(|p| p.name == final_name && p.visible)
+        {
+            let open = open_edge_count(p);
+            if open > 0 {
+                out.push(format!(
+                    "boolean `{}` has {open} open edges (seams or holes) — check it with probe_ray through any pocket/opening before trusting the render",
+                    p.name
+                ));
+            }
+        }
+    }
     // Material-after-copy: array/mirror/transform ops earlier in the list
     // cloned the (still uncolored) source, so the copies stay default-gray.
     for (i, op) in model.ops.iter().enumerate() {
@@ -287,9 +339,11 @@ pub fn lints(model: &Model) -> Vec<String> {
             count,
             degrees,
             start_degrees,
+            include_source,
             ..
         } = op
             && *count > 1
+            && !*include_source
             && !part_by_name(input).is_some_and(|p| !p.visible)
             && degrees.rem_euclid(360.0) == 0.0
             && start_degrees.rem_euclid(360.0) == 0.0

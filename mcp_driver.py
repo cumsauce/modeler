@@ -14,6 +14,8 @@ many driver invocations):
 Client (connects to the daemon, or spawns a throwaway server):
     mcp_driver.py --connect [--socket PATH] --calls calls.json [--save-shot p]
     mcp_driver.py --calls calls.json ...          # throwaway mode, as before
+Image options: --save-shot PATH (first image to PATH, extras PATH_2...),
+--save-dir DIR (every image, numbered), --b64 (also print base64; off by default).
 Calls JSON: [{"name": "...", "args": {...}}, ...]
 Without --calls in client/throwaway mode, reads calls line-by-line on stdin;
 "quit" in daemon mode stops the daemon.
@@ -64,7 +66,7 @@ class ModelerSession:
             if resp.get("id") == rid:
                 return sorted(t["name"] for t in resp["result"]["tools"])
 
-    def call(self, name, args=None, save_shot=None):
+    def call(self, name, args=None, save_shot=None, save_dir=None, b64=False):
         rid = self.next_id; self.next_id += 1
         self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                     "params": {"name": name, "arguments": args or {}}})
@@ -87,11 +89,28 @@ class ModelerSession:
             out = {"ok": not result.get("isError", False), "text": texts,
                    "n_images": len(images)}
             if images:
-                out["images_b64"] = [i.get("data", "") for i in images]
-                if save_shot and images:
-                    with open(save_shot, "wb") as f:
-                        f.write(base64.b64decode(images[0]["data"]))
+                if b64:  # opt-in: the base64 blobs drown the useful output
+                    out["images_b64"] = [i.get("data", "") for i in images]
+                saved = []
+                if save_shot:
+                    # First image to the exact path; extras get _2, _3 ... suffixes.
+                    stem, ext = os.path.splitext(save_shot)
+                    for k, img in enumerate(images):
+                        path = save_shot if k == 0 else f"{stem}_{k + 1}{ext or '.png'}"
+                        with open(path, "wb") as f:
+                            f.write(base64.b64decode(img["data"]))
+                        saved.append(path)
                     out["saved_shot"] = save_shot
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+                    self.shot_seq = getattr(self, "shot_seq", 0) + 1
+                    for k, img in enumerate(images):
+                        path = os.path.join(save_dir, f"{self.shot_seq:03d}-{name}-{k + 1}.png")
+                        with open(path, "wb") as f:
+                            f.write(base64.b64decode(img["data"]))
+                        saved.append(path)
+                if saved:
+                    out["saved_images"] = saved
             return out
 
     def close(self):
@@ -102,12 +121,12 @@ class ModelerSession:
         self.proc.terminate()
 
 
-def run_calls(session, calls, save_shot=None):
+def run_calls(session, calls, save_shot=None, save_dir=None, b64=False):
     for c in calls:
         if isinstance(c, str):
             print(json.dumps({"ok": True, "text": [c], "n_images": 0}), flush=True)
             continue
-        print(json.dumps(session.call(c["name"], c.get("args", {}), save_shot)),
+        print(json.dumps(session.call(c["name"], c.get("args", {}), save_shot, save_dir, b64)),
               flush=True)
 
 
@@ -137,7 +156,8 @@ def daemon_mode(socket_path, windowed):
                                  "n_images": 0}) + "\n").encode())
                             return
                         out = session.call(c["name"], c.get("args", {}),
-                                           c.get("save_shot"))
+                                           c.get("save_shot"), c.get("save_dir"),
+                                           c.get("b64", False))
                     except Exception as e:  # bad line or dead server
                         out = {"ok": False, "text": [f"daemon error: {e}"],
                                "n_images": 0}
@@ -149,7 +169,7 @@ def daemon_mode(socket_path, windowed):
             os.unlink(socket_path)
 
 
-def client_mode(socket_path, calls_path, save_shot):
+def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False):
     calls = json.load(open(calls_path)) if calls_path != "/dev/stdin" else json.load(sys.stdin)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(socket_path)
@@ -159,6 +179,10 @@ def client_mode(socket_path, calls_path, save_shot):
             payload = dict(c)
             if save_shot:
                 payload["save_shot"] = save_shot
+            if save_dir:
+                payload["save_dir"] = os.path.abspath(save_dir)
+            if b64:
+                payload["b64"] = True
             s.sendall((json.dumps(payload) + "\n").encode())
             print(f.readline().strip(), flush=True)
 
@@ -174,6 +198,10 @@ def main():
     save_shot = None
     if "--save-shot" in argv:
         save_shot = argv[argv.index("--save-shot") + 1]
+    save_dir = None
+    if "--save-dir" in argv:
+        save_dir = argv[argv.index("--save-dir") + 1]
+    b64 = "--b64" in argv
     calls_path = None
     if "--calls" in argv:
         calls_path = argv[argv.index("--calls") + 1]
@@ -181,14 +209,14 @@ def main():
     if daemon:
         daemon_mode(socket_path, windowed)
     elif connect:
-        client_mode(socket_path, calls_path, save_shot)
+        client_mode(socket_path, calls_path, save_shot, save_dir, b64)
     else:
         # Throwaway mode: own server, dies with this invocation.
         session = ModelerSession(windowed=windowed)
         print(json.dumps({"tools": session.tool_names()}), flush=True)
         try:
             if calls_path:
-                run_calls(session, json.load(open(calls_path)), save_shot)
+                run_calls(session, json.load(open(calls_path)), save_shot, save_dir, b64)
             else:
                 for line in sys.stdin:
                     line = line.strip()
@@ -196,7 +224,7 @@ def main():
                         break
                     c = json.loads(line)
                     print(json.dumps(session.call(c["name"], c.get("args", {}),
-                                                  save_shot)), flush=True)
+                                                  save_shot, save_dir, b64)), flush=True)
         finally:
             session.close()
 

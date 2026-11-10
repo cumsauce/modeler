@@ -197,6 +197,11 @@ pub(crate) struct OpRadialArrayArgs {
     /// rings (windmill blades, fan spokes).
     #[serde(default = "default_axis")]
     pub(crate) axis: Axis,
+    /// Simplest way to space items evenly: the source is copy 0 and `count`
+    /// items spread over `degrees`; copies are name_1..name_{count-1}. No
+    /// count-1 / start_degrees arithmetic needed.
+    #[serde(default)]
+    pub(crate) include_source: bool,
 }
 
 pub(crate) fn default_axis() -> Axis {
@@ -307,6 +312,8 @@ pub(crate) enum OpSpec {
         start_degrees: f32,
         #[serde(default = "default_axis")]
         axis: Axis,
+        #[serde(default)]
+        include_source: bool,
     },
     LinearArray {
         name: String,
@@ -383,6 +390,7 @@ impl From<OpSpec> for BatchItem {
                 degrees,
                 start_degrees,
                 axis,
+                include_source,
             } => BatchItem::Op(Op::RadialArray {
                 name,
                 input,
@@ -391,6 +399,7 @@ impl From<OpSpec> for BatchItem {
                 degrees,
                 start_degrees,
                 axis,
+                include_source,
             }),
             OpSpec::LinearArray {
                 name,
@@ -482,6 +491,10 @@ pub(crate) struct AgentShotArgs {
     /// Pixel height. Default 720.
     #[serde(default = "default_shot_height")]
     pub(crate) height: u32,
+    /// Frame only these parts (hidden ones included) instead of the whole
+    /// model, e.g. ["tower_final", "roof"] to zoom in on the building.
+    #[serde(default)]
+    pub(crate) focus: Option<Vec<String>>,
 }
 
 pub(crate) fn default_shot_width() -> u32 {
@@ -503,6 +516,9 @@ pub(crate) struct AgentViewsArgs {
     /// Pixel height per view. Default 720.
     #[serde(default = "default_shot_height")]
     pub(crate) height: u32,
+    /// Frame only these parts (hidden ones included) instead of the whole model.
+    #[serde(default)]
+    pub(crate) focus: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -517,6 +533,10 @@ pub(crate) struct ProbeRayArgs {
     pub(crate) origin: [f32; 3],
     /// Ray direction (normalized internally).
     pub(crate) dir: [f32; 3],
+    /// List every part the ray passes through, nearest first, instead of only
+    /// the first hit (to see what is behind an opening). Default false.
+    #[serde(default)]
+    pub(crate) all_hits: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

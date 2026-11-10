@@ -45,6 +45,7 @@ fn main() {
         315.0,
         45.0,
         modeler::Axis::Y,
+        false,
     )
     .unwrap_or_else(|e| panic!("{e}"));
 

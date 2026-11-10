@@ -8,7 +8,7 @@ pub(crate) struct PendingShots(pub(crate) Vec<Mutex<Option<ShotReply>>>);
 /// reply. Deferred to its own system because `MeshRayCast` borrows
 /// `Assets<Mesh>` immutably.
 #[derive(Resource, Default)]
-pub(crate) struct PendingProbes(pub(crate) Vec<Option<([f32; 3], [f32; 3], TextReply)>>);
+pub(crate) struct PendingProbes(pub(crate) Vec<Option<([f32; 3], [f32; 3], bool, TextReply)>>);
 
 /// Spawns one screenshot request per pending MCP tool call; the observer encodes the
 /// captured frame to PNG and answers the waiting tool.
@@ -37,7 +37,7 @@ pub(crate) fn run_probe(
     mut ray_cast: MeshRayCast,
     parts: Query<(Entity, &Name), With<PreviewPart>>,
 ) {
-    let Some(Some((origin, dir, reply))) = probes.0.pop() else {
+    let Some(Some((origin, dir, all_hits, reply))) = probes.0.pop() else {
         return;
     };
     let Ok(direction) = Dir3::new(Vec3::from(dir).normalize_or_zero()) else {
@@ -49,23 +49,47 @@ pub(crate) fn run_probe(
         direction,
     };
     let filter = |e| parts.contains(e);
-    let settings = MeshRayCastSettings::default().with_filter(&filter);
-    match ray_cast.cast_ray(ray, &settings).first() {
-        Some((entity, hit)) => {
-            let name = parts
-                .get(*entity)
-                .map(|(_, n)| n.as_str().to_string())
-                .unwrap_or_else(|_| "<unknown>".into());
-            let p = hit.point;
-            let _ = reply.send(Ok(format!(
-                "hit `{name}` at t={:.4}, point [{:.4}, {:.4}, {:.4}]",
-                hit.distance, p.x, p.y, p.z
-            )));
-        }
-        None => {
-            let _ = reply.send(Ok("no hit — the ray passes clean through".into()));
-        }
+    // By default the cast stops at the first hit; all_hits keeps going.
+    let keep_going = |_: Entity| false;
+    let mut settings = MeshRayCastSettings::default().with_filter(&filter);
+    if all_hits {
+        settings = settings.with_early_exit_test(&keep_going);
     }
+    let hits = ray_cast.cast_ray(ray, &settings);
+    let name_of = |entity: &Entity| {
+        parts
+            .get(*entity)
+            .map(|(_, n)| n.as_str().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    };
+    let describe = |entity: &Entity, hit: &bevy::picking::mesh_picking::ray_cast::RayMeshHit| {
+        let p = hit.point;
+        format!(
+            "hit `{}` at t={:.4}, point [{:.4}, {:.4}, {:.4}]",
+            name_of(entity),
+            hit.distance,
+            p.x,
+            p.y,
+            p.z
+        )
+    };
+    let text = match hits.first() {
+        None => "no hit — the ray passes clean through".to_string(),
+        Some((entity, hit)) if !all_hits => describe(entity, hit),
+        Some(_) => {
+            let lines: Vec<String> = hits
+                .iter()
+                .enumerate()
+                .map(|(i, (e, h))| format!("{}. {}", i + 1, describe(e, h)))
+                .collect();
+            format!(
+                "{} hit(s) along the ray, nearest first:\n{}",
+                lines.len(),
+                lines.join("\n")
+            )
+        }
+    };
+    let _ = reply.send(Ok(text));
 }
 
 /// Encode a captured frame to PNG bytes (BGRA/RGBA in, RGBA PNG out).

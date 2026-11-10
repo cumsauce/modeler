@@ -156,6 +156,73 @@ fn weld_and_drop_slivers(part: &mut Part) {
     part.uvs.clear();
 }
 
+/// Canonical, quantised plane keys of a part's world-space triangles:
+/// (unit normal with a fixed sign, plane offset), 2 mm cells. Two faces with the
+/// same key are coplanar (either orientation).
+fn plane_keys(part: &Part) -> std::collections::HashSet<[i32; 4]> {
+    let rot = quat_of(part.rotation);
+    let scale = Vec3::from(part.scale);
+    let t = Vec3::from(part.translation);
+    let world = |i: u32| rot * (Vec3::from(part.verts[i as usize]) * scale) + t;
+    let mut keys = std::collections::HashSet::new();
+    for tri in part.indices.as_chunks::<3>().0 {
+        if tri.iter().any(|&i| i as usize >= part.verts.len()) {
+            continue;
+        }
+        let (a, b, c) = (world(tri[0]), world(tri[1]), world(tri[2]));
+        let n = (b - a).cross(c - a);
+        if !n.is_finite() || n.length_squared() < 1e-12 {
+            continue;
+        }
+        let mut n = n.normalize();
+        let mut d = n.dot(a);
+        // Canonical sign: first significant component positive.
+        let lead = if n.x.abs() > 1e-3 {
+            n.x
+        } else if n.y.abs() > 1e-3 {
+            n.y
+        } else {
+            n.z
+        };
+        if lead < 0.0 {
+            n = -n;
+            d = -d;
+        }
+        const Q: f32 = 500.0;
+        keys.insert([
+            (n.x * 1000.0).round() as i32,
+            (n.y * 1000.0).round() as i32,
+            (n.z * 1000.0).round() as i32,
+            (d * Q).round() as i32,
+        ]);
+    }
+    keys
+}
+
+fn shares_plane(a: &Part, b: &Part) -> bool {
+    let ka = plane_keys(a);
+    plane_keys(b).iter().any(|k| ka.contains(k))
+}
+
+/// A copy of `b` translated by a tiny, deliberately irrational-looking offset
+/// (about 2 mm) until none of its planes coincide with `a`'s.
+fn nudge_off_shared_planes(a: &Part, b: &Part) -> Part {
+    let mut out = b.clone();
+    for attempt in 1..=4 {
+        let k = attempt as f32;
+        out = b.clone();
+        out.translation = [
+            b.translation[0] + 0.00231 * k,
+            b.translation[1] + 0.00173 * k,
+            b.translation[2] + 0.00197 * k,
+        ];
+        if !shares_plane(a, &out) {
+            break;
+        }
+    }
+    out
+}
+
 /// Boolean `op` on the named parts of `model`, returning a new part named
 /// `name.unwrap_or("{a}-{op}-{b}")` with `a`'s material. Errors on unknown parts or ops
 /// and on empty results (no overlap, coincident faces, ...).
@@ -172,6 +239,16 @@ pub fn boolean(
     let pb = model
         .part(b)
         .ok_or_else(|| ModelerError::NoPart(b.to_string()))?;
+    // csgrs drops faces when a face of `b` lies in the same plane as a
+    // face of `a` without overlapping it (typical: two cutters of equal
+    // depth cut into one wall). Nudge `b` a hair off such shared planes.
+    let nudged_b;
+    let pb = if shares_plane(pa, pb) {
+        nudged_b = nudge_off_shared_planes(pa, pb);
+        &nudged_b
+    } else {
+        pb
+    };
     let csg_a = part_to_csg(pa);
     let csg_b = part_to_csg(pb);
     // csgrs panics on some degenerate inputs; surface that as an error instead
@@ -381,5 +458,90 @@ mod tests {
                 "{what} v out of range: {uv:?}"
             );
         }
+    }
+
+    /// Two cutters of equal depth into one wall used to make csgrs drop the
+    /// first pocket's end face (coplanar but disjoint faces).
+    #[test]
+    fn equal_depth_cutters_keep_both_pockets() {
+        let mut model = Model::named("m");
+        let mk = |kind, size, t: [f32; 3], name: &str| {
+            let mut p =
+                crate::primitives::primitive(kind, size, name).unwrap_or_else(|e| panic!("{e}"));
+            p.translation = t;
+            p
+        };
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Cylinder,
+                [0.8, 3.0, 0.0],
+                [0.0, 1.7, 0.0],
+                "tower",
+            )
+            .into(),
+        );
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Box,
+                [0.5, 1.0, 0.7],
+                [0.0, 0.7, 0.8],
+                "door",
+            )
+            .into(),
+        );
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Box,
+                [0.3, 0.4, 0.7],
+                [0.0, 2.5, 0.8],
+                "win",
+            )
+            .into(),
+        );
+        let d1 = boolean(&model, BoolOp::Difference, "tower", "door", Some("d1"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        model.parts.push(d1.into());
+        let out = boolean(&model, BoolOp::Difference, "d1", "win", Some("o"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Ray down -z through each pocket must hit the pocket's end face
+        // (z ~ 0.45) before the tower's back wall (z = -0.8).
+        for y in [0.7f32, 2.5] {
+            let first = first_hit_z(&out, y);
+            assert!(
+                first.is_some_and(|z| (z - 0.45).abs() < 0.02),
+                "pocket at y={y} is open: first hit z = {first:?}"
+            );
+        }
+    }
+
+    /// z of the first triangle hit by a ray from (0, y, 2.5) along -z.
+    fn first_hit_z(part: &Part, y: f32) -> Option<f32> {
+        let (o, d) = (Vec3::new(0.0, y, 2.5), Vec3::new(0.0, 0.0, -1.0));
+        let mut best: Option<f32> = None;
+        for t in part.indices.as_chunks::<3>().0 {
+            let p: Vec<Vec3> = t
+                .iter()
+                .map(|&i| Vec3::from(part.verts[i as usize]))
+                .collect();
+            let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
+            let h = d.cross(e2);
+            let a = e1.dot(h);
+            if a.abs() < 1e-9 {
+                continue;
+            }
+            let f = 1.0 / a;
+            let s = o - p[0];
+            let u = f * s.dot(h);
+            let q = s.cross(e1);
+            let v = f * d.dot(q);
+            if !(0.0..=1.0).contains(&u) || v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let tt = f * e2.dot(q);
+            if tt > 1e-6 && best.is_none_or(|b| tt < b) {
+                best = Some(tt);
+            }
+        }
+        best.map(|t| o.z - t)
     }
 }

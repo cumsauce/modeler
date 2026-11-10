@@ -265,6 +265,7 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             degrees,
             start_degrees,
             axis,
+            include_source,
         } => {
             let mut source = lookup(named, input)?;
             if *count == 0 {
@@ -276,7 +277,8 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             }
             let axis_vec = axis.unit();
             let step = degrees / *count as f32;
-            for i in 0..*count {
+            // With the source as copy 0, only slots 1..count are new.
+            for i in u32::from(*include_source)..*count {
                 let yaw = start_degrees + i as f32 * step;
                 let mut part = source.clone();
                 part.name = format!("{name}_{i}");
@@ -448,7 +450,15 @@ pub fn output(op: &Op) -> &str {
 /// just `name`. [`output`] stays the op's identity key for upsert matching.
 pub fn outputs(op: &Op) -> Vec<String> {
     match op {
-        Op::RadialArray { name, count, .. } => (0..*count).map(|i| format!("{name}_{i}")).collect(),
+        Op::RadialArray {
+            name,
+            count,
+            include_source,
+            ..
+        } => {
+            let first = u32::from(*include_source);
+            (first..*count).map(|i| format!("{name}_{i}")).collect()
+        }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
         other => vec![output(other).to_string()],
     }
@@ -536,8 +546,10 @@ pub fn describe(ops: &[Op]) -> String {
                 degrees,
                 start_degrees,
                 axis,
+                include_source,
             } => format!(
-                "#{i} radial `{name}` = {count} x `{input}` over {degrees}° from {start_degrees}° about {axis} center={center:?}"
+                "#{i} radial `{name}` = {count} x `{input}` over {degrees}° from {start_degrees}° about {axis} center={center:?}{}",
+                if *include_source { " (source is copy 0)" } else { "" }
             ),
             Op::Material {
                 name,
@@ -643,6 +655,7 @@ mod tests {
                 degrees: 360.0,
                 start_degrees: 0.0,
                 axis: crate::Axis::Y,
+                include_source: false,
             },
             Op::Transform {
                 name: "leg_s".into(),
@@ -744,6 +757,7 @@ mod tests {
                 degrees: 360.0,
                 start_degrees: 0.0,
                 axis: crate::Axis::Y,
+                include_source: false,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -850,6 +864,7 @@ mod tests {
             degrees: 360.0,
             start_degrees: 45.0,
             axis: crate::Axis::Y,
+            include_source: false,
         }]);
         assert!(text.contains("8 x `petal`"), "{text}");
     }
@@ -874,6 +889,7 @@ mod tests {
             degrees: 360.0,
             start_degrees: 0.0,
             axis: crate::Axis::Y,
+            include_source: false,
         };
         assert_eq!(outputs(&radial), ["r_0", "r_1", "r_2"]);
         let linear = Op::LinearArray {

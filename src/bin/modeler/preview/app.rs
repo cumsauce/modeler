@@ -76,23 +76,29 @@ pub(crate) fn drain_commands(
                     let _ = reply.send(Ok(vec![]));
                 }
             }
-            Cmd::ProbeRay { origin, dir, reply } => {
+            Cmd::ProbeRay {
+                origin,
+                dir,
+                all_hits,
+                reply,
+            } => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no scene to ray-cast".into()));
                 } else {
-                    probes.0.push(Some((origin, dir, reply)));
+                    probes.0.push(Some((origin, dir, all_hits, reply)));
                 }
             }
             Cmd::AgentShot {
                 view,
                 width,
                 height,
+                focus,
                 reply,
             } => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no agent view".into()));
                 } else {
-                    agent_shots.0.push((view, width, height, reply));
+                    agent_shots.0.push((view, width, height, focus, reply));
                 }
             }
         }

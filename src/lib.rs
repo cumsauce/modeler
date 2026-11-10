@@ -245,6 +245,23 @@ impl Model {
         Some((sum / n).to_array())
     }
 
+    /// World bounds of the named parts (hidden or not), or `None` if none of
+    /// the names exist. Used to frame a render on part of the model.
+    pub fn bounds_of(&self, names: &[String]) -> Option<(Vec3, Vec3)> {
+        let mut acc: Option<(Vec3, Vec3)> = None;
+        for p in &self.parts {
+            if p.verts.is_empty() || !names.contains(&p.name) {
+                continue;
+            }
+            let (min, max) = p.bounds();
+            acc = Some(match acc {
+                None => (min, max),
+                Some((a, b)) => (a.min(min), b.max(max)),
+            });
+        }
+        acc
+    }
+
     /// World bounds over the visible parts only (hidden parts are not rendered
     /// or exported, so they should not frame the camera either).
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
@@ -620,6 +637,11 @@ pub enum Op {
         start_degrees: f32,
         #[serde(default = "default_axis")]
         axis: Axis,
+        /// When true the source part is copy 0 and `count` items are spread
+        /// evenly over `degrees` (copies are `name_1..name_{count-1}`), so no
+        /// `count-1` / `start_degrees` bookkeeping is needed.
+        #[serde(default)]
+        include_source: bool,
     },
     /// Re-materials an earlier part into a new output.
     Material {

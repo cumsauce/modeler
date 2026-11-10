@@ -188,6 +188,7 @@ impl Session {
         degrees: f32,
         start_degrees: f32,
         axis: Axis,
+        include_source: bool,
     ) -> CmdResult {
         self.apply_op(
             Op::RadialArray {
@@ -198,6 +199,7 @@ impl Session {
                 degrees,
                 start_degrees,
                 axis,
+                include_source,
             },
             &format!("op radial `{name}` = {count} x `{input}` over {degrees}° about {axis}"),
         )
@@ -969,6 +971,7 @@ mod tests {
             360.0,
             0.0,
             crate::Axis::Y,
+            false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.model.procedural());
@@ -986,6 +989,7 @@ mod tests {
             360.0,
             0.0,
             crate::Axis::Y,
+            false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts.len(), 10);
@@ -1195,6 +1199,7 @@ mod tests {
             360.0,
             0.0,
             crate::Axis::Y,
+            false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(
@@ -1222,6 +1227,7 @@ mod tests {
             360.0,
             60.0,
             crate::Axis::Y,
+            false,
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(!s2.lints().iter().any(|l| l.contains("overlap")));
@@ -1498,7 +1504,7 @@ mod tests {
         let mut s = Session::default();
         s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y, false)
             .unwrap_or_else(|e| panic!("{e}"));
         let err = s.op_primitive(
             "ring_0",
@@ -1516,7 +1522,7 @@ mod tests {
         let mut s = Session::default();
         s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y, false)
             .unwrap_or_else(|e| panic!("{e}"));
         s.op_transform("moved", "ring_1", Some([0.0, 3.0, 0.0]), None, None)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1554,7 +1560,7 @@ mod tests {
         let mut s = Session::default();
         s.op_primitive("p", crate::PrimitiveKind::Box, [1.0; 3], [0.0; 3], None)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y)
+        s.op_radial_array("ring", "p", 3, [0.0; 3], 360.0, 0.0, crate::Axis::Y, false)
             .unwrap_or_else(|e| panic!("{e}"));
         s
     }
@@ -1726,5 +1732,84 @@ mod tests {
         // `leg` was untouched by the last edit: both snapshots point at one mesh.
         assert!(std::sync::Arc::ptr_eq(&a.parts[0], &b.parts[0]));
         assert!(!std::sync::Arc::ptr_eq(&a.parts[1], &b.parts[1]));
+    }
+
+    #[test]
+    fn radial_include_source_spaces_count_items_evenly_without_overlap() {
+        let mut s = Session::default();
+        s.op_primitive(
+            "blade",
+            crate::PrimitiveKind::Box,
+            [0.1, 1.0, 0.1],
+            [0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_radial_array(
+            "blades",
+            "blade",
+            4,
+            [0.0; 3],
+            360.0,
+            0.0,
+            crate::Axis::Z,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Source + 3 copies at 90/180/270; no `blades_0` overlapping the source.
+        assert!(s.model.part("blades_0").is_none());
+        assert!(s.model.part("blades_3").is_some());
+        let x = s
+            .model
+            .part("blades_1")
+            .map(|p| p.translation[0])
+            .unwrap_or(9.0);
+        assert!(
+            (x + 1.0).abs() < 1e-5,
+            "90 degrees about z moves +y to -x, got {x}"
+        );
+        assert!(
+            s.lints().iter().all(|l| !l.contains("overlap")),
+            "{:?}",
+            s.lints()
+        );
+    }
+
+    #[test]
+    fn expect_bounds_names_the_part_that_sets_the_extreme() {
+        let mut s = op_session();
+        let err = s
+            .expect_bounds([None; 3], [None, Some(0.0), None], 0.01)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("set by `"), "{err}");
+        let _ = &mut s;
+    }
+
+    #[test]
+    fn open_boolean_outputs_get_a_lint() {
+        let mut s = Session::default();
+        s.op_primitive(
+            "a",
+            crate::PrimitiveKind::Cylinder,
+            [1.0, 2.0, 0.0],
+            [0.0; 3],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_primitive(
+            "b",
+            crate::PrimitiveKind::Box,
+            [0.5, 0.5, 3.0],
+            [0.4, 0.0, 0.0],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.op_boolean("c", crate::BoolOp::Difference, "a", "b")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let open = crate::verify::open_edge_count(s.model.part("c").unwrap_or_else(|| panic!("c")));
+        let lint = s.lints().iter().any(|l| l.contains("open edges"));
+        assert_eq!(open > 0, lint, "lint must track open_edge_count ({open})");
     }
 }

@@ -73,19 +73,12 @@ impl Tools {
             .send(Cmd::Screenshot(reply_tx))
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        let started = std::time::Instant::now();
         match Self::await_reply(reply_rx).await {
-            Ok(png) => {
-                log_call("screenshot", true, started.elapsed().as_millis());
-                Ok(CallToolResult::success(vec![
-                    Content::image(B64.encode(png), "image/png"),
-                    Content::text("current preview render"),
-                ]))
-            }
-            Err(message) => {
-                log_call("screenshot", false, started.elapsed().as_millis());
-                Ok(err_result(message))
-            }
+            Ok(png) => Ok(CallToolResult::success(vec![
+                Content::image(B64.encode(png), "image/png"),
+                Content::text("current preview render"),
+            ])),
+            Err(message) => Ok(err_result(message)),
         }
     }
 
@@ -96,14 +89,15 @@ impl Tools {
         view: AgentView,
         width: u32,
         height: u32,
+        focus: Option<Vec<String>>,
     ) -> Result<(Vec<u8>, String), ErrorData> {
-        let started = std::time::Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::AgentShot {
                 view,
                 width,
                 height,
+                focus,
                 reply: reply_tx,
             })
             .await
@@ -111,7 +105,6 @@ impl Tools {
         let png = Self::await_reply(reply_rx)
             .await
             .map_err(|e| ErrorData::internal_error(e, None))?;
-        log_call("agent_shot", true, started.elapsed().as_millis());
         Ok((png, format!("{view:?} {width}x{height}")))
     }
 }
@@ -449,10 +442,20 @@ impl Tools {
             degrees,
             start_degrees,
             axis,
+            include_source,
         }): Parameters<OpRadialArrayArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
-            s.op_radial_array(&name, &input, count, center, degrees, start_degrees, axis)
+            s.op_radial_array(
+                &name,
+                &input,
+                count,
+                center,
+                degrees,
+                start_degrees,
+                axis,
+                include_source,
+            )
         })
         .await
     }
@@ -652,13 +655,18 @@ impl Tools {
     #[tool]
     async fn probe_ray(
         &self,
-        Parameters(ProbeRayArgs { origin, dir }): Parameters<ProbeRayArgs>,
+        Parameters(ProbeRayArgs {
+            origin,
+            dir,
+            all_hits,
+        }): Parameters<ProbeRayArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::ProbeRay {
                 origin,
                 dir,
+                all_hits,
                 reply: reply_tx,
             })
             .await
@@ -693,10 +701,11 @@ impl Tools {
             view,
             width,
             height,
+            focus,
         }): Parameters<AgentShotArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let view = parse_agent_view(&view).map_err(|e| ErrorData::internal_error(e, None))?;
-        let png = self.agent_render(view, width, height).await?;
+        let png = self.agent_render(view, width, height, focus).await?;
         Ok(CallToolResult::success(vec![
             Content::image(B64.encode(png.0), "image/png"),
             Content::text(png.1),
@@ -714,6 +723,7 @@ impl Tools {
             views,
             width,
             height,
+            focus,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if views.is_empty() || views.len() > 6 {
@@ -728,7 +738,9 @@ impl Tools {
         }
         let mut content = Vec::with_capacity(parsed.len() * 2);
         for (i, view) in parsed.iter().enumerate() {
-            let (png, _) = self.agent_render(*view, width, height).await?;
+            let (png, _) = self
+                .agent_render(*view, width, height, focus.clone())
+                .await?;
             content.push(Content::text(format!("view {}: {view:?}", i + 1)));
             content.push(Content::image(B64.encode(png), "image/png"));
         }
@@ -812,6 +824,22 @@ impl Tools {
 /// the model's context without anyone having to read AGENTS.md first.
 #[tool_handler]
 impl rmcp::ServerHandler for Tools {
+    /// Dispatches through the router like the generated version, but records
+    /// every call (tool, ok/error, ms) for `session_log`.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let name = request.name.to_string();
+        let started = std::time::Instant::now();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = Self::tool_router().call(tcc).await;
+        let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
+        log_call(&name, ok, started.elapsed().as_millis());
+        result
+    }
+
     fn get_info(&self) -> rmcp::model::ServerInfo {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - Call scene_summary first (and after anything confusing): it shows parts, bounds, ops, annotations, plus warnings for known traps. An empty warnings list means none fired.
@@ -820,7 +848,9 @@ impl rmcp::ServerHandler for Tools {
 - op_transform values are ABSOLUTE, not additive: a part at y=0.375 transformed with translation y=0 lands at y=0. Restate the full position in every copy. op_primitive also takes an optional rotation quat [x,y,z,w].
 - hide_part/show_part take an argument named part; expect_parts takes parts; save_prefab requires prompt and warns when it overwrites an existing entry.
 - apply_ops batches can also include baked edits: type hide_part/show_part with part, or rename with part and to - they run in batch position.
-- radial_array takes an optional axis (y default, x or z for horizontal rings like windmill blades - no manual rotation needed).
+- radial_array takes an optional axis (y default, x or z for horizontal rings like windmill blades - no manual rotation needed). Pass include_source=true to space `count` items evenly with the source as copy 0 (copies name_1..).
+- probe_ray all_hits=true lists every part along the ray; agent_shot/agent_views take focus=[part names] to frame just those parts.
+- Booleans nudge the cutter ~2mm off planes it shares with the target (csgrs drops faces otherwise); scene_summary warns about boolean outputs with open edges - verify pockets with probe_ray.
 - session_log shows the recent per-call record (tool, ok/error, ms) for self-auditing.
 - Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
 - Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.

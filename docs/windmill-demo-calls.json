@@ -1,0 +1,470 @@
+[
+ {
+  "name": "new_model",
+  "args": {
+   "name": "windmill-demo"
+  }
+ },
+ {
+  "name": "apply_ops",
+  "args": {
+   "ops": [
+    {
+     "type": "primitive",
+     "name": "ground",
+     "kind": "cylinder",
+     "size": [
+      7,
+      0.2,
+      0
+     ],
+     "translation": [
+      0,
+      0.1,
+      0
+     ]
+    },
+    {
+     "type": "material",
+     "name": "ground",
+     "input": "ground",
+     "base_color": [
+      0.28,
+      0.55,
+      0.25,
+      1
+     ],
+     "roughness": 1
+    },
+    {
+     "type": "primitive",
+     "name": "tower",
+     "kind": "cylinder",
+     "size": [
+      0.8,
+      3,
+      0
+     ],
+     "translation": [
+      0,
+      1.7,
+      0
+     ]
+    },
+    {
+     "type": "material",
+     "name": "tower",
+     "input": "tower",
+     "base_color": [
+      0.93,
+      0.88,
+      0.78,
+      1
+     ],
+     "roughness": 0.9
+    },
+    {
+     "type": "primitive",
+     "name": "door_cutter",
+     "kind": "box",
+     "size": [
+      0.5,
+      1.0,
+      0.7
+     ],
+     "translation": [
+      0,
+      0.7,
+      0.8
+     ]
+    },
+    {
+     "type": "primitive",
+     "name": "win_cutter",
+     "kind": "box",
+     "size": [
+      0.3,
+      0.4,
+      0.7
+     ],
+     "translation": [
+      0,
+      2.5,
+      0.8
+     ]
+    },
+    {
+     "type": "boolean",
+     "name": "tower_door",
+     "op": "difference",
+     "a": "tower",
+     "b": "door_cutter"
+    },
+    {
+     "type": "boolean",
+     "name": "tower_cut",
+     "op": "difference",
+     "a": "tower_door",
+     "b": "win_cutter"
+    },
+    {
+     "type": "primitive",
+     "name": "roof",
+     "kind": "cone",
+     "size": [
+      1.05,
+      0.9,
+      0
+     ],
+     "translation": [
+      0,
+      3.65,
+      0
+     ]
+    },
+    {
+     "type": "material",
+     "name": "roof",
+     "input": "roof",
+     "base_color": [
+      0.7,
+      0.18,
+      0.14,
+      1
+     ],
+     "roughness": 0.7
+    },
+    {
+     "type": "primitive",
+     "name": "hub",
+     "kind": "cylinder",
+     "size": [
+      0.14,
+      0.4,
+      0
+     ],
+     "translation": [
+      0,
+      3.0,
+      0.95
+     ],
+     "rotation": [
+      0.7071,
+      0,
+      0,
+      0.7071
+     ]
+    },
+    {
+     "type": "material",
+     "name": "hub",
+     "input": "hub",
+     "base_color": [
+      0.2,
+      0.15,
+      0.12,
+      1
+     ]
+    },
+    {
+     "type": "primitive",
+     "name": "blade",
+     "kind": "box",
+     "size": [
+      0.28,
+      1.7,
+      0.05
+     ],
+     "translation": [
+      0,
+      3.95,
+      1.15
+     ]
+    },
+    {
+     "type": "material",
+     "name": "blade",
+     "input": "blade",
+     "base_color": [
+      0.72,
+      0.55,
+      0.32,
+      1
+     ],
+     "roughness": 0.8
+    },
+    {
+     "type": "radial_array",
+     "name": "blades",
+     "input": "blade",
+     "count": 4,
+     "center": [
+      0,
+      3.0,
+      1.15
+     ],
+     "degrees": 360,
+     "start_degrees": 0,
+     "axis": "z",
+     "include_source": true
+    },
+    {
+     "type": "primitive",
+     "name": "post",
+     "kind": "cylinder",
+     "size": [
+      0.05,
+      0.6,
+      0
+     ],
+     "translation": [
+      -4,
+      0.5,
+      3
+     ]
+    },
+    {
+     "type": "material",
+     "name": "post",
+     "input": "post",
+     "base_color": [
+      0.45,
+      0.3,
+      0.18,
+      1
+     ]
+    },
+    {
+     "type": "linear_array",
+     "name": "posts",
+     "input": "post",
+     "count": 9,
+     "offset": [
+      1,
+      0,
+      0
+     ]
+    },
+    {
+     "type": "primitive",
+     "name": "rail",
+     "kind": "box",
+     "size": [
+      8,
+      0.07,
+      0.06
+     ],
+     "translation": [
+      0,
+      0.62,
+      3
+     ]
+    },
+    {
+     "type": "material",
+     "name": "rail",
+     "input": "rail",
+     "base_color": [
+      0.5,
+      0.34,
+      0.2,
+      1
+     ]
+    },
+    {
+     "type": "mirror",
+     "name": "rail_back",
+     "input": "rail",
+     "axis": "z",
+     "offset": [
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "type": "primitive",
+     "name": "trunk",
+     "kind": "cylinder",
+     "size": [
+      0.15,
+      1.0,
+      0
+     ],
+     "translation": [
+      3.5,
+      0.7,
+      -2
+     ]
+    },
+    {
+     "type": "material",
+     "name": "trunk",
+     "input": "trunk",
+     "base_color": [
+      0.4,
+      0.27,
+      0.16,
+      1
+     ]
+    },
+    {
+     "type": "primitive",
+     "name": "leaves",
+     "kind": "sphere",
+     "size": [
+      0.9,
+      0,
+      0
+     ],
+     "translation": [
+      3.5,
+      1.9,
+      -2
+     ]
+    },
+    {
+     "type": "material",
+     "name": "leaves",
+     "input": "leaves",
+     "base_color": [
+      0.15,
+      0.45,
+      0.2,
+      1
+     ]
+    },
+    {
+     "type": "transform",
+     "name": "leaves_top",
+     "input": "leaves",
+     "translation": [
+      3.5,
+      2.6,
+      -2
+     ],
+     "scale": [
+      0.6,
+      0.6,
+      0.6
+     ]
+    },
+    {
+     "type": "hide_part",
+     "part": "tower"
+    },
+    {
+     "type": "hide_part",
+     "part": "tower_door"
+    },
+    {
+     "type": "hide_part",
+     "part": "door_cutter"
+    },
+    {
+     "type": "hide_part",
+     "part": "win_cutter"
+    },
+    {
+     "type": "rename",
+     "part": "tower_cut",
+     "to": "tower_final"
+    }
+   ]
+  }
+ },
+ {
+  "name": "validate",
+  "args": {}
+ },
+ {
+  "name": "check_rebuild",
+  "args": {}
+ },
+ {
+  "name": "expect_bounds",
+  "args": {
+   "min": [
+    null,
+    0,
+    null
+   ],
+   "max": [
+    null,
+    4.2,
+    null
+   ],
+   "tol": 0.05
+  }
+ },
+ {
+  "name": "probe_ray",
+  "args": {
+   "origin": [
+    0,
+    0.7,
+    2.5
+   ],
+   "dir": [
+    0,
+    0,
+    -1
+   ],
+   "all_hits": true
+  }
+ },
+ {
+  "name": "probe_ray",
+  "args": {
+   "origin": [
+    0,
+    2.5,
+    2.5
+   ],
+   "dir": [
+    0,
+    0,
+    -1
+   ],
+   "all_hits": true
+  }
+ },
+ {
+  "name": "scene_summary",
+  "args": {}
+ },
+ {
+  "name": "agent_shot",
+  "args": {
+   "view": "front",
+   "width": 900,
+   "height": 600,
+   "focus": [
+    "tower_final",
+    "roof",
+    "hub",
+    "blade",
+    "blades_1",
+    "blades_2",
+    "blades_3"
+   ]
+  }
+ },
+ {
+  "name": "agent_views",
+  "args": {
+   "views": [
+    "iso",
+    "right"
+   ],
+   "width": 700,
+   "height": 500
+  }
+ },
+ {
+  "name": "session_log",
+  "args": {
+   "limit": 8
+  }
+ }
+]
