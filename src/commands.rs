@@ -1158,6 +1158,7 @@ impl Session {
                 if let Some(c) = raw.get("count").and_then(|v| v.as_u64()) {
                     match ty {
                         "linear_array" => names.extend((1..c).map(|i| format!("{n}_{i}"))),
+                        "path_array" => names.extend((0..c).map(|i| format!("{n}_{i}"))),
                         "radial_array" => {
                             let first =
                                 raw.get("include_source").and_then(|v| v.as_bool()) != Some(false);

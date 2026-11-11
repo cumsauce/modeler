@@ -428,7 +428,7 @@ fn round_cross_section(cs: manifold_csg::CrossSection, r: f32) -> manifold_csg::
 
 /// A profile's rings after optional corner rounding (for sweep, which
 /// builds its own rings).
-fn rounded_rings(profile: &[Vec<[f32; 2]>], round: f32) -> Vec<Vec<[f64; 2]>> {
+pub(crate) fn rounded_rings(profile: &[Vec<[f32; 2]>], round: f32) -> Vec<Vec<[f64; 2]>> {
     let rings: Vec<Vec<[f64; 2]>> = profile
         .iter()
         .map(|r| r.iter().map(|p| [p[0] as f64, p[1] as f64]).collect())
@@ -449,8 +449,15 @@ pub fn sweep(
     path: &[[f32; 3]],
     closed: bool,
     round: f32,
+    twist: f32,
+    scale_end: f32,
 ) -> Result<Part, ModelerError> {
     check_profile(&[profile.to_vec()])?;
+    if scale_end.is_nan() || scale_end <= 0.0 || !twist.is_finite() {
+        return Err(ModelerError::Csg(format!(
+            "sweep `{name}`: scale_end must be > 0 and twist finite"
+        )));
+    }
     let min_pts = if closed { 3 } else { 2 };
     if path.len() < min_pts {
         return Err(ModelerError::Csg(format!(
@@ -517,11 +524,21 @@ pub fn sweep(
         prev_t = t;
     }
     let m = ring2.len();
+    // Fraction of the length at each point, for twist and scale_end.
+    let mut along = vec![0.0f32];
+    for w in pts.windows(2) {
+        along.push(along[along.len() - 1] + (w[1] - w[0]).length());
+    }
+    let total = along[along.len() - 1].max(1e-9);
     let mut part = Part::new(name);
     for (i, p) in pts.iter().enumerate() {
         let (t, nrm, bin, miter) = frames[i];
+        let f = along[i] / total;
+        let (sn, cs) = (twist * f).to_radians().sin_cos();
+        let k = 1.0 + (scale_end - 1.0) * f;
         for q in &ring2 {
-            let (u, v) = (q[0] as f32, q[1] as f32);
+            let (u0, v0) = (q[0] as f32 * k, q[1] as f32 * k);
+            let (u, v) = (u0 * cs - v0 * sn, u0 * sn + v0 * cs);
             // Miter scaling only along the bend (the component along the
             // previous segment's direction within the profile plane).
             let off = nrm * u + bin * v;
@@ -1331,7 +1348,8 @@ mod tests {
             .collect();
         // An L-shaped pipe: straight, bend, straight.
         let path = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-        let p = sweep("pipe", &circle, &path, false, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        let p =
+            sweep("pipe", &circle, &path, false, 0.0, 0.0, 1.0).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&p), 0);
         let v = signed_volume(&p);
         // ~ pi r^2 * 2 m of centreline.
@@ -1344,11 +1362,11 @@ mod tests {
             [2.0, 0.0, 2.0],
             [0.0, 0.0, 2.0],
         ];
-        let r = sweep("loop", &circle, &sq, true, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        let r = sweep("loop", &circle, &sq, true, 0.0, 0.0, 1.0).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&r), 0);
         assert!(signed_volume(&r) > 0.0);
         // Too short a path errors clearly.
-        assert!(sweep("x", &circle, &path[..1], false, 0.0).is_err());
+        assert!(sweep("x", &circle, &path[..1], false, 0.0, 0.0, 1.0).is_err());
     }
 
     #[test]

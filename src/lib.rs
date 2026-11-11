@@ -75,6 +75,7 @@ pub mod graph;
 pub mod inspect;
 pub mod ktx2;
 pub mod light;
+pub mod loft;
 pub mod lsystem;
 pub mod material;
 pub mod outline;
@@ -771,6 +772,10 @@ fn is_zero(x: &f32) -> bool {
     *x == 0.0
 }
 
+fn is_zero_u32(x: &u32) -> bool {
+    *x == 0
+}
+
 fn one2() -> [f32; 2] {
     [1.0, 1.0]
 }
@@ -848,6 +853,54 @@ pub enum Op {
         closed: bool,
         #[serde(default, skip_serializing_if = "is_zero")]
         round: f32,
+        /// `path` is control points of a smooth curve (Catmull-Rom).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        smooth: bool,
+        /// Curve segments per span when smooth (0 = by the bend).
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        samples: u32,
+        /// Degrees the profile turns from start to end.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        twist: f32,
+        /// Profile scale at the end (1 at the start, linear by length).
+        #[serde(default = "loft::one", skip_serializing_if = "loft::is_one")]
+        scale_end: f32,
+    },
+    /// A closed solid skinned through cross-sections (bottles, hulls, horns,
+    /// blades), along a straight layout or a path.
+    Loft {
+        name: String,
+        sections: Vec<loft::LoftSection>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<[f32; 3]>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        smooth: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        samples: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        steps: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        round: f32,
+    },
+    /// Copies of `input` along a path, `name_0..`: count, or spacing.
+    PathArray {
+        name: String,
+        input: String,
+        path: Vec<[f32; 3]>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        smooth: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        samples: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        closed: bool,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        count: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        spacing: f32,
+        #[serde(default = "loft::yes", skip_serializing_if = "loft::is_yes")]
+        align: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        roll_step: f32,
     },
     /// An L-system grown by a 3D turtle (trees, bushes, roots, coral): wood
     /// in `name`, leaves in `name_leaves`.

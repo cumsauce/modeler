@@ -980,8 +980,9 @@ pub struct SweepSpec {
     /// vertical path), v across. A circle: [{"arc": {"center": [0, 0],
     /// "radius": 0.02, "from": 0, "to": 360}}].
     profile: Vec<RingItem>,
-    /// World points [[x, y, z], ...] the profile travels along. Use many
-    /// points for curves (bends are mitred to keep thickness).
+    /// World points [[x, y, z], ...] the profile travels along (bends are
+    /// mitred to keep thickness). With smooth, a few control points of a
+    /// curve instead.
     path: Vec<[f32; 3]>,
     /// Join the end back to the start (a ring); otherwise both ends are capped.
     #[serde(default)]
@@ -989,6 +990,147 @@ pub struct SweepSpec {
     /// Round the profile's corners with this radius.
     #[serde(default)]
     round: f32,
+    /// true: the path is control points of a smooth curve (centripetal
+    /// Catmull-Rom) passing through every one, sampled finely: 4 points
+    /// make a hose.
+    #[serde(default)]
+    smooth: bool,
+    /// Same as smooth: "catmull_rom" (or "linear", the default).
+    #[serde(default)]
+    curve: Option<String>,
+    /// Curve segments per span between control points (default: by the
+    /// bend, about one per 5 degrees).
+    #[serde(default)]
+    samples: u32,
+    /// Degrees the profile turns about the path from start to end.
+    #[serde(default)]
+    twist: f32,
+    /// Profile scale at the end of the path (1 at the start, by length): a
+    /// tapering horn, tentacle or tail.
+    #[serde(default = "one")]
+    scale_end: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+/// `smooth` / `curve` of a path item as one flag.
+fn curve_smooth(ctx: &str, smooth: bool, curve: &Option<String>) -> Result<bool, String> {
+    match curve.as_deref() {
+        None | Some("linear") => Ok(smooth),
+        Some("catmull_rom" | "smooth") => Ok(true),
+        Some(o) => Err(format!(
+            "{ctx}: curve: unknown curve `{o}` (catmull_rom or linear)"
+        )),
+    }
+}
+
+/// One cross-section of a loft.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoftSectionSpec {
+    /// One ring [[a, b], ...] (points or arcs). Straight lofts: a is world x
+    /// and b world z before `rotation` (like an extrude footprint); on a
+    /// path, a is along the path normal (up) and b across, like sweep.
+    profile: Vec<RingItem>,
+    /// Centre of the section [x, y, z] (straight lofts).
+    #[serde(default)]
+    at: Option<[f32; 3]>,
+    /// Shorthand for at: [0, y, 0].
+    #[serde(default)]
+    y: Option<f32>,
+    /// Fraction 0..1 along the path (path lofts; default evenly spread).
+    #[serde(default)]
+    t: Option<f32>,
+    /// Tilts the section plane (straight lofts): [x, y, z, w], {axis,
+    /// degrees} or {x, y, z} degrees. Unrotated sections lie flat (normal +y).
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
+    /// Scales the profile: a number or [a, b]. 0 on the first or last
+    /// section closes the loft to a point (a horn or spire tip).
+    #[serde(default)]
+    scale: Option<ScaleArg>,
+}
+
+/// A number or a per-axis pair.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ScaleArg {
+    One(f32),
+    Two([f32; 2]),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoftSpec {
+    name: String,
+    /// Two or more cross-sections in order (shapes and sizes may differ: a
+    /// circle into a square). Each is resampled to the same point count
+    /// with matched start points, so the skin doesn't twist.
+    sections: Vec<LoftSectionSpec>,
+    /// Optional path [[x, y, z], ...]: sections sit at `t` along it, square
+    /// to it (a horn, a tusk, a curved blade). Without it, sections sit at
+    /// their own `at` / `y`.
+    #[serde(default)]
+    path: Vec<[f32; 3]>,
+    /// Smooth (Catmull-Rom) between sections and along the path instead of
+    /// straight: a bottle's shoulder, a hull's curve.
+    #[serde(default)]
+    smooth: bool,
+    /// Points around every section (default the most any section has, at
+    /// least 32; corners of rings with fewer points stay sharp).
+    #[serde(default)]
+    samples: u32,
+    /// Rings between consecutive sections (default 12 when smooth, else 1).
+    #[serde(default)]
+    steps: u32,
+    /// Round every profile's corners with this radius.
+    #[serde(default)]
+    round: f32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PathArraySpec {
+    /// Copies are name_0..name_{n-1}, copy 0 at the path start; hide the source.
+    name: String,
+    /// The part to copy, modelled at the origin with +x along the path and
+    /// +y up: copy i is the source moved to the i-th point (its own
+    /// translation becomes an offset in the path frame).
+    input: String,
+    /// World points [[x, y, z], ...].
+    path: Vec<[f32; 3]>,
+    /// true: the path is control points of a smooth curve (centripetal
+    /// Catmull-Rom) passing through every one, sampled finely: 4 points
+    /// make a hose.
+    #[serde(default)]
+    smooth: bool,
+    /// Same as smooth: "catmull_rom" (or "linear", the default).
+    #[serde(default)]
+    curve: Option<String>,
+    /// Curve segments per span between control points (default: by the
+    /// bend, about one per 5 degrees).
+    #[serde(default)]
+    samples: u32,
+    /// Loop the path (a ring of posts, a necklace): copies spread around it
+    /// with none doubled at the seam.
+    #[serde(default)]
+    closed: bool,
+    /// How many copies, evenly spread end to end.
+    #[serde(default)]
+    count: u32,
+    /// Or the distance between copies, meters (rounded so both ends of an
+    /// open path get one).
+    #[serde(default)]
+    spacing: f32,
+    /// Turn each copy to the path: +x along the tangent, +y up (default
+    /// true). false only moves them.
+    #[serde(default = "yes")]
+    align: bool,
+    /// Extra roll per copy about the tangent, degrees: 90 for chain links.
+    #[serde(default)]
+    roll_step: f32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1506,6 +1648,8 @@ pub enum OpSpec {
     Revolve(RevolveSpec),
     Group(GroupSpec),
     Sweep(SweepSpec),
+    Loft(LoftSpec),
+    PathArray(PathArraySpec),
     Lsystem(LSystemSpec),
     Text(TextSpec),
     Terrain(TerrainSpec),
@@ -1545,6 +1689,8 @@ pub const OP_TYPES: &[&str] = &[
     "revolve",
     "group",
     "sweep",
+    "loft",
+    "path_array",
     "lsystem",
     "text",
     "terrain",
@@ -1932,9 +2078,84 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             BatchItem::Op(Op::Sweep {
                 name: s.name,
                 profile: expand_ring(s.profile).map_err(|e| format!("{ctx}: profile: {e}"))?,
+                smooth: curve_smooth(&ctx, s.smooth, &s.curve)?,
+                samples: s.samples,
                 path: s.path,
                 closed: s.closed,
                 round: s.round,
+                twist: s.twist,
+                scale_end: s.scale_end,
+            })
+        }
+        "loft" => {
+            let s: LoftSpec = de(&ctx, &body)?;
+            let on_path = !s.path.is_empty();
+            let mut sections = Vec::with_capacity(s.sections.len());
+            for (k, sec) in s.sections.into_iter().enumerate() {
+                let c = format!("{ctx}: sections[{k}]");
+                let at = match (sec.at, sec.y) {
+                    (Some(_), Some(_)) => return Err(format!("{c}: give at or y, not both")),
+                    (Some(a), None) => a,
+                    (None, Some(y)) => [0.0, y, 0.0],
+                    (None, None) if on_path => [0.0; 3],
+                    (None, None) => {
+                        return Err(format!(
+                            "{c}: place the section with \"y\": h or \"at\": [x, y, z]"
+                        ));
+                    }
+                };
+                if on_path && (sec.at.is_some() || sec.y.is_some() || sec.rotation.is_some()) {
+                    return Err(format!(
+                        "{c}: on a path, sections are placed by t (0..1 along it), not at / y / rotation"
+                    ));
+                }
+                if !on_path && sec.t.is_some() {
+                    return Err(format!("{c}: t needs a path; use y or at"));
+                }
+                sections.push(crate::loft::LoftSection {
+                    profile: expand_ring(sec.profile).map_err(|e| format!("{c}: profile: {e}"))?,
+                    at,
+                    t: sec.t,
+                    rotation: rot(&c, &sec.rotation)?,
+                    scale: match sec.scale {
+                        None => [1.0, 1.0],
+                        Some(ScaleArg::One(v)) => [v, v],
+                        Some(ScaleArg::Two(v)) => v,
+                    },
+                });
+            }
+            if sections.len() < 2 {
+                return Err(format!("{ctx}: sections: a loft needs at least 2"));
+            }
+            BatchItem::Op(Op::Loft {
+                name: s.name,
+                sections,
+                path: s.path,
+                smooth: s.smooth,
+                samples: s.samples,
+                steps: s.steps,
+                round: s.round,
+            })
+        }
+        "path_array" => {
+            let s: PathArraySpec = de(&ctx, &body)?;
+            if s.count == 0 && (s.spacing.is_nan() || s.spacing <= 0.0) {
+                return Err(format!("{ctx}: give count (>= 1) or spacing (> 0, meters)"));
+            }
+            if s.count > 0 && s.spacing > 0.0 {
+                return Err(format!("{ctx}: give count or spacing, not both"));
+            }
+            BatchItem::Op(Op::PathArray {
+                name: s.name,
+                input: s.input,
+                smooth: curve_smooth(&ctx, s.smooth, &s.curve)?,
+                samples: s.samples,
+                path: s.path,
+                closed: s.closed,
+                count: s.count,
+                spacing: s.spacing,
+                align: s.align,
+                roll_step: s.roll_step,
             })
         }
         "text" => {
@@ -2440,6 +2661,16 @@ pub fn example(ty: &str) -> Option<Value> {
         "text" => {
             json!({"type": "text", "name": "exit_sign", "text": "EXIT", "font": "bold", "size": 0.15, "depth": 0.02, "translation": [0, 2.2, 0.01]})
         }
+        "loft" => {
+            json!({"type": "loft", "name": "bottle", "smooth": true, "sections": [
+                {"y": 0, "profile": [{"arc": {"center": [0, 0], "radius": 0.035, "from": 0, "to": 360}}]},
+                {"y": 0.16, "profile": [{"arc": {"center": [0, 0], "radius": 0.037, "from": 0, "to": 360}}]},
+                {"y": 0.22, "profile": [{"arc": {"center": [0, 0], "radius": 0.014, "from": 0, "to": 360}}]},
+                {"y": 0.28, "profile": [{"arc": {"center": [0, 0], "radius": 0.013, "from": 0, "to": 360}}]}]})
+        }
+        "path_array" => {
+            json!({"type": "path_array", "name": "posts", "input": "post", "path": [[0, 0, 0], [2, 0, 1], [4, 0, 0]], "smooth": true, "spacing": 0.8})
+        }
         "lsystem" => {
             json!({"type": "lsystem", "name": "oak", "preset": "tree", "seed": 3, "translation": [2, 0, 0]})
         }
@@ -2546,6 +2777,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "revolve" => schemars::schema_for!(RevolveSpec),
         "group" => schemars::schema_for!(GroupSpec),
         "sweep" => schemars::schema_for!(SweepSpec),
+        "loft" => schemars::schema_for!(LoftSpec),
+        "path_array" => schemars::schema_for!(PathArraySpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "text" => schemars::schema_for!(TextSpec),
         "terrain" => schemars::schema_for!(TerrainSpec),

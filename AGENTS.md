@@ -93,7 +93,8 @@ type, so there is no need to memorise field names.
 | `primitive` | name, kind, size, [translation / position], [rotation], [frame] |
 | `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
-| `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
+| `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round], [smooth], [samples], [twist], [scale_end] |
+| `loft` | name, sections [{profile, y / at, [rotation], [scale]} or {profile, t}...], [path], [smooth], [samples], [steps], [round] |
 | `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
 | `text` | name, text, size (capital height), [depth size/8], [font sans / bold / mono / path.ttf], [align center], [line_spacing], [letter_spacing], [translation], [rotation] |
 | `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
@@ -110,6 +111,7 @@ type, so there is no need to memorise field names.
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset, [local] |
+| `path_array` | name, input, path, count or spacing, [smooth], [closed], [align true], [roll_step] |
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
 | `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
@@ -228,7 +230,7 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   - `revolve`: points are `[radius, y]` (radius >= 0) around the y axis:
     vases, bowls, columns, bottles. `degrees` < 360 leaves flat end caps.
     Hollow a vessel by revolving an inner profile and taking a `difference`.
-- **Profiles** (extrude/revolve/sweep): ring entries are points or arcs,
+- **Profiles** (extrude/revolve/sweep/loft): ring entries are points or arcs,
   `{"arc": {"center": [a, b], "radius": r, "from": deg, "to": deg}}`
   (counter-clockwise from +a; 0 -> 360 is a full circle), so curves need no
   hand-made point lists. `round: r` fillets every profile corner.
@@ -236,6 +238,44 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   handles, frames, hoses); bends are mitred to keep the thickness, and
   `closed: true` loops the path (a ring) instead of capping it. Profile u is
   along the frame normal (world up to start, or +z on a vertical path).
+- **Smooth paths**: `sweep`, `path_array` and a path `loft` take
+  `smooth: true` (or `curve: "catmull_rom"`): `path` is then a few control
+  points of a centripetal Catmull-Rom curve that passes through every one,
+  sampled about every 5 degrees of bend (`samples` per span overrides), so
+  a hose is 4 points, not 40. `sweep` also takes `twist` (degrees from
+  start to end) and `scale_end` (profile scale at the end, by length: a
+  tapering horn or tail).
+- **`loft`** skins a closed solid (ready for booleans) through two or more
+  `sections`, which may change shape and size: a circle into a square, a
+  bottle body narrowing to its neck, a hull, a horn, a blade, a tapered
+  leg. Each section is a `profile` (one ring, points or arcs) at `y: h`
+  (or `at: [x, y, z]`), optionally `rotation` (unrotated sections lie
+  flat; `[a, b]` is world x / z like an extrude footprint) and `scale` (a
+  number or `[a, b]`). Rings are resampled to the same point count
+  (`samples`, default the most any section has, at least 32; corners of
+  rings with fewer points stay sharp) with start points matched, so the
+  skin doesn't twist. `smooth: true` runs a Catmull-Rom through the
+  sections (`steps` rings per span, default 12) instead of straight
+  ruled spans. With `path`, sections sit square to it at `t` (0..1 along
+  it, default evenly spread; `[a, b]` along the path normal / binormal
+  like sweep). `scale: 0` on the first or last section closes it to a
+  point (a horn tip, a spire). A bottle:
+  `{"type": "loft", "name": "bottle", "smooth": true, "sections": [{"y": 0,
+  "profile": [{"arc": {"center": [0, 0], "radius": 0.035, "from": 0, "to":
+  360}}]}, {"y": 0.16, ...r 0.037}, {"y": 0.22, ...r 0.014}, {"y": 0.28,
+  ...r 0.013}]}`; hollow it with a smaller loft and a `difference`.
+- **`path_array`** spaces copies of a part along a path (fence posts, rail
+  ties, lamps along a road, chain links): `{"type": "path_array", "name":
+  "posts", "input": "post", "path": [[0, 0, 0], [3, 0, 1.5], [6, 0, 0]],
+  "smooth": true, "spacing": 1.2}` makes `posts_0..`, copy 0 at the path
+  start and (open paths) one at the end, `spacing` rounded to fit;
+  `count` instead fixes the number. Model the source at the origin with
+  +x along the path and +y up: with `align` (default true) each copy turns
+  so +x follows the tangent (y stays up on a level path), and the source's
+  own translation is an offset in that frame (a post at y 0.5 stands on
+  the path). `roll_step: 90` rolls each copy 90 degrees more about the
+  tangent than the last (interlocking chain links); `closed` loops the
+  path with no copy doubled at the seam. Hide the source.
 - **`lsystem`** grows branching structures: trees, bushes, ferns, weeds,
   roots, coral, antlers, cracks. A `preset` gives a ready plant at real size
   (`tree` ~4.5 m broadleaf, `pine` conifer, `bush` ~1 m shrub, `fern` five
