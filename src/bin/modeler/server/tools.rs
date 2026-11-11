@@ -12,11 +12,34 @@ pub(crate) fn err_result(message: String) -> CallToolResult {
 /// oneshot reply, so state changes always happen on the main thread.
 pub(crate) struct Tools {
     pub(crate) tx: mpsc::Sender<Cmd>,
+    /// The latest render per (view, size, focus, style), for `diff`.
+    last_shots: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+}
+
+/// The image budget a model sees at full detail: larger images are
+/// downscaled before reading, so pixels past it cost tokens for nothing.
+const MAX_LONG_EDGE: f64 = 1568.0;
+const MAX_PIXELS: f64 = 1_150_000.0;
+
+/// Shrinks a cols x rows grid of w x h cells to fit the image budget.
+fn fit_budget(w: u32, h: u32, cols: u32, rows: u32) -> (u32, u32) {
+    let (gw, gh) = ((cols * w) as f64, (rows * h) as f64);
+    let k = (MAX_LONG_EDGE / gw)
+        .min(MAX_LONG_EDGE / gh)
+        .min((MAX_PIXELS / (gw * gh)).sqrt())
+        .min(1.0);
+    (
+        ((w as f64 * k) as u32).max(64),
+        ((h as f64 * k) as u32).max(64),
+    )
 }
 
 impl Tools {
     pub(crate) fn new(tx: mpsc::Sender<Cmd>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            last_shots: Default::default(),
+        }
     }
 
     async fn run(
@@ -123,6 +146,7 @@ impl Tools {
         width: u32,
         height: u32,
         focus: Option<Vec<String>>,
+        style: ShotStyle,
     ) -> Result<(Vec<u8>, String), ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -131,6 +155,7 @@ impl Tools {
                 width,
                 height,
                 focus,
+                style,
                 reply: reply_tx,
             })
             .await
@@ -139,6 +164,27 @@ impl Tools {
             .await
             .map_err(|e| ErrorData::internal_error(e, None))?;
         Ok((png, format!("{view} {width}x{height}")))
+    }
+}
+
+impl Tools {
+    /// Visible, drawable part names in model order (the `ids` colour order).
+    async fn visible_parts(&self) -> Option<Vec<String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.run(move |s| {
+            let names = s
+                .model
+                .parts
+                .iter()
+                .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>();
+            let _ = tx.send(names);
+            Ok(String::new())
+        })
+        .await
+        .ok()?;
+        rx.try_recv().ok()
     }
 }
 
@@ -378,14 +424,15 @@ impl Tools {
         self.run(move |s| s.new_model(&name)).await
     }
 
-    /// Build or edit the model: an array of items, each tagged with a "type" —
-    /// graph ops ("primitive", "transform", "boolean", "radial_array",
-    /// "linear_array", "mirror", "material") plus "hide_part", "show_part",
-    /// "rename", "delete", "tri_mesh" (raw triangles) and "uvs". Ops are
-    /// upserts by output name (re-issue to tweak). Items are applied in order;
-    /// the batch stops at the first error, naming the item and field. Pass
-    /// `expect` to verify in the same call. The result ends with the scene
-    /// summary. Use describe_op(kind) for an example payload.
+    /// Build or edit the model: an array of items, each tagged with a "type"
+    /// (primitive, extrude, revolve, sweep, hull, round, group, transform,
+    /// boolean, radial_array, linear_array, mirror, material, prefab,
+    /// hide_part, show_part, rename, delete, tri_mesh, uvs). Ops are upserts
+    /// by output name (re-issue to tweak). Items are applied in order; the
+    /// batch stops at the first error, naming the item and field. Pass
+    /// `expect` to verify in the same call. The result ends with a brief
+    /// summary (parts added/changed/removed + warnings; summary: "full" for
+    /// everything). Use describe_op(kind) for an example payload.
     #[tool]
     async fn apply_ops(
         &self,
@@ -393,10 +440,21 @@ impl Tools {
             ops,
             params,
             expect,
+            summary,
         }): Parameters<ApplyOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let full = match summary.as_deref() {
+            None | Some("brief") => false,
+            Some("full") => true,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!("summary must be \"brief\" or \"full\", got `{other}`"),
+                    None,
+                ));
+            }
+        };
         self.run_json(move |s| {
-            let text = match s.apply_values(params, ops) {
+            let text = match s.apply_values_as(params, ops, full) {
                 Ok(t) => t,
                 Err(e) => {
                     let json = serde_json::json!({"ok": false, "error": e.to_string(), "summary": s.summary_json()});
@@ -431,7 +489,8 @@ impl Tools {
     /// `"gz.*"` matches a prefix), `includes` (these exist, extras fine),
     /// `grounded` (no part floats), `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
     /// closed and outward-wound) and `rebuild` (uncached re-derivation matches
-    /// the cache). With no arguments runs validate + rebuild. Each check
+    /// the cache), `stable` (the centre of mass is over the footprint). With
+    /// no arguments runs validate + rebuild. Each check
     /// reports PASS/FAIL; any FAIL makes the call an error.
     #[tool]
     async fn verify(
@@ -525,7 +584,10 @@ impl Tools {
     /// "bottom" orthographic; "iso" perspective) or cameras you place
     /// ({yaw, pitch, dist?, target?, ortho?, fov?}; yaw 0 = from +z/front, 90 =
     /// from +x/right). Several views come back tiled into ONE labelled image
-    /// (grid: false for separate images). Windowed preview only.
+    /// (grid: false for separate images), sized to stay under ~1.15 MP.
+    /// style "ids" paints each part a flat colour with a legend; dims overlays
+    /// sizes and a scale bar; diff highlights what changed since the previous
+    /// render of the same views. Windowed preview only.
     #[tool]
     async fn agent_views(
         &self,
@@ -535,6 +597,9 @@ impl Tools {
             height,
             focus,
             grid,
+            style,
+            dims,
+            diff,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if views.is_empty() || views.len() > 9 {
@@ -543,6 +608,17 @@ impl Tools {
                 None,
             ));
         }
+        let ids = match style.as_deref() {
+            None | Some("shaded") => false,
+            Some("ids") => true,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!("style must be \"shaded\" or \"ids\", got `{other}`"),
+                    None,
+                ));
+            }
+        };
+        let shot_style = ShotStyle { ids, dims };
         let mut parsed = Vec::with_capacity(views.len());
         for v in views {
             parsed.push(match v {
@@ -559,19 +635,86 @@ impl Tools {
                 }),
             });
         }
-        let grid = grid.unwrap_or(parsed.len() > 1);
+        let n = parsed.len() as u32;
+        let grid = grid.unwrap_or(n > 1);
         let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
-        let (width, height) = (
+        let (w0, h0) = (
             width.unwrap_or(dw).clamp(64, 4096),
             height.unwrap_or(dh).clamp(64, 4096),
+        );
+        let (cols, rows) = if grid {
+            let c = (n as f64).sqrt().ceil() as u32;
+            (c, n.div_ceil(c))
+        } else {
+            (1, 1)
+        };
+        let (width, height) = fit_budget(w0, h0, cols, rows);
+        let mut notes = Vec::new();
+        if (width, height) != (w0, h0) {
+            notes.push(format!(
+                "cells shrunk from {w0}x{h0} to {width}x{height} to stay within the ~1.15 MP image budget"
+            ));
+        }
+        let style_key = format!(
+            "{}{}",
+            if ids { "ids" } else { "shaded" },
+            if dims { "+dims" } else { "" }
         );
         let mut shots = Vec::with_capacity(parsed.len());
         for view in &parsed {
             let (png, _) = self
-                .agent_render(*view, width, height, focus.clone())
+                .agent_render(*view, width, height, focus.clone(), shot_style)
                 .await?;
-            shots.push((png, view.to_string()));
+            let key = format!("{view}|{width}x{height}|{focus:?}|{style_key}");
+            let prev = self
+                .last_shots
+                .lock()
+                .ok()
+                .and_then(|mut m| m.insert(key, png.clone()));
+            let label = view.to_string();
+            if !diff {
+                shots.push((png, label));
+                continue;
+            }
+            let Some(prev) = prev else {
+                notes.push(format!(
+                    "{label}: no earlier render to diff against (rendered as is; diff the next one)"
+                ));
+                shots.push((png, label));
+                continue;
+            };
+            let (before, after) = (
+                decode_png(&prev).map_err(|e| ErrorData::internal_error(e, None))?,
+                decode_png(&png).map_err(|e| ErrorData::internal_error(e, None))?,
+            );
+            let (img, frac, bb) = modeler::raster::diff(&before, &after)
+                .map_err(|e| ErrorData::internal_error(e, None))?;
+            let pct = frac * 100.0;
+            notes.push(match bb {
+                None => format!("{label}: no visible change"),
+                Some([x0, y0, x1, y1]) => format!(
+                    "{label}: {pct:.1}% of pixels changed (magenta = now there, cyan = was there), within px box [{x0}, {y0}]..[{x1}, {y1}]"
+                ),
+            });
+            let out = img
+                .to_png()
+                .map_err(|e| ErrorData::internal_error(e, None))?;
+            shots.push((out, format!("{label} diff {pct:.1}%")));
         }
+        let mut head = Vec::new();
+        if ids {
+            let names = self.visible_parts().await.unwrap_or_default();
+            head.push(format!(
+                "ids colours (legend also drawn in each view): {}",
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| format!("{}={n}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        head.extend(notes);
         if grid {
             let labels: Vec<String> = shots
                 .iter()
@@ -579,21 +722,94 @@ impl Tools {
                 .map(|(i, (_, l))| format!("{}: {l}", i + 1))
                 .collect();
             let png = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
-            return Ok(CallToolResult::success(vec![
-                Content::text(format!(
+            head.insert(
+                0,
+                format!(
                     "{} views in one image, row-major: {}",
                     shots.len(),
                     labels.join(", ")
-                )),
+                ),
+            );
+            return Ok(CallToolResult::success(vec![
+                Content::text(head.join("\n")),
                 Content::image(B64.encode(png), "image/png"),
             ]));
         }
-        let mut content = Vec::with_capacity(shots.len() * 2);
+        let mut content = Vec::with_capacity(shots.len() * 2 + 1);
+        if !head.is_empty() {
+            content.push(Content::text(head.join("\n")));
+        }
         for (i, (png, label)) in shots.into_iter().enumerate() {
             content.push(Content::text(format!("view {}: {label}", i + 1)));
             content.push(Content::image(B64.encode(png), "image/png"));
         }
         Ok(CallToolResult::success(content))
+    }
+
+    /// Measure and probe the model numerically: `measure` pairs (gap,
+    /// touching or overlap volume/depth between two parts; one name = its
+    /// height above the ground), `section` (cut with the plane axis = at: per
+    /// part area, outlines, holes, thinnest wall, plus an image of the cut)
+    /// and `mass` (mass, centre of mass, and whether it tips over and at what
+    /// tilt; density kg/m3 per part, default 1000). Any combination in one call.
+    #[tool]
+    async fn inspect(
+        &self,
+        Parameters(InspectArgs {
+            measure,
+            section,
+            mass,
+        }): Parameters<InspectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if measure.is_none() && section.is_none() && mass.is_none() {
+            return Err(ErrorData::invalid_params(
+                "give measure, section and/or mass, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
+                None,
+            ));
+        }
+        let (png_tx, png_rx) = std::sync::mpsc::channel();
+        let result = self
+            .run_json(move |s| {
+                let model = &s.model;
+                let mut text = Vec::new();
+                let mut json = serde_json::Map::new();
+                if let Some(pairs) = measure {
+                    let mut rows = Vec::new();
+                    for pair in &pairs {
+                        let (t, j) =
+                            modeler::inspect::measure(model, pair).map_err(|e| (e, None))?;
+                        text.push(t);
+                        rows.push(j);
+                    }
+                    json.insert("measure".into(), rows.into());
+                }
+                if let Some(sec) = section {
+                    let (t, j, png) =
+                        modeler::inspect::section(model, &sec.axis, sec.at, sec.parts.as_deref())
+                            .map_err(|e| (e, None))?;
+                    text.push(t.trim_end().to_string());
+                    json.insert("section".into(), j);
+                    let _ = png_tx.send(png);
+                }
+                if let Some(m) = mass {
+                    let (t, j) = modeler::inspect::mass(
+                        model,
+                        &m.density,
+                        m.default_density.unwrap_or(1000.0),
+                    );
+                    text.push(t.trim_end().to_string());
+                    json.insert("mass".into(), j);
+                }
+                Ok((text.join("\n"), Some(serde_json::Value::Object(json))))
+            })
+            .await?;
+        let mut result = result;
+        if let Ok(png) = png_rx.try_recv() {
+            result
+                .content
+                .push(Content::image(B64.encode(png), "image/png"));
+        }
+        Ok(result)
     }
 
     /// Add a human-readable comment pinned to the model. Face, vertex and position are
@@ -703,7 +919,10 @@ impl rmcp::ServerHandler for Tools {
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings. agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image: [\"front\", \"right\", \"top\", \"iso\"] is one read. Look at an image after building.\n- Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, stable, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings.
+- inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not).
+- agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
+- apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - scene_summary, apply_ops and verify also return structuredContent JSON.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.

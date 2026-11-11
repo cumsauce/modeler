@@ -63,6 +63,10 @@ pub struct VerifySpec {
     /// Re-derive the graph uncached and diff against the cached parts.
     #[serde(default)]
     pub rebuild: Option<bool>,
+    /// The centre of mass sits over the footprint (the model does not tip
+    /// over), with uniform density.
+    #[serde(default)]
+    pub stable: Option<bool>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -457,7 +461,112 @@ impl Session {
         params: Option<crate::params::Params>,
         items: Vec<serde_json::Value>,
     ) -> CmdResult {
-        self.batch(|s| s.apply_values_inner(params, items))
+        self.apply_values_as(params, items, true)
+    }
+
+    /// [`Self::apply_values`] ending in the full scene summary (`full`) or a
+    /// brief one: counts, bounds, which parts were added / changed / removed,
+    /// and the warnings. The brief form keeps a long build's context small.
+    pub fn apply_values_as(
+        &mut self,
+        params: Option<crate::params::Params>,
+        items: Vec<serde_json::Value>,
+        full: bool,
+    ) -> CmdResult {
+        let before = self.part_fingerprints();
+        let text = self.batch(|s| s.apply_values_inner(params, items))?;
+        let tail = if full {
+            self.summary()
+        } else {
+            self.brief_summary(&before)
+        };
+        Ok(format!("{text}\n{tail}"))
+    }
+
+    /// A content hash per part (geometry, transform, material, visibility),
+    /// to tell which parts a call touched.
+    pub fn part_fingerprints(&self) -> std::collections::BTreeMap<String, u64> {
+        use std::hash::{Hash, Hasher};
+        self.model
+            .parts
+            .iter()
+            .map(|p| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for v in &p.verts {
+                    v.iter().for_each(|f| f.to_bits().hash(&mut h));
+                }
+                p.indices.hash(&mut h);
+                for f in p
+                    .translation
+                    .iter()
+                    .chain(&p.rotation)
+                    .chain(&p.scale)
+                    .chain(&p.material.base_color)
+                {
+                    f.to_bits().hash(&mut h);
+                }
+                p.material.roughness.to_bits().hash(&mut h);
+                p.material.metalness.to_bits().hash(&mut h);
+                p.visible.hash(&mut h);
+                (p.name.clone(), h.finish())
+            })
+            .collect()
+    }
+
+    /// The short result tail for `apply_ops`: model line, the parts this call
+    /// added (+), changed (~) and removed (-), and every warning.
+    pub fn brief_summary(&self, before: &std::collections::BTreeMap<String, u64>) -> String {
+        let after = self.part_fingerprints();
+        let bounds = self
+            .model
+            .bounds()
+            .map(|(min, max)| format!("bounds {min:?}..{max:?}"))
+            .unwrap_or_else(|| "empty".into());
+        let mut s = format!(
+            "model `{}` v{}: {} parts, {} ops, {bounds}\n",
+            self.model.name,
+            self.model.version,
+            self.model.parts.len(),
+            self.model.ops.len()
+        );
+        let mut changes = Vec::new();
+        for (n, h) in &after {
+            match before.get(n) {
+                None => changes.push(format!("+{n}")),
+                Some(b) if b != h => changes.push(format!("~{n}")),
+                _ => {}
+            }
+        }
+        for n in before.keys() {
+            if !after.contains_key(n) {
+                changes.push(format!("-{n}"));
+            }
+        }
+        if changes.is_empty() {
+            s += "parts: no change\n";
+        } else {
+            let shown = changes.len().min(40);
+            s += &format!(
+                "parts ({} changed): {}{}\n",
+                changes.len(),
+                changes[..shown].join(", "),
+                if changes.len() > shown { ", ..." } else { "" }
+            );
+        }
+        if self.pending_pin.is_some() {
+            s += "a pin is waiting in the live view: use add_annotation without face/vertex/position to comment on it\n";
+        }
+        let lints = self.lints();
+        if lints.is_empty() {
+            s += "warnings: none\n";
+        } else {
+            s += &format!("warnings ({}):\n", lints.len());
+            for l in &lints {
+                s += &format!("- {l}\n");
+            }
+        }
+        s += "(brief result: scene_summary lists every part; pass summary: \"full\" to get it here)\n";
+        s
     }
 
     fn apply_values_inner(
@@ -542,7 +651,7 @@ impl Session {
                 lines.push(format!("re-derived {n} op(s) that read changed params"));
             }
         }
-        lines.push(self.apply_items(parsed, true)?);
+        lines.push(self.apply_items(parsed, false)?);
         Ok(lines.join("\n"))
     }
 
@@ -726,7 +835,8 @@ impl Session {
             && spec.grounded.is_none()
             && spec.bounds.is_none()
             && spec.validate.is_none()
-            && spec.rebuild.is_none();
+            && spec.rebuild.is_none()
+            && spec.stable.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
             Ok(t) => out.push((name.to_string(), true, t)),
@@ -764,6 +874,15 @@ impl Session {
         }
         if spec.rebuild.unwrap_or(empty) {
             record("rebuild", self.check_rebuild().map_err(|e| e.to_string()));
+        }
+        if spec.stable == Some(true) {
+            let (text, json) = crate::inspect::mass(&self.model, &Default::default(), 1000.0);
+            let first = text.lines().nth(1).unwrap_or("").to_string();
+            if json["stability"]["stable"].as_bool() == Some(true) {
+                record("stable", Ok(first));
+            } else {
+                record("stable", Err(first));
+            }
         }
         out
     }
@@ -2639,5 +2758,41 @@ mod tests {
         s.apply_values(None, batch)
             .unwrap_or_else(|e| panic!("re-issue failed: {e}"));
         assert_eq!(s.model.ops.len(), 2, "{}", s.describe_ops());
+    }
+
+    #[test]
+    fn brief_apply_result_lists_only_what_changed() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let ops = |v: serde_json::Value| -> Vec<serde_json::Value> {
+            serde_json::from_value(v).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let t = s
+            .apply_values_as(
+                None,
+                ops(serde_json::json!([
+                    {"type": "primitive", "name": "a", "kind": "box", "size": 1, "translation": [0, 0.5, 0]},
+                    {"type": "primitive", "name": "b", "kind": "box", "size": 1, "translation": [3, 0.5, 0]}
+                ])),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("parts (2 changed): +a, +b"), "{t}");
+        assert!(!t.contains("ops ("), "{t}");
+        let t = s
+            .apply_values_as(
+                None,
+                ops(serde_json::json!([
+                    {"type": "primitive", "name": "b", "kind": "box", "size": 2, "translation": [3, 1, 0]}
+                ])),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("parts (1 changed): ~b"), "{t}");
+        let spec = VerifySpec {
+            stable: Some(true),
+            ..Default::default()
+        };
+        assert!(s.verify(&spec).0);
     }
 }

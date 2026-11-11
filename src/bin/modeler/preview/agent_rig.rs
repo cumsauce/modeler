@@ -17,8 +17,28 @@ pub(crate) struct AgentCamera;
 /// One offscreen shot waiting for a frame: view, pixel size, reply.
 #[derive(Resource, Default)]
 pub(crate) struct PendingAgentShots(
-    pub(crate) Vec<(AgentView, u32, u32, Option<Vec<String>>, ShotReply)>,
+    pub(crate)  Vec<(
+        AgentView,
+        u32,
+        u32,
+        Option<Vec<String>>,
+        ShotStyle,
+        ShotReply,
+    )>,
 );
+
+/// How an agent shot is drawn: `ids` swaps every part for a flat, unlit,
+/// distinct colour (index = position among visible parts, legend drawn in);
+/// `dims` overlays the framed bounds' dimensions and a scale bar.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShotStyle {
+    pub(crate) ids: bool,
+    pub(crate) dims: bool,
+}
+
+/// Flat-colour stand-ins for an `ids` shot; only the agent camera sees their
+/// render layer, so the human's window never flickers.
+const ID_LAYER: usize = 7;
 
 /// Named agent camera views. The six cardinal views are orthographic (true
 /// proportions, auto-framed to the model bounds); `iso` is a perspective
@@ -284,11 +304,13 @@ pub(crate) fn process_agent_shot(
     mut agent_shots: ResMut<PendingAgentShots>,
     mut rig: ResMut<AgentRig>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut cameras: Query<(&mut Projection, &mut RenderTarget, &mut Transform), With<AgentCamera>>,
     modeler: Res<Modeler>,
     mut commands: Commands,
 ) {
-    let Some((view, width, height, focus, reply)) = agent_shots.0.pop() else {
+    let Some((view, width, height, focus, style, reply)) = agent_shots.0.pop() else {
         return;
     };
     let (Some(camera_entity), Some(image_handle)) = (rig.camera, rig.image.clone()) else {
@@ -297,17 +319,26 @@ pub(crate) fn process_agent_shot(
     };
     let mut image_handle = image_handle;
     let aspect = width as f32 / height.max(1) as f32;
+    let model = &modeler.session.model;
     let bounds = match &focus {
-        Some(names) => match modeler.session.model.bounds_of(names) {
+        Some(names) => match model.bounds_of(names) {
             Some(b) => Some(b),
             None => {
                 let _ = reply.send(Err(format!("focus: none of {names:?} exist as parts")));
                 return;
             }
         },
-        None => modeler.session.model.bounds(),
+        None => model.bounds(),
     };
     let (eye, target, up, new_projection) = agent_view_projection(view, bounds, aspect);
+    // Pixels per metre for orthographic shots (dimension overlays).
+    let ppm = match &new_projection {
+        Projection::Orthographic(o) => match o.scaling_mode {
+            ScalingMode::Fixed { width: ww, .. } => Some(width as f32 / ww),
+            _ => None,
+        },
+        _ => None,
+    };
     let Ok((mut projection, mut render_target, mut transform)) = cameras.get_mut(camera_entity)
     else {
         let _ = reply.send(Err("agent camera missing".into()));
@@ -315,6 +346,7 @@ pub(crate) fn process_agent_shot(
     };
     *projection = new_projection;
     *transform = Transform::from_translation(eye).looking_at(target, up);
+    let cam = *transform;
     let (cur_w, cur_h) = images
         .get(&image_handle)
         .map(|i| (i.width(), i.height()))
@@ -332,15 +364,168 @@ pub(crate) fn process_agent_shot(
         image_handle = fresh;
     }
     *render_target = RenderTarget::Image(image_handle.clone().into());
+    // Part-ID stand-ins on their own layer; the camera looks only at it.
+    let mut legend: Vec<(String, [u8; 4])> = Vec::new();
+    let mut stand_ins: Vec<Entity> = Vec::new();
+    if style.ids {
+        let drawable = model
+            .parts
+            .iter()
+            .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
+        for (i, part) in drawable.enumerate() {
+            legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
+            let bundle = part_bundle(part, &mut meshes, &mut materials);
+            let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
+            stand_ins.push(e);
+        }
+        // Unlit: swap the materials the bundle made for flat ones.
+        for (k, e) in stand_ins.iter().enumerate() {
+            let [r, g, b] = modeler::raster::id_color(k);
+            let m = materials.add(StandardMaterial {
+                base_color: Color::srgb(r, g, b),
+                unlit: true,
+                ..default()
+            });
+            commands.entity(*e).insert(MeshMaterial3d(m));
+        }
+        commands
+            .entity(camera_entity)
+            .insert(RenderLayers::layer(ID_LAYER));
+    }
+    // World box of what is framed, projected to pixels (ortho only).
+    let overlay = style.dims.then(|| {
+        let (lo, hi) = bounds.unwrap_or((Vec3::ZERO, Vec3::ZERO));
+        DimsOverlay {
+            ppm,
+            right: cam.right().as_vec3(),
+            up: cam.up().as_vec3(),
+            target,
+            lo,
+            hi,
+        }
+    });
     let slot = Mutex::new(Some(reply));
     commands
         .spawn(Screenshot::image(image_handle))
-        .observe(move |captured: On<ScreenshotCaptured>| {
-            if let Ok(mut s) = slot.lock()
-                && let Some(reply) = s.take()
-            {
-                let _ = reply.send(encode_png(&captured.image));
-            }
-        })
+        .observe(
+            move |captured: On<ScreenshotCaptured>, mut commands: Commands| {
+                for e in &stand_ins {
+                    commands.entity(*e).despawn();
+                }
+                if !stand_ins.is_empty() {
+                    commands
+                        .entity(camera_entity)
+                        .insert(RenderLayers::layer(0));
+                }
+                if let Ok(mut s) = slot.lock()
+                    && let Some(reply) = s.take()
+                {
+                    let out = image_to_canvas(&captured.image).and_then(|mut c| {
+                        if let Some(o) = &overlay {
+                            o.draw(&mut c);
+                        }
+                        if !legend.is_empty() {
+                            draw_legend(&mut c, &legend);
+                        }
+                        c.to_png()
+                    });
+                    let _ = reply.send(out);
+                }
+            },
+        )
         .insert(Name::new("mcp agent shot"));
+}
+
+/// What a `dims` overlay needs: the camera basis, framing scale and the
+/// framed world box.
+struct DimsOverlay {
+    ppm: Option<f32>,
+    right: Vec3,
+    up: Vec3,
+    target: Vec3,
+    lo: Vec3,
+    hi: Vec3,
+}
+
+impl DimsOverlay {
+    fn draw(&self, c: &mut Canvas) {
+        let size = self.hi - self.lo;
+        let Some(ppm) = self.ppm else {
+            // Perspective: no true scale, so just the overall size.
+            let t = format!(
+                "SIZE {:.3} X {:.3} X {:.3} M (X Y Z)",
+                size.x, size.y, size.z
+            );
+            c.text(6, c.h.saturating_sub(24), &t, 2);
+            return;
+        };
+        let (w, h) = (c.w as f32, c.h as f32);
+        let to_px = |p: Vec3| {
+            let d = p - self.target;
+            (
+                w * 0.5 + d.dot(self.right) * ppm,
+                h * 0.5 - d.dot(self.up) * ppm,
+            )
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for k in 0..8 {
+            let p = Vec3::new(
+                if k & 1 == 0 { self.lo.x } else { self.hi.x },
+                if k & 2 == 0 { self.lo.y } else { self.hi.y },
+                if k & 4 == 0 { self.lo.z } else { self.hi.z },
+            );
+            let (x, y) = to_px(p);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+        let col = [255, 220, 60, 255];
+        let (x0, y0, x1, y1) = (x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        // Horizontal dimension under the box, vertical one to its left.
+        let yb = (y1 + 14.0).min(h as f64 - 4.0);
+        let xl = (x0 - 14.0).max(4.0);
+        c.line((x0, yb), (x1, yb), col, 2);
+        c.line((x0, yb - 6.0), (x0, yb + 6.0), col, 2);
+        c.line((x1, yb - 6.0), (x1, yb + 6.0), col, 2);
+        c.line((xl, y0), (xl, y1), col, 2);
+        c.line((xl - 6.0, y0), (xl + 6.0, y0), col, 2);
+        c.line((xl - 6.0, y1), (xl + 6.0, y1), col, 2);
+        let wlab = modeler::raster::fmt_len(((x1 - x0) / ppm as f64).abs());
+        let hlab = modeler::raster::fmt_len(((y1 - y0) / ppm as f64).abs());
+        let tw = Canvas::text_width(&wlab, 2) as f64;
+        c.text(
+            ((x0 + x1) * 0.5 - tw * 0.5).max(0.0) as usize,
+            (yb + 6.0).min(h as f64 - 20.0).max(0.0) as usize,
+            &wlab,
+            2,
+        );
+        c.text(
+            (xl + 4.0).max(0.0) as usize,
+            ((y0 + y1) * 0.5 - 9.0).max(0.0) as usize,
+            &hlab,
+            2,
+        );
+        modeler::inspect::scale_bar(c, ppm as f64, c.w - 10, c.h - 10);
+    }
+}
+
+fn draw_legend(c: &mut Canvas, legend: &[(String, [u8; 4])]) {
+    let scale = if c.h >= 480 { 2 } else { 1 };
+    let row = 10 * scale + 2;
+    let max_rows = (c.h / row).saturating_sub(3).max(1);
+    // Below the grid's cell label (up to 22 px tall).
+    let mut y = 30;
+    for (name, col) in legend.iter().take(max_rows) {
+        for dy in 0..(8 * scale) as i64 {
+            for dx in 0..(8 * scale) as i64 {
+                c.set(4 + dx, y as i64 + dy, *col);
+            }
+        }
+        c.text(6 + 8 * scale, y, name, scale);
+        y += row;
+    }
+    if legend.len() > max_rows {
+        c.text(4, y, &format!("+{} MORE", legend.len() - max_rows), scale);
+    }
 }

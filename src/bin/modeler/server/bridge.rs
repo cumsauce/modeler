@@ -25,6 +25,7 @@ pub(crate) enum Cmd {
         width: u32,
         height: u32,
         focus: Option<Vec<String>>,
+        style: ShotStyle,
         reply: ShotReply,
     },
 }

@@ -25,7 +25,7 @@ fn run_op(op: BoolOp, a: &Manifold, b: &Manifold) -> Manifold {
 /// `MeshGL64::merge` (by position), which is what makes a primitive's
 /// seam-split mesh a closed solid to Manifold. Errors when the part is not a
 /// closed solid (open sheets like disc/plane/washer, torn meshes).
-fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
+pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
     let rot = quat_of(part.rotation);
     let scale = Vec3::from(part.scale);
     let t = Vec3::from(part.translation);
@@ -104,9 +104,16 @@ fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
         }
     }
     let not_solid = |e: String| {
+        let open = crate::verify::open_edge_count(part);
+        let why = if open > 0 {
+            format!("{open} open edges: it has holes or is a sheet")
+        } else {
+            "its surface is closed but inside-out or self-intersecting".to_string()
+        };
         ModelerError::Csg(format!(
-            "`{}` is not a closed solid ({e}); booleans need closed meshes \
-             (disc/plane/washer are open sheets)",
+            "`{}` is not a closed solid ({e}; {why}). Booleans, round and inspect need closed meshes: \
+             disc/plane/washer are open sheets (use a thin box, cylinder or extrude instead), \
+             and tri_mesh parts must be watertight",
             part.name
         ))
     };
@@ -179,9 +186,7 @@ pub fn boolean(
         .status()
         .map_err(|e| ModelerError::Csg(format!("{op}({a}, {b}) failed: {e}")))?;
     if result.is_empty() {
-        return Err(ModelerError::Csg(format!(
-            "{op}({a}, {b}) produced an empty mesh (no overlap?)"
-        )));
+        return Err(ModelerError::Csg(explain_empty(op, a, pa, b, pb)));
     }
     let default_name = format!("{a}-{op}-{b}");
     let mut part = manifold_to_part(&result, name.unwrap_or(&default_name), pa.material.clone());
@@ -190,6 +195,44 @@ pub fn boolean(
     part.rotation = Quat::IDENTITY.to_array();
     part.scale = [1.0; 3];
     Ok(part)
+}
+
+/// Why a boolean came out empty, in terms of the inputs' world boxes: which
+/// axis separates them and by how much, or that the cutter swallows `a`.
+fn explain_empty(op: BoolOp, a: &str, pa: &Part, b: &str, pb: &Part) -> String {
+    let (alo, ahi) = pa.bounds();
+    let (blo, bhi) = pb.bounds();
+    let fmt = |lo: Vec3, hi: Vec3| {
+        format!(
+            "[{:.3}, {:.3}, {:.3}]..[{:.3}, {:.3}, {:.3}]",
+            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+        )
+    };
+    let boxes = format!(
+        "`{a}` spans {}, `{b}` spans {}",
+        fmt(alo, ahi),
+        fmt(blo, bhi)
+    );
+    let gaps: Vec<(usize, f32)> = (0..3)
+        .map(|k| (k, (blo[k] - ahi[k]).max(alo[k] - bhi[k])))
+        .filter(|(_, g)| *g > 0.0)
+        .collect();
+    let axis = |k: usize| ["x", "y", "z"][k];
+    match op {
+        BoolOp::Difference => format!(
+            "difference({a}, {b}) is empty: `{b}` covers all of `{a}`, so nothing is left. Did you swap a and b (a is kept, b is cut away)? {boxes}"
+        ),
+        _ if !gaps.is_empty() => format!(
+            "{op}({a}, {b}) is empty: the parts don't touch, they are {} apart. Move one, or use group to combine separate parts. {boxes}",
+            gaps.iter()
+                .map(|(k, g)| format!("{g:.4} m along {}", axis(*k)))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ),
+        _ => format!(
+            "{op}({a}, {b}) is empty: the boxes overlap but the solids don't (e.g. one sits in the other's hollow or a ring's hole). {boxes}"
+        ),
+    }
 }
 
 /// Manifold builds sweeps Z-up; the modeler is Y-up. (x, y, z) -> (x, z, -y)
@@ -539,7 +582,16 @@ pub fn round(
     segments: u32,
 ) -> Result<Part, ModelerError> {
     let m = part_to_manifold(part)?;
+    let tris = m.num_tri();
     let out = match mode {
+        "fillet" | "chamfer" if tris > 20_000 => {
+            return Err(ModelerError::Csg(format!(
+                "round `{name}`: `{}` has {tris} triangles; {mode} on that many would take minutes. \
+                 Round the simple pieces before booleans/unions (a box is 12 triangles), \
+                 lower the input's segment count, or use mode smooth",
+                part.name
+            )));
+        }
         "fillet" | "chamfer" => {
             if r.is_nan() || r <= 0.0 {
                 return Err(ModelerError::Csg(format!(
@@ -566,8 +618,12 @@ pub fn round(
             };
             let eroded = m.minkowski_difference(&tool);
             if eroded.is_empty() {
+                let (lo, hi) = part.bounds();
+                let d = hi - lo;
                 return Err(ModelerError::Csg(format!(
-                    "round `{name}`: radius {r} is larger than half the part's thinnest section"
+                    "round `{name}`: radius {r} is larger than half of `{}`'s thinnest section \
+                     (its box is {:.4} x {:.4} x {:.4} m, and walls can be thinner); use a smaller radius",
+                    part.name, d.x, d.y, d.z
                 )));
             }
             eroded.minkowski_sum(&tool)

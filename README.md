@@ -37,6 +37,10 @@ Point your agent's MCP config at the `modeler` binary
   annotations; procedural geometry re-derives on load; atomic writes).
   Catalog lives in `~/Library/Application Support/friendslop/modeler/prefabs`
   (carried over from the friendSLOP days).
+- **Senses for agents**: `verify` checks (closed meshes, bounds, grounded,
+  stable), `inspect` (gaps/overlaps between parts, cross-sections, mass and
+  tipping), and `agent_views` renders: several views tiled into one image,
+  part-ID colouring, dimension overlays and before/after diffs.
 - **Annotations**: comments pinned to a part/face, typed in the preview
   window or via tools.
 

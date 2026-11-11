@@ -56,7 +56,7 @@ Three layers, read top to bottom:
    `~/Library/Application Support/friendslop/modeler/prefabs` + a
    `catalog.json` index. Saves are non-destructive and atomic.
 
-## MCP tool surface (28 tools)
+## MCP tool surface (29 tools)
 
 **Build: one tool, `apply_ops`.** Everything that changes geometry is an
 item in `apply_ops(ops, params?, expect?)`, each tagged with a `"type"`.
@@ -161,8 +161,16 @@ type, so there is no need to memorise field names.
   captured when the item is applied; re-issue it after re-saving the prefab.
 - **`expect`** runs checks after the batch in the same call (fields as for
   `verify`); any failure makes the call an error, but the batch stays applied.
-- The result ends with the scene summary; structured clients also get it as
-  JSON (`structuredContent`).
+- The result ends with a **brief summary**: part/op counts, bounds, the
+  parts this call added (`+`), changed (`~`) and removed (`-`), and every
+  warning. Pass `summary: "full"` (or call `scene_summary`) for the whole
+  part list; structured clients always get the full summary as JSON
+  (`structuredContent`).
+- **Failures explain themselves**: an empty boolean names the axis and gap
+  separating the inputs (or says the cutter swallows `a`, maybe swapped); a
+  non-solid input reports its open-edge count; `round` refuses inputs over
+  20k triangles and says to round pieces first, and a too-large radius
+  reports the part's size.
 
 Inspect: `scene_summary` (call FIRST and after anything confusing: parts,
 bounds, ops, params, annotations and **warnings**), `ops` (the graph, one
@@ -183,6 +191,7 @@ name: the producer first, then in-place material/visibility/transform edits).
     that sets the extreme.
   - `validate`: every part closed and outward-wound.
   - `rebuild`: an uncached re-derivation matches the cache.
+  - `stable`: the centre of mass (uniform density) sits over the footprint.
 
   Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
@@ -199,6 +208,28 @@ name: the producer first, then in-place material/visibility/transform edits).
   - The top view is a plan: +x right, -z up.
   - `focus: [parts]` frames just those, and framing works at any scale.
   - A shadowed key light makes openings read even in orthographic views.
+  - Images are sized to stay under ~1.15 MP (long edge 1568), the size a
+    model reads at full detail; bigger grids shrink their cells (the
+    result says so). A 2x2 grid of 640x480 is ~1.6k tokens.
+  - `style: "ids"`: each part a flat, unlit, distinct colour with a legend
+    (and the colour order in the text), to tell which shape is which part.
+  - `dims: true`: the framed box's width and height and a scale bar, at true
+    scale in orthographic views (overall size in perspective ones).
+  - `diff: true`: compares with the previous render of the same view, size,
+    focus and style: magenta where something now is, cyan where something
+    was, the rest greyed, plus the changed share and pixel box.
+- `inspect(measure?, section?, mass?)`: numeric senses, any combination per
+  call.
+  - `measure: [["a", "b"], ["c"]]`: two parts are apart (closest-surface
+    gap), touching, or overlapping (shared volume and penetration depth),
+    plus per-axis box gaps; one name gives its height above the ground.
+  - `section: {axis, at, parts?}`: cuts with the plane `axis = at` and
+    reports per part the area, outlines, holes and thinnest wall, plus an
+    image of the cut (y = plan, z = front, x = side). Shows hidden
+    interiors no outside view can: wall thickness, handles poking inside.
+  - `mass: {density?: {part: kg/m3}, default_density?}`: per-part and total
+    mass, centre of mass, the footprint, and whether it tips over (with the
+    tilt it tolerates). Default density 1000.
 - `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,
   same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an

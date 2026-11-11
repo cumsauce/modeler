@@ -94,12 +94,15 @@ pub(crate) fn drain_commands(
                 width,
                 height,
                 focus,
+                style,
                 reply,
             } => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no agent view".into()));
                 } else {
-                    agent_shots.0.push((view, width, height, focus, reply));
+                    agent_shots
+                        .0
+                        .push((view, width, height, focus, style, reply));
                 }
             }
         }

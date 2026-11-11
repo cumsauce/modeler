@@ -19,6 +19,47 @@ pub(crate) struct ApplyOpsArgs {
     /// makes the call an error (the batch itself stays applied).
     #[serde(default)]
     pub(crate) expect: Option<VerifySpec>,
+    /// "brief" (default): the result ends with the parts this call added /
+    /// changed / removed plus warnings. "full": the whole scene summary.
+    #[serde(default)]
+    pub(crate) summary: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct InspectArgs {
+    /// Pairs to measure: [["a", "b"], ...] gives the gap, contact or overlap
+    /// (volume and depth) between two parts; ["a"] alone gives its height
+    /// above the ground.
+    #[serde(default)]
+    pub(crate) measure: Option<Vec<Vec<String>>>,
+    /// A planar cut: {"axis": "x"|"y"|"z", "at": value, "parts"?: [...]}.
+    /// Returns each part's section area, outlines, holes and thinnest wall,
+    /// plus an image of the cut (y = plan, z = front, x = side).
+    #[serde(default)]
+    pub(crate) section: Option<SectionArg>,
+    /// Weigh the visible parts: {"density"?: {"part": kg/m3}, "default_density"?:
+    /// 1000}. Reports mass, centre of mass, and whether it tips over (and at
+    /// what tilt).
+    #[serde(default)]
+    pub(crate) mass: Option<MassArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SectionArg {
+    pub(crate) axis: String,
+    pub(crate) at: f32,
+    #[serde(default)]
+    pub(crate) parts: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MassArg {
+    #[serde(default)]
+    pub(crate) density: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub(crate) default_density: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +177,9 @@ pub(crate) struct AgentViewsArgs {
     /// camera {yaw, pitch, dist?, target?, ortho?, fov?}. E.g.
     /// ["front", "right", "top", "iso"] or [{"yaw": 30, "pitch": 20}, ...].
     pub(crate) views: Vec<ViewArg>,
-    /// Pixel width per view. Default 1280 (640 per cell in a grid).
+    /// Pixel width per view. Default 1280 (640 per cell in a grid, shrunk so
+    /// the whole image stays under ~1.15 MP, the size a model reads at full
+    /// detail).
     #[serde(default)]
     pub(crate) width: Option<u32>,
     /// Pixel height per view. Default 720 (480 per cell in a grid).
@@ -149,6 +192,19 @@ pub(crate) struct AgentViewsArgs {
     /// there is more than one view; false returns one image per view.
     #[serde(default)]
     pub(crate) grid: Option<bool>,
+    /// "shaded" (default) or "ids": every part a flat distinct colour with a
+    /// legend, to tell which shape is which part.
+    #[serde(default)]
+    pub(crate) style: Option<String>,
+    /// Overlay the framed box's width/height and a scale bar (true scale in
+    /// the orthographic views; overall size in perspective ones).
+    #[serde(default)]
+    pub(crate) dims: bool,
+    /// Compare with the previous render of the same view/size/style: magenta
+    /// where something now is, cyan where something was, the rest greyed,
+    /// with the changed share.
+    #[serde(default)]
+    pub(crate) diff: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
