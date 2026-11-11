@@ -607,9 +607,65 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             path,
             closed,
             round,
+            smooth,
+            samples,
+            twist,
+            scale_end,
         } => {
-            let part = crate::csg::sweep(name, profile, path, *closed, *round)?;
+            let path = crate::loft::sample_path(path, *closed, *smooth, *samples);
+            let part =
+                crate::csg::sweep(name, profile, &path, *closed, *round, *twist, *scale_end)?;
             upsert(named, name, part);
+        }
+        Op::Loft {
+            name,
+            sections,
+            path,
+            smooth,
+            samples,
+            steps,
+            round,
+        } => {
+            let o = crate::loft::LoftOpts {
+                path,
+                smooth: *smooth,
+                samples: *samples,
+                steps: *steps,
+                round: *round,
+            };
+            upsert(named, name, crate::loft::loft(name, sections, &o)?);
+        }
+        Op::PathArray {
+            name,
+            input,
+            path,
+            smooth,
+            samples,
+            closed,
+            count,
+            spacing,
+            align,
+            roll_step,
+        } => {
+            let source = lookup(named, input)?;
+            let path = crate::loft::sample_path(path, *closed, *smooth, *samples);
+            let at = crate::loft::placements(&path, *closed, *count, *spacing, *roll_step)
+                .map_err(|e| format!("path_array `{name}`: {e}"))?;
+            let (t0, r0) = (Vec3::from(source.translation), quat_of(source.rotation));
+            for (i, (p, r)) in at.into_iter().enumerate() {
+                let mut part = source.clone();
+                part.name = format!("{name}_{i}");
+                part.visible = true;
+                let r = if *align {
+                    r
+                } else {
+                    bevy::math::Quat::IDENTITY
+                };
+                part.translation = (p + r * t0).to_array();
+                part.rotation = (r * r0).normalize().to_array();
+                let part_name = part.name.clone();
+                upsert(named, &part_name, part);
+            }
         }
         Op::LSystem { name, def } => {
             let d =
@@ -1034,6 +1090,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Revolve { name, .. }
         | Op::Group { name, .. }
         | Op::Sweep { name, .. }
+        | Op::Loft { name, .. }
+        | Op::PathArray { name, .. }
         | Op::Hull { name, .. }
         | Op::LSystem { name, .. }
         | Op::Round { name, .. }
@@ -1067,6 +1125,23 @@ pub fn outputs(op: &Op) -> Vec<String> {
             (first..*count).map(|i| format!("{name}_{i}")).collect()
         }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
+        Op::PathArray {
+            name,
+            path,
+            smooth,
+            samples,
+            closed,
+            count,
+            spacing,
+            ..
+        } => {
+            let len = crate::loft::path_length(
+                &crate::loft::sample_path(path, *closed, *smooth, *samples),
+                *closed,
+            );
+            let n = crate::loft::count_for(len, *closed, *count, *spacing).unwrap_or(0);
+            (0..n).map(|i| format!("{name}_{i}")).collect()
+        }
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
         Op::LSystem { name, def } => {
             let mut v = vec![name.clone()];
@@ -1092,6 +1167,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Revolve { .. } => "revolve",
         Op::Group { .. } => "group",
         Op::Sweep { .. } => "sweep",
+        Op::Loft { .. } => "loft",
+        Op::PathArray { .. } => "path_array",
         Op::Hull { .. } => "hull",
         Op::LSystem { .. } => "lsystem",
         Op::Round { .. } => "round",
@@ -1119,8 +1196,10 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Extrude { .. }
         | Op::Revolve { .. }
         | Op::Sweep { .. }
+        | Op::Loft { .. }
         | Op::LSystem { .. }
         | Op::Prefab { .. } => Vec::new(),
+        Op::PathArray { input, .. } => vec![input],
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
@@ -1318,8 +1397,53 @@ pub fn describe(ops: &[Op]) -> String {
                 path,
                 closed,
                 round,
+                smooth,
+                samples,
+                twist,
+                scale_end,
             } => format!(
-                "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
+                "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}{}{}{}",
+                if *smooth { format!(" smooth (samples={samples})") } else { String::new() },
+                if *twist != 0.0 { format!(" twist={twist}") } else { String::new() },
+                if *scale_end != 1.0 { format!(" scale_end={scale_end}") } else { String::new() },
+            ),
+            Op::Loft {
+                name,
+                sections,
+                path,
+                smooth,
+                samples,
+                steps,
+                round,
+            } => format!(
+                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}",
+                sections
+                    .iter()
+                    .map(|s| format!(
+                        "{{profile={:?} {} scale={:?}{}}}",
+                        s.profile,
+                        s.t.map_or_else(|| format!("at={:?}", s.at), |t| format!("t={t}")),
+                        s.scale,
+                        s.rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if path.is_empty() { String::new() } else { format!(" path={path:?}") }
+            ),
+            Op::PathArray {
+                name,
+                input,
+                path,
+                smooth,
+                closed,
+                count,
+                spacing,
+                align,
+                roll_step,
+                ..
+            } => format!(
+                "#{i} path_array `{name}` = `{input}` along {path:?} smooth={smooth} closed={closed} {} align={align} roll_step={roll_step}",
+                if *count > 0 { format!("count={count}") } else { format!("spacing={spacing}") }
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
             Op::LSystem { name, def } => format!(
@@ -1712,6 +1836,73 @@ mod tests {
         // post (copy 0) + fence_1..fence_3
         assert_eq!(xs, [0.0, 1.0, 2.0, 3.0]);
         assert_eq!(parts[3].name, "fence_3");
+    }
+
+    #[test]
+    fn path_array_spaces_and_turns_copies() {
+        let op = Op::PathArray {
+            name: "posts".into(),
+            input: "post".into(),
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]],
+            smooth: false,
+            samples: 0,
+            closed: false,
+            count: 0,
+            spacing: 1.0,
+            align: true,
+            roll_step: 0.0,
+        };
+        assert_eq!(outputs(&op).len(), 4);
+        let parts = evaluate(&[
+            Op::Primitive {
+                name: "post".into(),
+                kind: crate::PrimitiveKind::Box,
+                size: [0.4, 1.0, 0.1],
+                translation: [0.2, 0.5, 0.0],
+                rotation: None,
+                frame: None,
+            },
+            op,
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(parts.len(), 5);
+        let last = &parts[4];
+        assert_eq!(last.name, "posts_3");
+        // +x turned onto the path (+z): the 0.2 offset lands along z.
+        let t = Vec3::from(last.translation);
+        assert!((t - Vec3::new(0.0, 0.5, 3.2)).length() < 1e-4, "{t}");
+        let x = quat_of(last.rotation) * Vec3::X;
+        assert!((x - Vec3::Z).length() < 1e-4, "{x}");
+    }
+
+    #[test]
+    fn smooth_sweep_is_a_closed_solid_through_its_points() {
+        let circle: Vec<[f32; 2]> = (0..16)
+            .map(|i| {
+                let a = i as f32 / 16.0 * std::f32::consts::TAU;
+                [0.02 * a.cos(), 0.02 * a.sin()]
+            })
+            .collect();
+        let parts = evaluate(&[Op::Sweep {
+            name: "hose".into(),
+            profile: circle,
+            path: vec![
+                [0.0, 0.0, 0.0],
+                [0.3, 0.4, 0.0],
+                [0.6, 0.1, 0.3],
+                [1.0, 0.5, 0.3],
+            ],
+            closed: false,
+            round: 0.0,
+            smooth: true,
+            samples: 0,
+            twist: 0.0,
+            scale_end: 0.5,
+        }])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(crate::csg::part_to_manifold(&parts[0]).is_ok());
+        let top = parts[0].verts.iter().map(|v| v[1]).fold(f32::MIN, f32::max);
+        assert!(top > 0.5 && top < 0.53, "{top}");
     }
 
     #[test]
