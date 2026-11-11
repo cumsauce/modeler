@@ -1164,9 +1164,17 @@ pub fn example(ty: &str) -> Option<Value> {
 /// `describe_op`: with a type, its example and JSON schema; without, one
 /// example line per type.
 pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
+    if let Some(t) = ty {
+        if t == "nodes" {
+            return crate::material::node::describe(None);
+        }
+        if let Some(n) = t.strip_prefix("node:") {
+            return crate::material::node::describe(Some(n));
+        }
+    }
     let Some(ty) = ty else {
         let mut out = vec![
-            "apply_ops item types (describe_op with a kind for its full schema). Values may be \"$param\" or \"=expr\".".to_string(),
+            "apply_ops item types (describe_op with a kind for its full schema; \"nodes\" lists material_ops node types, \"node:<type>\" gives one). Values may be \"$param\" or \"=expr\".".to_string(),
         ];
         for t in OP_TYPES {
             if let Some(e) = example(t) {

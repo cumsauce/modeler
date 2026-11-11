@@ -56,6 +56,13 @@ fn main() -> AppExit {
             );
             session.model = model;
         }
+        session.materials = modeler::material::Library::restore();
+        if !session.materials.docs.is_empty() {
+            eprintln!(
+                "restored {} working material(s) from autosave",
+                session.materials.docs.len()
+            );
+        }
     }
 
     let (tx, rx) = mpsc::channel::<Cmd>(64);

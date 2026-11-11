@@ -201,7 +201,7 @@ fn save_index(kind: Kind, catalog: &Catalog) -> Result<(), ModelerError> {
 
 /// Writes `bytes` to a sibling `.tmp` file and renames it over `path`, so a
 /// crash mid-write never leaves a torn file behind.
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ModelerError> {
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ModelerError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -230,6 +230,22 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
     // printing would multiply its size for nobody's benefit.
     let text = serde_json::to_string(model).map_err(|e| ModelerError::Parse(e.to_string()))?;
     atomic_write(&path, text.as_bytes())
+}
+
+/// Autosaves any per-kind session state (e.g. the working materials) as
+/// `session.json` in that kind's folder.
+pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), ModelerError> {
+    let dir = kind_dir(kind)?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
+    let text = serde_json::to_string(state).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&dir.join("session.json"), text.as_bytes())
+}
+
+/// The autosaved per-kind session state, if present and parseable.
+pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> {
+    let text = fs::read_to_string(kind_dir(kind).ok()?.join("session.json")).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// The last autosaved session model, if one exists and parses. Missing or

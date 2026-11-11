@@ -1806,7 +1806,8 @@ fn slope(s: &Samples, h: &Field, i: usize) -> (f32, f32) {
     ((r - l) / (2.0 * t), (u - d) / (2.0 * t))
 }
 
-/// Tangent-space normal (vec3, z up, -1..1) from a height field in meters
+/// Tangent-space normal (vec3, -1..1; x right, y up the image, z out: the
+/// glTF convention) from a height field in meters
 /// (or any units × `strength`).
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1824,9 +1825,12 @@ impl Eval for NormalFromHeight {
     }
 }
 
+/// The tangent-space normal of a height field at sample `i`, in the glTF /
+/// OpenGL convention: +x along +u, +y *up the image* (toward smaller v; rows
+/// run down), +z out of the surface.
 pub fn height_normal(s: &Samples, h: &Field, i: usize, k: f32) -> [f32; 3] {
     let (dx, dy) = slope(s, h, i);
-    let n = [-dx * k, -dy * k, 1.0];
+    let n = [-dx * k, dy * k, 1.0];
     let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
     n.map(|v| v / l)
 }
@@ -2005,4 +2009,113 @@ pub fn refs(body: &Value) -> Vec<(String, String)> {
     }
     walk(body, None, &mut out);
     out
+}
+
+/// An example node of each type (fields only; `name` added), used by
+/// `describe_op("node:<type>")` and checked to parse by a test.
+pub fn example(ty: &str) -> Option<Value> {
+    use serde_json::json;
+    let body = match ty {
+        "input" => json!({"of": "position"}),
+        "transform" => json!({"scale": 2, "rotate": 0, "offset": [0.1, 0]}),
+        "combine" => json!({"x": "n1", "y": 0.5}),
+        "split" => json!({"input": "pos"}),
+        "polar" => json!({"center": [0.5, 0.5]}),
+        "kaleido" => json!({"segments": 6, "center": [0.5, 0.5]}),
+        "warp" => json!({"by": "n1", "amount": 0.05}),
+        "tile_grid" => json!({"size": [0.25, 0.0625], "stagger": 0.5}),
+        "repeat" => json!({"period": [0.1, 0.1]}),
+        "triplanar" => json!({}),
+        "circle" => json!({"coords": "cells.local", "radius": 0.03}),
+        "rect" => json!({"coords": "bricks.local", "size": [0.24, 0.055], "round": 0.004}),
+        "segment" => json!({"a": [0, 0], "b": [1, 1], "width": 0.01}),
+        "polygon" => json!({"points": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.8]]}),
+        "star" => json!({"radius": 0.2, "inner": 0.08, "points": 5, "center": [0.5, 0.5]}),
+        "hexagon" => json!({"coords": "cells.local", "radius": 0.04}),
+        "arc" => json!({"radius": 0.3, "from": 0, "to": 180, "width": 0.02, "center": [0.5, 0.5]}),
+        "rings" => json!({"spacing": 0.012, "center": [0.5, -2.0]}),
+        "sphere" => json!({"radius": 0.1}),
+        "box" => json!({"size": [0.2, 0.2, 0.2], "round": 0.01}),
+        "torus" => json!({"major": 0.2, "minor": 0.05}),
+        "capsule" => json!({"a": [0, -0.1, 0], "b": [0, 0.1, 0], "radius": 0.05}),
+        "cylinder" => json!({"radius": 0.1, "height": 0.3}),
+        "plane" => json!({"normal": [0, 1, 0], "offset": 0.0}),
+        "sdf_op" => json!({"op": "smooth_union", "a": "c1", "b": "c2", "k": 0.02}),
+        "sdf_round" => json!({"input": "box1", "radius": 0.01}),
+        "onion" => json!({"input": "c1", "thickness": 0.005}),
+        "displace" => json!({"input": "c1", "by": "n1", "amount": 0.01}),
+        "mask" => json!({"sdf": "brick", "mode": "fill"}),
+        "noise" => json!({"size": 0.05, "octaves": 5, "mode": "fbm", "seed": 1}),
+        "worley" => json!({"size": 0.08, "jitter": 1.0}),
+        "math" => json!({"op": "mix", "a": "#202020", "b": "#c0c0c0", "c": "n1"}),
+        "remap" => json!({"input": "n1", "from": [0, 1], "to": [0.6, 0.9]}),
+        "random" => json!({"id": "bricks.id", "out": "color", "min": 0.4, "max": 0.6}),
+        "color" => json!({"value": "#8a5a3c"}),
+        "ramp" => json!({"input": "n1", "stops": [[0.0, "#3b2a1e"], [1.0, "#a07850"]]}),
+        "hsv" => json!({"input": "col", "hue": 0.02, "sat": 0.9, "val": "n1"}),
+        "blend" => {
+            json!({"a": "mortar_col", "b": "brick_col", "mode": "normal", "opacity": "brick_mask"})
+        }
+        "levels" => json!({"input": "n1", "in": [0.3, 0.7], "gamma": 1.2}),
+        "blur" => json!({"input": "h", "radius": 0.004}),
+        "normal_from_height" => json!({"height": "h", "strength": 1.0}),
+        "ao_from_height" => json!({"height": "h", "radius": 0.01}),
+        "curvature" => json!({"height": "h", "strength": 1.0}),
+        "dilate" => json!({"input": "mask1", "radius": 0.003}),
+        "output" => {
+            json!({"base_color": "col", "roughness": "rough", "metallic": 0, "height": "h"})
+        }
+        _ => return None,
+    };
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), json!(ty));
+    m.insert("name".into(), json!(format!("{ty}1")));
+    if let Value::Object(b) = body {
+        m.extend(b);
+    }
+    Some(Value::Object(m))
+}
+
+/// `describe_op("node:<type>")` / `describe_op("nodes")`.
+pub fn describe(ty: Option<&str>) -> Result<String, String> {
+    let Some(ty) = ty else {
+        let mut out = vec![
+            "material_ops node types (describe_op \"node:<type>\" for the schema). Inputs are numbers, [r, g, b], \"#rrggbb\" or another node (\"name\" / \"name.port\"); coords default to the sample's uv (meters).".to_string(),
+        ];
+        for t in NODE_TYPES {
+            if let Some(e) = example(t) {
+                out.push(format!("- {t}: {e}"));
+            }
+        }
+        return Ok(out.join("\n"));
+    };
+    let Some(s) = schema(ty) else {
+        return Err(format!(
+            "unknown node type `{ty}` (one of: {})",
+            NODE_TYPES.join(", ")
+        ));
+    };
+    Ok(format!(
+        "example:\n{}\n\nschema (plus \"type\": \"{ty}\", \"name\"):\n{}",
+        serde_json::to_string_pretty(&example(ty).unwrap_or(Value::Null)).unwrap_or_default(),
+        serde_json::to_string_pretty(&s).unwrap_or_default()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_node_type_has_a_parseable_example() {
+        for t in NODE_TYPES {
+            let Some(Value::Object(mut m)) = example(t) else {
+                panic!("no example for {t}");
+            };
+            m.remove("type");
+            m.remove("name");
+            parse_body(t, &Value::Object(m), t).unwrap_or_else(|e| panic!("{e}"));
+            assert!(describe(Some(t)).is_ok());
+        }
+    }
 }

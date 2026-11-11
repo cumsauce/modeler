@@ -119,6 +119,75 @@ pub(crate) struct AnnotationIdArgs {
 pub(crate) struct HistoryIdArgs {
     /// The history node id, as shown by history.
     pub(crate) id: usize,
+    /// "model" (default) or "material:<name>".
+    #[serde(default)]
+    pub(crate) doc: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct DocArgs {
+    /// "model" (default) or "material:<name>" for a material's own history.
+    #[serde(default)]
+    pub(crate) doc: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct MaterialOpsArgs {
+    /// The working material to edit (created if missing).
+    pub(crate) material: String,
+    /// Nodes to upsert, each {"type", "name", ...} (see describe_op).
+    #[serde(default)]
+    pub(crate) ops: Vec<Value>,
+    /// Named numbers usable as "$name" / "=expr" in node fields.
+    #[serde(default)]
+    pub(crate) params: Option<std::collections::BTreeMap<String, f64>>,
+    /// "tile" (default) or "object".
+    #[serde(default)]
+    pub(crate) domain: Option<String>,
+    /// Tile size in meters (tile domain; default 1).
+    #[serde(default)]
+    pub(crate) tile: Option<f32>,
+    /// Bake resolution in texels (default 512).
+    #[serde(default)]
+    pub(crate) resolution: Option<u32>,
+    /// Checks after the edit: {"tileable", "ranges", "normals": true,
+    /// "albedo": true | [lo, hi], "coverage": [{"node", "min", "max"}]}.
+    #[serde(default)]
+    pub(crate) expect: Option<modeler::material::MatExpect>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct MaterialViewArgs {
+    /// Material name (default: the one last edited).
+    #[serde(default)]
+    pub(crate) material: Option<String>,
+    /// Show one node's output ("name" or "name.port") instead.
+    #[serde(default)]
+    pub(crate) node: Option<String>,
+    /// Channel thumbnails to show (default: base_color + every driven one).
+    #[serde(default)]
+    pub(crate) channels: Option<Vec<String>>,
+    /// Sphere image size in px (default 256).
+    #[serde(default)]
+    pub(crate) size: Option<usize>,
+    /// Preview sphere diameter in meters (default 2 tiles, or 0.5 m).
+    #[serde(default)]
+    pub(crate) diameter: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct MaterialCatalogArgs {
+    /// list, working, describe, save, load or delete.
+    pub(crate) action: String,
+    /// The material (save defaults to the active one).
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) prompt: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -267,4 +336,7 @@ pub(crate) struct HistoryArgs {
     /// Show only the newest N nodes (plus the cursor). Default 30.
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+    /// "model" (default) or "material:<name>".
+    #[serde(default)]
+    pub(crate) doc: Option<String>,
 }

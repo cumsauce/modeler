@@ -177,6 +177,8 @@ pub struct PendingPin {
 /// The modeling session the MCP tools drive.
 pub struct Session {
     pub model: Model,
+    /// The working procedural materials (each with its own history tree).
+    pub materials: crate::material::Library,
     /// The human's last click on the model, if it hasn't been commented yet.
     pub pending_pin: Option<PendingPin>,
     /// Nesting depth of [`Session::batch`]; while > 0, commits are collected
@@ -189,6 +191,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             model: Model::named("model"),
+            materials: Default::default(),
             pending_pin: None,
             batch_depth: 0,
             batch_labels: Vec::new(),

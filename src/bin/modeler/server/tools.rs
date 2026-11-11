@@ -67,6 +67,7 @@ impl Tools {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = Cmd::Exec(Box::new(move |session: &mut Session| {
             let before = session.persist_fingerprint();
+            let mats_before = session.materials.fingerprint();
             let reply = match f(session) {
                 Ok((text, json)) => {
                     let _ = json_tx.send(json);
@@ -84,6 +85,9 @@ impl Tools {
                 && let Err(e) = catalog::save_session_state(&session.model)
             {
                 eprintln!("session autosave failed: {e}");
+            }
+            if session.materials.fingerprint() != mats_before {
+                session.materials.autosave();
             }
             let _ = reply_tx.send(reply.clone());
             reply
@@ -203,6 +207,187 @@ pub(crate) fn log_call(tool: &str, ok: bool, ms: u128) {
 
 #[tool_router]
 impl Tools {
+    /// Build or edit a procedural PBR material (created if missing): an
+    /// array of nodes, each {"type", "name", ...fields}, upserted by name
+    /// (re-issue to tweak; {"type": "delete", "name"} removes one). Nodes read
+    /// other nodes by name ("bricks", or a port "bricks.id"); constants are
+    /// numbers, [r, g, b] or "#rrggbb". One `output` node names the channels
+    /// (base_color, roughness, metallic, height (meters, makes the normal),
+    /// normal, ao, emissive, opacity). domain "tile" (default: seamless
+    /// `tile` meters square, mapped at real scale) or "object" (3D fields on
+    /// the surface). Atomic: any error changes nothing. `expect` checks
+    /// tileable, ranges, albedo, normals, coverage. describe_op(kind) has an
+    /// example and schema for every node type.
+    #[tool]
+    async fn material_ops(
+        &self,
+        Parameters(MaterialOpsArgs {
+            material,
+            ops,
+            params,
+            domain,
+            tile,
+            resolution,
+            expect,
+        }): Parameters<MaterialOpsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| {
+            let (text, ok) = s.materials.ops(
+                &material,
+                ops,
+                params,
+                domain,
+                tile,
+                resolution,
+                expect.as_ref(),
+            )?;
+            if ok {
+                Ok(text)
+            } else {
+                Err(format!("expect FAILED (the edit was applied)\n{text}").into())
+            }
+        })
+        .await
+    }
+
+    /// Look at a material without the window: a lit sphere plus channel
+    /// thumbnails (or `channels` to pick them), or `node` ("noise1",
+    /// "bricks.id") to see one node's output. Rendered on the CPU from the
+    /// same bake that gets exported. Default: the material last edited.
+    #[tool]
+    async fn material_view(
+        &self,
+        Parameters(MaterialViewArgs {
+            material,
+            node,
+            channels,
+            size,
+            diameter,
+        }): Parameters<MaterialViewArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (png_tx, png_rx) = std::sync::mpsc::channel();
+        let r = self
+            .run(move |s| {
+                let (text, png) = s.materials.view(
+                    material.as_deref(),
+                    node.as_deref(),
+                    channels,
+                    size,
+                    diameter,
+                )?;
+                let _ = png_tx.send(png);
+                Ok(text)
+            })
+            .await?;
+        let mut r = r;
+        if let Ok(png) = png_rx.try_recv() {
+            r.content.push(Content::image(B64.encode(png), "image/png"));
+        }
+        Ok(r)
+    }
+
+    /// The material library (shared across models, like prefabs): action
+    /// "list" (saved entries), "working" (this session's materials),
+    /// "describe" (a working or saved material's nodes), "save" (a working
+    /// material, with description, tags, prompt), "load" (into the working
+    /// set) or "delete" (moves the file to removed/).
+    #[tool]
+    async fn material_catalog(
+        &self,
+        Parameters(MaterialCatalogArgs {
+            action,
+            name,
+            description,
+            tags,
+            prompt,
+        }): Parameters<MaterialCatalogArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| {
+            use modeler::catalog::Kind;
+            let need = |what: &str, v: &Option<String>| {
+                v.clone().ok_or_else(|| format!("{action}: needs `{what}`"))
+            };
+            Ok(match action.as_str() {
+                "list" => {
+                    let e = catalog::list_kind(Kind::Materials)?;
+                    if e.is_empty() {
+                        "material library is empty".to_string()
+                    } else {
+                        format_catalog(&e).replace("catalog entries", "saved materials")
+                    }
+                }
+                "working" => {
+                    let lines: Vec<String> = s
+                        .materials
+                        .docs
+                        .values()
+                        .map(|d| {
+                            format!(
+                                "- `{}` v{}: {} domain, {} node(s){}",
+                                d.name,
+                                d.version,
+                                d.domain,
+                                d.nodes.len(),
+                                if s.materials.active.as_deref() == Some(&d.name) {
+                                    " (active)"
+                                } else {
+                                    ""
+                                }
+                            )
+                        })
+                        .collect();
+                    if lines.is_empty() {
+                        "no working materials".into()
+                    } else {
+                        lines.join("\n")
+                    }
+                }
+                "describe" => {
+                    let n = need("name", &name)?;
+                    match s.materials.get(Some(&n)) {
+                        Ok(d) => d.describe(),
+                        Err(_) => {
+                            let e = catalog::entry(Kind::Materials, &n)?;
+                            let d: modeler::material::MatDoc =
+                                catalog::load_doc(Kind::Materials, &n)?;
+                            format!(
+                                "saved `{}`: {} [{}]\nprompt: {}\n{}",
+                                e.name,
+                                e.description,
+                                e.tags.join(", "),
+                                e.prompt,
+                                d.describe()
+                            )
+                        }
+                    }
+                }
+                "save" => {
+                    let tags = tags.unwrap_or_default();
+                    let t: Vec<&str> = tags.iter().map(String::as_str).collect();
+                    s.materials.save(
+                        name.as_deref(),
+                        &need("description", &description)?,
+                        &t,
+                        &prompt.clone().unwrap_or_default(),
+                    )?
+                }
+                "load" => s.materials.load(&need("name", &name)?)?,
+                "delete" => {
+                    let n = need("name", &name)?;
+                    catalog::delete_doc(Kind::Materials, &n)?;
+                    format!("deleted saved material `{n}` (moved to removed/)")
+                }
+                other => {
+                    return Err(format!(
+                        "action `{other}`: use list, working, describe, save, load or delete"
+                    )
+                    .into());
+                }
+            })
+        })
+        .await
+    }
+
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
     /// Call this first (and after any confusing result) to ground yourself in the model.
     #[tool]
@@ -314,17 +499,33 @@ impl Tools {
     }
 
     /// Undo the last mutation (parts, booleans, transforms, materials, renames...).
+    /// `doc: "material:<name>"` undoes that material's last edit instead.
     #[tool]
-    async fn undo(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| s.undo()).await
+    async fn undo(
+        &self,
+        Parameters(DocArgs { doc }): Parameters<DocArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| match material_doc(doc.as_deref())? {
+            Some(m) => Ok(s.materials.undo(m)?),
+            None => s.undo(),
+        })
+        .await
     }
 
     /// Redo: re-apply the most recent undone mutation (the newest child in the
     /// history tree). If you jumped to an older state and edited, redo follows
     /// the branch you are on.
+    /// `doc: "material:<name>"` acts on that material's history.
     #[tool]
-    async fn redo(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| s.redo()).await
+    async fn redo(
+        &self,
+        Parameters(DocArgs { doc }): Parameters<DocArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| match material_doc(doc.as_deref())? {
+            Some(m) => Ok(s.materials.redo(m)?),
+            None => s.redo(),
+        })
+        .await
     }
 
     /// Show the history tree: one line per snapshot with its id, parent, label
@@ -333,9 +534,13 @@ impl Tools {
     #[tool]
     async fn history(
         &self,
-        Parameters(HistoryArgs { limit }): Parameters<HistoryArgs>,
+        Parameters(HistoryArgs { limit, doc }): Parameters<HistoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| Ok(s.history(limit))).await
+        self.run(move |s| match material_doc(doc.as_deref())? {
+            Some(m) => Ok(s.materials.history(m)?),
+            None => Ok(s.history(limit)),
+        })
+        .await
     }
 
     /// Prune old history to bound memory and autosave size: keeps the newest
@@ -356,9 +561,13 @@ impl Tools {
     #[tool]
     async fn jump(
         &self,
-        Parameters(HistoryIdArgs { id }): Parameters<HistoryIdArgs>,
+        Parameters(HistoryIdArgs { id, doc }): Parameters<HistoryIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.jump(id)).await
+        self.run(move |s| match material_doc(doc.as_deref())? {
+            Some(m) => Ok(s.materials.jump(m, id)?),
+            None => s.jump(id),
+        })
+        .await
     }
 
     /// List the procedural graph: one line per op with its inputs.
@@ -908,6 +1117,7 @@ impl rmcp::ServerHandler for Tools {
 - scene_summary, apply_ops and verify also return structuredContent JSON.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
+- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. undo/redo/jump/history take doc \"material:<name>\".
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
@@ -916,6 +1126,19 @@ Full details live in AGENTS.md next to the source.";
         )
         .with_server_info(rmcp::model::Implementation::new("modeler", "0.1.0"))
         .with_instructions(INSTRUCTIONS)
+    }
+}
+
+/// `doc` on history tools: None/"model" = the model, "material:<name>" (or
+/// "material" for the active one) = a material's own history.
+fn material_doc(doc: Option<&str>) -> Result<Option<Option<&str>>, String> {
+    match doc {
+        None | Some("model") => Ok(None),
+        Some("material") => Ok(Some(None)),
+        Some(d) => match d.strip_prefix("material:") {
+            Some(n) => Ok(Some(Some(n))),
+            None => Err(format!("doc `{d}`: use \"model\" or \"material:<name>\"")),
+        },
     }
 }
 

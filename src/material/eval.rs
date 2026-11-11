@@ -65,6 +65,41 @@ impl Samples {
         }
     }
 
+    /// The surface of a sphere of `radius` meters centred at the origin as
+    /// an equirectangular grid (`2n` × `n`, top row = north pole): pos and
+    /// normal per texel, uv = (longitude, colatitude) arc lengths in meters.
+    /// The object-domain preview, before part atlases exist.
+    pub fn sphere(n: usize, radius: f32) -> Samples {
+        let (w, h) = ((2 * n).max(2), n.max(1));
+        let r = radius.max(1e-6);
+        let mut uv = Vec::with_capacity(w * h);
+        let mut pos = Vec::with_capacity(w * h);
+        let mut nrm = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let th = (y as f32 + 0.5) / h as f32 * std::f32::consts::PI;
+            for x in 0..w {
+                let ph = (x as f32 + 0.5) / w as f32 * std::f32::consts::TAU;
+                let d = [th.sin() * ph.sin(), th.cos(), th.sin() * ph.cos()];
+                uv.push([ph * r, th * r]);
+                pos.push(d.map(|c| c * r));
+                nrm.push(d);
+            }
+        }
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        ("sphere", n, r.to_bits()).hash(&mut hs);
+        Samples {
+            w,
+            h,
+            uv: Arc::new(Buf::V2(uv)),
+            pos: Arc::new(Buf::V3(pos)),
+            nrm: Arc::new(Buf::V3(nrm)),
+            valid: None,
+            period: 0.0,
+            texel: std::f32::consts::PI * r / h as f32,
+            key: hs.finish(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.w * self.h
     }

@@ -3,11 +3,13 @@
 //! grid, or the texels of a part's atlas) and baked into PBR channels.
 
 pub mod bake;
+pub mod doc;
 pub mod eval;
 pub mod node;
 pub mod noise;
 pub mod sdf;
 
 pub use bake::{Channels, bake};
+pub use doc::{Library, MatDoc, MatExpect};
 pub use eval::{Samples, evaluate};
 pub use node::{Buf, In, NODE_TYPES};

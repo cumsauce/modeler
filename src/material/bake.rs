@@ -194,39 +194,35 @@ impl Channels {
         Ok(out)
     }
 
-    /// The largest jump across the tile's wrap seams relative to the largest
-    /// jump between interior neighbours, per channel (≈ 1 or less = seamless).
+    /// How seamy the tile's wrap edges are: per edge texel, the jump across
+    /// the wrap over the mean jump just inside on both sides, and the median
+    /// of that over every edge texel. ~1 when the tile repeats cleanly (the
+    /// seam looks like any other texel step, even for fine noise); a
+    /// pattern that does not wrap lands well above 2.
     pub fn seam_ratio(&self, name: &str) -> Result<f32, String> {
         let img = self.image(name)?;
         let (w, h) = (img.w, img.h);
+        if w < 3 || h < 3 {
+            return Ok(0.0);
+        }
         let g = |x: usize, y: usize| -> [f32; 3] {
             let i = (y * w + x) * 4;
             [img.px[i] as f32, img.px[i + 1] as f32, img.px[i + 2] as f32]
         };
         let d = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f32::max);
-        let mut inner = 0.0f32;
+        let mut r = Vec::with_capacity(w + h);
         for y in 0..h {
-            for x in 1..w {
-                inner = inner.max(d(g(x - 1, y), g(x, y)));
-            }
+            let seam = d(g(w - 1, y), g(0, y));
+            let local = 0.5 * (d(g(w - 2, y), g(w - 1, y)) + d(g(0, y), g(1, y)));
+            r.push(seam / (local + 2.0));
         }
         for x in 0..w {
-            for y in 1..h {
-                inner = inner.max(d(g(x, y - 1), g(x, y)));
-            }
+            let seam = d(g(x, h - 1), g(x, 0));
+            let local = 0.5 * (d(g(x, h - 2), g(x, h - 1)) + d(g(x, 0), g(x, 1)));
+            r.push(seam / (local + 2.0));
         }
-        let mut seam = 0.0f32;
-        for y in 0..h {
-            seam = seam.max(d(g(w - 1, y), g(0, y)));
-        }
-        for x in 0..w {
-            seam = seam.max(d(g(x, h - 1), g(x, 0)));
-        }
-        Ok(if inner < 1.0 {
-            if seam < 1.0 { 0.0 } else { f32::INFINITY }
-        } else {
-            seam / inner
-        })
+        r.sort_by(f32::total_cmp);
+        Ok(r[r.len() / 2])
     }
 }
 
@@ -260,7 +256,7 @@ mod tests {
         let a = bake(&bricks(), &p, &s, false).unwrap_or_else(|e| panic!("{e}"));
         for ch in ["base_color", "roughness", "normal"] {
             let r = a.seam_ratio(ch).unwrap_or_else(|e| panic!("{e}"));
-            assert!(r <= 1.0, "{ch} seam ratio {r}");
+            assert!(r <= 1.5, "{ch} seam ratio {r}");
         }
         assert!(a.roughness.iter().all(|r| (0.7..=0.95).contains(r)));
         assert!(a.driven.contains(&"normal"));
