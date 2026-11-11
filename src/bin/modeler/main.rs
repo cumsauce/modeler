@@ -2,7 +2,8 @@
 //! server on stdio. No game code.
 //!
 //! Run `modeler` for a windowed preview, `modeler --headless` for no window/render,
-//! and `modeler --model <path.json>` to start from a saved [`modeler::Model`].
+//! `modeler --model <path.json>` to start from a saved [`modeler::Model`], and
+//! `modeler --restore` to pick up the autosaved session (the default starts empty).
 //!
 //! Bridge design: the MCP server runs in its own thread on its own tokio runtime
 //! (winit wants the main thread, so Bevy keeps it). Tools send a `Cmd` (a closure over
@@ -60,10 +61,14 @@ fn main() -> AppExit {
     let mut offscreen = false;
     let mut print_catalog_dir = false;
     let mut model_path: Option<PathBuf> = None;
+    // Start empty unless asked: `--restore` (or MODELER_RESTORE=1) brings
+    // back the autosaved session, open docs and working materials.
+    let mut restore = std::env::var("MODELER_RESTORE").is_ok_and(|v| v == "1");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--headless" => headless = true,
+            "--restore" => restore = true,
             "--offscreen" => offscreen = true,
             "--model" => model_path = args.next().map(PathBuf::from),
             "--print-catalog-dir" => print_catalog_dir = true,
@@ -77,7 +82,7 @@ fn main() -> AppExit {
                 unsafe { std::env::set_var("MODELER_PROJECT", dir) };
             }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json>] [--project <game dir>] [--print-catalog-dir])"
+                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json> | --restore] [--project <game dir>] [--print-catalog-dir])"
             ),
         }
     }
@@ -125,9 +130,9 @@ fn main() -> AppExit {
             }
             Err(e) => eprintln!("could not load {}: {e}", path.display()),
         }
-    } else {
-        // No explicit model: restore the last session's autosave so unnamed
-        // WIP (ops, parts, history tree, annotations) survives a restart.
+    } else if restore {
+        // Restore the last session's autosave so unnamed WIP (ops, parts,
+        // history tree, annotations) survives a restart.
         if let Some(model) = catalog::load_session_state() {
             eprintln!(
                 "restored session model `{}` (v{}) from autosave",

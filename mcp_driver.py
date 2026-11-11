@@ -93,6 +93,7 @@ class ModelerSession:
         # mode: "windowed" (preview window), "offscreen" (renders agent views,
         # no window), "headless" (no renderer at all).
         cmd = [BINARY] + {"windowed": [], "offscreen": ["--offscreen"]}.get(mode, ["--headless"])
+        cmd.append("--restore")  # daemon restarts and throwaway runs pick up the autosave
         env = dict(os.environ)
         if slot:
             # A server that does not own the main autosave writes

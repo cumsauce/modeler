@@ -554,7 +554,7 @@ re-derives it with the scene's tokens layered over its own (scene wins;
 re-themes with `style set` on the scene); an object patches tokens for that
 instance (`{"colors": {"primary": "#c33"}}`, a red-alert variant). Only
 items that read tokens (`@color`, presets) follow. The inactive docs
-autosave to `open_docs.json` and restore on startup; the preview window
+autosave to `open_docs.json` and come back with `--restore`; the preview window
 shows tabs for open docs (click to switch).
 
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
@@ -567,7 +567,10 @@ outliner groups, listed with their parts), `list_annotations`,
 ms). Every mutation marks the session for autosave (ops, params, history,
 annotations; op-derived parts are left out and re-derive on restore), and the
 app writes `session.json` once edits pause for 0.5 s and on exit, so the write
-never sits on a tool call. It is restored on startup. The history tree goes to an append-only
+never sits on a tool call. A server started with `--restore` (or
+`MODELER_RESTORE=1`) restores it on startup; a plain `modeler` (what the
+MCP config runs) starts empty, and its first edit starts a new autosave.
+`mcp_driver.py` always passes `--restore`, so daemon restarts keep the work. The history tree goes to an append-only
 journal beside it (`session.history.jsonl`, one node per line): a save
 appends only the new nodes, and rewrites the file only after undo branches
 or pruning, so the autosave stays small however long the session runs. `save_prefab` only
@@ -846,7 +849,7 @@ Material toggles match O, S and M.
   `pkill -f target/debug/modeler` — the MCP client respawns the server from
   the binary on disk on the next tool call. The respawned session AUTOSAVES
   and RESTORES: mutations are written to `session.json` in the catalog dir
-  0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server without an explicit `--model` restores it on startup, so
+  0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server started with `--restore` (the driver always does) restores it on startup, so
   unnamed WIP survives restarts. `new_model` starts clean (the old model
   stays one undo away, also in the autosave). `--model <path>` skips the
   restore and loads that file instead. The MCP tool list is fixed per
