@@ -7,7 +7,7 @@ use crate::{Model, Op, Part, Vec3, graph, quat_of};
 
 /// Signed volume of a part's mesh in world space (transform applied). Positive
 /// for outward-wound closed meshes; reliable only as a sanity signal for
-/// boolean outputs, which csgrs produces closed and welded.
+/// boolean outputs, which Manifold produces closed.
 fn world_signed_volume(p: &Part) -> f64 {
     let rot = quat_of(p.rotation);
     let scale = Vec3::from(p.scale);
@@ -362,9 +362,9 @@ pub fn lints(model: &Model) -> Vec<String> {
             _ => {}
         }
     }
-    // Boolean outputs with open edges: csgrs seams or missing faces. Curved
-    // cuts often carry a few harmlessly; a large count can mean see-through
-    // geometry, so point at the deterministic checks.
+    // Boolean outputs with open edges that enclose real area. Manifold outputs
+    // are closed, so this is a safety net: curved cuts can show a few
+    // weld-grid open edges that enclose ~0 area and stay silent.
     for op in &model.ops {
         if let Op::Boolean { name, .. } = op
             && let final_name = final_name_after_renames(&model.ops, name)

@@ -46,7 +46,9 @@ pub fn ensure_normals(part: &mut Part) {
 /// normals of the triangles sharing its vertex that lie within `degrees` of the
 /// corner's own face. Vertices whose corners disagree are split, so a hard edge
 /// (a boolean cut) stays crisp while a faceted cylinder wall stays smooth.
-/// Rewrites verts/normals/indices; UVs are cleared, so re-project them after.
+/// Incidence is gathered by position (1e-5 grid), so verts split only for a UV
+/// seam still share one smooth normal. Rewrites verts/normals/indices; UVs are
+/// kept when present (split verts copy theirs).
 pub fn crease_normals(part: &mut Part, degrees: f32) {
     use std::collections::HashMap;
     let count = part.verts.len();
@@ -58,7 +60,22 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
     let idx = |i: usize| -> usize { part.indices.get(i).copied().unwrap_or(i as u32) as usize };
     let mut tri_ids = Vec::with_capacity(tris);
     let mut face_n = Vec::with_capacity(tris);
-    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); count];
+    // Group verts by position so UV-seam duplicates share incidence.
+    let mut group_of_pos: HashMap<[i64; 3], usize> = HashMap::new();
+    let group: Vec<usize> = part
+        .verts
+        .iter()
+        .map(|v| {
+            let k = [
+                (v[0] as f64 * 1e5).round() as i64,
+                (v[1] as f64 * 1e5).round() as i64,
+                (v[2] as f64 * 1e5).round() as i64,
+            ];
+            let next = group_of_pos.len();
+            *group_of_pos.entry(k).or_insert(next)
+        })
+        .collect();
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); group_of_pos.len()];
     for t in 0..tris {
         let (a, b, c) = (idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2));
         if a >= count || b >= count || c >= count {
@@ -70,19 +87,21 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
         tri_ids.push([a, b, c]);
         face_n.push(n);
         for v in [a, b, c] {
-            incident[v].push(k);
+            incident[group[v]].push(k);
         }
     }
     let cos_limit = degrees.to_radians().cos();
     let mut verts = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let keep_uvs = part.uvs.len() == count;
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices = Vec::new();
     let mut remap: HashMap<(usize, [i32; 3]), u32> = HashMap::new();
     for (k, ids) in tri_ids.iter().enumerate() {
         let own = face_n[k].normalize_or_zero();
         for &v in ids {
             let mut acc = Vec3::ZERO;
-            for &o in &incident[v] {
+            for &o in &incident[group[v]] {
                 if face_n[o].normalize_or_zero().dot(own) >= cos_limit {
                     acc += face_n[o];
                 }
@@ -103,6 +122,9 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
             let id = *remap.entry(key).or_insert_with(|| {
                 verts.push(part.verts[v]);
                 normals.push(n.to_array());
+                if keep_uvs {
+                    uvs.push(part.uvs[v]);
+                }
                 (verts.len() - 1) as u32
             });
             indices.push(id);
@@ -111,7 +133,7 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
     part.verts = verts;
     part.normals = normals;
     part.indices = indices;
-    part.uvs.clear();
+    part.uvs = uvs;
 }
 
 /// Project UVs with `projection` (default "box"). Keeps every UV in [0, 1].

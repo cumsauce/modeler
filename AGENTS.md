@@ -58,16 +58,15 @@ tweak path):
 - `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
   parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
   may tweak.
-- **Booleans** nudge the second operand ~2 mm when one of its faces shares a
-  plane with a face of the first (csgrs drops faces on coplanar-but-disjoint
-  planes, e.g. two equal-depth cutters). `scene_summary` warns when a visible
-  boolean output has open edges that enclose real missing area (hairline seams
-  don't trigger it). Booleans output welded meshes (1e-4 grid), but curved cuts can still
-  carry seam edges — `validate` reports them honestly; they render fine in
-  practice. Curved-on-curved (cylinder−cylinder, torus anything) can produce
-  corrupted noise — compose or fake instead (the catalog's mug does).
-  Boolean math comes from csgrs, which only exports polygon soup, so the
-  weld is the glue; don't expect guaranteed manifoldness.
+- **Booleans** run on Manifold (the kernel OpenSCAD and Blender use): outputs
+  are closed solids, coplanar faces (equal-depth cutters) are exact, and
+  curved-on-curved (cylinder−cylinder, sphere/torus anything) works. Input
+  UVs ride through the cut; normals are creased at 40°. **Both inputs must be
+  closed solids** — disc/plane/washer (open sheets) and torn meshes error
+  with "is not a closed solid". `validate` can report a few open edges on
+  curved cuts: Manifold places intersection verts closer than its 1e-5 weld
+  grid; they are not holes (`scene_summary` only warns when open edges
+  enclose real missing area).
 - `op_primitive(name, kind, size, translation, rotation?)` — `size` is
   **always exactly `[f32; 3]`**: `box`/`plane`/`wedge` (full extents),
   `sphere` (**radius = size[0]; [1]/[2] ignored** — flatten with a transform's
@@ -81,8 +80,7 @@ tweak path):
   `translation [0.4, 0, 0]` lands at y=0. Restate the template's full
   position/rotation in every copy.
 - `op_boolean(name, op, a, b)` — `union`/`difference`/`intersection`; bakes
-  transforms into verts. Panics inside csgrs on degenerate triangles, so keep
-  inputs sane. Errors (e.g. no overlap) roll the graph back — it never stays
+  transforms into verts. Errors (e.g. no overlap) roll the graph back — it never stays
   broken.
 - `op_radial_array(name, input, count, center, degrees, start_degrees,
   axis?, include_source?)` — ring of copies about `axis` (`"y"` default; `"x"`/`"z"` make

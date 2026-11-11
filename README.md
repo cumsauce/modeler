@@ -6,6 +6,8 @@ window. Built standalone out of the friendSLOP workspace; no game code.
 ## Run
 
 ```sh
+# Booleans use Manifold (C++): the first build needs git, cmake and a C++
+# compiler, and clones the library from the network.
 cargo run                # MCP server on stdio + preview window
 cargo run -- --headless  # no window/render, for CI or remote agents
 ```

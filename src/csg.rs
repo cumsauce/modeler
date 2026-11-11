@@ -1,231 +1,143 @@
-//! Boolean operations on parts via csgrs. Both parts are transformed into model space
-//! (translation/rotation/scale baked in), the op runs on triangle soup, and the result
-//! comes back as a plain triangle `Part` with box-projected UVs and part `a`'s material.
+//! Boolean operations on parts via Manifold (`manifold-csg`, bindings to the C++
+//! kernel OpenSCAD and Blender use). Both parts are transformed into model space
+//! (translation/rotation/scale baked in) and carry their UVs as vertex properties;
+//! the result is a closed, manifold triangle `Part` with interpolated UVs, creased
+//! normals and part `a`'s material. Coplanar faces are resolved exactly by the
+//! kernel, so no nudging or welding is needed.
 
 use crate::{BoolOp, Model, ModelerError, Part, quat_of};
 use bevy::math::{Quat, Vec3};
-use csgrs::CSG;
-use std::collections::HashMap;
+use manifold_csg::{Manifold, MeshGL64};
 
-fn run_op(op: BoolOp, a: &CSG<()>, b: &CSG<()>) -> CSG<()> {
+/// Vertex properties per vertex: position (3) + UV (2).
+const N_PROPS: usize = 5;
+
+fn run_op(op: BoolOp, a: &Manifold, b: &Manifold) -> Manifold {
     match op {
         BoolOp::Union => a.union(b),
-        BoolOp::Difference => a.subtract(b),
-        BoolOp::Intersect => a.intersect(b),
+        BoolOp::Difference => a.difference(b),
+        BoolOp::Intersect => a.intersection(b),
     }
 }
 
-/// A part's triangles in model space, as a csgrs mesh: translation, rotation and scale
-/// baked in. Each triangle becomes its own face; csgrs derives the plane normals.
-fn part_to_csg(part: &Part) -> CSG<()> {
-    let rot = quat_of(part.rotation);
-    let scale = Vec3::from(part.scale);
-    let to_model = |v: &[f32; 3]| -> [f64; 3] {
-        let p = rot * (Vec3::from(*v) * scale) + Vec3::from(part.translation);
-        [p.x as f64, p.y as f64, p.z as f64]
-    };
-    let count = part.verts.len();
-    let index_at =
-        |i: usize| -> usize { part.indices.get(i).copied().unwrap_or(i as u32) as usize };
-    let tris = if part.indices.is_empty() {
-        count / 3
-    } else {
-        part.indices.len() / 3
-    };
-    let points: Vec<[f64; 3]> = part.verts.iter().map(to_model).collect();
-    let mut faces: Vec<Vec<usize>> = Vec::with_capacity(tris);
-    for t in 0..tris {
-        let i = [index_at(t * 3), index_at(t * 3 + 1), index_at(t * 3 + 2)];
-        if i.iter().any(|k| *k >= count) {
-            continue;
-        }
-        // Skip degenerate triangles: csgrs panics on planes through collinear points.
-        let (va, vb, vc) = (
-            Vec3::from(part.verts[i[0]]),
-            Vec3::from(part.verts[i[1]]),
-            Vec3::from(part.verts[i[2]]),
-        );
-        let n = (vb - va).cross(vc - va);
-        if !n.is_finite() || n.length_squared() < 1e-12 {
-            continue;
-        }
-        faces.push(i.to_vec());
-    }
-    // `polyhedron` panics on out-of-range indices, so the validation above must hold.
-    debug_assert!(faces.iter().flatten().all(|k| *k < points.len()));
-    CSG::polyhedron(&points, &faces)
-}
-
-/// csgrs emits polygon soup; the weld merges cut-boundary duplicates. Remaining seams
-/// are possible and are reported by validate — acceptable.
-/// Returns a flat triangle part (three verts per triangle), welded and sliver-free.
-fn csg_to_part(csg: &CSG<()>, name: &str, material: crate::Material) -> Part {
-    let mut part = triangle_soup(csg, name, material);
-    weld_and_drop_slivers(&mut part);
-    part
-}
-
-/// The unwelded csgrs output: one vertex triple per triangle.
-fn triangle_soup(csg: &CSG<()>, name: &str, material: crate::Material) -> Part {
-    let mut part = Part::new(name);
-    part.material = material;
-    for poly in csg.to_polygons() {
-        for tri in poly.triangulate() {
-            let base = part.verts.len() as u32;
-            for v in &tri {
-                let p = &v.pos;
-                part.verts.push([p.x as f32, p.y as f32, p.z as f32]);
-            }
-            part.indices.extend([base, base + 1, base + 2]);
-        }
-    }
-    part
-}
-
-/// Quantise a position onto the 1e-4 weld grid (the tolerance `validate` uses).
-fn grid_key(v: &[f32; 3]) -> [i64; 3] {
-    [
-        (v[0] as f64 * 1e4).round() as i64,
-        (v[1] as f64 * 1e4).round() as i64,
-        (v[2] as f64 * 1e4).round() as i64,
-    ]
-}
-
-/// Snap a quantised position back to its grid-cell centre as f32, so a vertex's
-/// position agrees exactly with its key.
-fn snap_to_grid(v: &[f32; 3]) -> [f32; 3] {
-    let k = grid_key(v);
-    [
-        (k[0] as f32) / 1e4,
-        (k[1] as f32) / 1e4,
-        (k[2] as f32) / 1e4,
-    ]
-}
-
-/// Weld near-duplicate vertices left behind by csgrs's triangle-soup output and drop
-/// degenerate triangles. Vertices are merged on a 1e-4 quantisation grid (the
-/// tolerance `validate` uses) and snapped to its centres, so a vertex's position
-/// agrees exactly with its key. Normals and UVs are cleared — callers must
-/// regenerate them (see `boolean`). O(n); cannot hang.
-fn weld_and_drop_slivers(part: &mut Part) {
-    let mut remap: HashMap<[i64; 3], u32> = HashMap::with_capacity(part.verts.len());
-    let mut welded = Vec::with_capacity(part.verts.len());
-    let mut to_welded = vec![0u32; part.verts.len()];
-    for (i, v) in part.verts.iter().enumerate() {
-        match remap.entry(grid_key(v)) {
-            std::collections::hash_map::Entry::Occupied(e) => to_welded[i] = *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                to_welded[i] = welded.len() as u32;
-                e.insert(welded.len() as u32);
-                welded.push(snap_to_grid(v));
-            }
-        }
-    }
-    let mut seen: HashMap<[u32; 3], ()> = HashMap::with_capacity(part.indices.len());
-    let mut indices = Vec::with_capacity(part.indices.len());
-    for tri in part.indices.as_chunks::<3>().0 {
-        let i = [
-            to_welded[tri[0] as usize],
-            to_welded[tri[1] as usize],
-            to_welded[tri[2] as usize],
-        ];
-        // Drop triangles collapsed by welding, exact duplicates, and slivers
-        // (near-zero area, computed on world-scale coords: verts are already in
-        // local/model space).
-        if i[0] == i[1] || i[1] == i[2] || i[0] == i[2] {
-            continue;
-        }
-        let mut sorted = i;
-        sorted.sort_unstable();
-        if seen.insert(sorted, ()).is_some() {
-            continue;
-        }
-        let (va, vb, vc) = (
-            Vec3::from(welded[i[0] as usize]),
-            Vec3::from(welded[i[1] as usize]),
-            Vec3::from(welded[i[2] as usize]),
-        );
-        if (vb - va).cross(vc - va).length() < 1e-9 {
-            continue;
-        }
-        indices.extend(i);
-    }
-    part.verts = welded;
-    part.indices = indices;
-    part.normals = vec![[0.0; 3]; part.verts.len()];
-    part.uvs.clear();
-}
-
-/// Canonical, quantised plane keys of a part's world-space triangles:
-/// (unit normal with a fixed sign, plane offset), 2 mm cells. Two faces with the
-/// same key are coplanar (either orientation).
-fn plane_keys(part: &Part) -> std::collections::HashSet<[i32; 4]> {
+/// A part as a Manifold: transform baked into the positions, UVs carried as
+/// properties. Vertices split only for UV/normal seams are re-joined by
+/// `MeshGL64::merge` (by position), which is what makes a primitive's
+/// seam-split mesh a closed solid to Manifold. Errors when the part is not a
+/// closed solid (open sheets like disc/plane/washer, torn meshes).
+fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
     let rot = quat_of(part.rotation);
     let scale = Vec3::from(part.scale);
     let t = Vec3::from(part.translation);
-    let world = |i: u32| rot * (Vec3::from(part.verts[i as usize]) * scale) + t;
-    let mut keys = std::collections::HashSet::new();
-    for tri in part.indices.as_chunks::<3>().0 {
-        if tri.iter().any(|&i| i as usize >= part.verts.len()) {
-            continue;
-        }
-        let (a, b, c) = (world(tri[0]), world(tri[1]), world(tri[2]));
-        let n = (b - a).cross(c - a);
-        if !n.is_finite() || n.length_squared() < 1e-12 {
-            continue;
-        }
-        let mut n = n.normalize();
-        let mut d = n.dot(a);
-        // Canonical sign: first significant component positive.
-        let lead = if n.x.abs() > 1e-3 {
-            n.x
-        } else if n.y.abs() > 1e-3 {
-            n.y
-        } else {
-            n.z
-        };
-        if lead < 0.0 {
-            n = -n;
-            d = -d;
-        }
-        const Q: f32 = 500.0;
-        keys.insert([
-            (n.x * 1000.0).round() as i32,
-            (n.y * 1000.0).round() as i32,
-            (n.z * 1000.0).round() as i32,
-            (d * Q).round() as i32,
+    // Parts without UVs get a box projection first so every vertex has one.
+    let projected;
+    let src = if part.uvs.len() == part.verts.len() {
+        part
+    } else {
+        let mut p = part.clone();
+        let _ = crate::uv::ensure_uvs(&mut p, Some("box"));
+        projected = p;
+        &projected
+    };
+    let mut props = Vec::with_capacity(src.verts.len() * N_PROPS);
+    for (i, v) in src.verts.iter().enumerate() {
+        let p = rot * (Vec3::from(*v) * scale) + t;
+        let uv = src.uvs.get(i).copied().unwrap_or([0.0; 2]);
+        props.extend([
+            p.x as f64,
+            p.y as f64,
+            p.z as f64,
+            uv[0] as f64,
+            uv[1] as f64,
         ]);
     }
-    keys
-}
-
-fn shares_plane(a: &Part, b: &Part) -> bool {
-    let ka = plane_keys(a);
-    plane_keys(b).iter().any(|k| ka.contains(k))
-}
-
-/// A copy of `b` translated by a tiny, deliberately irrational-looking offset
-/// (about 2 mm) until none of its planes coincide with `a`'s.
-fn nudge_off_shared_planes(a: &Part, b: &Part) -> Part {
-    let mut out = b.clone();
-    for attempt in 1..=4 {
-        let k = attempt as f32;
-        out = b.clone();
-        out.translation = [
-            b.translation[0] + 0.00231 * k,
-            b.translation[1] + 0.00173 * k,
-            b.translation[2] + 0.00197 * k,
-        ];
-        if !shares_plane(a, &out) {
-            break;
+    let count = src.verts.len();
+    let tris: Vec<usize> = if src.indices.is_empty() {
+        (0..count - count % 3).collect()
+    } else {
+        src.indices.iter().map(|&i| i as usize).collect()
+    };
+    if tris.iter().any(|&i| i >= count) {
+        return Err(ModelerError::Csg(format!(
+            "`{}` has out-of-range triangle indices",
+            part.name
+        )));
+    }
+    // Weld by position (1e-5 grid): verts split only for UV/normal seams become
+    // merge pairs, so Manifold sees one topological vertex but keeps both UVs.
+    let key = |i: usize| -> [i64; 3] {
+        [
+            (props[i * N_PROPS] * 1e5).round() as i64,
+            (props[i * N_PROPS + 1] * 1e5).round() as i64,
+            (props[i * N_PROPS + 2] * 1e5).round() as i64,
+        ]
+    };
+    let mut first: std::collections::HashMap<[i64; 3], usize> = Default::default();
+    let mut rep = vec![0usize; count];
+    let (mut merge_from, mut merge_to) = (Vec::new(), Vec::new());
+    for (i, r) in rep.iter_mut().enumerate() {
+        let f = *first.entry(key(i)).or_insert(i);
+        *r = f;
+        if f != i {
+            merge_from.push(i as u64);
+            merge_to.push(f as u64);
         }
     }
-    out
+    // Drop triangles that collapse once welded (e.g. UV-sphere pole fans).
+    let mut kept: Vec<u64> = Vec::with_capacity(tris.len());
+    for t in tris.as_chunks::<3>().0 {
+        let r = [rep[t[0]], rep[t[1]], rep[t[2]]];
+        if r[0] != r[1] && r[1] != r[2] && r[0] != r[2] {
+            kept.extend(t.iter().map(|&i| i as u64));
+        }
+    }
+    let not_solid = |e: String| {
+        ModelerError::Csg(format!(
+            "`{}` is not a closed solid ({e}); booleans need closed meshes \
+             (disc/plane/washer are open sheets)",
+            part.name
+        ))
+    };
+    let opts = manifold_csg::MeshGL64Options::new().merge_vertices(&merge_from, &merge_to);
+    let mesh = MeshGL64::new_with_options(&props, N_PROPS, &kept, opts)
+        .map_err(|e| not_solid(e.to_string()))?;
+    let m = Manifold::from_meshgl64(&mesh).map_err(|e| not_solid(e.to_string()))?;
+    m.status().map_err(|e| not_solid(e.to_string()))?;
+    // A double-sided sheet is "closed" topologically but encloses nothing.
+    if m.volume().abs() < 1e-9 {
+        return Err(not_solid("zero volume".into()));
+    }
+    Ok(m)
+}
+
+/// A Manifold back into a triangle `Part`: positions and interpolated UVs from
+/// the properties, creased normals (40°, so cut edges stay hard), `material`.
+fn manifold_to_part(m: &Manifold, name: &str, material: crate::Material) -> Part {
+    let mesh = m.to_meshgl64();
+    let n = mesh.num_prop().max(3);
+    let props = mesh.vert_properties();
+    let mut part = Part::new(name);
+    part.material = material;
+    for v in props.chunks(n) {
+        part.verts.push([v[0] as f32, v[1] as f32, v[2] as f32]);
+        if n >= N_PROPS {
+            part.uvs.push([v[3] as f32, v[4] as f32]);
+        }
+    }
+    part.indices = mesh.tri_verts().iter().map(|&i| i as u32).collect();
+    if part.uvs.len() != part.verts.len() {
+        part.uvs.clear();
+    }
+    crate::uv::crease_normals(&mut part, 40.0);
+    if part.uvs.len() != part.verts.len() {
+        let _ = crate::uv::ensure_uvs(&mut part, Some("box"));
+    }
+    part
 }
 
 /// Boolean `op` on the named parts of `model`, returning a new part named
-/// `name.unwrap_or("{a}-{op}-{b}")` with `a`'s material. Errors on unknown parts or ops
-/// and on empty results (no overlap, coincident faces, ...).
+/// `name.unwrap_or("{a}-{op}-{b}")` with `a`'s material. Errors on unknown parts,
+/// non-solid inputs and empty results (no overlap, ...).
 pub fn boolean(
     model: &Model,
     op: BoolOp,
@@ -239,41 +151,21 @@ pub fn boolean(
     let pb = model
         .part(b)
         .ok_or_else(|| ModelerError::NoPart(b.to_string()))?;
-    // csgrs drops faces when a face of `b` lies in the same plane as a
-    // face of `a` without overlapping it (typical: two cutters of equal
-    // depth cut into one wall). Nudge `b` a hair off such shared planes.
-    let nudged_b;
-    let pb = if shares_plane(pa, pb) {
-        nudged_b = nudge_off_shared_planes(pa, pb);
-        &nudged_b
-    } else {
-        pb
-    };
-    let csg_a = part_to_csg(pa);
-    let csg_b = part_to_csg(pb);
-    // csgrs panics on some degenerate inputs; surface that as an error instead
-    // of taking the whole server down.
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_op(op, &csg_a, &csg_b)))
-            .map_err(|_| {
-                ModelerError::Csg(format!("csg panicked on {op}({a},{b}): degenerate input"))
-            })?;
-    let default_name = format!("{a}-{op}-{b}");
-    let out_name = name.unwrap_or(&default_name);
-    let mut part = csg_to_part(&result, out_name, pa.material.clone());
-    if part.verts.is_empty() || part.tri_count() == 0 {
+    let result = run_op(op, &part_to_manifold(pa)?, &part_to_manifold(pb)?);
+    result
+        .status()
+        .map_err(|e| ModelerError::Csg(format!("{op}({a}, {b}) failed: {e}")))?;
+    if result.is_empty() {
         return Err(ModelerError::Csg(format!(
             "{op}({a}, {b}) produced an empty mesh (no overlap?)"
         )));
     }
+    let default_name = format!("{a}-{op}-{b}");
+    let mut part = manifold_to_part(&result, name.unwrap_or(&default_name), pa.material.clone());
     // The transform is baked into the verts, so the part sits at the model root.
     part.translation = [0.0; 3];
     part.rotation = Quat::IDENTITY.to_array();
     part.scale = [1.0; 3];
-    // Welding invalidated per-vertex data: rebuild normals first (the box UV
-    // projection reads them), then re-project the UVs.
-    crate::uv::crease_normals(&mut part, 40.0);
-    let _ = crate::uv::ensure_uvs(&mut part, Some("box"));
     Ok(part)
 }
 
@@ -377,67 +269,22 @@ mod tests {
     }
 
     #[test]
-    fn weld_dedupes_verts_and_drops_degenerates() {
-        // A partial overlap difference produces cut-boundary duplicates in the raw
-        // soup; the weld must merge them and leave a clean indexed mesh.
+    fn partial_difference_is_closed_and_clean() {
+        // A corner bite: the output must be a closed manifold with no
+        // degenerate triangles, inside the big box's extents.
         let mut model = model_with_box("big", 2.0);
         let mut cutter =
             crate::primitives::primitive(crate::PrimitiveKind::Box, [2.0, 1.0, 1.0], "cutter")
                 .unwrap_or_else(|_| panic!("cutter failed"));
-        cutter.translation = [1.0, 0.0, 1.5]; // bites a corner off the big box
+        cutter.translation = [1.0, 0.0, 1.5];
         model.parts.push(cutter.into());
         let out = match boolean(&model, crate::BoolOp::Difference, "big", "cutter", None) {
             Ok(out) => out,
             Err(e) => panic!("partial difference failed: {e}"),
         };
-        let soup = triangle_soup(
-            &run_op(
-                crate::BoolOp::Difference,
-                &part_to_csg(model.part("big").unwrap_or_else(|| panic!("big missing"))),
-                &part_to_csg(
-                    model
-                        .part("cutter")
-                        .unwrap_or_else(|| panic!("cutter missing")),
-                ),
-            ),
-            "soup",
-            out.material.clone(),
-        );
-        // Welding dedupes: strictly fewer verts than the per-triangle soup.
-        assert!(
-            out.verts.len() < soup.verts.len(),
-            "welded {} verts vs unwelded {}",
-            out.verts.len(),
-            soup.verts.len()
-        );
-        // No two verts share a quantized key.
-        // Hard edges split verts on purpose (crease normals), but a split pair
-        // must differ in normal: (position, normal) is unique.
-        let mut keys: Vec<([i64; 3], [i32; 3])> = out
-            .verts
-            .iter()
-            .zip(&out.normals)
-            .map(|(v, n)| {
-                (
-                    grid_key(v),
-                    [
-                        (n[0] * 100.0).round() as i32,
-                        (n[1] * 100.0).round() as i32,
-                        (n[2] * 100.0).round() as i32,
-                    ],
-                )
-            })
-            .collect();
-        let total = keys.len();
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(keys.len(), total, "duplicate (position, normal) verts");
-        // No degenerate triangles: distinct indices and real area.
+        assert_eq!(crate::verify::open_edge_count(&out), 0, "open edges");
         assert!(out.tri_count() > 0, "result must be non-empty");
         for tri in out.indices.as_chunks::<3>().0 {
-            assert_ne!(tri[0], tri[1]);
-            assert_ne!(tri[1], tri[2]);
-            assert_ne!(tri[0], tri[2]);
             let (va, vb, vc) = (
                 Vec3::from(out.verts[tri[0] as usize]),
                 Vec3::from(out.verts[tri[1] as usize]),
@@ -448,12 +295,138 @@ mod tests {
                 "degenerate triangle {tri:?}"
             );
         }
-        // Bounds: the corner bite stays within the big box's original extents.
         let (min, max) = out.bounds();
         assert!(min.x > -2.0 - 1e-5 && max.x < 2.0 + 1e-5);
         assert!(min.y > -2.0 - 1e-5 && max.y < 2.0 + 1e-5);
         assert!(min.z > -2.0 - 1e-5 && max.z < 2.0 + 1e-5);
         validate(&out, "partial-difference");
+    }
+
+    /// Curved-on-curved used to come out as noise under csgrs.
+    #[test]
+    fn curved_on_curved_is_manifold() {
+        let mut model = Model::named("m");
+        let mk = |kind, size, t: [f32; 3], r: [f32; 4], name: &str| {
+            let mut p =
+                crate::primitives::primitive(kind, size, name).unwrap_or_else(|e| panic!("{e}"));
+            p.translation = t;
+            p.rotation = r;
+            p
+        };
+        let id = [0.0, 0.0, 0.0, 1.0];
+        let x90 = [0.70710677, 0.0, 0.0, 0.70710677];
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Cylinder,
+                [1.0, 2.0, 0.0],
+                [0.0; 3],
+                id,
+                "c1",
+            )
+            .into(),
+        );
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Cylinder,
+                [0.4, 3.0, 0.0],
+                [0.0; 3],
+                x90,
+                "c2",
+            )
+            .into(),
+        );
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Sphere,
+                [1.2, 0.0, 0.0],
+                [0.0; 3],
+                id,
+                "s",
+            )
+            .into(),
+        );
+        model.parts.push(
+            mk(
+                crate::PrimitiveKind::Torus,
+                [1.0, 0.3, 0.0],
+                [0.0; 3],
+                id,
+                "t",
+            )
+            .into(),
+        );
+        for (a, b) in [("c1", "c2"), ("s", "c1"), ("c1", "t"), ("s", "t")] {
+            for op in [BoolOp::Difference, BoolOp::Union, BoolOp::Intersect] {
+                let out = boolean(&model, op, a, b, None)
+                    .unwrap_or_else(|e| panic!("{op}({a},{b}): {e}"));
+                // No see-through holes, and the output is a valid solid for
+                // the next boolean (chained cuts). Raw open-edge counts can be
+                // nonzero here: Manifold places intersection verts closer than
+                // the counter's 1e-5 weld grid, which it then merges.
+                let (gap, _) = crate::verify::boundary_gap_area(&out);
+                assert!(gap < 1e-9, "{op}({a},{b}) has a hole: {gap}");
+                part_to_manifold(&out).unwrap_or_else(|e| panic!("{op}({a},{b}) re-import: {e}"));
+                validate(&out, op.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn open_sheet_operand_errs_cleanly() {
+        let mut model = model_with_box("a", 1.0);
+        model.parts.push(
+            crate::primitives::primitive(crate::PrimitiveKind::Disc, [0.5, 0.0, 0.0], "d")
+                .unwrap_or_else(|e| panic!("{e}"))
+                .into(),
+        );
+        let err = match boolean(&model, BoolOp::Difference, "a", "d", None) {
+            Ok(_) => panic!("disc operand should error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("closed solid"), "{err}");
+    }
+
+    /// UVs ride through the boolean: the untouched faces of a box keep their
+    /// own UV corners instead of being box-reprojected.
+    #[test]
+    fn input_uvs_survive_the_boolean() {
+        let mut model = model_with_box("big", 2.0);
+        let mut cutter = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "c")
+            .unwrap_or_else(|e| panic!("{e}"));
+        cutter.translation = [0.0, 0.0, 2.0]; // pocket into the +z face only
+        model.parts.push(cutter.into());
+        let big = model.part("big").unwrap_or_else(|| panic!("big"));
+        // UV of the -z face's corner (-2,-2,-2) in the input.
+        let want: Vec<[f32; 2]> = big
+            .verts
+            .iter()
+            .zip(&big.uvs)
+            .zip(&big.normals)
+            .filter(|((v, _), n)| {
+                (Vec3::from(**v) - Vec3::splat(-2.0)).length() < 1e-4 && n[2] < -0.5
+            })
+            .map(|((_, uv), _)| *uv)
+            .collect();
+        assert!(!want.is_empty());
+        let out =
+            boolean(&model, BoolOp::Difference, "big", "c", None).unwrap_or_else(|e| panic!("{e}"));
+        let got: Vec<[f32; 2]> = out
+            .verts
+            .iter()
+            .zip(&out.uvs)
+            .zip(&out.normals)
+            .filter(|((v, _), n)| {
+                (Vec3::from(**v) - Vec3::splat(-2.0)).length() < 1e-4 && n[2] < -0.5
+            })
+            .map(|((_, uv), _)| *uv)
+            .collect();
+        for uv in &want {
+            assert!(
+                got.iter()
+                    .any(|g| (g[0] - uv[0]).abs() < 1e-4 && (g[1] - uv[1]).abs() < 1e-4),
+                "input uv {uv:?} lost; got {got:?}"
+            );
+        }
     }
 
     fn validate(part: &Part, what: &str) {
@@ -477,7 +450,8 @@ mod tests {
     }
 
     /// Two cutters of equal depth into one wall used to make csgrs drop the
-    /// first pocket's end face (coplanar but disjoint faces).
+    /// first pocket's end face (coplanar but disjoint faces). Manifold handles
+    /// it exactly, with no nudge.
     #[test]
     fn equal_depth_cutters_keep_both_pockets() {
         let mut model = Model::named("m");

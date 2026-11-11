@@ -47,5 +47,11 @@ Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
   the preview entirely, and the orbit camera's pitch now spans -80 to +80 degrees
   (-1.4 to 1.4 rad) so you can look from below.
 
+## Boolean backend swap (2026-11-11)
+- **csgrs -> Manifold (`manifold-csg`).** The BSP kernel's workarounds are gone:
+  no 2 mm nudge, no soup weld, no panic catching, no box-reprojected UVs.
+  Equal-depth pockets and curved-on-curved cuts are exact; input UVs survive.
+  Open sheets as operands now error clearly instead of producing garbage.
+
 ## Still open
-- The nudge is a workaround for csgrs; a robust boolean backend would remove it.
+- Nothing from this demo.

@@ -1261,7 +1261,7 @@ mod tests {
     fn lint_boolean_volume_sanity() {
         // A difference whose output kept the input's full volume: the cutter
         // misses. Built by hand (ops + matching parts) so the volumes are
-        // exact — a real csgrs difference with an overlapping cutter shrinks.
+        // exact — a real difference with an overlapping cutter shrinks.
         let mut s = Session::default();
         let mut a = Part::new("a");
         a.verts = vec![
@@ -1788,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn open_boolean_outputs_get_a_lint() {
+    fn boolean_outputs_are_closed_and_lint_clean() {
         let mut s = Session::default();
         s.op_primitive(
             "a",
@@ -1809,13 +1809,8 @@ mod tests {
         s.op_boolean("c", crate::BoolOp::Difference, "a", "b")
             .unwrap_or_else(|e| panic!("{e}"));
         let part = s.model.part("c").unwrap_or_else(|| panic!("c"));
-        let open = crate::verify::open_edge_count(part);
-        let (gap, surface) = crate::verify::boundary_gap_area(part);
-        let lint = s.lints().iter().any(|l| l.contains("open edges"));
-        let expect = open > 0 && gap > 0.002 * surface;
-        assert_eq!(
-            expect, lint,
-            "lint must track gap area ({open} open, gap {gap}/{surface})"
-        );
+        // Manifold outputs are closed, so the open-edge lint stays silent.
+        assert_eq!(crate::verify::open_edge_count(part), 0);
+        assert!(!s.lints().iter().any(|l| l.contains("open edges")));
     }
 }

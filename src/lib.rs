@@ -136,8 +136,8 @@ pub struct Model {
     /// are exactly the graph's derivation, so saves can omit them. Baked-part
     /// edits clear it (the cache then carries information the ops don't).
     /// A stored flag instead of a re-evaluation: serialization walks every
-    /// history snapshot, and re-deriving each one re-runs booleans (csgrs
-    /// repairs can take minutes) — that was the daemon hang.
+    /// history snapshot, and re-deriving each one re-runs booleans (the old
+    /// csgrs backend could take minutes) — that was the daemon hang.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub derived_from_ops: bool,
 }

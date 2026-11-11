@@ -850,7 +850,7 @@ impl rmcp::ServerHandler for Tools {
 - apply_ops batches can also include baked edits: type hide_part/show_part with part, or rename with part and to - they run in batch position.
 - radial_array takes an optional axis (y default, x or z for horizontal rings like windmill blades - no manual rotation needed). Pass include_source=true to space `count` items evenly with the source as copy 0 (copies name_1..).
 - probe_ray all_hits=true lists every part along the ray; agent_shot/agent_views take focus=[part names] to frame just those parts.
-- Booleans nudge the cutter ~2mm off planes it shares with the target (csgrs drops faces otherwise); scene_summary warns about boolean outputs with open edges - verify pockets with probe_ray.
+- Booleans run on Manifold: outputs are closed solids, coplanar and curved-on-curved cuts are exact. Both inputs must be closed solids (disc/plane/washer error). Verify pockets with probe_ray.
 - session_log shows the recent per-call record (tool, ok/error, ms) for self-auditing.
 - Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
 - Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.

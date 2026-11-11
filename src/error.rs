@@ -15,7 +15,7 @@ pub enum ModelerError {
     /// The op graph has a dependency cycle (names of the stuck ops).
     #[error("ops form a dependency cycle involving {0}")]
     Cycle(String),
-    /// A boolean/CSG failure (empty result, csgrs panic, ...).
+    /// A boolean/CSG failure (empty result, non-solid input, ...).
     #[error("{0}")]
     Csg(String),
     /// Filesystem trouble (catalog, autosave, export).
