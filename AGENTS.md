@@ -729,9 +729,20 @@ work, and every material has its own history tree.
   colours; the uv mapping runs after the whole graph, so cut faces and copies
   are mapped too (it replaces any `uvs` projection on those parts). Factors
   become 1 (white) unless given, then multiply the textures.
-- **Export:** `export_model` writes the baked textures (PNG in the buffer:
-  base colour, metallic-roughness, normal, occlusion / emissive when driven;
-  shared per bake) and a TANGENT attribute.
+- **Export:** `export_model` writes the baked textures (base colour,
+  metallic-roughness, normal, occlusion / emissive when driven) and a
+  TANGENT attribute. **Textures are shared files by default for `.gltf`**:
+  each PNG goes to the `textures/` folder at the root of the `assets/`
+  folder the model is exported into (else `textures/` beside the .gltf),
+  named by material, channel and a hash of its content
+  (`stone-base_color-1a2b....png`), and the .gltf points at it by uri. Every
+  model using the same bake points at the same file, so Bevy's asset server
+  loads it once. `.glb` embeds them unless `optimize: {"textures":
+  "shared"}`; `{"textures": "embed"}` packs a .gltf's too. Only **tile**
+  materials (the default domain: metric, repeating) can be shared across
+  models; an **object** bake is fitted to one mesh, and the export report
+  counts those. Use tile materials for anything a kit reuses (stone, bark,
+  leaves, metal) and keep object materials for one-off hero parts.
 - **History:** `undo` / `redo` / `jump` / `history` take `doc:
   "material:<name>"` (or `"material"` for the active one).
 - **Bake cache:** bakes are cached by key (material, params, and for

@@ -378,3 +378,55 @@ fn game_export_dedups_instances_culls_and_packs_orm() {
     );
     assert!(report.contains("contact culling"), "{report}");
 }
+
+/// Two .gltf models under one `assets/` folder share one set of texture
+/// files, named by content, in `assets/textures/`.
+#[test]
+fn gltf_exports_share_texture_files() {
+    let mut s = modeler::commands::Session::default();
+    let nodes = serde_json::json!([
+        {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
+        {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": 0.005},
+        {"type": "output", "name": "out", "base_color": "m", "roughness": 0.8}
+    ]);
+    s.materials
+        .ops(
+            "stone",
+            nodes.as_array().unwrap().clone(),
+            None,
+            None,
+            None,
+            Some(32),
+            None,
+        )
+        .unwrap();
+    let dir = temp_dir("shared").join("assets");
+    let mut files = Vec::new();
+    for (name, size) in [("rock_a", 1.0), ("rock_b", 0.6)] {
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "r", "kind": "box", "size": size, "translation": [0, 0.5, 0]},
+            {"type": "material", "name": "r", "pbr": "stone"}
+        ]);
+        s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+            .unwrap();
+        let path = dir.join("models").join(format!("{name}.gltf"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let report =
+            modeler::gltf::export_gltf_with(&s.model, &path, &modeler::export_opt::Options::none())
+                .unwrap();
+        assert!(report.contains("textures: shared PNGs"), "{report}");
+        let (doc, _, images) = gltf::import(&path).expect("gltf imports with external images");
+        assert_eq!(images.len(), 3);
+        for img in doc.images() {
+            let gltf::image::Source::Uri { uri, .. } = img.source() else {
+                panic!("image packed into the buffer");
+            };
+            assert!(uri.starts_with("../textures/"), "{uri}");
+            files.push(uri.to_string());
+        }
+    }
+    files.sort();
+    files.dedup();
+    assert_eq!(files.len(), 3, "both rocks point at the same 3 files");
+    assert_eq!(std::fs::read_dir(dir.join("textures")).unwrap().count(), 3);
+}

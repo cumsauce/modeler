@@ -43,6 +43,10 @@ pub struct Options {
     pub orm: bool,
     /// `KHR_materials_emissive_strength` on emissive materials (bloom).
     pub emissive_strength: Option<f32>,
+    /// Baked textures as shared PNG files (`Some(true)`) or packed into the
+    /// buffer (`Some(false)`); `None` = the format's default (.gltf shares,
+    /// .glb embeds).
+    pub shared_textures: Option<bool>,
 }
 
 impl Options {
@@ -60,6 +64,7 @@ impl Options {
             small_indices: false,
             orm: false,
             emissive_strength: None,
+            shared_textures: None,
         }
     }
 
@@ -109,6 +114,13 @@ impl Options {
             };
             match k.as_str() {
                 "preset" => {}
+                "textures" => {
+                    o.shared_textures = match x.as_str() {
+                        Some("shared") => Some(true),
+                        Some("embed") => Some(false),
+                        _ => return Err("optimize.textures: \"shared\" or \"embed\"".into()),
+                    }
+                }
                 "dedup_materials" => o.dedup_materials = flag(x)?,
                 "cull_contacts" => o.cull_contacts = flag(x)?,
                 "instance" => o.instance = flag(x)?,

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -168,10 +168,59 @@ fn check_part(i: usize, part: &Part) -> Result<(), String> {
 
 /// Builds the glTF JSON and its binary buffer. `buffer_uri` is `Some` for
 /// .gltf + .bin, `None` for an embedded .glb buffer.
-pub(crate) fn build(
+/// Where shared textures go: `dir` on disk, referenced from the glTF as
+/// `uri_prefix` + file name.
+pub struct TextureOut {
+    pub dir: PathBuf,
+    pub uri_prefix: String,
+}
+
+impl TextureOut {
+    /// The shared texture folder for a model exported to `path`: the
+    /// `textures/` folder at the root of the `assets/` folder holding it (so
+    /// every model in a game shares one set), else `textures/` beside it.
+    pub fn for_export(path: &Path) -> TextureOut {
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        for (up, a) in dir.ancestors().enumerate() {
+            if a.file_name().is_some_and(|n| n == "assets") {
+                return TextureOut {
+                    dir: a.join("textures"),
+                    uri_prefix: "../".repeat(up) + "textures/",
+                };
+            }
+        }
+        TextureOut {
+            dir: dir.join("textures"),
+            uri_prefix: "textures/".into(),
+        }
+    }
+}
+
+/// 64-bit FNV-1a: texture files are named by their content, so the same
+/// bake from any model is one file.
+fn content_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn file_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn build_with(
     model: &Model,
     buffer_uri: Option<String>,
     opts: &crate::export_opt::Options,
+    tex_out: Option<&TextureOut>,
 ) -> Result<(Value, Vec<u8>, String), crate::ModelerError> {
     use crate::export_opt::MeshRef;
     let visible: Vec<Part> = model
@@ -200,6 +249,9 @@ pub(crate) fn build(
     // Part index -> its mesh index (instanced copies point at the source's).
     let mut mesh_of: Vec<usize> = Vec::with_capacity(exported.len());
     let mut texture_bytes = 0usize;
+    // Shared texture files: written, reused (already on disk), per-part
+    // (object-domain bakes, unique to one mesh).
+    let (mut tex_written, mut tex_reused, mut tex_unique) = (0usize, 0usize, 0usize);
     for (pi, part) in exported.iter().enumerate() {
         // ---- material
         let mut pbr = json!({
@@ -216,15 +268,41 @@ pub(crate) fn build(
                 let ch = crate::material::pbr::bake_part(part)?
                     .ok_or_else(|| format!("part '{}': no bake", part.name))?;
                 let t = crate::material::pbr::textures(&ch);
+                let per_part = r.graph().is_ok_and(|g| g.domain == "object");
                 let mut add = |px: &[u8], what: &str| -> Result<u32, String> {
                     let png = crate::raster::encode_png(t.w as u32, t.h as u32, px)?;
                     texture_bytes += png.len();
-                    let view = b.view(&png, None);
-                    images.push(json!({
-                        "name": format!("{}-{what}", r.material),
-                        "bufferView": view,
-                        "mimeType": "image/png",
-                    }));
+                    let name = format!("{}-{what}", r.material);
+                    if let Some(out) = tex_out {
+                        let file = format!("{}-{:016x}.png", file_safe(&name), content_hash(&png));
+                        let fp = out.dir.join(&file);
+                        if fp.exists() {
+                            tex_reused += 1;
+                        } else {
+                            std::fs::create_dir_all(&out.dir)
+                                .map_err(|e| format!("creating {}: {e}", out.dir.display()))?;
+                            let tmp = fp.with_extension("png.tmp");
+                            std::fs::write(&tmp, &png)
+                                .and_then(|_| std::fs::rename(&tmp, &fp))
+                                .map_err(|e| format!("writing {}: {e}", fp.display()))?;
+                            tex_written += 1;
+                        }
+                        if per_part {
+                            tex_unique += 1;
+                        }
+                        images.push(json!({
+                            "name": name,
+                            "uri": format!("{}{file}", out.uri_prefix),
+                            "mimeType": "image/png",
+                        }));
+                    } else {
+                        let view = b.view(&png, None);
+                        images.push(json!({
+                            "name": name,
+                            "bufferView": view,
+                            "mimeType": "image/png",
+                        }));
+                    }
                     textures.push(json!({"sampler": 0, "source": images.len() - 1}));
                     Ok((textures.len() - 1) as u32)
                 };
@@ -663,6 +741,18 @@ pub(crate) fn build(
             lights.len()
         );
     }
+    if let Some(out) = tex_out {
+        report += &format!(
+            "\ntextures: shared PNGs in {} ({tex_written} written, {tex_reused} already there from other exports)",
+            out.dir.display()
+        );
+        if tex_unique > 0 {
+            report += &format!(
+                "\n  {tex_unique} of them are object-domain bakes fitted to one mesh: no other model can share them. \
+                 A tile-domain material (metric, repeating) is shared by every model that uses it."
+            );
+        }
+    }
     Ok((doc, b.bin, report))
 }
 
@@ -688,7 +778,9 @@ pub fn export_gltf_with(
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("bad export path {}", path.display()))?
         .to_owned();
-    let (json, bin, report) = build(model, Some(format!("{stem_name}.bin")), opts)?;
+    let tex = (opts.shared_textures != Some(false)).then(|| TextureOut::for_export(path));
+    let (json, bin, report) =
+        build_with(model, Some(format!("{stem_name}.bin")), opts, tex.as_ref())?;
     let json_text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
     let bin_path = path.with_extension("bin");
     fs::write(&bin_path, &bin).map_err(|e| format!("writing {}: {e}", bin_path.display()))?;
@@ -707,7 +799,8 @@ pub fn export_glb_with(
     path: &Path,
     opts: &crate::export_opt::Options,
 ) -> Result<String, crate::ModelerError> {
-    let (json, bin, report) = build(model, None, opts)?;
+    let tex = (opts.shared_textures == Some(true)).then(|| TextureOut::for_export(path));
+    let (json, bin, report) = build_with(model, None, opts, tex.as_ref())?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
     json_chunk.resize(align4(json_chunk.len()), b' ');
     let mut bin_chunk = bin;

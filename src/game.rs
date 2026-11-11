@@ -309,10 +309,11 @@ mod tests {
             .unwrap_or_default();
         assert!(err.contains("convex"), "{err}");
 
-        let (doc, _, report) = ok(crate::gltf::build(
+        let (doc, _, report) = ok(crate::gltf::build_with(
             &s.model,
             None,
             &crate::export_opt::Options::none(),
+            None,
         ));
         let nodes = ok(doc["nodes"].as_array().ok_or("nodes"));
         let find = |n: &str| nodes.iter().position(|x| x["name"] == json!(n));

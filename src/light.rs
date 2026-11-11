@@ -216,7 +216,7 @@ mod tests {
             .unwrap_or_default();
         assert!(err.contains("kind"), "{err}");
         let (doc, _, report) =
-            crate::gltf::build(&s.model, None, &crate::export_opt::Options::none())
+            crate::gltf::build_with(&s.model, None, &crate::export_opt::Options::none(), None)
                 .unwrap_or_else(|e| panic!("{e}"));
         let lights = &doc["extensions"]["KHR_lights_punctual"]["lights"];
         assert_eq!(lights.as_array().map_or(0, Vec::len), 3);
