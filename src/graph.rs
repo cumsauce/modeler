@@ -619,6 +619,12 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 upsert(named, &format!("{name}_leaves"), l);
             }
         }
+        Op::Terrain { name, def } => {
+            let p = def
+                .build(name)
+                .map_err(|e| format!("terrain `{name}`: {e}"))?;
+            upsert(named, name, p);
+        }
         Op::Hull { name, inputs } => {
             let parts: Vec<Arc<Part>> = inputs
                 .iter()
@@ -1036,6 +1042,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
         | Op::LSystem { name, .. }
+        | Op::Terrain { name, .. }
         | Op::Round { name, .. }
         | Op::Shell { name, .. }
         | Op::Transform { name, .. }
@@ -1094,6 +1101,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
         Op::LSystem { .. } => "lsystem",
+        Op::Terrain { .. } => "terrain",
         Op::Round { .. } => "round",
         Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
@@ -1120,6 +1128,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Revolve { .. }
         | Op::Sweep { .. }
         | Op::LSystem { .. }
+        | Op::Terrain { .. }
         | Op::Prefab { .. } => Vec::new(),
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
@@ -1322,6 +1331,20 @@ pub fn describe(ops: &[Op]) -> String {
                 "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::Terrain { name, def } => format!(
+                "#{i} terrain `{name}` style={} size={:?} resolution={} height={} scale={} octaves={} seed={} base={} flatten={} paths={} at={:?}",
+                def.style,
+                def.size,
+                def.resolution,
+                def.height,
+                def.scale,
+                def.octaves,
+                def.seed,
+                def.base,
+                def.flatten.len(),
+                def.paths.len(),
+                def.translation
+            ),
             Op::LSystem { name, def } => format!(
                 "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
                 def.axiom,

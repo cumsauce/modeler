@@ -95,6 +95,7 @@ type, so there is no need to memorise field names.
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
 | `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
+| `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
@@ -267,6 +268,26 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   branches themselves. Runaway growth
   (over 400k symbols or 40k segments) is refused with a hint. Params work
   in every number (`"length": "$h"`).
+- **`terrain`** makes the ground of a level: a closed slab (heightfield
+  top with smooth normals, vertical skirt walls, flat bottom at `base`)
+  centred on the origin, so booleans, `place`, `grounded` and `probe_ray`
+  all work on it, and metric uvs map tile materials at real size. The top
+  runs from about y = 0 (valleys) to `height`; `scale` is the feature size
+  (hill spacing, dune wavelength) and `resolution` the cell size (at most
+  1M cells; 60 x 60 at 0.5 m builds in milliseconds). Styles: `hills`,
+  `ridges` (sharp crests), `dunes` (long windward slopes, steep slip faces
+  across `wind` degrees), `mesa` (`terraces` flat treads and cliffs),
+  `flat` (a level slab for pads and paths only). Same `seed` = same
+  ground, and a bigger `size` extends it without moving what was there.
+  `flatten: [{"at": [x, z], "radius": 6 | "size": [w, d], "height"?: y,
+  "falloff": 3}]` levels a pad for a building (height defaults to the
+  ground's own at `at`); `paths: [{"points": [[x, z], ...], "width": 3,
+  "depth": 0.3, "falloff"?}]` carves a bed level across its width that
+  follows the ground lengthwise (a road at 0.1-0.3, a river at 1-2; pads
+  win where they cross). `edge_falloff` eases the border down to y = 0.
+  Then `place` buildings onto it (`{"type": "place", "parts": ["hut"],
+  "on": "ground", "at": [x, z]}`) and colour it with a tile material that
+  mixes grass and rock by `facing` up.
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`shell`** hollows a closed solid: every face moves in by exactly

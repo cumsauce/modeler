@@ -82,6 +82,7 @@ pub mod raster;
 pub mod simplify;
 pub mod spec;
 pub mod style;
+pub mod terrain;
 pub mod uv;
 pub mod verify;
 
@@ -848,6 +849,13 @@ pub enum Op {
         name: String,
         #[serde(flatten)]
         def: Box<crate::lsystem::LSystem>,
+    },
+    /// A ground slab with a noise heightfield top (closed: skirt + flat bottom).
+    #[serde(rename = "terrain")]
+    Terrain {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::terrain::Terrain>,
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },
