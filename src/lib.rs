@@ -82,6 +82,7 @@ pub mod raster;
 pub mod simplify;
 pub mod spec;
 pub mod style;
+pub mod text;
 pub mod uv;
 pub mod verify;
 
@@ -152,6 +153,10 @@ pub struct Part {
     /// flank). Derived after moves; never saved.
     #[serde(skip)]
     pub occluders: Option<std::sync::Arc<Vec<Vec<[[f32; 3]; 3]>>>>,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -848,6 +853,25 @@ pub enum Op {
         name: String,
         #[serde(flatten)]
         def: Box<crate::lsystem::LSystem>,
+    },
+    /// 3D text standing up, letters facing +z, baseline on y = 0.
+    Text {
+        name: String,
+        text: String,
+        #[serde(default)]
+        font: String,
+        size: f32,
+        depth: f32,
+        #[serde(default)]
+        align: String,
+        #[serde(default = "one")]
+        line_spacing: f32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        letter_spacing: f32,
+        #[serde(default)]
+        translation: [f32; 3],
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },

@@ -770,6 +770,39 @@ impl LSystemSpec {
     }
 }
 
+/// 3D text: letters standing up facing +z (readable from the front), the
+/// first line's baseline on y = 0, `depth` thick toward -z. One closed
+/// solid, ready for booleans (engrave by subtracting it).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextSpec {
+    name: String,
+    /// The text; `\n` starts a new line.
+    text: String,
+    /// "sans" (default), "bold", "mono", or a path to a .ttf / .otf file.
+    #[serde(default)]
+    font: String,
+    /// Capital letter height, meters.
+    size: f32,
+    /// Thickness, meters (default: size / 8).
+    #[serde(default)]
+    depth: Option<f32>,
+    /// "center" (default), "left" or "right" about x = 0.
+    #[serde(default)]
+    align: Option<String>,
+    /// Line height multiplier (1).
+    #[serde(default)]
+    line_spacing: Option<f32>,
+    /// Extra space between letters, as a share of the capital height.
+    #[serde(default)]
+    letter_spacing: f32,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SweepSpec {
@@ -1190,6 +1223,7 @@ pub enum OpSpec {
     Group(GroupSpec),
     Sweep(SweepSpec),
     Lsystem(LSystemSpec),
+    Text(TextSpec),
     Hull(HullSpec),
     Round(RoundSpec),
     Shell(ShellSpec),
@@ -1224,6 +1258,7 @@ pub const OP_TYPES: &[&str] = &[
     "group",
     "sweep",
     "lsystem",
+    "text",
     "hull",
     "round",
     "shell",
@@ -1608,6 +1643,25 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 path: s.path,
                 closed: s.closed,
                 round: s.round,
+            })
+        }
+        "text" => {
+            let s: TextSpec = de(&ctx, &body)?;
+            let align = s.align.unwrap_or_else(|| "center".into());
+            if !["center", "left", "right"].contains(&align.as_str()) {
+                return Err(format!("{ctx}: align: center, left or right, got `{align}`"));
+            }
+            BatchItem::Op(Op::Text {
+                name: s.name,
+                text: s.text,
+                font: s.font,
+                size: s.size,
+                depth: s.depth.unwrap_or(s.size / 8.0),
+                align,
+                line_spacing: s.line_spacing.unwrap_or(1.0),
+                letter_spacing: s.letter_spacing,
+                translation: s.translation,
+                rotation: rot(&ctx, &s.rotation)?,
             })
         }
         "lsystem" => {
@@ -2009,6 +2063,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "sweep" => {
             json!({"type": "sweep", "name": "handle", "profile": [{"arc": {"center": [0, 0], "radius": 0.012, "from": 0, "to": 360}}], "path": [[0, 0.9, 0], [0, 0.95, 0.05], [0, 1.05, 0.05], [0, 1.1, 0]]})
         }
+        "text" => {
+            json!({"type": "text", "name": "exit_sign", "text": "EXIT", "font": "bold", "size": 0.15, "depth": 0.02, "translation": [0, 2.2, 0.01]})
+        }
         "lsystem" => {
             json!({"type": "lsystem", "name": "oak", "preset": "tree", "seed": 3, "translation": [2, 0, 0]})
         }
@@ -2104,6 +2161,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "group" => schemars::schema_for!(GroupSpec),
         "sweep" => schemars::schema_for!(SweepSpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
+        "text" => schemars::schema_for!(TextSpec),
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "shell" => schemars::schema_for!(ShellSpec),

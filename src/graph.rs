@@ -611,6 +611,34 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::csg::sweep(name, profile, path, *closed, *round)?;
             upsert(named, name, part);
         }
+        Op::Text {
+            name,
+            text,
+            font,
+            size,
+            depth,
+            align,
+            line_spacing,
+            letter_spacing,
+            translation,
+            rotation,
+        } => {
+            let mut part = crate::text::build(
+                name,
+                text,
+                font,
+                *size,
+                *depth,
+                align,
+                *line_spacing,
+                *letter_spacing,
+            )?;
+            part.translation = *translation;
+            if let Some(r) = rotation {
+                part.rotation = *r;
+            }
+            upsert(named, name, part);
+        }
         Op::LSystem { name, def } => {
             let d =
                 crate::lsystem::build(name, def).map_err(|e| format!("lsystem `{name}`: {e}"))?;
@@ -1036,6 +1064,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
         | Op::LSystem { name, .. }
+        | Op::Text { name, .. }
         | Op::Round { name, .. }
         | Op::Shell { name, .. }
         | Op::Transform { name, .. }
@@ -1094,6 +1123,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
         Op::LSystem { .. } => "lsystem",
+        Op::Text { .. } => "text",
         Op::Round { .. } => "round",
         Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
@@ -1120,6 +1150,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Revolve { .. }
         | Op::Sweep { .. }
         | Op::LSystem { .. }
+        | Op::Text { .. }
         | Op::Prefab { .. } => Vec::new(),
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
@@ -1322,6 +1353,17 @@ pub fn describe(ops: &[Op]) -> String {
                 "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::Text {
+                name,
+                text,
+                font,
+                size,
+                depth,
+                translation,
+                ..
+            } => format!(
+                "#{i} text `{name}` {text:?} font={font:?} size={size} depth={depth} at={translation:?}"
+            ),
             Op::LSystem { name, def } => format!(
                 "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
                 def.axiom,

@@ -43,6 +43,13 @@ pub struct Options {
     pub orm: bool,
     /// `KHR_materials_emissive_strength` on emissive materials (bloom).
     pub emissive_strength: Option<f32>,
+    /// Simplified copies per heavy part, as triangle ratios ([0.5, 0.2]).
+    pub lods: Vec<f32>,
+    /// Camera distances (m) where each level takes over; empty = from each
+    /// part's size.
+    pub lod_distances: Vec<f32>,
+    /// Parts with fewer triangles get no LODs.
+    pub lod_min_tris: usize,
     /// How baked textures are written; `None` = the format's default
     /// (.gltf: shared KTX2 files, .glb: KTX2 in the buffer).
     pub textures: Option<TextureMode>,
@@ -76,6 +83,9 @@ impl Options {
             small_indices: false,
             orm: false,
             emissive_strength: None,
+            lods: Vec::new(),
+            lod_distances: Vec::new(),
+            lod_min_tris: 300,
             textures: None,
         }
     }
@@ -168,6 +178,21 @@ impl Options {
                         .ok_or("optimize.view_samples: 1..4096")?
                         as usize
                 }
+                "lods" => {
+                    o.lods = serde_json::from_value(x.clone())
+                        .ok()
+                        .filter(|v: &Vec<f32>| v.iter().all(|r| *r > 0.0 && *r < 1.0))
+                        .ok_or("optimize.lods: triangle ratios in (0, 1), e.g. [0.5, 0.2]")?;
+                }
+                "lod_distances" => {
+                    o.lod_distances = serde_json::from_value(x.clone())
+                        .ok()
+                        .filter(|v: &Vec<f32>| v.windows(2).all(|w| w[0] < w[1]) && v.iter().all(|d| *d > 0.0))
+                        .ok_or("optimize.lod_distances: increasing meters, one per lod, e.g. [20, 60]")?;
+                }
+                "lod_min_tris" => {
+                    o.lod_min_tris = x.as_u64().ok_or("optimize.lod_min_tris: a count")? as usize
+                }
                 "emissive_strength" => {
                     o.emissive_strength = match x {
                         Value::Null => None,
@@ -224,7 +249,20 @@ pub enum MeshRef {
 pub struct Prepared {
     pub parts: Vec<Part>,
     pub meshes: Vec<MeshRef>,
+    /// Per part: its level of detail when the model has LODs.
+    pub lod: Vec<Option<Lod>>,
     pub report: Report,
+}
+
+/// A part's place in a LOD chain: `level` 0 is the full mesh; `source` is
+/// the level-0 part (whose textures the simplified copies reuse: the
+/// simplifier keeps uvs); visible from `near` to `far` meters (None = on).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lod {
+    pub level: usize,
+    pub source: usize,
+    pub near: f32,
+    pub far: Option<f32>,
 }
 
 /// Before / after counts and what each pass did.
@@ -337,7 +375,7 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
             parts.len()
         ));
     }
-    let meshes = if o.instance && !o.merge {
+    let mut meshes = if o.instance && !o.merge {
         let m = find_instances(&parts);
         let copies = m.iter().filter(|r| **r != MeshRef::Own).count();
         report.lines.push(format!(
@@ -347,11 +385,112 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
     } else {
         vec![MeshRef::Own; parts.len()]
     };
+    let lod = add_lods(&mut parts, &mut meshes, o, &mut report);
     Prepared {
         parts,
         meshes,
+        lod,
         report,
     }
+}
+
+/// Appends simplified copies `<part>.lod1..` of every part with at least
+/// `lod_min_tris` triangles (instanced copies share their source's LOD
+/// meshes) and returns each part's LOD placement.
+fn add_lods(
+    parts: &mut Vec<Part>,
+    meshes: &mut Vec<MeshRef>,
+    o: &Options,
+    report: &mut Report,
+) -> Vec<Option<Lod>> {
+    let n = parts.len();
+    let mut lod = vec![None; n];
+    if o.lods.is_empty() {
+        return lod;
+    }
+    // Switch distances: given, or from the part's size (a part ~1 m across
+    // simplifies at 15 m and 45 m, ...).
+    let switch = |p: &Part, k: usize| -> f32 {
+        if let Some(d) = o.lod_distances.get(k) {
+            return *d;
+        }
+        let (lo, hi) = p.verts.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
+            (lo.min(Vec3::from(*v)), hi.max(Vec3::from(*v)))
+        });
+        let size = ((hi - lo) * Vec3::from(p.scale)).length().max(0.05);
+        size * 15.0 * 3f32.powi(k as i32)
+    };
+    // source index -> the indices of its lod parts.
+    let mut made: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    let (mut tris_before, mut tris_after, mut chains) = (0usize, 0usize, 0usize);
+    for i in 0..n {
+        if parts[i].indices.len() / 3 < o.lod_min_tris || meshes[i] != MeshRef::Own {
+            continue;
+        }
+        chains += 1;
+        let mut ids = Vec::new();
+        for (k, ratio) in o.lods.iter().enumerate() {
+            let mut p = crate::simplify::simplify(&parts[i], *ratio);
+            tris_before += parts[i].indices.len() / 3;
+            tris_after += p.indices.len() / 3;
+            p.name = format!("{}.lod{}", parts[i].name, k + 1);
+            parts.push(p);
+            meshes.push(MeshRef::Own);
+            ids.push(parts.len() - 1);
+        }
+        made.insert(i, ids);
+    }
+    // Instanced copies of a part with LODs get LOD copies of their own,
+    // sharing the source's LOD meshes.
+    for i in 0..n {
+        let MeshRef::CopyOf { source, offset } = meshes[i] else {
+            continue;
+        };
+        let Some(src_lods) = made.get(&source).cloned() else {
+            continue;
+        };
+        let mut ids = Vec::new();
+        for (k, s) in src_lods.iter().enumerate() {
+            let mut p = parts[*s].clone();
+            p.name = format!("{}.lod{}", parts[i].name, k + 1);
+            p.translation = parts[i].translation;
+            p.rotation = parts[i].rotation;
+            p.scale = parts[i].scale;
+            parts.push(p);
+            meshes.push(MeshRef::CopyOf { source: *s, offset });
+            ids.push(parts.len() - 1);
+        }
+        made.insert(i, ids);
+    }
+    lod.resize(parts.len(), None);
+    for (src, ids) in &made {
+        let d: Vec<f32> = (0..ids.len()).map(|k| switch(&parts[*src], k)).collect();
+        let base = match meshes[*src] {
+            MeshRef::CopyOf { source, .. } => source,
+            MeshRef::Own => *src,
+        };
+        lod[*src] = Some(Lod {
+            level: 0,
+            source: base,
+            near: 0.0,
+            far: Some(d[0]),
+        });
+        for (k, id) in ids.iter().enumerate() {
+            lod[*id] = Some(Lod {
+                level: k + 1,
+                source: base,
+                near: d[k],
+                far: d.get(k + 1).copied(),
+            });
+        }
+    }
+    report.lines.push(format!(
+        "lods: {chains} part(s) got {} level(s) each ({} -> {} triangles per level, summed); nodes carry extras.lod {{level, near, far}} for Bevy's VisibilityRange",
+        o.lods.len(),
+        tris_before,
+        tris_after
+    ));
+    lod
 }
 
 // ---------------------------------------------------------------- culling

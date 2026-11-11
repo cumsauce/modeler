@@ -21,6 +21,7 @@ rayon = "1"
 libc = "0.2"
 texture-compressor = { version = "0.2", features = ["parallel"] }
 ruzstd = "0.8.3"
+ttf-parser = "0.25"
 
 [dev-dependencies]
 gltf = "1"

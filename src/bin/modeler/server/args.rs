@@ -80,7 +80,8 @@ pub(crate) struct ExportModelArgs {
     #[serde(default)]
     pub(crate) format: Option<String>,
     /// "game", "none" (default), or overrides {preset?, textures?: "ktx2"
-    /// (gltf default) | "png" | "embed" (glb default) | "embed_png", dedup_materials?, cull_contacts?,
+    /// (gltf default) | "png" | "embed" (glb default) | "embed_png", lods?: [0.5, 0.2],
+    /// lod_distances?: [m, ..], lod_min_tris?, dedup_materials?, cull_contacts?,
     /// visible_from?: [{min, max}], view_samples?, instance?, merge?:
     /// "by_material", merge_keep?: [patterns], weld?, small_indices?, orm?,
     /// emissive_strength?}.

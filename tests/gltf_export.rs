@@ -495,3 +495,46 @@ fn gltf_exports_share_texture_files() {
         }
     }
 }
+
+/// LODs: heavy parts get simplified sibling nodes with distance ranges;
+/// light parts don't; instanced copies share the LOD meshes.
+#[test]
+fn lods_add_simplified_nodes_with_ranges() {
+    let mut s = modeler::commands::Session::default();
+    let items = serde_json::json!([
+        {"type": "primitive", "name": "ball", "kind": "sphere", "size": 0.5, "translation": [0, 0.5, 0]},
+        {"type": "linear_array", "name": "ball", "input": "ball", "count": 2, "offset": [2, 0, 0]},
+        {"type": "primitive", "name": "crate", "kind": "box", "size": 0.5, "translation": [-2, 0.25, 0]},
+        {"type": "text", "name": "label", "text": "LOD", "size": 0.3, "translation": [0, 1.2, 0]}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    let opts = modeler::export_opt::Options::parse(&serde_json::json!({
+        "lods": [0.5, 0.2], "textures": "embed_png"}))
+    .unwrap();
+    let dir = temp_dir("lods");
+    let path = dir.join("lods.glb");
+    let report = modeler::gltf::export_glb_with(&s.model, &path, &opts).unwrap();
+    assert!(report.contains("lods:"), "{report}");
+    let (doc, _, _) = gltf::import(&path).expect("imports");
+    let names: Vec<String> = doc.nodes().filter_map(|n| n.name().map(String::from)).collect();
+    for n in ["ball", "ball.lod1", "ball.lod2", "ball_1.lod1", "ball_1.lod2"] {
+        assert!(names.iter().any(|x| x == n), "{n} missing from {names:?}");
+    }
+    assert!(!names.iter().any(|x| x == "crate.lod1"), "a 12-triangle box got LODs");
+    let tris = |name: &str| {
+        let n = doc.nodes().find(|n| n.name() == Some(name)).unwrap();
+        let p = n.mesh().unwrap().primitives().next().unwrap();
+        p.indices().unwrap().count() / 3
+    };
+    assert!(tris("ball.lod1") < tris("ball"));
+    assert!(tris("ball.lod2") < tris("ball.lod1"));
+    let extras = |name: &str| -> serde_json::Value {
+        let n = doc.nodes().find(|n| n.name() == Some(name)).unwrap();
+        serde_json::from_str(n.extras().as_ref().unwrap().get()).unwrap()
+    };
+    let (l0, l1) = (extras("ball")["lod"].clone(), extras("ball.lod1")["lod"].clone());
+    assert_eq!(l0["level"], 0);
+    assert_eq!(l1["level"], 1);
+    assert_eq!(l0["far"], l1["near"]);
+}

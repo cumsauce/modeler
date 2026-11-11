@@ -95,6 +95,7 @@ type, so there is no need to memorise field names.
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
 | `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
+| `text` | name, text, size (capital height), [depth size/8], [font sans / bold / mono / path.ttf], [align center], [line_spacing], [letter_spacing], [translation], [rotation] |
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
@@ -267,6 +268,12 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   branches themselves. Runaway growth
   (over 400k symbols or 40k segments) is refused with a hint. Params work
   in every number (`"length": "$h"`).
+- **`text`**: 3D letters (signs, labels, plaques, console legends) as one
+  closed solid, standing up and readable from the front (+z), the first
+  line's baseline on y = 0, `depth` thick toward -z; `\n` starts a line.
+  Bundled fonts: `sans`, `bold`, `mono` (Fira, OFL); any .ttf/.otf path
+  works. Engrave by subtracting it from a plate; lay it flat with a
+  rotation. A missing glyph is an error naming it.
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`shell`** hollows a closed solid: every face moves in by exactly
@@ -509,7 +516,16 @@ batches, bytes):
   ["door*"]` keeps parts the game needs by name.
 - `weld`, `small_indices` (u16), `orm` (AO packed into metal-roughness R),
   `emissive_strength` (KHR_materials_emissive_strength) are on in `game`.
-- Nodes carry `extras {part, material, comments}` for game-side lookup.
+- `lods: [0.5, 0.2]` (opt-in): every part with at least `lod_min_tris`
+  (300) triangles gets simplified copies `<part>.lod1`, `.lod2` (quadric
+  simplification that keeps seams and uvs, so they reuse the full part's
+  textures) as sibling nodes. Each node's `extras.lod = {level, near,
+  far}` gives the camera distances (m) it is meant for: `lod_distances:
+  [20, 60]`, or by default 15x and 45x the part's size. Instanced copies
+  share the LOD meshes. In Bevy, put a `VisibilityRange` from those
+  numbers on each node (`start_margin: near..near`, `end_margin:
+  far..far`, or with a few meters of crossfade).
+- Nodes carry `extras {part, material, comments, lod?}` for game-side lookup.
 
 **Lights:** `{"type": "light", "name": "bulb", "kind": "point",
 "translation": [0, 1.4, 0], "color": "#ffd8a8", "intensity": 800,

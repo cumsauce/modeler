@@ -243,7 +243,13 @@ pub(crate) fn build_with(
     }
     let prepared = crate::export_opt::prepare(visible, opts);
     let exported = &prepared.parts;
-    crate::material::pbr::prebake(exported.iter());
+    crate::material::pbr::prebake(
+        exported
+            .iter()
+            .zip(&prepared.lod)
+            .filter(|(_, l)| l.is_none_or(|l| l.level == 0))
+            .map(|(p, _)| p),
+    );
     let mut b = Builder::default();
     let (mut nodes, mut meshes, mut materials) = (Vec::new(), Vec::new(), Vec::new());
     let (mut images, mut textures) = (Vec::new(), Vec::new());
@@ -269,9 +275,17 @@ pub(crate) fn build_with(
         let mut textured = false;
         if let Some(r) = &part.material.pbr {
             textured = true;
-            let key = crate::material::pbr::bake_key(r, Some(part));
+            // A LOD copy wears its full-detail part's textures (the
+            // simplifier keeps uvs), so object bakes aren't redone per level.
+            let bake_src = prepared
+                .lod
+                .get(pi)
+                .copied()
+                .flatten()
+                .map_or(part, |l| &exported[l.source]);
+            let key = crate::material::pbr::bake_key(r, Some(bake_src));
             if let std::collections::hash_map::Entry::Vacant(slot) = sets.entry(key) {
-                let ch = crate::material::pbr::bake_part(part)?
+                let ch = crate::material::pbr::bake_part(bake_src)?
                     .ok_or_else(|| format!("part '{}': no bake", part.name))?;
                 let t = crate::material::pbr::textures(&ch);
                 let per_part = r.graph().is_ok_and(|g| g.domain == "object");
@@ -541,6 +555,9 @@ pub(crate) fn build_with(
         });
         if !opts.is_none() {
             let mut extras = json!({"part": part.name});
+            if let Some(Some(l)) = prepared.lod.get(pi) {
+                extras["lod"] = json!({"level": l.level, "near": l.near, "far": l.far});
+            }
             if let Some(r) = &part.material.pbr {
                 extras["material"] = json!(r.material);
             }

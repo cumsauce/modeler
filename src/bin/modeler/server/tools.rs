@@ -576,7 +576,9 @@ Style::default()
     /// overrides, e.g. `{"visible_from": [{"min": [..], "max": [..]}]}` to drop
     /// faces no camera inside those boxes can see, `{"merge": "by_material",
     /// "merge_keep": ["door*"]}` for one draw call per material,
-    /// `{"emissive_strength": 4}` for bloom. The result reports before -> after.
+    /// `{"emissive_strength": 4}` for bloom, `{"lods": [0.5, 0.2]}` for
+    /// simplified `<part>.lod1/.lod2` nodes with distance ranges in extras.lod.
+    /// The result reports before -> after.
     #[tool]
     async fn export_model(
         &self,
@@ -900,7 +902,7 @@ Style::default()
     }
 
     /// Build or edit the model: an array of items, each tagged with a "type"
-    /// (primitive, extrude, revolve, sweep, lsystem, hull, round, shell, group, transform,
+    /// (primitive, extrude, revolve, sweep, lsystem, text, hull, round, shell, group, transform,
     /// boolean, radial_array, linear_array, mirror, material, prefab,
     /// hide_part, show_part, rename, delete, tri_mesh, uvs, move, place,
     /// repeat, light, collider, marker). Ops are upserts
