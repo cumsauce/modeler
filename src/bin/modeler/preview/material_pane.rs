@@ -42,6 +42,8 @@ pub(crate) struct MatPane {
     boxes: Vec<(String, Vec2)>,
     zoom: f32,
     selected: Option<usize>,
+    /// The pane size the layout was made for (rebuilds on resize).
+    laid_out: UVec2,
 }
 
 const BOX_W: f32 = 120.0;
@@ -109,6 +111,7 @@ pub(crate) fn update_material_pane(
     mut boxes: Query<(&MatBox, &mut BorderColor)>,
     mut images: ResMut<Assets<Image>>,
     mut commands: Commands,
+    assets: Res<AssetServer>,
 ) {
     if keys.just_pressed(KeyCode::KeyM) && typing.text.is_empty() {
         pane.visible = !pane.visible;
@@ -133,6 +136,15 @@ pub(crate) fn update_material_pane(
         return;
     }
     let size = computed.size() * computed.inverse_scale_factor();
+    // Not measured yet (the first frame after opening): lay out next frame.
+    if size.x < 50.0 || size.y < 50.0 {
+        return;
+    }
+    // A resized pane (window, or the pane width) lays everything out again.
+    if size.round().as_uvec2() != pane.laid_out {
+        pane.laid_out = size.round().as_uvec2();
+        pane.shown = None;
+    }
     let cursor = windows.single().ok().and_then(|w| w.cursor_position());
     pane.hover = cursor.is_some_and(|c| c.x < size.x && c.y < size.y);
 
@@ -287,10 +299,7 @@ pub(crate) fn update_material_pane(
                     }
                     b.spawn((
                         Text::new(format!("{} ({})", p.name, p.ty)),
-                        TextFont {
-                            font_size: FontSize::Px((11.0 * z).max(7.0)),
-                            ..default()
-                        },
+                        ui_text(&assets, (11.0 * z).max(7.0), false),
                         TextColor(Color::WHITE),
                     ));
                 });
@@ -303,7 +312,7 @@ pub(crate) fn update_material_pane(
         .selected
         .and_then(|i| pane.boxes.get(i))
         .map(|b| b.0.clone());
-    let (text, img) = match doc::render(d, node.as_deref(), None, Some(256), None) {
+    let (_text, img) = match doc::render(d, node.as_deref(), None, Some(256), None) {
         Ok(r) => r,
         Err(e) => (e, Canvas::new(8, 8, [0, 0, 0, 255])),
     };
@@ -316,11 +325,11 @@ pub(crate) fn update_material_pane(
         im.image = canvas_image(&img, &mut images);
     }
     if let Ok(mut t) = title.single_mut() {
-        let first = text.lines().next().unwrap_or_default().to_string();
         t.0 = format!(
-            "{first}\n{} node(s) | history {} nodes | click a node to inspect it, again for the material | M closes",
-            d.nodes.len(),
-            d.history.nodes.len()
+            "Material `{}` v{}  ·  {} nodes  ·  click a node to inspect",
+            d.name,
+            d.version,
+            d.nodes.len()
         );
     }
     let sel = pane.selected;
@@ -334,8 +343,8 @@ pub(crate) fn update_material_pane(
 }
 
 /// The pane's UI tree (hidden until M).
-pub(crate) fn setup_material_pane(mut commands: Commands) {
-    commands
+pub(crate) fn setup_material_pane(mut commands: Commands, assets: Res<AssetServer>) {
+    let pane = commands
         .spawn((
             Name::new("material pane"),
             MatHud,
@@ -344,30 +353,14 @@ pub(crate) fn setup_material_pane(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(0.0),
                 left: Val::Px(0.0),
-                width: Val::Percent(50.0),
+                width: Val::Percent(PANE_FRACTION * 100.0),
                 height: Val::Percent(100.0),
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+            pane_bg(),
         ))
         .with_children(|p| {
-            p.spawn((
-                MatTitle,
-                Text::new(String::new()),
-                TextFont {
-                    font_size: FontSize::Px(12.0),
-                    ..default()
-                },
-                TextColor(Color::srgba(0.85, 0.88, 0.92, 0.9)),
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(6.0),
-                    left: Val::Px(10.0),
-                    right: Val::Px(10.0),
-                    ..default()
-                },
-            ));
             p.spawn((
                 MatPreview,
                 ImageNode::default(),
@@ -389,5 +382,13 @@ pub(crate) fn setup_material_pane(mut commands: Commands) {
                     ..default()
                 },
             ));
-        });
+        })
+        .id();
+    spawn_pane_header(
+        &mut commands,
+        &assets,
+        pane,
+        PaneToggle::Material,
+        (MatTitle, Text::new(String::new())),
+    );
 }

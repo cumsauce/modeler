@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "MCP-driven mesh modeling tool: primitives, CSG booleans, UVs, op graph, glTF export. No game code"
 
 [dependencies]
-bevy = { version = "=0.20.0", features = ["picking"] }
+bevy = { version = "=0.20.0", features = ["picking", "bevy_feathers"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_path_to_error = "0.1"

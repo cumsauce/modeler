@@ -28,13 +28,13 @@ pub(crate) struct GraphEdge(usize, usize);
 /// Panel state: the view, its layout, the camera over it and the selection.
 #[derive(Resource, Default)]
 pub(crate) struct GraphPanel {
-    version: Option<u64>,
+    pub(crate) version: Option<u64>,
     view: modeler::graph_view::GraphView,
     layout: modeler::graph_view::Layout,
     zoom: f32,
     pan: Vec2,
     /// The human zoomed or panned: stop auto-fitting.
-    user_view: bool,
+    pub(crate) user_view: bool,
     drag: Option<Vec2>,
     /// Pixels moved since the button went down (a click stays under 4).
     drag_moved: f32,
@@ -82,7 +82,7 @@ pub(crate) fn update_graph_hud(
     >,
     mut edges: Query<(&GraphEdge, &mut Node, &mut UiTransform), Without<GraphBox>>,
     mut commands: Commands,
-    mut orbit: ResMut<Orbit>,
+    (mut orbit, assets): (ResMut<Orbit>, Res<AssetServer>),
 ) {
     if keys.just_pressed(KeyCode::KeyG) && typing.text.is_empty() {
         visible.0 = !visible.0;
@@ -157,18 +157,12 @@ pub(crate) fn update_graph_hud(
                 .with_children(|b| {
                     b.spawn((
                         Text::new(n.name.clone()),
-                        TextFont {
-                            font_size: FontSize::Px(13.0),
-                            ..default()
-                        },
+                        ui_text(&assets, 13.0, true),
                         TextColor(Color::WHITE.with_alpha(if n.dimmed { 0.6 } else { 1.0 })),
                     ));
                     b.spawn((
                         Text::new(sub),
-                        TextFont {
-                            font_size: FontSize::Px(10.0),
-                            ..default()
-                        },
+                        ui_text(&assets, 10.0, false),
                         TextColor(Color::srgba(0.85, 0.88, 0.92, 0.75)),
                     ));
                 });
@@ -331,7 +325,12 @@ pub(crate) fn update_graph_hud(
     }
 }
 
-/// With the panel open the 3D view is a separate pane on the right half (not
+/// A side pane's width in physical pixels.
+fn pane_w(w: u32) -> u32 {
+    (w as f32 * PANE_FRACTION).round() as u32
+}
+
+/// With the panel open the 3D view is a separate pane on the right (not
 /// drawn under the panel), so screenshots of it never include the graph.
 pub(crate) fn graph_pane_viewport(
     visible: Res<GraphHudVisible>,
@@ -345,8 +344,8 @@ pub(crate) fn graph_pane_viewport(
     let want = (visible.0 || mat.visible).then(|| {
         let (w, h) = (window.physical_width(), window.physical_height());
         bevy::camera::Viewport {
-            physical_position: UVec2::new(w / 2, 0),
-            physical_size: UVec2::new((w - w / 2).max(1), h.max(1)),
+            physical_position: UVec2::new(pane_w(w), 0),
+            physical_size: UVec2::new((w - pane_w(w)).max(1), h.max(1)),
             ..default()
         }
     });

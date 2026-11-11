@@ -167,6 +167,12 @@ fn main() -> AppExit {
         .insert_resource(bevy::pbr::DefaultOpaqueRendererMethod::deferred())
         .add_systems(Startup, (setup_scene, setup_material_pane))
         .add_systems(Startup, setup_agent_camera)
+        .add_plugins(bevy::feathers::FeathersPlugins)
+        .insert_resource(bevy::feathers::theme::UiTheme(
+            bevy::feathers::dark_theme::create_dark_theme(),
+        ))
+        .add_systems(Startup, setup_toolbar)
+        .add_systems(Update, sync_toolbar)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }
     app.run()

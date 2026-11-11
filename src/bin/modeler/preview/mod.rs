@@ -14,3 +14,5 @@ mod panel;
 pub(crate) use panel::*;
 mod picking;
 pub(crate) use picking::*;
+mod ui;
+pub(crate) use ui::*;

@@ -485,18 +485,18 @@ large scenes stay quick to pan when zoomed in), scroll = zoom (trackpad pixel
 scroll is scaled to wheel lines), arrows + PageUp/Down too.
 Auto-drift stops once the human steers; a model change re-frames the camera
 around true world bounds (bounds include part transforms). **G** toggles the
-node-graph pane (left half; the 3D view shrinks to the right half, and `screenshot`
+node-graph pane (left 40% of the window, `PANE_FRACTION`; the 3D view takes the rest, and `screenshot`
 captures only the 3D pane, never the graph; `MODELER_GRAPH=1` opens it at start). It has one box per
 geometry op, coloured by kind, with edges from each input to its reader. In-place
 edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, and
 a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A
 spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, any drag
 pans, clicking a box makes its parts pulse in 3D and double-clicking frames them (`src/graph_view.rs` holds
-the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the material pane in the same left half (G and M replace each other;
+the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the material pane in the same left pane (G and M replace each other;
 `MODELER_MATERIALS=1` opens it at start): the active material's graph by dependency level with a live
 thumbnail per node, a lit sphere and the channels, and clicking a node shows its
 output large (click again for the material). Click a part then type to annotate
-(Enter commits, Esc cancels; Backspace deletes; spaces work).
+(Enter commits, Esc cancels; Backspace deletes; spaces work). The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Graph / Material toggles match G and M.
 
 ## Dev notes / gotchas
 

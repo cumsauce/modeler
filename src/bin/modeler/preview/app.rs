@@ -363,7 +363,11 @@ pub(crate) fn screen_reflections() -> impl Bundle {
 }
 
 /// Camera and lights (no floor: the camera may orbit below the model).
-pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+pub(crate) fn setup_scene(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    assets: Res<AssetServer>,
+) {
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
     // entity does nothing), so faces turned from the sun went black. A dim
     // camera-aligned fill keeps every side readable as the human orbits.
@@ -420,19 +424,20 @@ pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Imag
         Name::new("typing hud"),
         TypingHud,
         Text::new(String::new()),
-        TextFont {
-            font_size: FontSize::Px(20.0),
-            ..default()
-        },
-        TextColor(Color::WHITE),
+        ui_text(&assets, 16.0, false),
+        ui_color(false),
         Node {
             position_type: PositionType::Absolute,
             bottom: Val::Px(8.0),
-            left: Val::Px(8.0),
+            right: Val::Px(8.0),
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
             ..default()
         },
+        bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
+        GlobalZIndex(3),
     ));
-    commands
+    let graph = commands
         .spawn((
             Name::new("graph hud"),
             GraphHud,
@@ -441,33 +446,30 @@ pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Imag
                 position_type: PositionType::Absolute,
                 top: Val::Px(0.0),
                 left: Val::Px(0.0),
-                width: Val::Percent(50.0),
+                width: Val::Percent(PANE_FRACTION * 100.0),
                 height: Val::Percent(100.0),
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+            pane_bg(),
         ))
         .with_children(|p| {
             p.spawn((
                 GraphCanvas,
                 Node {
                     position_type: PositionType::Absolute,
-                    top: Val::Px(0.0),
+                    top: Val::Px(HEADER_H),
                     left: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
                     ..default()
                 },
             ));
             p.spawn((
                 GraphFooter,
                 Text::new(String::new()),
-                TextFont {
-                    font_size: FontSize::Px(12.0),
-                    ..default()
-                },
-                TextColor(Color::srgba(0.8, 0.83, 0.88, 0.8)),
+                ui_text(&assets, 11.0, false),
+                ui_color(true),
                 Node {
                     position_type: PositionType::Absolute,
                     bottom: Val::Px(0.0),
@@ -476,8 +478,16 @@ pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Imag
                     padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.03, 0.035, 0.05, 0.97)),
+                bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
                 GlobalZIndex(1),
             ));
-        });
+        })
+        .id();
+    spawn_pane_header(
+        &mut commands,
+        &assets,
+        graph,
+        PaneToggle::Graph,
+        Text::new("Op graph"),
+    );
 }
