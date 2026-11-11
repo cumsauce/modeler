@@ -26,8 +26,58 @@ pub struct Channels {
     pub opacity: Vec<f32>,
     /// Which channels the graph actually drives (the rest are defaults).
     pub driven: Vec<&'static str>,
+    /// Whole-surface factors (clearcoat, anisotropy, transmission, ...).
+    pub extras: Extras,
     /// Nodes computed (not served from the cache).
     pub runs: usize,
+}
+
+/// Scalar material factors beyond the textured channels; `None` = the
+/// renderer's default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Extras {
+    pub clearcoat: Option<f32>,
+    pub clearcoat_roughness: Option<f32>,
+    pub anisotropy: Option<f32>,
+    /// Degrees.
+    pub anisotropy_rotation: Option<f32>,
+    pub transmission: Option<f32>,
+    pub specular_transmission: Option<f32>,
+    pub thickness: Option<f32>,
+    pub ior: Option<f32>,
+}
+
+impl Extras {
+    pub fn of(o: &node::Output) -> Extras {
+        Extras {
+            clearcoat: o.clearcoat,
+            clearcoat_roughness: o.clearcoat_roughness,
+            anisotropy: o.anisotropy,
+            anisotropy_rotation: o.anisotropy_rotation,
+            transmission: o.transmission,
+            specular_transmission: o.specular_transmission,
+            thickness: o.thickness,
+            ior: o.ior,
+        }
+    }
+
+    /// One line for summaries, empty when nothing is set.
+    pub fn describe(&self) -> String {
+        let f = [
+            ("clearcoat", self.clearcoat),
+            ("clearcoat_roughness", self.clearcoat_roughness),
+            ("anisotropy", self.anisotropy),
+            ("anisotropy_rotation", self.anisotropy_rotation),
+            ("transmission", self.transmission),
+            ("specular_transmission", self.specular_transmission),
+            ("thickness", self.thickness),
+            ("ior", self.ior),
+        ];
+        f.iter()
+            .filter_map(|(k, v)| v.map(|v| format!("{k} {v}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Every channel name, in display order.
@@ -53,16 +103,60 @@ pub fn bake(
     channels(&ev, s)
 }
 
+/// One layer's channel values, per sample.
+struct Layered {
+    base: Vec<[f32; 3]>,
+    rough: Vec<f32>,
+    metal: Vec<f32>,
+    normal: Vec<[f32; 3]>,
+    height: Vec<f32>,
+    ao: Vec<f32>,
+    emis: Vec<[f32; 3]>,
+    opac: Vec<f32>,
+}
+
 /// Assembles the channels from an evaluated graph.
 pub fn channels(ev: &Evaluated, s: &Samples) -> Result<Channels, String> {
-    let n = s.len();
     let o = ev.output().cloned().unwrap_or_default();
     let mut driven = Vec::new();
+    let l = assemble(ev, s, &o, "output", &mut driven, 0)?;
+    driven.sort_unstable();
+    driven.dedup();
+    Ok(Channels {
+        w: s.w,
+        h: s.h,
+        base_color: l.base,
+        roughness: l.rough,
+        metallic: l.metal,
+        normal: l.normal,
+        height: l.height,
+        ao: l.ao,
+        emissive: l.emis,
+        opacity: l.opac,
+        driven,
+        extras: Extras::of(&o),
+        runs: ev.runs,
+    })
+}
+
+/// One output node's channels, with its `over` layers blended in.
+fn assemble(
+    ev: &Evaluated,
+    s: &Samples,
+    o: &node::Output,
+    who: &str,
+    driven: &mut Vec<&'static str>,
+    depth: usize,
+) -> Result<Layered, String> {
+    if depth > 8 {
+        return Err(format!("{who}: layers nest too deep (a layer cycle?)"));
+    }
+    let n = s.len();
     let mut ch = |name: &'static str, i: &Option<In>, default: Field| -> Result<Field, String> {
         match i {
             Some(i) => {
                 driven.push(name);
-                ev.field(i).map_err(|e| format!("output.{name}: {e}"))
+                ev.field(i).map_err(|e| format!("{who}.{name}: {e}"))
             }
             None => Ok(default),
         }
@@ -99,20 +193,59 @@ pub fn channels(ev: &Evaluated, s: &Samples) -> Result<Channels, String> {
             }
         })
         .collect();
-    Ok(Channels {
-        w: s.w,
-        h: s.h,
-        base_color: par3(&base),
-        roughness: par1(&rough),
-        metallic: par1(&metal),
+    let mut acc = Layered {
+        base: par3(&base),
+        rough: par1(&rough),
+        metal: par1(&metal),
         normal,
         height: par1(&height),
         ao: par1(&ao),
-        emissive: par3(&emis),
-        opacity: par1(&opac),
-        driven,
-        runs: ev.runs,
-    })
+        emis: par3(&emis),
+        opac: par1(&opac),
+    };
+    for (li, layer) in o.over.iter().enumerate() {
+        let lw = format!("{who}.over[{li}]");
+        let lo = ev
+            .output_named(&layer.output)
+            .ok_or_else(|| format!("{lw}: `{}` is not an output node", layer.output))?;
+        let top = assemble(ev, s, lo, &layer.output, driven, depth + 1)?;
+        let m = ev
+            .field(&layer.mask)
+            .map_err(|e| format!("{lw}.mask: {e}"))?;
+        let t: Vec<f32> = (0..n)
+            .into_par_iter()
+            .map(|i| m.f(i).clamp(0.0, 1.0))
+            .collect();
+        let l1 = |a: &mut Vec<f32>, b: &[f32]| {
+            a.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, x)| *x += (b[i] - *x) * t[i]);
+        };
+        let l3 = |a: &mut Vec<[f32; 3]>, b: &[[f32; 3]]| {
+            a.par_iter_mut().enumerate().for_each(|(i, x)| {
+                for c in 0..3 {
+                    x[c] += (b[i][c] - x[c]) * t[i];
+                }
+            });
+        };
+        l3(&mut acc.base, &top.base);
+        l1(&mut acc.rough, &top.rough);
+        l1(&mut acc.metal, &top.metal);
+        l1(&mut acc.height, &top.height);
+        l1(&mut acc.ao, &top.ao);
+        l3(&mut acc.emis, &top.emis);
+        l1(&mut acc.opac, &top.opac);
+        l3(&mut acc.normal, &top.normal);
+        acc.normal.par_iter_mut().for_each(|v| {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            *v = if l > 1e-9 {
+                v.map(|c| c / l)
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+        });
+    }
+    Ok(acc)
 }
 
 #[inline]

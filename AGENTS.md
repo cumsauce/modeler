@@ -293,7 +293,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, scope?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, scope?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `scope: ["bars_*", "basket"]` limits what the other checks report to
     those parts (`*` globs): grounded / supported / rests / bounds /
@@ -327,6 +327,12 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `validate`: every part closed and outward-wound.
   - `rebuild`: an uncached re-derivation matches the cache.
   - `stable`: the centre of mass (uniform density) sits over the footprint.
+  - `materials`: `true` fails visible parts still on the default grey
+    material; `"pbr"` also fails flat colours, so every part needs a
+    procedural material (`material_ops`, then a `material` item with
+    `pbr`). **Every model should pass `materials: true`**, and prefer
+    `"pbr"` for anything that ships: put it in the build's `expect`.
+    `save_prefab` warns about grey parts (and notes flat colours).
   - `collisions`: no part passes through another. `true`, or `{allow:
     [["c_leg*", "c_seat"]], max: 0.2}`. Fails any pair where more than
     `max` (default 20%) of the smaller part's volume is inside the other,
@@ -624,12 +630,41 @@ work, and every material has its own history tree.
   onion, displace, mask (fill / stroke / glow, anti-aliased). Noise: noise
   (value / gradient; fbm / ridged / turbulence), worley (f1 / f2 / edge /
   id). Maths and colour: math, remap, random (per id), color, ramp, hsv,
-  blend, levels. Neighbourhood: blur, normal_from_height, ao_from_height,
-  curvature, dilate.
+  blend, levels, gradient (linear / radial; 3-value points read object
+  position, a fade across a part), facing (cosine to a direction: dust on
+  tops, moss on one side), image (a PNG, `size` meters per repeat; ports
+  colour / alpha / value). Neighbourhood: blur, dir_blur (smear along an
+  angle or a `flow` field: streaks, brushed metal, hair),
+  normal_from_height, ao_from_height, curvature, dilate, islands (connected
+  regions of a mask: `id` per island for `random`, `area`).
+- **`scatter`** is a tile sampler: shapes (ellipse, circle, rect, feather,
+  leaf) strewn on a jittered grid of `cell` meters, `per_cell` each, with
+  random `scale`, `angle_jitter` and `density`, pointing along `angle` or a
+  `flow` field, stacked `layering: "random"` or `"flow"` (upstream ones on
+  top: feathers, scales, shingles). The top instance drives the ports:
+  `mask`, `local` (-1..1 inside it, base to tip along y: draw any detail
+  with other nodes on these coords), `id` (per instance, for `random`),
+  `height` (a dome) and `edge` (meters inside). Tileable.
+- **Mesh-aware masks** (object domain on a part): `mesh_ao` (occlusion
+  from the part's own mesh: creases and hollows darken) and
+  `mesh_curvature` (0.5 flat, ports `convex` for edge wear and `concave`
+  for dirt in crevices), from a voxelized copy of the part. Only the part
+  itself counts, not its neighbours; without a mesh (tile domain, the
+  preview sphere) they read neutral.
 - **`output`** names the channels: base_color, roughness, metallic,
   height (meters; the normal is derived from it, times normal_strength,
   unless `normal` is given), ao, emissive, opacity. Missing channels use
-  defaults. Normals are in the glTF convention (+y up the image).
+  defaults. Normals are in the glTF convention (+y up the image). Whole-
+  surface factors (numbers): `clearcoat` / `clearcoat_roughness`
+  (lacquer, wet), `anisotropy` / `anisotropy_rotation` (degrees; brushed
+  metal, hair, satin), `transmission` (light through leaves, paper, skin),
+  `specular_transmission` + `thickness` + `ior` (glass, water). They show
+  in the preview and export as KHR_materials_clearcoat / anisotropy /
+  diffuse_transmission / transmission / volume / ior.
+- **Layers**: `output` takes `over: [{"output": "dirt_out", "mask":
+  "dirt_m"}]`, each a whole other `output` node blended in (every channel)
+  where its mask is 1, in order: moss over stone, rust over paint, mud over
+  feathers. The main output is the one no other output layers in.
 - **`expect`** checks: `tileable` (bakes the tile shifted by half a tile and
   compares: a non-periodic node fails, naming the channel), `ranges` (finite,
   0..1), `albedo` (non-metal luminance in 0.02..0.9 at the 1st / 99th

@@ -327,6 +327,16 @@ pub fn samples(part: &Part, n: usize) -> Samples {
         period: 0.0,
         texel,
         key: h.finish(),
+        mesh: Some(Arc::new(super::meshvox::MeshVox::new(
+            (0..tri_count(part))
+                .filter_map(|t| {
+                    let c = [0, 1, 2].map(|k| corner(part, t * 3 + k));
+                    c.iter()
+                        .all(|&k| k < part.verts.len())
+                        .then(|| c.map(|k| (Vec3::from(part.verts[k]) * sc).to_array()))
+                })
+                .collect(),
+        ))),
     }
 }
 

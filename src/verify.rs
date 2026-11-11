@@ -518,12 +518,7 @@ pub fn lints(model: &Model) -> Vec<String> {
         if !p.visible {
             continue;
         }
-        let m = &p.material;
-        if m.pbr.is_none()
-            && m.base_color == [0.7, 0.7, 0.7, 1.0]
-            && m.roughness == 0.6
-            && m.metalness == 0.0
-        {
+        if p.material.is_default() {
             out.push(format!(
                 "part `{}` still has the default material (forgot an op_material?)",
                 p.name

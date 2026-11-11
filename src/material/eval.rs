@@ -37,6 +37,8 @@ pub struct Samples {
     pub texel: f32,
     /// Identifies the domain in cache keys.
     pub key: u64,
+    /// The part's mesh (object domain on a part), for mesh-aware nodes.
+    pub mesh: Option<Arc<super::meshvox::MeshVox>>,
 }
 
 impl Samples {
@@ -74,6 +76,7 @@ impl Samples {
             period: tile,
             texel: t,
             key: h.finish(),
+            mesh: None,
         }
     }
 
@@ -109,6 +112,7 @@ impl Samples {
             period: 0.0,
             texel: std::f32::consts::PI * r / h as f32,
             key: hs.finish(),
+            mesh: None,
         }
     }
 
@@ -285,9 +289,27 @@ pub struct Evaluated {
 
 impl Evaluated {
     /// The output node, if the graph has one.
+    /// The main output: the last `output` node no other output layers in.
     pub fn output(&self) -> Option<&Output> {
+        let layered: Vec<&str> = self
+            .nodes
+            .iter()
+            .filter_map(|p| match &p.node {
+                Node::Output(o) => Some(o.over.iter().map(|l| l.output.as_str())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         self.nodes.iter().rev().find_map(|p| match &p.node {
-            Node::Output(o) => Some(o),
+            Node::Output(o) if !layered.contains(&p.name.as_str()) => Some(o),
+            _ => None,
+        })
+    }
+
+    /// An `output` node by name (a layer).
+    pub fn output_named(&self, name: &str) -> Option<&Output> {
+        self.nodes.iter().find_map(|p| match &p.node {
+            Node::Output(o) if p.name == name => Some(o),
             _ => None,
         })
     }

@@ -320,6 +320,31 @@ fn pbr_material(
     if t.blend {
         m.alpha_mode = AlphaMode::Blend;
     }
+    let x = &ch.extras;
+    if let Some(v) = x.clearcoat {
+        m.clearcoat = v;
+    }
+    if let Some(v) = x.clearcoat_roughness {
+        m.clearcoat_perceptual_roughness = v;
+    }
+    if let Some(v) = x.anisotropy {
+        m.anisotropy_strength = v;
+    }
+    if let Some(v) = x.anisotropy_rotation {
+        m.anisotropy_rotation = v.to_radians();
+    }
+    if let Some(v) = x.transmission {
+        m.diffuse_transmission = v;
+    }
+    if let Some(v) = x.specular_transmission {
+        m.specular_transmission = v;
+    }
+    if let Some(v) = x.thickness {
+        m.thickness = v;
+    }
+    if let Some(v) = x.ior {
+        m.ior = v;
+    }
     if cache.0.len() > 256 {
         cache.0.clear();
     }

@@ -259,6 +259,41 @@ pub(crate) fn build(
                 if let Some(e) = &t.emissive {
                     set["emissive"] = json!(add(e, "emissive")?);
                 }
+                let x = &ch.extras;
+                let mut ext = serde_json::Map::new();
+                if x.clearcoat.is_some() || x.clearcoat_roughness.is_some() {
+                    ext.insert(
+                        "KHR_materials_clearcoat".into(),
+                        json!({"clearcoatFactor": x.clearcoat.unwrap_or(0.0),
+                               "clearcoatRoughnessFactor": x.clearcoat_roughness.unwrap_or(0.5)}),
+                    );
+                }
+                if x.anisotropy.is_some() {
+                    ext.insert(
+                        "KHR_materials_anisotropy".into(),
+                        json!({"anisotropyStrength": x.anisotropy.unwrap_or(0.0),
+                               "anisotropyRotation": x.anisotropy_rotation.unwrap_or(0.0).to_radians()}),
+                    );
+                }
+                if let Some(t) = x.transmission {
+                    ext.insert(
+                        "KHR_materials_diffuse_transmission".into(),
+                        json!({"diffuseTransmissionFactor": t}),
+                    );
+                }
+                if let Some(t) = x.specular_transmission {
+                    ext.insert(
+                        "KHR_materials_transmission".into(),
+                        json!({"transmissionFactor": t}),
+                    );
+                }
+                if let Some(t) = x.thickness {
+                    ext.insert("KHR_materials_volume".into(), json!({"thicknessFactor": t}));
+                }
+                if let Some(i) = x.ior {
+                    ext.insert("KHR_materials_ior".into(), json!({"ior": i}));
+                }
+                set["ext"] = serde_json::Value::Object(ext);
                 slot.insert(set);
             }
             let set = &sets[&key];
@@ -281,6 +316,30 @@ pub(crate) fn build(
             }
             if set["blend"] == json!(true) {
                 material["alphaMode"] = json!("BLEND");
+            }
+            if let Some(ext) = set.get("ext").and_then(|e| e.as_object())
+                && !ext.is_empty()
+            {
+                if !material["extensions"].is_object() {
+                    material["extensions"] = json!({});
+                }
+                for (k, v) in ext {
+                    material["extensions"][k] = v.clone();
+                    if let Some(name) = [
+                        "KHR_materials_clearcoat",
+                        "KHR_materials_anisotropy",
+                        "KHR_materials_diffuse_transmission",
+                        "KHR_materials_transmission",
+                        "KHR_materials_volume",
+                        "KHR_materials_ior",
+                    ]
+                    .into_iter()
+                    .find(|n| n == k)
+                        && !extensions.contains(&name)
+                    {
+                        extensions.push(name);
+                    }
+                }
             }
         }
         if part.material.base_color[3] < 0.999 {

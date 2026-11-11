@@ -98,6 +98,17 @@ pub struct Material {
     pub pbr: Option<material::PbrRef>,
 }
 
+impl Material {
+    /// Still the untouched default look (no material item reached it).
+    pub fn is_default(&self) -> bool {
+        let d = Material::default();
+        self.pbr.is_none()
+            && self.base_color == d.base_color
+            && self.roughness == d.roughness
+            && self.metalness == d.metalness
+    }
+}
+
 impl Default for Material {
     fn default() -> Self {
         Self {

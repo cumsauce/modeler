@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::eval::Samples;
+use super::nodes2::{DirBlur, Facing, Gradient, Image, Islands, MeshAo, MeshCurvature, Scatter};
 use super::noise::{self, Lattice};
 use super::sdf;
 
@@ -352,6 +353,14 @@ node_types! {
     "ao_from_height" => AoFromHeight,
     "curvature" => Curvature,
     "dilate" => Dilate,
+    "scatter" => Scatter,
+    "mesh_ao" => MeshAo,
+    "mesh_curvature" => MeshCurvature,
+    "gradient" => Gradient,
+    "facing" => Facing,
+    "image" => Image,
+    "islands" => Islands,
+    "dir_blur" => DirBlur,
     "output" => Output,
 }
 
@@ -1980,6 +1989,43 @@ pub struct Output {
     pub emissive: Option<In>,
     #[serde(default)]
     pub opacity: Option<In>,
+    /// Whole materials layered on top, in order: each names another
+    /// `output` node, blended in (every channel) where its `mask` is 1.
+    #[serde(default)]
+    pub over: Vec<Layer>,
+    /// Clear lacquer over the surface, 0..1 (varnish, car paint, wet look).
+    #[serde(default)]
+    pub clearcoat: Option<f32>,
+    #[serde(default)]
+    pub clearcoat_roughness: Option<f32>,
+    /// Stretched highlights, 0..1 (brushed metal, hair, satin, feathers).
+    #[serde(default)]
+    pub anisotropy: Option<f32>,
+    /// Highlight direction in degrees (0 = along the texture's u).
+    #[serde(default)]
+    pub anisotropy_rotation: Option<f32>,
+    /// Light passing through and scattering, 0..1 (leaves, paper, skin, wax).
+    #[serde(default)]
+    pub transmission: Option<f32>,
+    /// Clear refraction, 0..1 (glass, water).
+    #[serde(default)]
+    pub specular_transmission: Option<f32>,
+    /// Thickness in meters for transmission.
+    #[serde(default)]
+    pub thickness: Option<f32>,
+    /// Index of refraction (default 1.5).
+    #[serde(default)]
+    pub ior: Option<f32>,
+}
+
+/// One whole-material layer of an output.
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Layer {
+    /// Another `output` node: the layer's material.
+    pub output: String,
+    /// Where it shows (0..1).
+    pub mask: In,
 }
 
 impl Eval for Output {
@@ -1991,7 +2037,9 @@ impl Eval for Output {
 /// Node references in a node body: every string that is not a colour and
 /// not a mode/kind/op word, as (node, port).
 pub fn refs(body: &Value) -> Vec<(String, String)> {
-    const WORDS: &[&str] = &["type", "name", "op", "mode", "kind", "of", "out"];
+    const WORDS: &[&str] = &[
+        "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path",
+    ];
     let mut out = Vec::new();
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {
         match v {
@@ -2062,8 +2110,19 @@ pub fn example(ty: &str) -> Option<Value> {
         "ao_from_height" => json!({"height": "h", "radius": 0.01}),
         "curvature" => json!({"height": "h", "strength": 1.0}),
         "dilate" => json!({"input": "mask1", "radius": 0.003}),
+        "scatter" => {
+            json!({"cell": 0.012, "size": [0.014, 0.02], "shape": "feather", "per_cell": 2, "scale": [0.8, 1.2], "angle_jitter": 12, "layering": "flow"})
+        }
+        "mesh_ao" => json!({"radius": 0.03}),
+        "mesh_curvature" => json!({"radius": 0.01, "gain": 1.5}),
+        "gradient" => json!({"from": [0, 0.3, 0.1], "to": [0, 0.2, -0.2]}),
+        "facing" => json!({"dir": [0, 1, 0], "lo": 0.3, "hi": 0.8}),
+        "image" => json!({"path": "textures/decal.png", "size": [0.5, 0.5]}),
+        "islands" => json!({"input": "stone_mask"}),
+        "dir_blur" => json!({"input": "n1", "length": 0.02, "angle": 90}),
         "output" => {
-            json!({"base_color": "col", "roughness": "rough", "metallic": 0, "height": "h"})
+            json!({"base_color": "col", "roughness": "rough", "metallic": 0, "height": "h",
+                   "over": [{"output": "dirt_out", "mask": "dirt_mask"}], "clearcoat": 0.3})
         }
         _ => return None,
     };

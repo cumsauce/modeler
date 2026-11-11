@@ -66,6 +66,34 @@ pub enum PivotSpec {
     Anchor(String),
 }
 
+/// Visible parts on the default material, and those with only a flat
+/// colour (no procedural `pbr` material).
+pub fn material_gaps(model: &Model) -> (Vec<String>, Vec<String>) {
+    let (mut bare, mut flat) = (Vec::new(), Vec::new());
+    for p in model.parts.iter().filter(|p| p.visible) {
+        if p.material.is_default() {
+            bare.push(p.name.clone());
+        } else if p.material.pbr.is_none() {
+            flat.push(p.name.clone());
+        }
+    }
+    (bare, flat)
+}
+
+/// A name list cut to 12 with a count of the rest.
+fn fold(names: &[String]) -> String {
+    let mut s = names
+        .iter()
+        .take(12)
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > 12 {
+        s += &format!(", +{} more", names.len() - 12);
+    }
+    s
+}
+
 /// Resolves an anchor's words against a box.
 pub fn anchor_point(words: &str, lo: Vec3, hi: Vec3) -> Result<[f32; 3], String> {
     let mut f = [0.5f32; 3];
@@ -109,6 +137,11 @@ pub struct VerifySpec {
     /// `"strict"` fails them.
     #[serde(default)]
     pub grounded: Option<GroundedSpec>,
+    /// Every visible part has a material: `true` fails parts on the default
+    /// material, `"pbr"` also fails flat colours (a procedural `pbr`
+    /// material required).
+    #[serde(default)]
+    pub materials: Option<GroundedSpec>,
     /// Limit the checks to these parts (`*` globs): grounded / supported /
     /// validate / bounds / stable report only them (grounding still uses
     /// every part), collisions keep pairs with at least one side in scope.
@@ -1737,7 +1770,8 @@ impl Session {
             && spec.stable.is_none()
             && spec.supported.is_none()
             && spec.rests.is_none()
-            && spec.collisions.is_none();
+            && spec.collisions.is_none()
+            && spec.materials.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
             Ok(t) => out.push((name.to_string(), true, t)),
@@ -1933,6 +1967,57 @@ impl Session {
                         "{} pair(s) pass through each other: {} (intended joints go in `allow: [[a, b]]`, or `{{\"pair\": [a, b], \"depth\": 0.003}}` for shallow ones){joints_txt}{excused_txt}",
                         bad.len(),
                         list.join("; ")
+                    )),
+                );
+            }
+        }
+        let pbr = match &spec.materials {
+            None | Some(GroundedSpec::On(false)) => None,
+            Some(GroundedSpec::On(true)) => Some(false),
+            Some(GroundedSpec::Mode(m)) if m == "pbr" => Some(true),
+            Some(GroundedSpec::Mode(m)) => {
+                record(
+                    "materials",
+                    Err(format!("materials: `{m}`: use true or \"pbr\"")),
+                );
+                None
+            }
+        };
+        if let Some(pbr) = pbr {
+            let (bare, flat) = material_gaps(view);
+            let mut bad = Vec::new();
+            if !bare.is_empty() {
+                bad.push(format!(
+                    "{} part(s) on the default material: {}",
+                    bare.len(),
+                    fold(&bare)
+                ));
+            }
+            if pbr && !flat.is_empty() {
+                bad.push(format!(
+                    "{} part(s) with a flat colour, no pbr material: {}",
+                    flat.len(),
+                    fold(&flat)
+                ));
+            }
+            if bad.is_empty() {
+                record(
+                    "materials",
+                    Ok(if pbr {
+                        "every visible part has a pbr material".into()
+                    } else {
+                        format!(
+                            "every visible part has a material ({} flat colour, the rest pbr)",
+                            flat.len()
+                        )
+                    }),
+                );
+            } else {
+                record(
+                    "materials",
+                    Err(format!(
+                        "{} (give each a material item; pbr: a procedural material, see material_ops)",
+                        bad.join("; ")
                     )),
                 );
             }
@@ -4380,6 +4465,39 @@ mod tests {
             panic!("bad size should fail");
         };
         assert!(e.to_string().contains("repeat r=blob"), "{e}");
+    }
+
+    #[test]
+    fn verify_materials_flags_grey_and_flat_parts() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "a", "kind": "box", "size": 0.1, "translation": [0, 0.05, 0]},
+                {"type": "primitive", "name": "b", "kind": "box", "size": 0.1, "translation": [0.2, 0.05, 0]},
+                {"type": "material", "name": "b", "color": "#c33"}
+            ]),
+        );
+        let check = |s: &Session, v: serde_json::Value| {
+            let spec: VerifySpec = serde_json::from_value(serde_json::json!({"materials": v}))
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.verify_checks(&spec)
+                .into_iter()
+                .find(|(n, _, _)| n == "materials")
+                .unwrap_or_else(|| panic!("no materials check"))
+        };
+        let (_, ok, text) = check(&s, serde_json::json!(true));
+        assert!(
+            !ok && text.contains("`a`") && !text.contains("`b`"),
+            "{text}"
+        );
+        run(
+            &mut s,
+            serde_json::json!([{"type": "material", "name": "a", "color": "#333"}]),
+        );
+        assert!(check(&s, serde_json::json!(true)).1);
+        let (_, ok, text) = check(&s, serde_json::json!("pbr"));
+        assert!(!ok && text.contains("flat colour"), "{text}");
     }
 
     #[test]

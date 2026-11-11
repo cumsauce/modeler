@@ -589,11 +589,25 @@ Style::default()
             let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
             catalog::save_prefab(&s.model, &description, &tag_refs, &prompt).map(
                 |(name, overwrote)| {
-                    if overwrote {
+                    let mut out = if overwrote {
                         format!("saved `{name}` — overwrote an existing catalog entry")
                     } else {
                         format!("saved `{name}`")
+                    };
+                    let (bare, flat) = modeler::commands::material_gaps(&s.model);
+                    if !bare.is_empty() {
+                        out += &format!(
+                            "\nwarning: {} visible part(s) still on the default material ({}): give every part a material, ideally a procedural pbr one; verify {{\"materials\": true}} lists them",
+                            bare.len(),
+                            bare.iter().take(8).map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                        );
+                    } else if !flat.is_empty() {
+                        out += &format!(
+                            "\nnote: {} visible part(s) use a flat colour, no pbr material; verify {{\"materials\": \"pbr\"}} lists them",
+                            flat.len()
+                        );
                     }
+                    out
                 },
             )
         })
@@ -1316,6 +1330,7 @@ impl rmcp::ServerHandler for Tools {
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
+- Every model gets materials: give each visible part a material item, preferably a procedural pbr one (material_ops, then {\"type\": \"material\", \"name\": part, \"pbr\": name}); flat colours only for small details. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
