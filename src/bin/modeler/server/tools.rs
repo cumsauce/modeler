@@ -551,33 +551,12 @@ impl Tools {
             all_hits,
         }): Parameters<ProbeRayArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Cmd::ProbeRay {
-                origin,
-                dir,
-                all_hits,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        let text = match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
-            Ok(Ok(Ok(text))) => text,
-            Ok(Ok(Err(e))) => return Err(ErrorData::internal_error(e, None)),
-            Ok(Err(_)) => {
-                return Err(ErrorData::internal_error(
-                    "preview app dropped the probe",
-                    None,
-                ));
-            }
-            Err(_) => {
-                return Err(ErrorData::internal_error(
-                    "timed out after 15s waiting for the preview app - the render may be stuck; retry or restart the daemon",
-                    None,
-                ));
-            }
-        };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        // CPU ray cast on the model itself: works headless too.
+        self.run(move |s| {
+            modeler::contact::probe_text(&s.model, origin, dir, all_hits)
+                .map_err(modeler::ModelerError::from)
+        })
+        .await
     }
 
     /// Render agent views: named ("front", "back", "left", "right", "top",
@@ -910,7 +889,8 @@ impl rmcp::ServerHandler for Tools {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); graph order doesn't matter.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter. A batch is atomic: any failing item rolls the whole call back.
+- Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\").
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
@@ -920,7 +900,7 @@ impl rmcp::ServerHandler for Tools {
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, stable, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings.
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], stable, bounds {min,max,tol}, validate, rebuild}, or call verify. grounded = touches something (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint). probe_ray proves openings (headless too).
 - inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not).
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
@@ -945,11 +925,17 @@ pub(crate) fn format_catalog(entries: &[CatalogEntry]) -> String {
     }
     let mut out = format!("{} catalog entries\n", entries.len());
     for e in entries {
+        let knobs = catalog::knobs(e);
         out += &format!(
-            "- `{}`: {} [{}]\n",
+            "- `{}`: {} [{}]{}\n",
             e.name,
             e.description,
-            e.tags.join(", ")
+            e.tags.join(", "),
+            if knobs.is_empty() {
+                String::new()
+            } else {
+                format!(" (knobs: {knobs})")
+            }
         );
     }
     out

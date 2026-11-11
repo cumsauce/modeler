@@ -73,7 +73,8 @@ type, so there is no need to memorise field names.
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
-| `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot] |
+| `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot: point or anchor] |
+| `place` | [name], parts, on, [at [x, z]], [gap] (drop onto `on`'s top surface) |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset |
@@ -115,6 +116,21 @@ type, so there is no need to memorise field names.
   in list order (later = outer parent). Give it a `name` and re-issue that
   name to adjust, e.g. lean a bike onto its kickstand with
   `{"type": "move", "name": "lean", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]}`.
+- **`place`** drops parts onto a surface so nothing is placed by hand
+  arithmetic: `{"type": "place", "name": "mug_on", "parts": ["mug"], "on":
+  "desk_top", "at": [-0.4, 0.1]}` slides the mug's footprint centre to
+  x -0.4, z 0.1, then moves it vertically until its underside rests on the
+  desk's top surface (sloped and uneven tops work; `gap` leaves clearance).
+  It is a named, post-graph move like `move`, so it re-runs on every change:
+  lower the desk with a param and the mug follows.
+- **Anchor pivots**: a move's `pivot` may be a point or an anchor on a
+  bounding box: `"bottom-back"` (the moved parts' own box) or
+  `"laptop_screen:bottom-front"` (another part's box; `*` patterns work).
+  Words: left/right (x), bottom/top (y), back/front (z, front = +z),
+  center; axes not named stay centred. Anchors and the default pivot are
+  measured on the parts *without* this move, so re-issuing a named move
+  never drifts. A laptop hinge: `{"type": "move", "name": "hinge", "parts":
+  ["screen"], "axis": [1, 0, 0], "degrees": -15, "pivot": "screen:bottom-front"}`.
 - **Radial arrays** default to `include_source: true`: the source is item 0
   and `count` items spread evenly (copies `name_1..`). With `false`, `count`
   new copies `name_0..` start at `start_degrees` and the source stays put.
@@ -160,7 +176,7 @@ type, so there is no need to memorise field names.
   are closed solids, coplanar and curved-on-curved cuts are exact, and input
   UVs ride through; normals are creased at 40°. **Both inputs must be closed
   solids**: disc/plane/washer (open sheets) error with "is not a closed
-  solid". A failed op rolls back; the graph never stays broken.
+  solid". A failed op rolls back the whole call; the graph never stays broken.
 - **disc/washer/plane** are double-sided sheets in the XY plane (vertical);
   lay one flat with rotation `[-0.707, 0, 0, 0.707]`.
 - **Params**: `params: {"tower_h": 2}` sets named numbers before the items
@@ -172,8 +188,12 @@ type, so there is no need to memorise field names.
   instances a saved catalog model; its visible parts become `lamp1.pole`,
   `lamp1.shade`, ... and feed later ops like any part. The part list is
   captured when the item is applied; re-issue it after re-saving the prefab.
+- **Batches are atomic**: if any item fails, the whole call rolls back
+  (the error says so) and the model is exactly as before. Items may read
+  parts made later in the same batch.
 - **`expect`** runs checks after the batch in the same call (fields as for
   `verify`); any failure makes the call an error, but the batch stays applied.
+- Part lists fold array runs: `+book, +book_1..13`.
 - The result lists only notable items (routine `ok` lines become
   "applied N item(s)") and ends with a **brief summary**: part/op counts, bounds, the
   parts this call added (`+`), changed (`~`) and removed (`-`), and every
@@ -193,13 +213,23 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, bounds?, validate?, rebuild?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, bounds?, validate?, rebuild?, stable?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `parts`: exact part names, order-insensitive; reports missing and
     unexpected names. `*` matches any run of characters (`"gz.*"` covers a
     prefab instance).
   - `includes`: these names must exist; extras are fine (`*` works too).
-  - `grounded`: every part touches the ground or another part (no floaters).
+  - `grounded`: every part touches the ground or another part (no floaters),
+    by real geometry: shared volume, or surfaces within 0.2% of the smaller
+    part's size (10 µm..1 mm), so a 0.8 mm gap under a laptop screen fails.
+    (The `scene_summary` floating warning is a cheap bounding-box version.)
+  - `supported`: nothing hangs. Each part is on the ground, shares volume
+    with another (a joint), or touches another BELOW its centre of mass.
+    Catches a part only wedged against something above it, which
+    `grounded` passes.
+  - `rests: [["mug", "desk_top"], ...]`: each `a` rests on (or is
+    attached to) `b`; failures say whether they don't touch at all or only
+    touch at/above `a`'s centre of mass.
   - `bounds: {min, max, tol}`: per-axis world bounds, `null` skips an axis
     ("sits on the ground" = `min [null, 0, null]`); failures name the part
     that sets the extreme.
@@ -210,7 +240,7 @@ name: the producer first, then in-place material/visibility/transform edits).
   Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
   every part, nearest first). Proves openings are open and fills are solid.
-  Windowed preview only.
+  Runs on the model itself, so it works headless too.
 - `agent_views(views, width?, height?, focus?, grid?)`: offscreen renders,
   independent of the human's window.
   - Up to 9 views: `front`/`back`/`left`/`right`/`top`/`bottom`
@@ -271,7 +301,9 @@ name: the producer first, then in-place material/visibility/transform edits).
 **Model, catalog, output:** `new_model(name)` (the old model stays one undo
 away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
 tags, prompt)` (all required; reports when it overwrote an entry),
-`load_prefab(name)`, `catalog_list`, `catalog_describe`,
+`load_prefab(name)`, `catalog_list` and `catalog_describe` (each entry also
+lists its knobs: params with values and named moves/places, read from the
+file),
 `export_model(path, "glb" | "gltf")` (skips hidden parts).
 
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?)`

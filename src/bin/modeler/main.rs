@@ -103,7 +103,6 @@ fn main() -> AppExit {
     })
     .insert_resource(Headless(headless))
     .insert_resource(PendingShots::default())
-    .insert_resource(PendingProbes::default())
     .insert_resource(PendingAgentShots::default())
     .insert_resource(AgentRig::default())
     .insert_resource(Orbit::default())
@@ -119,7 +118,6 @@ fn main() -> AppExit {
             drain_commands,
             quit_when_server_done(headless),
             take_screenshot.run_if(windowed),
-            run_probe.run_if(windowed),
             rebuild_scene.run_if(windowed),
             orbit_camera.run_if(windowed),
             pin_on_click.run_if(windowed),

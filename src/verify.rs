@@ -75,21 +75,23 @@ pub fn expect_parts(model: &Model, expected: &[String]) -> CmdResult {
     let (globs, exact): (Vec<&str>, Vec<&str>) = expected
         .iter()
         .map(String::as_str)
-        .partition(|e| e.ends_with('*'));
-    let prefixes: Vec<&str> = globs.iter().map(|g| g.trim_end_matches('*')).collect();
+        .partition(|e| e.contains('*'));
+    let _ = &globs;
     let expected: std::collections::BTreeSet<&str> = exact.into_iter().collect();
     let mut missing: Vec<&str> = expected.difference(&actual).copied().collect();
     missing.extend(
         globs
             .iter()
-            .zip(&prefixes)
-            .filter(|(_, p)| !actual.iter().any(|a| a.starts_with(**p)))
-            .map(|(g, _)| *g),
+            .filter(|g| !actual.iter().any(|a| crate::name_matches(g, a)))
+            .copied(),
     );
-    let extra: Vec<_> = actual
+    let extra: Vec<String> = actual
         .difference(&expected)
-        .filter(|a| !prefixes.iter().any(|p| a.starts_with(p)))
+        .filter(|a| !globs.iter().any(|g| crate::name_matches(g, a)))
+        .map(|s| s.to_string())
         .collect();
+    let missing: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+    let (missing, extra) = (crate::compact_names(&missing), crate::compact_names(&extra));
     if missing.is_empty() && extra.is_empty() {
         let suffix = if hidden.is_empty() {
             String::new()
@@ -622,9 +624,10 @@ pub fn expect_includes(model: &Model, wanted: &[String]) -> CmdResult {
     }
 }
 
-/// Every visible part touches another or the ground (see [`floating_parts`]).
+/// Every visible part touches another or the ground, by real geometry
+/// ([`crate::contact::floating`]; the scene warning uses cheap bounds).
 pub fn expect_grounded(model: &Model) -> CmdResult {
-    let f = floating_parts(model);
+    let f = crate::contact::floating(model);
     if f.is_empty() {
         Ok("every visible part touches the ground or another part".into())
     } else {

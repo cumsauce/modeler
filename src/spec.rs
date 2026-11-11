@@ -472,10 +472,29 @@ pub struct MoveSpec {
     axis: Option<[f32; 3]>,
     #[serde(default)]
     degrees: Option<f32>,
-    /// Point the rotation turns about. Default: the centre of the moved
-    /// parts' bottom face.
+    /// Point the rotation turns about: [x, y, z], or an anchor such as
+    /// "bottom-back" (the moved parts' box) or "lid:bottom-back" (another
+    /// part's box). Default: the centre of the moved parts' bottom face.
     #[serde(default)]
-    pivot: Option<[f32; 3]>,
+    pivot: Option<crate::commands::PivotSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceSpec {
+    /// Optional id; re-issue the same name to adjust.
+    #[serde(default)]
+    name: Option<String>,
+    /// Parts to drop (names / `*` patterns), moved as one body.
+    parts: Vec<String>,
+    /// The part whose top surface they land on.
+    on: String,
+    /// Footprint centre [x, z] to slide to first; default: where they are.
+    #[serde(default)]
+    at: Option<[f32; 2]>,
+    /// Clearance above the surface. Default 0 (touching).
+    #[serde(default)]
+    gap: Option<f32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -627,6 +646,7 @@ pub enum OpSpec {
     Round(RoundSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
+    Place(PlaceSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
     LinearArray(LinearArraySpec),
@@ -651,6 +671,7 @@ pub const OP_TYPES: &[&str] = &[
     "round",
     "transform",
     "move",
+    "place",
     "boolean",
     "radial_array",
     "linear_array",
@@ -854,6 +875,25 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 translation: s.translation,
                 rotation,
                 pivot: s.pivot,
+                on: None,
+                at: None,
+                gap: None,
+            }
+        }
+        "place" => {
+            let s: PlaceSpec = de(&ctx, &body)?;
+            if s.parts.is_empty() {
+                return Err(format!("{ctx}: parts is empty"));
+            }
+            BatchItem::Move {
+                name: s.name,
+                parts: s.parts,
+                translation: None,
+                rotation: None,
+                pivot: None,
+                on: Some(s.on),
+                at: s.at,
+                gap: s.gap,
             }
         }
         "boolean" => {
@@ -1008,8 +1048,11 @@ pub fn example(ty: &str) -> Option<Value> {
         "transform" => {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
         }
+        "place" => {
+            json!({"type": "place", "name": "mug_on_desk", "parts": ["mug"], "on": "desk_top", "at": [-0.4, 0.1]})
+        }
         "move" => {
-            json!({"type": "move", "name": "lean", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]})
+            json!({"type": "move", "name": "hinge", "parts": ["lid"], "axis": [1, 0, 0], "degrees": -20, "pivot": "lid:bottom-back"})
         }
         "boolean" => {
             json!({"type": "boolean", "name": "wall_cut", "op": "difference", "a": "wall", "b": "door_cutter"})
@@ -1065,6 +1108,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "round" => schemars::schema_for!(RoundSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
+        "place" => schemars::schema_for!(PlaceSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),
         "linear_array" => schemars::schema_for!(LinearArraySpec),

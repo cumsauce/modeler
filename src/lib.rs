@@ -22,8 +22,47 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
+/// Shortens runs of array copies for display: `book_1, book_2, … book_13`
+/// becomes `book_1..13` (three or more consecutive numbers); everything else
+/// is kept as is, in order.
+pub fn compact_names(names: &[String]) -> Vec<String> {
+    let split = |n: &str| -> Option<(String, u32)> {
+        let (base, num) = n.rsplit_once('_')?;
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) || num.len() > 6 {
+            return None;
+        }
+        Some((base.to_string(), num.parse().ok()?))
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        if let Some((base, start)) = split(&names[i]) {
+            let mut j = i + 1;
+            let mut last = start;
+            while j < names.len() {
+                match split(&names[j]) {
+                    Some((b, n)) if b == base && n == last + 1 => {
+                        last = n;
+                        j += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if j - i >= 3 {
+                out.push(format!("{base}_{start}..{last}"));
+                i = j;
+                continue;
+            }
+        }
+        out.push(names[i].clone());
+        i += 1;
+    }
+    out
+}
+
 pub mod catalog;
 pub mod commands;
+pub mod contact;
 pub mod csg;
 pub mod error;
 pub mod gltf;
@@ -741,6 +780,17 @@ pub enum Op {
         #[serde(default)]
         rotation: Option<[f32; 4]>,
         pivot: [f32; 3],
+        /// `place`: after turning/translating, drop the parts straight down
+        /// (or up) until they rest on this part's top surface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<String>,
+        /// `place`: first slide the parts so their footprint centre is at
+        /// this [x, z].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<[f32; 2]>,
+        /// `place`: clearance left above the surface (default 0).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gap: Option<f32>,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {
@@ -863,6 +913,18 @@ pub struct Annotation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_names_folds_array_runs() {
+        let n: Vec<String> = ["book", "book_1", "book_2", "book_3", "x_1", "x_2", "y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            super::compact_names(&n),
+            ["book", "book_1..3", "x_1", "x_2", "y"]
+        );
+    }
+
     #[test]
     fn name_patterns_take_star_anywhere() {
         use super::name_matches as m;

@@ -50,6 +50,7 @@ fn badge(op: &Op) -> &'static str {
         Op::Visibility { .. } => "shown",
         Op::Transform { .. } => "placed",
         Op::Rename { .. } => "renamed",
+        Op::Move { on: Some(_), .. } => "dropped",
         _ => "moved",
     }
 }
@@ -171,6 +172,42 @@ pub struct Layout {
 }
 
 pub const COL: f32 = 200.0;
+/// Standalone boxes (no inputs, no readers) pack into this many columns to
+/// the right of the connected graph instead of stacking in one tall column.
+const GRID_COLS: usize = 3;
+
+/// Where each node is pulled to: its depth column (x only), or for a
+/// standalone node a grid slot (x and y).
+fn targets(view: &GraphView) -> Vec<(f32, Option<f32>)> {
+    let linked: Vec<bool> = (0..view.nodes.len())
+        .map(|i| view.edges.iter().any(|e| e.0 == i || e.1 == i))
+        .collect();
+    let max_depth = view
+        .nodes
+        .iter()
+        .zip(&linked)
+        .filter(|(_, l)| **l)
+        .map(|(n, _)| n.depth)
+        .max();
+    let grid_x = max_depth.map_or(0.0, |d| (d + 1) as f32 * COL + 20.0);
+    let mut k = 0;
+    view.nodes
+        .iter()
+        .zip(&linked)
+        .map(|(n, l)| {
+            if *l {
+                (n.depth as f32 * COL, None)
+            } else {
+                let slot = (
+                    grid_x + (k % GRID_COLS) as f32 * COL,
+                    Some((k / GRID_COLS) as f32 * 50.0),
+                );
+                k += 1;
+                slot
+            }
+        })
+        .collect()
+}
 
 impl Layout {
     /// Adopts a new view: keeps known positions, drops new nodes in near their
@@ -194,8 +231,8 @@ impl Layout {
                     parents.iter().map(|p| p[1]).sum::<f32>() / parents.len() as f32
                 };
                 let drop = if first { 0.0 } else { -120.0 };
-                self.pos
-                    .insert(n.key.clone(), [n.depth as f32 * COL, y + drop]);
+                let (tx, ty) = targets(view)[i];
+                self.pos.insert(n.key.clone(), [tx, ty.unwrap_or(y) + drop]);
                 self.vel.insert(n.key.clone(), [0.0, 0.0]);
             }
             if !first && self.sigs.get(&n.key) != Some(&n.sig) {
@@ -217,8 +254,12 @@ impl Layout {
             .map(|v| self.pos.get(&v.key).copied().unwrap_or([0.0, 0.0]))
             .collect();
         let mut f = vec![[0.0f32; 2]; n];
-        for (i, v) in view.nodes.iter().enumerate() {
-            f[i][0] += (v.depth as f32 * COL - p[i][0]) * 30.0;
+        let goal = targets(view);
+        for (i, (tx, ty)) in goal.iter().enumerate() {
+            f[i][0] += (tx - p[i][0]) * 30.0;
+            if let Some(ty) = ty {
+                f[i][1] += (ty - p[i][1]) * 30.0;
+            }
         }
         for &(a, b) in &view.edges {
             let dy = p[b][1] - p[a][1];
@@ -229,7 +270,8 @@ impl Layout {
             for j in (i + 1)..n {
                 let dx = p[j][0] - p[i][0];
                 let dy = p[j][1] - p[i][1];
-                if dx.abs() > COL * 0.8 {
+                // Grid boxes hold their slots; only graph boxes push apart.
+                if dx.abs() > COL * 0.8 || goal[i].1.is_some() || goal[j].1.is_some() {
                     continue;
                 }
                 let gap = 46.0 - dy.abs();
@@ -329,5 +371,27 @@ mod tests {
             }
         }
         assert!((l.pos["group:g"][0] - COL).abs() < 2.0);
+    }
+
+    #[test]
+    fn standalone_boxes_pack_into_a_grid() {
+        let items: Vec<serde_json::Value> = (0..7)
+            .map(|i| serde_json::json!({"type": "primitive", "name": format!("p{i}"), "kind": "box", "size": 1, "translation": [i * 2, 0, 0]}))
+            .collect();
+        let m = model(serde_json::Value::Array(items));
+        let v = build(&m);
+        let mut l = Layout::default();
+        l.sync(&v);
+        for _ in 0..600 {
+            l.step(&v, 1.0 / 60.0);
+        }
+        let ys: Vec<f32> = (0..7)
+            .map(|i| l.pos[&format!("primitive:p{i}")][1])
+            .collect();
+        let tallest = ys.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            tallest < 3.0 * 50.0 + 1.0,
+            "7 boxes in 3 columns are 3 rows: {ys:?}"
+        );
     }
 }

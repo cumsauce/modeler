@@ -136,11 +136,14 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     // Parent transforms, applied to the finished parts in list order.
     for op in ops {
         let Op::Move {
+            name: move_name,
             parts,
             translation,
             rotation,
             pivot,
-            ..
+            on,
+            at,
+            gap,
         } = op
         else {
             continue;
@@ -157,8 +160,91 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             part.translation = (p + r * (Vec3::from(part.translation) - p) + t).to_array();
             part.rotation = (r * quat_of(part.rotation)).to_array();
         }
+        if let Some(on) = on {
+            place_on(&mut named, move_name, parts, on, *at, gap.unwrap_or(0.0))?;
+        }
     }
     Ok(named.into_iter().map(|(_, part)| part).collect())
+}
+
+/// The `place` step of a move: slide the matched parts to `at` (footprint
+/// centre, x/z), then drop (or lift) them vertically until their underside
+/// rests on `on`'s top surface plus `gap`. Clearance is sampled along
+/// vertical lines through every vertex of both, so a small part on a big top
+/// and a big part on a small post both land.
+fn place_on(
+    named: &mut Named,
+    move_name: &str,
+    patterns: &[String],
+    on: &str,
+    at: Option<[f32; 2]>,
+    gap: f32,
+) -> Result<(), ModelerError> {
+    let hit = |n: &str| n != on && patterns.iter().any(|p| crate::name_matches(p, n));
+    let Some(support) = named.iter().find(|(n, _)| n == on).map(|(_, p)| p.clone()) else {
+        return Err(format!("place `{move_name}`: no part `{on}` to place on").into());
+    };
+    let moving: Vec<usize> = (0..named.len()).filter(|&i| hit(&named[i].0)).collect();
+    if moving.is_empty() {
+        return Err(format!("place `{move_name}`: no part matches {patterns:?}").into());
+    }
+    let bounds = |named: &Named| {
+        moving.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), &i| {
+            let (a, b) = named[i].1.bounds();
+            (lo.min(a), hi.max(b))
+        })
+    };
+    if let Some([x, z]) = at {
+        let (lo, hi) = bounds(named);
+        let shift = Vec3::new(x - (lo.x + hi.x) * 0.5, 0.0, z - (lo.z + hi.z) * 0.5);
+        for &i in &moving {
+            let p = Arc::make_mut(&mut named[i].1);
+            p.translation = (Vec3::from(p.translation) + shift).to_array();
+        }
+    }
+    let s_tris = crate::contact::world_tris(&support);
+    let m_tris: Vec<[Vec3; 3]> = moving
+        .iter()
+        .flat_map(|&i| crate::contact::world_tris(&named[i].1))
+        .collect();
+    let (slo, shi) = support.bounds();
+    let (mlo, mhi) = bounds(named);
+    let top = shi.y.max(mhi.y) + 1.0;
+    let bottom = slo.y.min(mlo.y) - 1.0;
+    // Highest surface of `tris` on the vertical line at (x, z), from above;
+    // lowest from below.
+    let first_down = |tris: &[[Vec3; 3]], x: f32, z: f32| {
+        crate::contact::ray_tris(Vec3::new(x, top, z), Vec3::NEG_Y, tris).map(|t| top - t)
+    };
+    let first_up = |tris: &[[Vec3; 3]], x: f32, z: f32| {
+        crate::contact::ray_tris(Vec3::new(x, bottom, z), Vec3::Y, tris).map(|t| bottom + t)
+    };
+    let mut clearance = f32::MAX;
+    let samples = s_tris
+        .iter()
+        .chain(&m_tris)
+        .flat_map(|t| {
+            let c = (t[0] + t[1] + t[2]) / 3.0;
+            [t[0], t[1], t[2], c]
+        })
+        .map(|v| (v.x, v.z));
+    for (x, z) in samples {
+        if let (Some(under), Some(surface)) = (first_up(&m_tris, x, z), first_down(&s_tris, x, z)) {
+            clearance = clearance.min(under - surface);
+        }
+    }
+    if clearance == f32::MAX {
+        return Err(format!(
+            "place `{move_name}`: nothing of {patterns:?} is above or below `{on}` (give at: [x, z] over it)"
+        )
+        .into());
+    }
+    let dy = gap - clearance;
+    for &i in &moving {
+        let p = Arc::make_mut(&mut named[i].1);
+        p.translation[1] += dy;
+    }
+    Ok(())
 }
 
 /// Computes a run order for `ops`. Each op depends on the nearest earlier op
@@ -794,8 +880,20 @@ pub fn describe(ops: &[Op]) -> String {
                 translation,
                 rotation,
                 pivot,
+                on,
+                at,
+                gap,
             } => {
-                let mut s = format!("#{i} move `{name}` parts={parts:?} pivot={pivot:?}");
+                let mut s = match on {
+                    Some(on) => format!("#{i} place `{name}` parts={parts:?} on=`{on}`"),
+                    None => format!("#{i} move `{name}` parts={parts:?} pivot={pivot:?}"),
+                };
+                if let Some(a) = at {
+                    s += &format!(" at={a:?}");
+                }
+                if let Some(g) = gap {
+                    s += &format!(" gap={g}");
+                }
                 if let Some(r) = rotation {
                     s += &format!(" rot={r:?}");
                 }

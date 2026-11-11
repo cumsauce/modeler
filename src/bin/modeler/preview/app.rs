@@ -39,7 +39,6 @@ pub(crate) fn drain_commands(
     headless: Res<Headless>,
     mut modeler: ResMut<Modeler>,
     mut pending: ResMut<PendingShots>,
-    mut probes: ResMut<PendingProbes>,
     mut agent_shots: ResMut<PendingAgentShots>,
     mut orbit: ResMut<Orbit>,
 ) {
@@ -75,18 +74,6 @@ pub(crate) fn drain_commands(
                     orbit.dist = dist.clamp(0.2, 200.0);
                     orbit.user = true;
                     let _ = reply.send(Ok(vec![]));
-                }
-            }
-            Cmd::ProbeRay {
-                origin,
-                dir,
-                all_hits,
-                reply,
-            } => {
-                if headless.0 {
-                    let _ = reply.send(Err("headless: no scene to ray-cast".into()));
-                } else {
-                    probes.0.push(Some((origin, dir, all_hits, reply)));
                 }
             }
             Cmd::AgentShot {

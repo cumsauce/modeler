@@ -1,7 +1,9 @@
 //! The tool operations as plain functions on a [`Session`] (model + undo history). Pure,
 //! unit-testable, wiring-free API used by both the MCP tools and tests.
 
+use crate::Vec3;
 use crate::{Annotation, Axis, BoolOp, Model, ModelerError, Op, Part, PrimitiveKind, graph};
+use std::sync::Arc;
 
 pub type CmdResult = Result<String, ModelerError>;
 
@@ -37,14 +39,55 @@ pub enum BatchItem {
         part: String,
         projection: String,
     },
-    /// One rigid relative transform over many parts (names / `*` globs).
+    /// One rigid relative transform over many parts (names / `*` globs);
+    /// with `on`, a `place` (drop onto that part's top surface).
     Move {
         name: Option<String>,
         parts: Vec<String>,
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
-        pivot: Option<[f32; 3]>,
+        pivot: Option<PivotSpec>,
+        on: Option<String>,
+        at: Option<[f32; 2]>,
+        gap: Option<f32>,
     },
+}
+
+/// A move's pivot: a point, or an anchor on a bounding box —
+/// `"bottom-back"` (the moved parts' own box) or `"laptop_screen:bottom-front"`
+/// (another part's box; `*` patterns allowed). Words: left/right (x),
+/// bottom/top (y), back/front (z), center; unnamed axes stay centred.
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PivotSpec {
+    Point([f32; 3]),
+    Anchor(String),
+}
+
+/// Resolves an anchor's words against a box.
+pub fn anchor_point(words: &str, lo: Vec3, hi: Vec3) -> Result<[f32; 3], String> {
+    let mut f = [0.5f32; 3];
+    for w in words.split(['-', ' ', ',', '_']).filter(|w| !w.is_empty()) {
+        match w {
+            "left" => f[0] = 0.0,
+            "right" => f[0] = 1.0,
+            "bottom" => f[1] = 0.0,
+            "top" => f[1] = 1.0,
+            "back" => f[2] = 0.0,
+            "front" => f[2] = 1.0,
+            "center" | "centre" | "middle" => {}
+            other => {
+                return Err(format!(
+                    "anchor word `{other}`: use left/right, bottom/top, back/front, center"
+                ));
+            }
+        }
+    }
+    Ok([
+        lo.x + (hi.x - lo.x) * f[0],
+        lo.y + (hi.y - lo.y) * f[1],
+        lo.z + (hi.z - lo.z) * f[2],
+    ])
 }
 
 /// Deterministic checks for `verify` and an `apply_ops` expect block. Each
@@ -75,6 +118,14 @@ pub struct VerifySpec {
     /// over), with uniform density.
     #[serde(default)]
     pub stable: Option<bool>,
+    /// Nothing hangs: every visible part is on the ground, shares volume
+    /// with another part (a joint), or touches another BELOW its centre of
+    /// mass. Fails a part only wedged against something above it.
+    #[serde(default)]
+    pub supported: Option<bool>,
+    /// Pairs `[a, b]`: `a` rests on (or is attached to) `b`.
+    #[serde(default)]
+    pub rests: Option<Vec<[String; 2]>>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -549,7 +600,23 @@ impl Session {
         full: bool,
     ) -> CmdResult {
         let before = self.part_fingerprints();
-        let text = self.batch(|s| s.apply_values_inner(params, items))?;
+        // Atomic: a failing item rolls the whole call back.
+        let snapshot = self.model.clone();
+        let text = match self.batch(|s| s.apply_values_inner(params, items)) {
+            Ok(t) => t,
+            Err(e) => {
+                let version = self.model.version + 1;
+                self.model = snapshot;
+                self.model.version = version;
+                let msg = e.to_string();
+                return Err(if msg.contains("nothing was applied") {
+                    msg
+                } else {
+                    format!("{msg}\n(rolled back: nothing from this call was applied)")
+                }
+                .into());
+            }
+        };
         if full {
             return Ok(format!("{text}\n{}", self.summary()));
         }
@@ -618,26 +685,37 @@ impl Session {
             self.model.parts.len(),
             self.model.ops.len()
         );
-        let mut changes = Vec::new();
-        for (n, h) in &after {
-            match before.get(n) {
-                None => changes.push(format!("+{n}")),
-                Some(b) if b != h => changes.push(format!("~{n}")),
+        // Model order (not alphabetical), so array copies stay adjacent and
+        // fold into `name_1..N`.
+        let (mut added, mut changed, mut removed) = (Vec::new(), Vec::new(), Vec::new());
+        for p in &self.model.parts {
+            let n = &p.name;
+            match (before.get(n), after.get(n)) {
+                (None, _) => added.push(n.clone()),
+                (Some(b), Some(h)) if b != h => changed.push(n.clone()),
                 _ => {}
             }
         }
         for n in before.keys() {
             if !after.contains_key(n) {
-                changes.push(format!("-{n}"));
+                removed.push(n.clone());
             }
+        }
+        let count = added.len() + changed.len() + removed.len();
+        let mut changes = Vec::new();
+        for (sign, list) in [("+", &added), ("~", &changed), ("-", &removed)] {
+            changes.extend(
+                crate::compact_names(list)
+                    .into_iter()
+                    .map(|n| format!("{sign}{n}")),
+            );
         }
         if changes.is_empty() {
             s += "parts: no change\n";
         } else {
             let shown = changes.len().min(40);
             s += &format!(
-                "parts ({} changed): {}{}\n",
-                changes.len(),
+                "parts ({count} changed): {}{}\n",
                 changes[..shown].join(", "),
                 if changes.len() > shown { ", ..." } else { "" }
             );
@@ -824,8 +902,11 @@ impl Session {
                     translation,
                     rotation,
                     pivot,
+                    on,
+                    at,
+                    gap,
                 } => self
-                    .move_parts(name, &parts, translation, rotation, pivot)
+                    .move_parts(name, &parts, translation, rotation, pivot, (on, at, gap))
                     .map_err(fail)?,
                 BatchItem::Uvs { part, projection } => {
                     self.set_uvs(&part, &projection).map_err(fail)?
@@ -865,28 +946,20 @@ impl Session {
     /// centre of their combined bottom face, fixed now), then translation.
     /// It applies after the graph, so nothing downstream sees it. Named
     /// moves are upserts: re-issue `name` to adjust.
+    #[allow(clippy::type_complexity)]
     pub fn move_parts(
         &mut self,
         name: Option<String>,
         patterns: &[String],
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
-        pivot: Option<[f32; 3]>,
+        pivot: Option<PivotSpec>,
+        (on, at, gap): (Option<String>, Option<[f32; 2]>, Option<f32>),
     ) -> CmdResult {
-        let matches = |n: &str| patterns.iter().any(|p| crate::name_matches(p, n));
-        let names: Vec<String> = self
-            .model
-            .parts
-            .iter()
-            .filter(|p| matches(&p.name))
-            .map(|p| p.name.clone())
-            .collect();
-        if names.is_empty() {
-            return Err(format!("move: no part matches {patterns:?}").into());
-        }
         if !self.model.derived_from_ops {
             return Err("move needs an op-built model (this one has baked parts); use transform on each part".into());
         }
+        let verb = if on.is_some() { "place" } else { "move" };
         let name = name.unwrap_or_else(|| {
             let n = self
                 .model
@@ -894,18 +967,70 @@ impl Session {
                 .iter()
                 .filter(|o| matches!(o, Op::Move { .. }))
                 .count();
-            format!("move_{}", n + 1)
+            format!("{verb}_{}", n + 1)
         });
-        // An existing move of this name is replaced, so the default pivot is
-        // measured on the parts without it.
-        let pivot = match pivot {
-            Some(p) => p,
-            None => {
-                let (lo, hi) = self.model.bounds_of(&names).unwrap_or_default();
-                [(lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5]
-            }
+        // Measure on the parts as they are WITHOUT this move (a re-issue
+        // replaces it), so pivots and anchors don't drift.
+        let parts_now: Vec<Arc<Part>> = if self
+            .model
+            .ops
+            .iter()
+            .any(|o| matches!(o, Op::Move { name: n, .. } if *n == name))
+        {
+            let ops: Vec<Op> = self
+                .model
+                .ops
+                .iter()
+                .filter(|o| !matches!(o, Op::Move { name: n, .. } if *n == name))
+                .cloned()
+                .collect();
+            graph::evaluate(&ops)?
+        } else {
+            self.model.parts.clone()
         };
-        let label = format!("move `{name}`");
+        let box_of = |pats: &[String]| {
+            parts_now
+                .iter()
+                .filter(|p| {
+                    !p.verts.is_empty() && pats.iter().any(|q| crate::name_matches(q, &p.name))
+                })
+                .fold(None, |acc: Option<(Vec3, Vec3)>, p| {
+                    let (lo, hi) = p.bounds();
+                    Some(match acc {
+                        None => (lo, hi),
+                        Some((a, b)) => (a.min(lo), b.max(hi)),
+                    })
+                })
+        };
+        let count = parts_now
+            .iter()
+            .filter(|p| patterns.iter().any(|q| crate::name_matches(q, &p.name)))
+            .count();
+        let Some((lo, hi)) = box_of(patterns) else {
+            return Err(format!("{verb}: no part matches {patterns:?}").into());
+        };
+        let pivot = match pivot {
+            Some(PivotSpec::Point(p)) => p,
+            Some(PivotSpec::Anchor(a)) => {
+                let (target, words) = match a.split_once(':') {
+                    Some((t, w)) => (Some(t.to_string()), w.to_string()),
+                    None => (None, a.clone()),
+                };
+                let (alo, ahi) = match &target {
+                    Some(t) => box_of(std::slice::from_ref(t))
+                        .ok_or_else(|| format!("{verb}: pivot anchor `{a}`: no part `{t}`"))?,
+                    None => (lo, hi),
+                };
+                anchor_point(&words, alo, ahi).map_err(|e| format!("{verb}: pivot `{a}`: {e}"))?
+            }
+            None => [(lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5],
+        };
+        if let Some(on) = &on
+            && !parts_now.iter().any(|p| &p.name == on)
+        {
+            return Err(format!("place: no part `{on}` to place on").into());
+        }
+        let label = format!("{verb} `{name}`");
         self.apply_op(
             Op::Move {
                 name: name.clone(),
@@ -913,16 +1038,21 @@ impl Session {
                 translation,
                 rotation,
                 pivot,
+                on: on.clone(),
+                at,
+                gap,
             },
             &label,
         )?;
-        Ok(format!(
-            "move `{name}`: {} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust)",
-            names.len(),
-            pivot[0],
-            pivot[1],
-            pivot[2]
-        ))
+        Ok(match on {
+            Some(on) => format!(
+                "place `{name}`: {count} part(s) dropped onto `{on}` (re-issue name `{name}` to adjust)"
+            ),
+            None => format!(
+                "move `{name}`: {count} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust)",
+                pivot[0], pivot[1], pivot[2]
+            ),
+        })
     }
 
     /// [`Self::set_visible`] on one part, or on every part matching a
@@ -1033,7 +1163,9 @@ impl Session {
             && spec.bounds.is_none()
             && spec.validate.is_none()
             && spec.rebuild.is_none()
-            && spec.stable.is_none();
+            && spec.stable.is_none()
+            && spec.supported.is_none()
+            && spec.rests.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
             Ok(t) => out.push((name.to_string(), true, t)),
@@ -1071,6 +1203,41 @@ impl Session {
         }
         if spec.rebuild.unwrap_or(empty) {
             record("rebuild", self.check_rebuild().map_err(|e| e.to_string()));
+        }
+        if spec.supported == Some(true) {
+            let bad = crate::contact::unsupported(&self.model);
+            if bad.is_empty() {
+                record(
+                    "supported",
+                    Ok("every visible part is on the ground, attached, or rests on something below its centre of mass".into()),
+                );
+            } else {
+                let list: Vec<String> = bad
+                    .iter()
+                    .map(|(n, t)| {
+                        if t.is_empty() {
+                            format!("`{n}` touches nothing")
+                        } else {
+                            format!(
+                                "`{n}` only touches {} at/above its centre of mass",
+                                t.join(", ")
+                            )
+                        }
+                    })
+                    .collect();
+                record(
+                    "supported",
+                    Err(format!("unsupported: {}", list.join("; "))),
+                );
+            }
+        }
+        if let Some(pairs) = &spec.rests {
+            for [a, b] in pairs {
+                record(
+                    &format!("rests {a} on {b}"),
+                    crate::contact::rests_on(&self.model, a, b),
+                );
+            }
         }
         if spec.stable == Some(true) {
             let (text, json) = crate::inspect::mass(&self.model, &Default::default(), 1000.0);
@@ -3023,6 +3190,112 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         let r = s.apply_values(None, ops);
         assert!(r.is_err(), "the array still reads `cut`");
+    }
+
+    fn run(s: &mut Session, items: serde_json::Value) -> String {
+        let serde_json::Value::Array(items) = items else {
+            panic!("array");
+        };
+        s.apply_values_as(None, items, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn place_drops_parts_onto_a_surface_and_follows_params() {
+        let mut s = Session::default();
+        s.apply_values_as(
+            Some([("h".to_string(), 0.75)].into_iter().collect()),
+            vec![
+                serde_json::json!({"type": "primitive", "name": "top", "kind": "box", "size": [1.2, 0.03, 0.6], "translation": [0, "=$h - 0.015", 0]}),
+                serde_json::json!({"type": "primitive", "name": "mug", "kind": "cylinder", "size": {"radius": 0.04, "height": 0.1}, "translation": [0, 3, 0]}),
+                serde_json::json!({"type": "place", "name": "mug_on", "parts": ["mug"], "on": "top", "at": [0.3, 0.1]}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let lo = |s: &Session, n: &str| s.model.part(n).map(|p| p.bounds().0).unwrap_or_default();
+        let m = lo(&s, "mug");
+        assert!(
+            (m.y - 0.75).abs() < 1e-4 && (m.x - 0.26).abs() < 1e-4,
+            "{m:?}"
+        );
+        // The desk gets lower: the mug follows.
+        s.apply_values_as(
+            Some([("h".to_string(), 0.7)].into_iter().collect()),
+            vec![],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!((lo(&s, "mug").y - 0.7).abs() < 1e-4);
+        // A tilted support: lands on the slope, touching.
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "ramp", "kind": "box", "size": [1, 0.05, 1], "translation": [3, 0.5, 0], "rotation": [0, 0, 0.1305, 0.9914]},
+                {"type": "primitive", "name": "puck", "kind": "cylinder", "size": {"radius": 0.05, "height": 0.02}, "translation": [3, 2, 0]},
+                {"type": "place", "name": "puck_on", "parts": ["puck"], "on": "ramp"}
+            ]),
+        );
+        assert!(crate::contact::rests_on(&s.model, "puck", "ramp").is_ok());
+        let bad = s.apply_values_as(
+            None,
+            vec![serde_json::json!({"type": "place", "parts": ["puck"], "on": "nope"})],
+            true,
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn anchor_pivots_resolve_and_reissue_does_not_drift() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "base", "kind": "box", "size": [0.3, 0.02, 0.2], "translation": [0, 0.01, 0]},
+                {"type": "primitive", "name": "lid", "kind": "box", "size": [0.3, 0.2, 0.01], "translation": [0, 0.12, -0.095]},
+                {"type": "move", "name": "hinge", "parts": ["lid"], "axis": [1, 0, 0], "degrees": -20, "pivot": "lid:bottom-back"}
+            ]),
+        );
+        let first = s
+            .model
+            .part("lid")
+            .map(|p| p.translation)
+            .unwrap_or_default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "move", "name": "hinge", "parts": ["lid"], "axis": [1, 0, 0], "degrees": -20, "pivot": "lid:bottom-back"}
+            ]),
+        );
+        let again = s
+            .model
+            .part("lid")
+            .map(|p| p.translation)
+            .unwrap_or_default();
+        for k in 0..3 {
+            assert!((first[k] - again[k]).abs() < 1e-5, "{first:?} {again:?}");
+        }
+        // The hinge edge stays put: the lid's lowest back point is still at y 0.02.
+        let (lo, _) = s.model.part("lid").map(|p| p.bounds()).unwrap_or_default();
+        assert!((lo.y - 0.02).abs() < 1e-4, "{lo:?}");
+        assert!(anchor_point("sideways", Vec3::ZERO, Vec3::ONE).is_err());
+    }
+
+    #[test]
+    fn a_failing_batch_rolls_back_entirely() {
+        let mut s = Session::default();
+        let before = s.model.ops.len();
+        let r = s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "primitive", "name": "a", "kind": "box", "size": 1}),
+                serde_json::json!({"type": "boolean", "name": "c", "op": "union", "a": "a", "b": "ghost"}),
+            ],
+            true,
+        );
+        assert!(r.is_err_and(|e| e.to_string().contains("rolled back")));
+        assert_eq!(s.model.ops.len(), before);
+        assert!(s.model.part("a").is_none());
     }
 
     #[test]

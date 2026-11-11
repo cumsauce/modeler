@@ -94,6 +94,43 @@ pub struct CatalogEntry {
     pub created_at: String,
 }
 
+/// The knobs a saved model exposes, read from its file without evaluating
+/// it: named params (with values) and named moves/places, so other agents
+/// can tune a prefab instead of rebuilding it.
+pub fn knobs(entry: &CatalogEntry) -> String {
+    let Ok(dir) = catalog_dir() else {
+        return String::new();
+    };
+    let Ok(text) = fs::read_to_string(dir.join(&entry.file)) else {
+        return String::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    if let Some(p) = v["params"].as_object().filter(|p| !p.is_empty()) {
+        let list: Vec<String> = p.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        out.push(format!("params {}", list.join(", ")));
+    }
+    let moves: Vec<String> = v["ops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| o.get("move"))
+        .filter_map(|m| {
+            let n = m["name"].as_str()?;
+            Some(match m["on"].as_str() {
+                Some(on) => format!("{n} (place on {on})"),
+                None => n.to_string(),
+            })
+        })
+        .collect();
+    if !moves.is_empty() {
+        out.push(format!("moves {}", moves.join(", ")));
+    }
+    out.join("; ")
+}
+
 /// The `catalog.json` index.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Catalog {
@@ -255,10 +292,14 @@ pub fn describe(name: &str) -> Result<String, ModelerError> {
         .find(|e| e.name == wanted)
         .ok_or_else(|| format!("no prefab named '{wanted}' in the catalog"))?;
     Ok(format!(
-        "name: {}\ndescription: {}\ntags: {}\nprompt: {}\nfile: {}\ncreated: {}",
+        "name: {}\ndescription: {}\ntags: {}\nknobs: {}\nprompt: {}\nfile: {}\ncreated: {}",
         entry.name,
         entry.description,
         entry.tags.join(", "),
+        {
+            let k = knobs(entry);
+            if k.is_empty() { "none".to_string() } else { k }
+        },
         entry.prompt,
         entry.file,
         entry.created_at,
