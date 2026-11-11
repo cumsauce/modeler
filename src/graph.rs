@@ -404,10 +404,27 @@ fn place_group(
     let surface = |v: Vec3| s_grid.cast(at_h(v, top), d).map(|t| top - t);
     let leading = |v: Vec3| m_grid.cast(at_h(v, bottom), -d).map(|t| bottom + t);
     let mut clearance = f32::MAX;
-    let samples = s_tris.iter().chain(&m_tris).flat_map(|t| {
-        let c = (t[0] + t[1] + t[2]) / 3.0;
-        [t[0], t[1], t[2], c]
-    });
+    // Only points inside both footprints (across the travel axis) can meet:
+    // a key over a big dome samples the few dome triangles under it, not all.
+    let pad = (mhi - mlo).max(shi - slo).max_element() * 1e-4 + 1e-6;
+    let (flo, fhi) = (
+        mlo.max(slo) - Vec3::splat(pad),
+        mhi.min(shi) + Vec3::splat(pad),
+    );
+    let inside = |v: Vec3| v[u] >= flo[u] && v[u] <= fhi[u] && v[w] >= flo[w] && v[w] <= fhi[w];
+    let tri_in = |t: &&[Vec3; 3]| {
+        let (a, b) = (t[0].min(t[1]).min(t[2]), t[0].max(t[1]).max(t[2]));
+        a[u] <= fhi[u] && b[u] >= flo[u] && a[w] <= fhi[w] && b[w] >= flo[w]
+    };
+    let samples = s_tris
+        .iter()
+        .chain(&m_tris)
+        .filter(tri_in)
+        .flat_map(|t| {
+            let c = (t[0] + t[1] + t[2]) / 3.0;
+            [t[0], t[1], t[2], c]
+        })
+        .filter(|&v| inside(v));
     for v in samples {
         if let (Some(lead), Some(surf)) = (leading(v), surface(v)) {
             clearance = clearance.min(lead - surf);

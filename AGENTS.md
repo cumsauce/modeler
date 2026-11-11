@@ -9,6 +9,7 @@ cargo run                # MCP server + preview window (what the MCP config runs
 cargo run -- --headless  # no window/render — for piping JSON-RPC lines in tests
 cargo run --example procedural_flower   # reference for the op-graph workflow
 cargo test               # lib tests + gltf round-trip tests (fast loop)
+cargo test --test perf -- --nocapture   # timing budgets (edit, place, verify, autosave)
 cargo clippy --all-targets -- -D warnings && cargo fmt
 ```
 
@@ -566,7 +567,10 @@ outliner groups, listed with their parts), `list_annotations`,
 ms). Every mutation marks the session for autosave (ops, params, history,
 annotations; op-derived parts are left out and re-derive on restore), and the
 app writes `session.json` once edits pause for 0.5 s and on exit, so the write
-never sits on a tool call. It is restored on startup. `save_prefab` only
+never sits on a tool call. It is restored on startup. The history tree goes to an append-only
+journal beside it (`session.history.jsonl`, one node per line): a save
+appends only the new nodes, and rewrites the file only after undo branches
+or pruning, so the autosave stays small however long the session runs. `save_prefab` only
 names and indexes it.
 
 ## Style tokens

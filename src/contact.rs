@@ -400,37 +400,59 @@ pub fn collisions(
 /// Parts that stay grounded only through deep overlaps: grounded normally,
 /// but floating once overlaps burying more than `deep` of the smaller part
 /// stop counting as contacts. Each with the parts it passes through.
+/// Every visible part's [`Body`] and every touching pair (each tested once,
+/// in parallel), shared by the checks of one `verify` call.
+pub struct Contacts<'a> {
+    bodies: Vec<Body<'a>>,
+    /// (i, j, how they meet, overlap fraction when they share volume).
+    pairs: Vec<(usize, usize, Contact, Option<f64>)>,
+}
+
+impl<'a> Contacts<'a> {
+    pub fn new(model: &'a Model) -> Contacts<'a> {
+        use rayon::prelude::*;
+        let bodies = bodies_of(model);
+        let n = bodies.len();
+        let near: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .filter(|&(i, j)| {
+                boxes_near(
+                    &bodies[i],
+                    &bodies[j],
+                    tolerance(bodies[i].part, bodies[j].part),
+                )
+            })
+            .collect();
+        let pairs = near
+            .par_iter()
+            .filter_map(|&(i, j)| {
+                let c = contact(&bodies[i], &bodies[j])?;
+                let f = matches!(c, Contact::Overlap)
+                    .then(|| overlap_between(&bodies[i], &bodies[j]).map_or(0.0, |o| o.fraction));
+                Some((i, j, c, f))
+            })
+            .collect();
+        Contacts { bodies, pairs }
+    }
+}
+
 /// The `grounded` check in one pass: the floating parts, and the parts held
 /// up only by passing more than `deep` of the smaller part into another.
-/// Builds each solid and tests each pair once (it used to run the pairwise
-/// contact search three times).
+/// Each solid is built and each pair tested once.
 pub fn grounding(model: &Model, deep: f64) -> (Vec<String>, Vec<(String, Vec<String>)>) {
-    use rayon::prelude::*;
-    let bodies = bodies_of(model);
+    grounding_in(&Contacts::new(model), model, deep)
+}
+
+/// [`grounding`] over contacts already found.
+pub fn grounding_in(
+    c: &Contacts,
+    model: &Model,
+    deep: f64,
+) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+    let bodies = &c.bodies;
     let n = bodies.len();
-    // Every touching pair once; overlaps carry how deep they go.
-    // Pairs are independent: test them in parallel.
-    let pairs: Vec<(usize, usize)> = (0..n)
-        .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
-        .filter(|&(i, j)| {
-            boxes_near(
-                &bodies[i],
-                &bodies[j],
-                tolerance(bodies[i].part, bodies[j].part),
-            )
-        })
-        .collect();
-    let edges: Vec<(usize, usize, Option<f64>)> = pairs
-        .par_iter()
-        .filter_map(|&(i, j)| match contact(&bodies[i], &bodies[j]) {
-            None => None,
-            Some(Contact::Overlap) => {
-                let f = overlap_between(&bodies[i], &bodies[j]).map_or(0.0, |o| o.fraction);
-                Some((i, j, Some(f)))
-            }
-            Some(_) => Some((i, j, None)),
-        })
-        .collect();
+    let edges: Vec<(usize, usize, Option<f64>)> =
+        c.pairs.iter().map(|&(i, j, _, f)| (i, j, f)).collect();
     let ground = ground_level(model);
     let on_ground: Vec<bool> = bodies
         .iter()
@@ -619,60 +641,49 @@ fn ground_level(model: &Model) -> f32 {
     model.bounds().map_or(0.0, |(lo, _)| lo.y.min(0.0))
 }
 
-/// Why a part is held up, or `None` when nothing holds it.
-fn support_of(a: &Body, bodies: &[Body], ground: f32) -> Option<String> {
-    let (lo, _) = a.bounds;
-    if lo.y <= ground + ground_tolerance(a.part) {
-        return Some("on the ground".into());
-    }
-    let cy = com_y(a.part);
-    let margin = tolerance(a.part, a.part);
-    let mut above = Vec::new();
-    for b in bodies {
-        if std::ptr::eq(b.part, a.part) {
-            continue;
-        }
-        match contact(a, b) {
-            Some(Contact::Overlap) => return Some(format!("attached to `{}`", b.part.name)),
-            Some(Contact::Surface(pts)) => {
-                // A flat part (a sheet lying down) is held by contact in its
-                // own plane; anything else needs contact below its centre.
-                let (plo, phi) = a.bounds;
-                let flat = phi.y - plo.y <= margin * 2.0;
-                if flat || pts.iter().any(|p| p.y < cy - margin) {
-                    return Some(format!("rests on `{}`", b.part.name));
-                }
-                above.push(b.part.name.clone());
-            }
-            None => {}
-        }
-    }
-    let _ = above;
-    None
-}
-
 /// Visible parts that nothing holds up: off the ground, sharing no volume
 /// with another part, and with no surface contact below their centre of
 /// mass. Catches what [`floating`] cannot: a part only touching something
 /// ABOVE it (wedged under a shelf) or only touching beside it at its top.
 /// Each entry is `(name, what it touches, if anything)`.
 pub fn unsupported(model: &Model) -> Vec<(String, Vec<String>)> {
-    use rayon::prelude::*;
-    let bodies = bodies_of(model);
+    unsupported_in(&Contacts::new(model), model)
+}
+
+/// [`unsupported`] over contacts already found: each pair was tested once
+/// (contact is symmetric), not once from each side.
+pub fn unsupported_in(c: &Contacts, model: &Model) -> Vec<(String, Vec<String>)> {
     let ground = ground_level(model);
-    // Each part's support is independent: in parallel, kept in model order.
-    bodies
-        .par_iter()
-        .filter(|a| support_of(a, &bodies, ground).is_none())
-        .map(|a| {
-            let touching: Vec<String> = bodies
-                .iter()
-                .filter(|b| !std::ptr::eq(b.part, a.part) && contact(a, b).is_some())
-                .map(|b| b.part.name.clone())
-                .collect();
-            (a.part.name.clone(), touching)
-        })
-        .collect()
+    let mut touching: Vec<Vec<(usize, &Contact)>> = vec![Vec::new(); c.bodies.len()];
+    for (i, j, k, _) in &c.pairs {
+        touching[*i].push((*j, k));
+        touching[*j].push((*i, k));
+    }
+    let mut out = Vec::new();
+    for (i, a) in c.bodies.iter().enumerate() {
+        let (lo, hi) = a.bounds;
+        if lo.y <= ground + ground_tolerance(a.part) {
+            continue;
+        }
+        let cy = com_y(a.part);
+        let margin = tolerance(a.part, a.part);
+        let flat = hi.y - lo.y <= margin * 2.0;
+        // Same rule as support_of: shared volume holds it; so does surface
+        // contact below its centre of mass (any contact, for a flat part).
+        let held = touching[i].iter().any(|(_, k)| match k {
+            Contact::Overlap => true,
+            Contact::Surface(pts) => flat || pts.iter().any(|p| p.y < cy - margin),
+        });
+        if !held {
+            let mut idx: Vec<usize> = touching[i].iter().map(|(j, _)| *j).collect();
+            idx.sort_unstable();
+            out.push((
+                a.part.name.clone(),
+                idx.iter().map(|&j| c.bodies[j].part.name.clone()).collect(),
+            ));
+        }
+    }
+    out
 }
 
 /// Every visible part's [`Body`] (solid, triangles, bounds), built in

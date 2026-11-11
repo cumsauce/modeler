@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Model, ModelerError};
+use crate::{Doc, Model, ModelerError};
 
 /// A library kind: each lives in its own folder with its own `catalog.json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +118,7 @@ fn ensure_project_gitignore() {
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */session.json\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
+         */session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
          *.tmp\n*/*.tmp\n",
     );
 }
@@ -349,6 +349,130 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
     atomic_write(&path, text.as_bytes())
 }
 
+/// What the history journal holds on disk, so the next autosave can append
+/// only the nodes recorded since (see [`save_session_journaled`]).
+#[derive(Debug, Default, Clone)]
+pub struct JournalState {
+    /// Nodes already in the journal file.
+    written: usize,
+    /// (parent, label, version) of the last written node, to tell that the
+    /// live history still extends the file (not pruned or swapped).
+    tail: Option<(Option<usize>, String, u64)>,
+    /// The file this state describes (the slot can change mid-session).
+    path: Option<PathBuf>,
+}
+
+/// One history node as a journal line; children are rebuilt from parents.
+#[derive(Serialize, Deserialize)]
+struct JournalLine {
+    model: Model,
+    #[serde(default)]
+    parent: Option<usize>,
+    #[serde(default)]
+    label: String,
+}
+
+fn journal_path() -> Result<PathBuf, ModelerError> {
+    let name = autosave_file("session").replace(".json", ".history.jsonl");
+    Ok(catalog_dir()?.join(name))
+}
+
+fn node_key(n: &crate::Snapshot) -> (Option<usize>, String, u64) {
+    (n.parent, n.label.clone(), n.model.version)
+}
+
+/// Autosaves the session with its history in an append-only journal
+/// (`session.history.jsonl`, one node per line): only the nodes recorded
+/// since the last save are written, instead of the whole tree every time.
+/// `session.json` holds the model with an empty node list (and the cursor).
+/// When the history no longer extends what was written (pruned, another
+/// document loaded), the journal is rewritten whole. Op-derived parts are
+/// left out as in [`save_session_state`].
+pub fn save_session_journaled(
+    model: &mut Model,
+    st: &mut JournalState,
+) -> Result<(), ModelerError> {
+    ensure_project_gitignore();
+    let path = session_state_path()?;
+    let jpath = journal_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
+    }
+    let nodes = &model.history.nodes;
+    let extends = st.path.as_ref() == Some(&jpath)
+        && st.written <= nodes.len()
+        && match (&st.tail, st.written) {
+            (None, 0) => jpath.exists() && fs::metadata(&jpath).is_ok_and(|m| m.len() == 0),
+            (Some(k), w) if w > 0 => node_key(&nodes[w - 1]) == *k,
+            _ => false,
+        };
+    let line = |n: &crate::Snapshot| {
+        serde_json::to_string(&JournalLine {
+            model: n.model.for_file(),
+            parent: n.parent,
+            label: n.label.clone(),
+        })
+        .map_err(|e| ModelerError::Parse(e.to_string()))
+    };
+    if extends {
+        if st.written < nodes.len() {
+            let mut text = String::new();
+            for n in &nodes[st.written..] {
+                text += &line(n)?;
+                text.push('\n');
+            }
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&jpath)
+                .map_err(|e| ModelerError::Io(format!("opening {}: {e}", jpath.display())))?;
+            f.write_all(text.as_bytes())
+                .map_err(|e| ModelerError::Io(format!("writing {}: {e}", jpath.display())))?;
+        }
+    } else {
+        let mut text = String::new();
+        for n in nodes {
+            text += &line(n)?;
+            text.push('\n');
+        }
+        atomic_write(&jpath, text.as_bytes())?;
+    }
+    st.written = nodes.len();
+    st.tail = nodes.last().map(node_key);
+    st.path = Some(jpath);
+    // The model itself, its node list moved out (the journal has it).
+    let taken = std::mem::take(&mut model.history.nodes);
+    let text = serde_json::to_string(&slim(model).as_ref())
+        .map_err(|e| ModelerError::Parse(e.to_string()));
+    model.history.nodes = taken;
+    atomic_write(&path, text?.as_bytes())
+}
+
+/// Reads the journal's nodes (children rebuilt from parents); a torn last
+/// line (a crash mid-append) is dropped.
+fn read_journal(path: &std::path::Path) -> Option<Vec<crate::Snapshot>> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut nodes: Vec<crate::Snapshot> = Vec::new();
+    for l in text.lines() {
+        let Ok(j) = serde_json::from_str::<JournalLine>(l) else {
+            break;
+        };
+        let id = nodes.len();
+        let parent = j.parent.filter(|&p| p < id);
+        if let Some(p) = parent {
+            nodes[p].children.push(id);
+        }
+        nodes.push(crate::Snapshot {
+            model: j.model,
+            parent,
+            children: Vec::new(),
+            label: j.label,
+        });
+    }
+    Some(nodes)
+}
+
 /// The model as autosaved: without its cached parts when they all derive
 /// from the ops (re-derived on restore, like prefabs). The parts were most
 /// of the bytes (3.9 of 4 MB for the duck), rewritten on every edit.
@@ -555,6 +679,25 @@ pub fn load_session_state() -> Option<Model> {
     if let Err(e) = model.check_format() {
         eprintln!("ignoring session autosave: {e}");
         return None;
+    }
+    // The journal next to whichever session file was read (this server's
+    // slot, or the main one).
+    let dir = catalog_dir().ok()?;
+    let slot = format!("session.{}.json", autosave_slot());
+    let jname = if autosave_owner().is_some() && dir.join(&slot).exists() {
+        slot.replace(".json", ".history.jsonl")
+    } else {
+        "session.history.jsonl".to_string()
+    };
+    if model.history.nodes.is_empty()
+        && let Some(nodes) = read_journal(&dir.join(jname))
+    {
+        model.history.current = model
+            .history
+            .current
+            .filter(|&c| c < nodes.len())
+            .or_else(|| nodes.len().checked_sub(1));
+        model.history.nodes = nodes;
     }
     if let Err(e) = model.restore_parts() {
         eprintln!("session autosave: re-deriving parts failed: {e}");
@@ -836,6 +979,70 @@ mod tests {
         model.name = "wip2".into();
         save_session_state(&model).unwrap();
         assert_eq!(load_session_state().unwrap().name, "wip2");
+    }
+
+    #[test]
+    fn session_history_goes_to_an_append_only_journal() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, single-threaded; edition 2024 makes set_var unsafe.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("journal")) };
+        let mut s = crate::commands::Session::default();
+        let step = |s: &mut crate::commands::Session, i: usize| {
+            let item: Vec<serde_json::Value> = serde_json::from_str(&format!(
+                r#"[{{"type":"primitive","name":"p{i}","kind":"box","size":0.1,"translation":[{i},0.05,0]}}]"#
+            ))
+            .unwrap_or_else(|e| panic!("{e}"));
+            s.apply_values(None, item).unwrap_or_else(|e| panic!("{e}"));
+        };
+        let lines = || {
+            fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let mut st = JournalState::default();
+        for i in 0..3 {
+            step(&mut s, i);
+        }
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lines(), 3);
+        let raw = fs::read_to_string(session_state_path().unwrap_or_else(|e| panic!("{e}")))
+            .unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        assert!(
+            v["history"]["nodes"]
+                .as_array()
+                .is_none_or(|n| n.is_empty()),
+            "session.json carries no snapshots"
+        );
+        let before = fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
+            .unwrap_or_default();
+        for i in 3..5 {
+            step(&mut s, i);
+        }
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        let after = fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
+            .unwrap_or_default();
+        assert_eq!(lines(), 5);
+        assert!(after.starts_with(&before), "appended, not rewritten");
+        let back = load_session_state().unwrap_or_else(|| panic!("no autosave"));
+        assert_eq!(back.history.nodes.len(), 5);
+        assert_eq!(back.history.current, s.model.history.current);
+        let kids = |m: &Model| {
+            m.history
+                .nodes
+                .iter()
+                .map(|n| n.children.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kids(&back), kids(&s.model));
+        assert_eq!(back.parts.len(), 5, "parts re-derive from the ops");
+        // A prune no longer extends the file: it is rewritten.
+        s.history_prune(2).unwrap_or_else(|e| panic!("{e}"));
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lines(), s.model.history.nodes.len());
+        let back = load_session_state().unwrap_or_else(|| panic!("no autosave"));
+        assert_eq!(back.history.nodes.len(), s.model.history.nodes.len());
     }
 
     #[test]

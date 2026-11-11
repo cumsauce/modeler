@@ -341,11 +341,24 @@ pub fn revolve(
     round: f32,
 ) -> Result<Part, ModelerError> {
     check_profile(profile)?;
-    if let Some(p) = profile.iter().flatten().find(|p| p[0] < 0.0) {
+    // Arcs that end on the axis land a rounding error past it (an arc to 90°
+    // gives radius -1.3e-7): snap those to 0, reject real negatives.
+    let scale = profile
+        .iter()
+        .flatten()
+        .map(|p| p[0].abs().max(p[1].abs()))
+        .fold(0.0f32, f32::max);
+    let snap = (scale * 1e-5).max(1e-6);
+    if let Some(p) = profile.iter().flatten().find(|p| p[0] < -snap) {
         return Err(ModelerError::Csg(format!(
             "revolve `{name}`: profile points are [radius, y] with radius >= 0, got {p:?}"
         )));
     }
+    let snapped: Vec<Vec<[f32; 2]>> = profile
+        .iter()
+        .map(|r| r.iter().map(|p| [p[0].max(0.0), p[1]]).collect())
+        .collect();
+    let profile = &snapped;
     if degrees.is_nan() || degrees <= 0.0 || degrees > 360.0 {
         return Err(ModelerError::Csg(format!(
             "revolve `{name}`: degrees must be in (0, 360], got {degrees}"
@@ -1152,6 +1165,15 @@ mod tests {
         );
         // Tapered to a point (the profile origin): a pyramid, 1/3 * base * h.
         assert!((signed_volume(&p) - 0.5 / 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn revolve_snaps_rounding_past_the_axis_but_rejects_real_negatives() {
+        // An arc to 90 degrees ends at radius ~ -1.3e-7.
+        let dome = vec![vec![[0.0, 0.0], [3.0, 0.0], [2.12, 2.12], [-1.3e-7, 3.0]]];
+        assert!(revolve("dome", &dome, 360.0, 32, 0.0).is_ok());
+        let bad = vec![vec![[0.0, 0.0], [1.0, 0.0], [-0.1, 1.0]]];
+        assert!(revolve("bad", &bad, 360.0, 32, 0.0).is_err());
     }
 
     #[test]

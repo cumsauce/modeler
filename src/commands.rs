@@ -240,6 +240,8 @@ pub struct Session {
     pub others: Vec<Model>,
     /// Autosaves waiting to be written (see [`Session::flush_autosave`]).
     pub autosave_due: AutosaveDue,
+    /// How much of the history the autosave journal already holds.
+    pub journal: crate::catalog::JournalState,
 }
 
 /// Which autosaves are pending and since when: edits only mark them, and
@@ -267,6 +269,7 @@ impl Default for Session {
             batch_labels: Vec::new(),
             others: Vec::new(),
             autosave_due: AutosaveDue::default(),
+            journal: Default::default(),
         }
     }
 }
@@ -310,42 +313,61 @@ fn move_report(before: &[Arc<Part>], after: &[Arc<Part>], patterns: &[String]) -
         };
     }
     // Only parts near the moved set, before or after, can change contact.
-    let near = |p: &Part, set: &[Arc<Part>]| {
-        let (lo, hi) = p.bounds();
-        set.iter().filter(|m| moved(m)).any(|m| {
-            let (a, b) = m.bounds();
-            (0..3).all(|k| lo[k] <= b[k] + 1e-3 && a[k] <= hi[k] + 1e-3)
-        })
+    // Bounds once per part, not per comparison.
+    let moved_boxes = |set: &[Arc<Part>]| -> Vec<(Vec3, Vec3)> {
+        set.iter()
+            .filter(|m| moved(m))
+            .map(|m| m.bounds())
+            .collect()
     };
-    let by_name = |ps: &[Arc<Part>], n: &str| ps.iter().find(|p| p.name == n).cloned();
+    let (mb0, mb1) = (moved_boxes(&before), moved_boxes(&after));
+    let near_any = |lo: Vec3, hi: Vec3, boxes: &[(Vec3, Vec3)]| {
+        boxes
+            .iter()
+            .any(|(a, b)| (0..3).all(|k| lo[k] <= b[k] + 1e-3 && a[k] <= hi[k] + 1e-3))
+    };
+    // Each part's solid is built once, on first use (the old loop rebuilt
+    // one per pair, and every part's for each "left behind" test).
+    let bodies = |ps: &[Arc<Part>]| -> Vec<std::cell::OnceCell<Body<'_>>> {
+        ps.iter().map(|_| std::cell::OnceCell::new()).collect()
+    };
+    let (b0, b1) = (bodies(&before), bodies(&after));
+    let idx = |ps: &[Arc<Part>], n: &str| ps.iter().position(|p| p.name == n);
+    let get0 = |i: usize| b0[i].get_or_init(|| Body::new(&before[i]));
+    let get1 = |i: usize| b1[i].get_or_init(|| Body::new(&after[i]));
+    let boxes1: Vec<(Vec3, Vec3)> = after.iter().map(|p| p.bounds()).collect();
+    let close = |a: usize, b: usize| {
+        let ((alo, ahi), (blo, bhi)) = (boxes1[a], boxes1[b]);
+        (0..3).all(|k| alo[k] <= bhi[k] + 1e-3 && blo[k] <= ahi[k] + 1e-3)
+    };
+    let moved0: Vec<usize> = (0..before.len()).filter(|&i| moved(&before[i])).collect();
+    let moved1: Vec<usize> = (0..after.len()).filter(|&i| moved(&after[i])).collect();
     let mut left = Vec::new();
     let mut new_ov = Vec::new();
-    for u in after.iter().filter(|p| !moved(p)) {
-        if !near(u, &before) && !near(u, &after) {
+    for (ui, u) in after.iter().enumerate().filter(|(_, p)| !moved(p)) {
+        let (lo, hi) = boxes1[ui];
+        if !near_any(lo, hi, &mb0) && !near_any(lo, hi, &mb1) {
             continue;
         }
-        let Some(u0) = by_name(&before, &u.name) else {
+        let Some(u0i) = idx(&before, &u.name) else {
             continue;
         };
-        let (ub0, ub1) = (Body::new(&u0), Body::new(u));
-        let touched_moved = before
+        let touched_moved = moved0
             .iter()
-            .filter(|m| moved(m))
-            .any(|m| contact(&ub0, &Body::new(m)).is_some());
+            .any(|&m| contact(get0(u0i), get0(m)).is_some());
         if touched_moved
-            && after
-                .iter()
-                .filter(|p| p.name != u.name)
-                .all(|o| contact(&ub1, &Body::new(o)).is_none())
+            && (0..after.len())
+                .filter(|&o| o != ui && close(ui, o))
+                .all(|o| contact(get1(ui), get1(o)).is_none())
         {
             left.push(u.name.clone());
         }
-        for m in after.iter().filter(|m| moved(m)) {
-            let Some(m0) = by_name(&before, &m.name) else {
+        for &mi in &moved1 {
+            let Some(m0i) = idx(&before, &after[mi].name) else {
                 continue;
             };
-            let was = crate::contact::overlap_between(&ub0, &Body::new(&m0)).is_some();
-            if !was && let Some(o) = crate::contact::overlap_between(&ub1, &Body::new(m)) {
+            let was = crate::contact::overlap_between(get0(u0i), get0(m0i)).is_some();
+            if !was && let Some(o) = crate::contact::overlap_between(get1(ui), get1(mi)) {
                 new_ov.push(o);
             }
         }
@@ -1789,6 +1811,9 @@ impl Session {
 
     /// The checks behind [`Self::verify`] as (name, passed, detail).
     pub fn verify_checks(&self, spec: &VerifySpec) -> Vec<(String, bool, String)> {
+        // Pair contacts, found once and shared by grounded and supported.
+        let contacts_cell = std::cell::OnceCell::new();
+        let contacts = || contacts_cell.get_or_init(|| crate::contact::Contacts::new(&self.model));
         let scope: Vec<String> = spec.scope.clone().unwrap_or_default();
         let in_scope =
             |n: &str| scope.is_empty() || scope.iter().any(|p| crate::name_matches(p, n));
@@ -1844,7 +1869,7 @@ impl Session {
             _ => None,
         };
         if let Some(strict) = strict {
-            let (floating, held) = crate::contact::grounding(&self.model, 0.2);
+            let (floating, held) = crate::contact::grounding_in(contacts(), &self.model, 0.2);
             let floating: Vec<String> = floating.into_iter().filter(|n| in_scope(n)).collect();
             let deep: Vec<String> = held
                 .into_iter()
@@ -1905,10 +1930,11 @@ impl Session {
             record("rebuild", self.check_rebuild().map_err(|e| e.to_string()));
         }
         if spec.supported == Some(true) {
-            let bad: Vec<(String, Vec<String>)> = crate::contact::unsupported(&self.model)
-                .into_iter()
-                .filter(|(n, _)| in_scope(n))
-                .collect();
+            let bad: Vec<(String, Vec<String>)> =
+                crate::contact::unsupported_in(contacts(), &self.model)
+                    .into_iter()
+                    .filter(|(n, _)| in_scope(n))
+                    .collect();
             if bad.is_empty() {
                 record(
                     "supported",
@@ -2147,20 +2173,22 @@ impl Session {
             return;
         }
         let due = std::mem::take(&mut self.autosave_due);
-        fn without_parts<R>(m: &mut Model, f: impl FnOnce(&Model) -> R) -> R {
-            if m.parts_derive_from_ops() {
-                let parts = std::mem::take(&mut m.parts);
-                let r = f(m);
-                m.parts = parts;
-                r
+        if due.model {
+            // Parts out for the write (op-derived ones re-derive on restore),
+            // history appended to the journal rather than rewritten.
+            let parts = if self.model.parts_derive_from_ops() {
+                Some(std::mem::take(&mut self.model.parts))
             } else {
-                f(m)
+                None
+            };
+            if let Err(e) =
+                crate::catalog::save_session_journaled(&mut self.model, &mut self.journal)
+            {
+                eprintln!("session autosave failed: {e}");
             }
-        }
-        if due.model
-            && let Err(e) = without_parts(&mut self.model, crate::catalog::save_session_state)
-        {
-            eprintln!("session autosave failed: {e}");
+            if let Some(p) = parts {
+                self.model.parts = p;
+            }
         }
         if due.docs {
             let taken: Vec<_> = self
