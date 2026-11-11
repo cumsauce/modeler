@@ -175,6 +175,84 @@ pub fn open_edge_count(p: &Part) -> usize {
     edges.values().filter(|c| **c != 2).count()
 }
 
+/// Area enclosed by a part's unmatched (boundary) half-edges, as a fraction of
+/// its surface area. Hairline seams and T-junction cracks bound ~zero area, while
+/// a missing wall bounds the wall's whole area, so this separates harmless cut
+/// seams from see-through holes. Returns (enclosed area, surface area).
+pub fn boundary_gap_area(p: &Part) -> (f64, f64) {
+    use std::collections::HashMap;
+    let mut ids: HashMap<[i64; 3], u32> = HashMap::new();
+    let mut welded = Vec::with_capacity(p.verts.len());
+    for v in &p.verts {
+        let key = [
+            (v[0] * 1e5).round() as i64,
+            (v[1] * 1e5).round() as i64,
+            (v[2] * 1e5).round() as i64,
+        ];
+        let next = ids.len() as u32;
+        welded.push(*ids.entry(key).or_insert(next));
+    }
+    let pos = |i: u32| {
+        let v = p.verts[i as usize];
+        [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]
+    };
+    let mut half: HashMap<(u32, u32), (i32, u32)> = HashMap::new();
+    let mut surface = 0.0f64;
+    for t in p.indices.as_chunks::<3>().0 {
+        let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+        let (u, w) = (
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+        );
+        let cr = [
+            u[1] * w[2] - u[2] * w[1],
+            u[2] * w[0] - u[0] * w[2],
+            u[0] * w[1] - u[1] * w[0],
+        ];
+        surface += 0.5 * (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+        for e in 0..3 {
+            let (i, j) = (t[e], t[(e + 1) % 3]);
+            let (wi, wj) = (welded[i as usize], welded[j as usize]);
+            if wi == wj {
+                continue;
+            }
+            // Net count per undirected edge: +1 forward, -1 backward.
+            let (key, sign) = if wi < wj {
+                ((wi, wj), 1)
+            } else {
+                ((wj, wi), -1)
+            };
+            let entry = half.entry(key).or_insert((0, i));
+            entry.0 += sign;
+            if sign == 1 {
+                entry.1 = i;
+            }
+        }
+    }
+    let mut first_vert = vec![0u32; ids.len()];
+    for (i, w) in welded.iter().enumerate().rev() {
+        first_vert[*w as usize] = i as u32;
+    }
+    let rep = |w: u32| first_vert[w as usize];
+    // Remaining net edges are unmatched; sum their vector area (1/2 sum a x b).
+    let mut acc = [0.0f64; 3];
+    for (&(lo, hi), &(net, _)) in &half {
+        if net == 0 {
+            continue;
+        }
+        let (a, b) = if net > 0 {
+            (pos(rep(lo)), pos(rep(hi)))
+        } else {
+            (pos(rep(hi)), pos(rep(lo)))
+        };
+        acc[0] += a[1] * b[2] - a[2] * b[1];
+        acc[1] += a[2] * b[0] - a[0] * b[2];
+        acc[2] += a[0] * b[1] - a[1] * b[0];
+    }
+    let enclosed = 0.5 * (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
+    (enclosed, surface)
+}
+
 /// The name a part ends up with after any `Rename` ops that follow it.
 fn final_name_after_renames(ops: &[Op], name: &str) -> String {
     let mut cur = name.to_string();
@@ -296,10 +374,12 @@ pub fn lints(model: &Model) -> Vec<String> {
                 .find(|p| p.name == final_name && p.visible)
         {
             let open = open_edge_count(p);
-            if open > 0 {
+            let (gap, surface) = boundary_gap_area(p);
+            if open > 0 && gap > 0.002 * surface {
                 out.push(format!(
-                    "boolean `{}` has {open} open edges (seams or holes) — check it with probe_ray through any pocket/opening before trusting the render",
-                    p.name
+                    "boolean `{}` has {open} open edges enclosing {gap:.3} m² of missing surface ({:.1}% of its area) — likely a hole; check with probe_ray through any pocket/opening",
+                    p.name,
+                    100.0 * gap / surface.max(1e-9)
                 ));
             }
         }
@@ -398,6 +478,22 @@ pub fn lints(model: &Model) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gap_area_sees_missing_wall_but_not_closed_mesh() {
+        let Ok(mut b) = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "b")
+        else {
+            panic!("box failed");
+        };
+        let (gap, surf) = super::boundary_gap_area(&b);
+        assert!(gap < 1e-9, "closed box encloses no gap, got {gap}");
+        assert!((surf - 6.0).abs() < 1e-4);
+        // Drop one triangle pair worth of faces: remove the last two triangles.
+        let n = b.indices.len();
+        b.indices.truncate(n - 6);
+        let (gap, _) = super::boundary_gap_area(&b);
+        assert!((gap - 1.0).abs() < 1e-3, "missing 1 m² face, got {gap}");
+    }
+
     use super::*;
 
     #[test]

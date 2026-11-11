@@ -272,7 +272,7 @@ pub fn boolean(
     part.scale = [1.0; 3];
     // Welding invalidated per-vertex data: rebuild normals first (the box UV
     // projection reads them), then re-project the UVs.
-    crate::uv::ensure_normals(&mut part);
+    crate::uv::crease_normals(&mut part, 40.0);
     let _ = crate::uv::ensure_uvs(&mut part, Some("box"));
     Ok(part)
 }
@@ -411,11 +411,27 @@ mod tests {
             soup.verts.len()
         );
         // No two verts share a quantized key.
-        let mut keys: Vec<[i64; 3]> = out.verts.iter().map(grid_key).collect();
+        // Hard edges split verts on purpose (crease normals), but a split pair
+        // must differ in normal: (position, normal) is unique.
+        let mut keys: Vec<([i64; 3], [i32; 3])> = out
+            .verts
+            .iter()
+            .zip(&out.normals)
+            .map(|(v, n)| {
+                (
+                    grid_key(v),
+                    [
+                        (n[0] * 100.0).round() as i32,
+                        (n[1] * 100.0).round() as i32,
+                        (n[2] * 100.0).round() as i32,
+                    ],
+                )
+            })
+            .collect();
         let total = keys.len();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), total, "duplicate quantized verts");
+        assert_eq!(keys.len(), total, "duplicate (position, normal) verts");
         // No degenerate triangles: distinct indices and real area.
         assert!(out.tri_count() > 0, "result must be non-empty");
         for tri in out.indices.as_chunks::<3>().0 {

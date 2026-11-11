@@ -42,6 +42,78 @@ pub fn ensure_normals(part: &mut Part) {
     }
 }
 
+/// Angle-thresholded smooth normals: each triangle corner averages the face
+/// normals of the triangles sharing its vertex that lie within `degrees` of the
+/// corner's own face. Vertices whose corners disagree are split, so a hard edge
+/// (a boolean cut) stays crisp while a faceted cylinder wall stays smooth.
+/// Rewrites verts/normals/indices; UVs are cleared, so re-project them after.
+pub fn crease_normals(part: &mut Part, degrees: f32) {
+    use std::collections::HashMap;
+    let count = part.verts.len();
+    let tris = if part.indices.is_empty() {
+        count / 3
+    } else {
+        part.indices.len() / 3
+    };
+    let idx = |i: usize| -> usize { part.indices.get(i).copied().unwrap_or(i as u32) as usize };
+    let mut tri_ids = Vec::with_capacity(tris);
+    let mut face_n = Vec::with_capacity(tris);
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for t in 0..tris {
+        let (a, b, c) = (idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2));
+        if a >= count || b >= count || c >= count {
+            continue;
+        }
+        let n = (Vec3::from(part.verts[b]) - Vec3::from(part.verts[a]))
+            .cross(Vec3::from(part.verts[c]) - Vec3::from(part.verts[a]));
+        let k = tri_ids.len();
+        tri_ids.push([a, b, c]);
+        face_n.push(n);
+        for v in [a, b, c] {
+            incident[v].push(k);
+        }
+    }
+    let cos_limit = degrees.to_radians().cos();
+    let mut verts = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut indices = Vec::new();
+    let mut remap: HashMap<(usize, [i32; 3]), u32> = HashMap::new();
+    for (k, ids) in tri_ids.iter().enumerate() {
+        let own = face_n[k].normalize_or_zero();
+        for &v in ids {
+            let mut acc = Vec3::ZERO;
+            for &o in &incident[v] {
+                if face_n[o].normalize_or_zero().dot(own) >= cos_limit {
+                    acc += face_n[o];
+                }
+            }
+            let n = if acc.length_squared() > 1e-12 {
+                acc.normalize()
+            } else {
+                Vec3::Y
+            };
+            let key = (
+                v,
+                [
+                    (n.x * 1000.0).round() as i32,
+                    (n.y * 1000.0).round() as i32,
+                    (n.z * 1000.0).round() as i32,
+                ],
+            );
+            let id = *remap.entry(key).or_insert_with(|| {
+                verts.push(part.verts[v]);
+                normals.push(n.to_array());
+                (verts.len() - 1) as u32
+            });
+            indices.push(id);
+        }
+    }
+    part.verts = verts;
+    part.normals = normals;
+    part.indices = indices;
+    part.uvs.clear();
+}
+
 /// Project UVs with `projection` (default "box"). Keeps every UV in [0, 1].
 pub fn ensure_uvs(part: &mut Part, projection: Option<&str>) -> Result<(), String> {
     project(part, projection.unwrap_or("box"))
@@ -234,6 +306,20 @@ pub fn validate_uvs(part: &crate::Part, what: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crease_splits_hard_edges_and_keeps_flat_welded() {
+        let mut p = Part::new("fold");
+        p.verts = vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+        p.indices = vec![0, 1, 2, 0, 3, 1];
+        crease_normals(&mut p, 40.0);
+        assert!(p.verts.len() > 4, "90 degree edge must split verts");
+        let mut q = Part::new("flat");
+        q.verts = vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [1., 1., 0.]];
+        q.indices = vec![0, 1, 2, 2, 1, 3];
+        crease_normals(&mut q, 40.0);
+        assert_eq!(q.verts.len(), 4, "coplanar faces stay welded");
+    }
+
     use super::*;
 
     /// A raw tetrahedron: no normals, no UVs.

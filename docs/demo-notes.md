@@ -33,11 +33,18 @@ Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
 7. **Radial array bookkeeping -> FIXED.** `include_source: true`.
 8. **`expect_bounds` -> FIXED.** Failures name the part that sets the extreme.
 
-## Still open (found while verifying)
-- The large flat grey backdrop in the iso shot is unexplained (not yet checked
-  whether it is the ground disc, the ground plane or the camera's clear colour).
-- Smooth per-vertex normals across boolean cut edges give dark streaks on the
-  tower; recompute normals per face (or by angle threshold) on boolean outputs.
-- The boolean lint cannot tell harmless curved-cut seams from real holes
-  (108 open edges on `tower_final` renders fine); a ray-based check would.
+## Follow-up pass (2026-11-11): the open items
+- **Dark streaks on the cut tower -> FIXED.** Boolean outputs now use
+  angle-thresholded normals (`uv::crease_normals`, 40 degrees): vertices split at
+  hard cut edges, cylinder walls stay smooth.
+- **Boolean lint false positive -> FIXED.** The lint now measures the area
+  enclosed by boundary edges (`verify::boundary_gap_area`) and warns only above
+  0.2% of the part's surface. A missing wall encloses its whole area; hairline
+  seams (108 open edges on `tower_final`) enclose ~0, so the warning is gone.
+  `validate` still reports raw open edges.
+- **Grey iso backdrop -> FIXED.** It was the preview's 100x100 grey floor slab,
+  which the agent camera also rendered. The floor now lives on render layer 1,
+  which only the human window's camera draws.
+
+## Still open
 - The nudge is a workaround for csgrs; a robust boolean backend would remove it.

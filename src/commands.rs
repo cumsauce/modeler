@@ -1808,8 +1808,14 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         s.op_boolean("c", crate::BoolOp::Difference, "a", "b")
             .unwrap_or_else(|e| panic!("{e}"));
-        let open = crate::verify::open_edge_count(s.model.part("c").unwrap_or_else(|| panic!("c")));
+        let part = s.model.part("c").unwrap_or_else(|| panic!("c"));
+        let open = crate::verify::open_edge_count(part);
+        let (gap, surface) = crate::verify::boundary_gap_area(part);
         let lint = s.lints().iter().any(|l| l.contains("open edges"));
-        assert_eq!(open > 0, lint, "lint must track open_edge_count ({open})");
+        let expect = open > 0 && gap > 0.002 * surface;
+        assert_eq!(
+            expect, lint,
+            "lint must track gap area ({open} open, gap {gap}/{surface})"
+        );
     }
 }

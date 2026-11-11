@@ -61,7 +61,8 @@ tweak path):
 - **Booleans** nudge the second operand ~2 mm when one of its faces shares a
   plane with a face of the first (csgrs drops faces on coplanar-but-disjoint
   planes, e.g. two equal-depth cutters). `scene_summary` warns when a visible
-  boolean output has open edges. Booleans output welded meshes (1e-4 grid), but curved cuts can still
+  boolean output has open edges that enclose real missing area (hairline seams
+  don't trigger it). Booleans output welded meshes (1e-4 grid), but curved cuts can still
   carry seam edges — `validate` reports them honestly; they render fine in
   practice. Curved-on-curved (cylinder−cylinder, torus anything) can produce
   corrupted noise — compose or fake instead (the catalog's mug does).
