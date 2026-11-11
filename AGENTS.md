@@ -496,7 +496,7 @@ the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the m
 `MODELER_MATERIALS=1` opens it at start): the active material's graph by dependency level with a live
 thumbnail per node, a lit sphere and the channels, and clicking a node shows its
 output large (click again for the material). Click a part then type to annotate
-(Enter commits, Esc cancels; Backspace deletes; spaces work). The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Graph / Material toggles match G and M.
+(Enter commits, Esc cancels; Backspace deletes; spaces work). **O** toggles the outliner in the same left pane (`MODELER_OUTLINE=1` opens it at start): the scene as a hierarchy (`src/outline.rs`): prefab instances and array runs fold into expandable groups, hidden parts (cutters, blanks, sources) sink into one dimmed group, each row shows its material. Click a row to select it (its parts pulse in 3D), click a selected group or its chevron to open it, double-click to frame it; the wheel scrolls. The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Outliner / Graph / Material toggles match O, G and M.
 
 ## Dev notes / gotchas
 

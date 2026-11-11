@@ -121,6 +121,9 @@ fn main() -> AppExit {
     .insert_resource(MatPane::open(
         std::env::var_os("MODELER_MATERIALS").is_some(),
     ))
+    .insert_resource(OutlinePane::open(
+        std::env::var_os("MODELER_OUTLINE").is_some(),
+    ))
     .init_resource::<PinTyping>()
     .init_resource::<PendingPinSpawn>()
     .add_systems(
@@ -139,6 +142,7 @@ fn main() -> AppExit {
             highlight_selected.run_if(windowed),
             graph_pane_viewport.run_if(windowed),
             update_material_pane.run_if(windowed),
+            update_outline_pane.run_if(windowed),
         ),
     );
     if headless {
@@ -171,7 +175,7 @@ fn main() -> AppExit {
         .insert_resource(bevy::feathers::theme::UiTheme(
             bevy::feathers::dark_theme::create_dark_theme(),
         ))
-        .add_systems(Startup, setup_toolbar)
+        .add_systems(Startup, (setup_toolbar, setup_outline_pane))
         .add_systems(Update, sync_toolbar)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }

@@ -70,6 +70,7 @@ pub mod graph;
 pub mod graph_view;
 pub mod inspect;
 pub mod material;
+pub mod outline;
 pub mod params;
 pub mod primitives;
 pub mod raster;

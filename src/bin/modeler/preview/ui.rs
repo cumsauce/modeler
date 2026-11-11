@@ -51,15 +51,24 @@ pub(crate) fn pane_bg() -> ThemeBackgroundColor {
 pub(crate) enum PaneToggle {
     Graph,
     Material,
+    Outline,
 }
 
 fn toggle(
     which: PaneToggle,
     graph: &mut GraphHudVisible,
     mat: &mut MatPane,
+    outline: &mut OutlinePane,
     panel: &mut GraphPanel,
 ) {
     match which {
+        PaneToggle::Outline => {
+            outline.visible = !outline.visible;
+            if outline.visible {
+                graph.0 = false;
+                mat.visible = false;
+            }
+        }
         PaneToggle::Graph => {
             graph.0 = !graph.0;
             panel.user_view = false;
@@ -83,10 +92,11 @@ fn on_toggle(
     which: Query<&PaneToggle>,
     mut graph: ResMut<GraphHudVisible>,
     mut mat: ResMut<MatPane>,
+    mut outline: ResMut<OutlinePane>,
     mut panel: ResMut<GraphPanel>,
 ) {
     if let Ok(w) = which.get(activate.event_target()) {
-        toggle(*w, &mut graph, &mut mat, &mut panel);
+        toggle(*w, &mut graph, &mut mat, &mut outline, &mut panel);
     }
 }
 
@@ -165,6 +175,7 @@ pub(crate) fn setup_toolbar(mut commands: Commands) {
         ))
         .id();
     for (which, label) in [
+        (PaneToggle::Outline, "Outliner  O"),
         (PaneToggle::Graph, "Graph  G"),
         (PaneToggle::Material, "Material  M"),
     ] {
@@ -188,12 +199,14 @@ pub(crate) struct ToolbarToggle;
 pub(crate) fn sync_toolbar(
     graph: Res<GraphHudVisible>,
     mat: Res<MatPane>,
+    outline: Res<OutlinePane>,
     mut buttons: Query<(&PaneToggle, &mut ButtonVariant), With<ToolbarToggle>>,
 ) {
     for (which, mut variant) in &mut buttons {
         let open = match which {
             PaneToggle::Graph => graph.0,
             PaneToggle::Material => mat.visible,
+            PaneToggle::Outline => outline.visible,
         };
         let want = ButtonVariant::selected(open);
         if *variant != want {

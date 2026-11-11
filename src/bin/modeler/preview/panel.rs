@@ -335,13 +335,14 @@ fn pane_w(w: u32) -> u32 {
 pub(crate) fn graph_pane_viewport(
     visible: Res<GraphHudVisible>,
     mat: Res<MatPane>,
+    outline: Res<OutlinePane>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Camera, With<MainCamera>>,
 ) {
     let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
         return;
     };
-    let want = (visible.0 || mat.visible).then(|| {
+    let want = (visible.0 || mat.visible || outline.visible).then(|| {
         let (w, h) = (window.physical_width(), window.physical_height());
         bevy::camera::Viewport {
             physical_position: UVec2::new(pane_w(w), 0),
@@ -366,11 +367,13 @@ pub(crate) fn highlight_selected(
     time: Res<Time>,
     panel: Res<GraphPanel>,
     visible: Res<GraphHudVisible>,
+    outline: Res<OutlinePane>,
     parts: Query<(&Name, &MeshMaterial3d<StandardMaterial>), With<PreviewPart>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let sel: &[String] = match panel.selected.filter(|_| visible.0) {
         Some(i) => panel.view.nodes.get(i).map_or(&[], |n| &n.outputs),
+        None if outline.visible => &outline.selected_parts,
         None => &[],
     };
     let pulse = 0.35 + 0.25 * (time.elapsed_secs() * 5.0).sin();

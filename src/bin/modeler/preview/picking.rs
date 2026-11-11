@@ -44,8 +44,9 @@ pub(crate) fn pin_on_click(
     drag: Res<CameraDrag>,
     panel: Res<GraphPanel>,
     mat_pane: Res<MatPane>,
+    outline: Res<OutlinePane>,
 ) {
-    if panel.hover || mat_pane.hover {
+    if panel.hover || mat_pane.hover || outline.hover {
         return;
     }
     // Pins land on a click (press + release with barely any movement), never on
