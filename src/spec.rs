@@ -803,6 +803,174 @@ pub struct TextSpec {
     rotation: Option<RotationSpec>,
 }
 
+/// A number (a square) or [width, depth].
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Size2 {
+    One(f32),
+    Two([f32; 2]),
+}
+
+impl Size2 {
+    fn get(&self) -> [f32; 2] {
+        match self {
+            Size2::One(v) => [*v, *v],
+            Size2::Two(v) => *v,
+        }
+    }
+}
+
+/// A level pad in a terrain (a building plot, a plaza, a camp).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PadSpec {
+    /// Centre [x, z] in the terrain's own coordinates.
+    at: [f32; 2],
+    /// Circle radius, meters (or give `size`).
+    #[serde(default)]
+    radius: Option<f32>,
+    /// A rectangle [width, depth] (or one number: a square) instead of a circle.
+    #[serde(default)]
+    size: Option<Size2>,
+    /// Pad top y (default: the ground's own height at `at`).
+    #[serde(default)]
+    height: Option<f32>,
+    /// Meters over which it blends back into the ground (3).
+    #[serde(default)]
+    falloff: Option<f32>,
+}
+
+/// A carved bed along a polyline: a road (depth 0.1-0.3), a river (1-2).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerrainPathSpec {
+    /// [[x, z], ...] in the terrain's own coordinates.
+    points: Vec<[f32; 2]>,
+    /// Flat bed width, meters (3).
+    #[serde(default)]
+    width: Option<f32>,
+    /// How far below the ground on either side, meters (0.3).
+    #[serde(default)]
+    depth: Option<f32>,
+    /// Bank width blending back into the ground, meters (= width).
+    #[serde(default)]
+    falloff: Option<f32>,
+}
+
+/// Ground: a closed slab whose top is a noise heightfield at real size,
+/// centred on the origin (top between y = 0 and `height`, flat bottom at
+/// `base`), with level `flatten` pads and carved `paths`. UVs are metric.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerrainSpec {
+    name: String,
+    /// [width (x), depth (z)] meters, or one number for a square (60).
+    #[serde(default)]
+    size: Option<Size2>,
+    /// Meters per grid cell (0.5; at most 1M cells).
+    #[serde(default)]
+    resolution: Option<f32>,
+    /// Relief, meters (6): the highest ground reaches about this y.
+    #[serde(default)]
+    height: Option<f32>,
+    /// Feature size, meters (20): hill / ridge spacing, dune wavelength.
+    #[serde(default)]
+    scale: Option<f32>,
+    /// Noise octaves, 1..10 (5): more = finer detail.
+    #[serde(default)]
+    octaves: Option<u32>,
+    /// Amplitude kept per octave, 0..1 (0.5): higher = rougher.
+    #[serde(default)]
+    gain: Option<f32>,
+    /// "hills" (default), "ridges" (sharp crests), "dunes" (wind-blown
+    /// crests, see `wind`), "mesa" (terraced plateaus, see `terraces`),
+    /// "flat" (a level slab, for pads and paths only).
+    #[serde(default)]
+    style: Option<String>,
+    /// Same seed = same ground.
+    #[serde(default)]
+    seed: Option<u64>,
+    /// y of the flat bottom (-1); must be below every top point.
+    #[serde(default)]
+    base: Option<f32>,
+    /// mesa: number of terraces (5).
+    #[serde(default)]
+    terraces: Option<u32>,
+    /// dunes: wind direction, degrees about +y (0: crests run along x).
+    #[serde(default)]
+    wind: Option<f32>,
+    /// Meters over which the edges ease down to y = 0 (0 = off): a map border.
+    #[serde(default)]
+    edge_falloff: Option<f32>,
+    /// Level pads: [{"at": [x, z], "radius": 6, "height"?: 0, "falloff"?: 3}].
+    #[serde(default)]
+    flatten: Vec<PadSpec>,
+    /// Carved beds: [{"points": [[x, z], ...], "width": 3, "depth": 0.3}].
+    #[serde(default)]
+    paths: Vec<TerrainPathSpec>,
+    #[serde(default, alias = "position")]
+    translation: Option<[f32; 3]>,
+    /// Rotation: [x, y, z, w], {"axis": [0, 1, 0], "degrees": 30} or {"y": 30}.
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
+}
+
+impl TerrainSpec {
+    fn into_op(self, ctx: &str) -> Result<Op, String> {
+        let mut d = crate::terrain::Terrain::default();
+        if let Some(s) = &self.size {
+            d.size = s.get();
+        }
+        macro_rules! over {
+            ($($f:ident),*) => { $(if let Some(v) = self.$f { d.$f = v; })* };
+        }
+        over!(
+            resolution,
+            height,
+            scale,
+            octaves,
+            gain,
+            style,
+            seed,
+            base,
+            terraces,
+            wind,
+            edge_falloff,
+            translation
+        );
+        d.flatten = self
+            .flatten
+            .into_iter()
+            .map(|p| crate::terrain::Pad {
+                at: p.at,
+                radius: p.radius.unwrap_or(0.0),
+                size: p.size.map(|s| s.get()),
+                height: p.height,
+                falloff: p.falloff.unwrap_or(3.0),
+            })
+            .collect();
+        d.paths = self
+            .paths
+            .into_iter()
+            .map(|p| {
+                let width = p.width.unwrap_or(3.0);
+                crate::terrain::Path {
+                    points: p.points,
+                    width,
+                    depth: p.depth.unwrap_or(0.3),
+                    falloff: p.falloff.unwrap_or(width),
+                }
+            })
+            .collect();
+        d.rotation = rot(ctx, &self.rotation)?;
+        d.validate().map_err(|e| format!("{ctx}: {e}"))?;
+        Ok(Op::Terrain {
+            name: self.name,
+            def: Box::new(d),
+        })
+    }
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SweepSpec {
@@ -1224,6 +1392,7 @@ pub enum OpSpec {
     Sweep(SweepSpec),
     Lsystem(LSystemSpec),
     Text(TextSpec),
+    Terrain(TerrainSpec),
     Hull(HullSpec),
     Round(RoundSpec),
     Shell(ShellSpec),
@@ -1259,6 +1428,7 @@ pub const OP_TYPES: &[&str] = &[
     "sweep",
     "lsystem",
     "text",
+    "terrain",
     "hull",
     "round",
     "shell",
@@ -1668,6 +1838,10 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let s: LSystemSpec = de(&ctx, &body)?;
             BatchItem::Op(s.into_op(&ctx)?)
         }
+        "terrain" => {
+            let s: TerrainSpec = de(&ctx, &body)?;
+            BatchItem::Op(s.into_op(&ctx)?)
+        }
         "hull" => {
             let s: HullSpec = de(&ctx, &body)?;
             if s.inputs.is_empty() {
@@ -2069,6 +2243,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "lsystem" => {
             json!({"type": "lsystem", "name": "oak", "preset": "tree", "seed": 3, "translation": [2, 0, 0]})
         }
+        "terrain" => {
+            json!({"type": "terrain", "name": "ground", "size": [60, 60], "height": 6, "scale": 20, "style": "hills", "seed": 1, "flatten": [{"at": [0, 0], "radius": 6, "falloff": 4}], "paths": [{"points": [[-30, -10], [0, -4], [30, 8]], "width": 3, "depth": 0.3}]})
+        }
         "hull" => {
             json!({"type": "hull", "name": "pill", "inputs": ["ball_a", "ball_b"]})
         }
@@ -2162,6 +2339,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "sweep" => schemars::schema_for!(SweepSpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "text" => schemars::schema_for!(TextSpec),
+        "terrain" => schemars::schema_for!(TerrainSpec),
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "shell" => schemars::schema_for!(ShellSpec),

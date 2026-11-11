@@ -83,6 +83,7 @@ pub mod simplify;
 pub mod spec;
 pub mod style;
 pub mod text;
+pub mod terrain;
 pub mod uv;
 pub mod verify;
 
@@ -872,6 +873,13 @@ pub enum Op {
         translation: [f32; 3],
         #[serde(default)]
         rotation: Option<[f32; 4]>,
+    },
+    /// A ground slab with a noise heightfield top (closed: skirt + flat bottom).
+    #[serde(rename = "terrain")]
+    Terrain {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::terrain::Terrain>,
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },

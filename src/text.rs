@@ -186,10 +186,6 @@ pub fn build(
         let [x, y, z] = *n;
         *n = [x, z, -y];
     }
-    // Shift so the front face is at z = 0.
-    for v in &mut part.verts {
-        v[2] += depth;
-    }
     Ok(part)
 }
 
