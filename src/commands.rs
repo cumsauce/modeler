@@ -2,7 +2,6 @@
 //! unit-testable, wiring-free API used by both the MCP tools and tests.
 
 use crate::{Annotation, Axis, BoolOp, Model, ModelerError, Op, Part, PrimitiveKind, graph};
-use crate::{Quat, Vec3};
 
 pub type CmdResult = Result<String, ModelerError>;
 
