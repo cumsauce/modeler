@@ -186,10 +186,7 @@ impl Model {
             self.derived_from_ops = false;
             return Ok(());
         }
-        self.parts = crate::graph::evaluate(&self.ops)?
-            .into_iter()
-            .map(std::sync::Arc::new)
-            .collect();
+        self.parts = crate::graph::evaluate(&self.ops)?;
         self.derived_from_ops = true;
         Ok(())
     }
@@ -200,10 +197,7 @@ impl Model {
             self.derived_from_ops = false;
             return Ok(());
         }
-        self.parts = crate::graph::evaluate_uncached(&self.ops)?
-            .into_iter()
-            .map(std::sync::Arc::new)
-            .collect();
+        self.parts = crate::graph::evaluate_uncached(&self.ops)?;
         self.derived_from_ops = true;
         Ok(())
     }

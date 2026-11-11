@@ -15,7 +15,11 @@ const STACKS: u32 = 16;
 /// A named primitive. `size` is full extents for "box" (and the plane's x/z extents), and
 /// `[radius, height, 0]` for everything else (torus: `[ring radius, tube radius, 0]`;
 /// washer: `[inner radius, outer radius, 0]`).
-pub fn primitive(kind: PrimitiveKind, size: [f32; 3], name: &str) -> Result<Part, String> {
+pub fn primitive(
+    kind: PrimitiveKind,
+    size: [f32; 3],
+    name: &str,
+) -> Result<Part, crate::ModelerError> {
     let mesh = match kind {
         PrimitiveKind::Box => Cuboid::new(size[0], size[1], size[2]).mesh().build(),
         PrimitiveKind::Sphere => Sphere { radius: size[0] }
@@ -31,9 +35,7 @@ pub fn primitive(kind: PrimitiveKind, size: [f32; 3], name: &str) -> Result<Part
             let ring = size[0];
             let tube = size[1];
             if tube <= 0.0 || tube >= ring {
-                return Err(format!(
-                    "torus needs 0 < tube ({tube}) < ring radius ({ring})"
-                ));
+                return Err(format!("torus needs 0 < tube ({tube}) < ring radius ({ring})").into());
             }
             Torus::new(ring - tube, ring + tube).mesh().build()
         }
@@ -43,9 +45,7 @@ pub fn primitive(kind: PrimitiveKind, size: [f32; 3], name: &str) -> Result<Part
         PrimitiveKind::Washer => {
             let (inner, outer) = (size[0], size[1]);
             if inner <= 0.0 || outer <= inner {
-                return Err(format!(
-                    "washer needs 0 < inner ({inner}) < outer ({outer})"
-                ));
+                return Err(format!("washer needs 0 < inner ({inner}) < outer ({outer})").into());
             }
             Annulus {
                 inner_circle: Circle { radius: inner },
@@ -89,7 +89,7 @@ pub fn primitive(kind: PrimitiveKind, size: [f32; 3], name: &str) -> Result<Part
     let mut part = Part::new(name);
     extract(&mesh, &mut part)?;
     if part.verts.is_empty() || part.tri_count() == 0 {
-        return Err(format!("primitive `{kind}` produced an empty mesh"));
+        return Err(format!("primitive `{kind}` produced an empty mesh").into());
     }
     // Open surfaces are double-sided: append a reversed copy so neither
     // orientation back-face-culls (and welded edges pair up in `validate`).
@@ -133,7 +133,7 @@ fn make_double_sided(part: &mut Part) {
 }
 
 /// Pull POSITION/NORMAL/UV_0 and the index buffer out of a bevy mesh into a [`Part`].
-pub fn extract(mesh: &Mesh, part: &mut Part) -> Result<(), String> {
+pub fn extract(mesh: &Mesh, part: &mut Part) -> Result<(), crate::ModelerError> {
     for (attr, out3) in [
         (Mesh::ATTRIBUTE_POSITION, &mut part.verts),
         (Mesh::ATTRIBUTE_NORMAL, &mut part.normals),
@@ -141,7 +141,7 @@ pub fn extract(mesh: &Mesh, part: &mut Part) -> Result<(), String> {
         let values = mesh.try_attribute(attr).map_err(|e| e.to_string())?;
         *out3 = match values {
             VertexAttributeValues::Float32x3(v) => v.clone(),
-            other => return Err(format!("attribute {attr:?} is not f32x3: {other:?}")),
+            other => return Err(format!("attribute {attr:?} is not f32x3: {other:?}").into()),
         };
     }
     // Renormalize: floating point drift on generated meshes, mostly the cone's apex.
@@ -156,7 +156,7 @@ pub fn extract(mesh: &Mesh, part: &mut Part) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     part.uvs = match values {
         VertexAttributeValues::Float32x2(v) => v.clone(),
-        other => return Err(format!("attribute UV_0 is not f32x2: {other:?}")),
+        other => return Err(format!("attribute UV_0 is not f32x2: {other:?}").into()),
     };
     part.indices = match mesh.indices() {
         Some(Indices::U16(idx)) => idx.iter().map(|i| *i as u32).collect(),
@@ -176,7 +176,7 @@ mod tests {
         let Ok(part) = kind
             .parse()
             .map_err(|e: String| e)
-            .and_then(|k| primitive(k, size, kind))
+            .and_then(|k| primitive(k, size, kind).map_err(|e| e.to_string()))
         else {
             panic!("{kind} failed to build");
         };

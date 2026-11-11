@@ -175,11 +175,9 @@ impl Tools {
         let path = PathBuf::from(path);
         self.run(move |s| match format.as_str() {
             "glb" => gltf::export_glb(&s.model, &path)
-                .map(|_| format!("exported `{}` to {}", s.model.name, path.display()))
-                .map_err(modeler::ModelerError::Io),
+                .map(|_| format!("exported `{}` to {}", s.model.name, path.display())),
             "gltf" => gltf::export_gltf(&s.model, &path)
-                .map(|_| format!("exported `{}` to {}", s.model.name, path.display()))
-                .map_err(modeler::ModelerError::Io),
+                .map(|_| format!("exported `{}` to {}", s.model.name, path.display())),
             other => Err(format!("unknown format `{other}` (use \"gltf\" or \"glb\")").into()),
         })
         .await

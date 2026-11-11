@@ -8,7 +8,7 @@ use bevy::math::{Quat, Vec3};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Evaluates every op and returns the derived parts. Ops run in dependency
 /// order (each op after the op that produces its inputs), falling back to
@@ -20,14 +20,14 @@ use std::sync::Mutex;
 /// keyed by (op parameters, the content hashes of its input parts), so tweaking
 /// one op re-runs only it and what depends on it; booleans upstream of the
 /// change are free. See [`evaluate_uncached`] for verification.
-pub fn evaluate(ops: &[Op]) -> Result<Vec<Part>, ModelerError> {
+pub fn evaluate(ops: &[Op]) -> Result<Vec<Arc<Part>>, ModelerError> {
     evaluate_with(ops, true)
 }
 
 /// Like [`evaluate`] but ignores and never fills the cache: always a fresh
 /// derivation, for `check_rebuild` (a cached result would hide
 /// non-determinism and stale-cache bugs).
-pub fn evaluate_uncached(ops: &[Op]) -> Result<Vec<Part>, ModelerError> {
+pub fn evaluate_uncached(ops: &[Op]) -> Result<Vec<Arc<Part>>, ModelerError> {
     evaluate_with(ops, false)
 }
 
@@ -35,7 +35,11 @@ pub fn evaluate_uncached(ops: &[Op]) -> Result<Vec<Part>, ModelerError> {
 /// (cheap, and the working set re-fills as the graph is re-evaluated).
 const CACHE_MAX_ENTRIES: usize = 2048;
 
-type OpCache = HashMap<u64, Vec<(String, Part)>>;
+/// Named parts during evaluation. Shared (`Arc`) so cache hits and the
+/// returned parts reuse meshes instead of deep-copying them.
+type Named = Vec<(String, Arc<Part>)>;
+
+type OpCache = HashMap<u64, Named>;
 
 thread_local! {
     /// Ops actually executed (cache misses) on this thread; lets tests prove
@@ -65,9 +69,9 @@ fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
     h.finish()
 }
 
-fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Part>, ModelerError> {
+fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerError> {
     let order = eval_order(ops)?;
-    let mut named: Vec<(String, Part)> = Vec::new();
+    let mut named: Named = Vec::new();
     // Content hash of each named part: the key of the op run that wrote it,
     // combined with the output name.
     let mut hashes: HashMap<String, u64> = HashMap::new();
@@ -93,14 +97,14 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Part>, ModelerError>
         match hit {
             Some(parts) => {
                 for (name, part) in parts {
-                    upsert(&mut named, &name, part);
+                    upsert_shared(&mut named, &name, part);
                 }
             }
             None => {
                 RUNS.with(|r| r.set(r.get() + 1));
                 run_op(op, &mut named)?;
                 if use_cache && !matches!(op, Op::Rename { .. }) {
-                    let produced: Vec<(String, Part)> = outs
+                    let produced: Named = outs
                         .iter()
                         .filter_map(|n| {
                             named
@@ -224,7 +228,7 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
 }
 
 /// Runs one op against the named-part map, upserting its output.
-fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> {
+fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
     match op {
         Op::Primitive {
             name,
@@ -283,10 +287,7 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             // `csg::boolean` looks parts up on a model and bakes their
             // transforms into the verts, so hand it a scratch pair.
             let mut scratch = crate::Model::named("scratch");
-            scratch.parts = vec![
-                std::sync::Arc::new(lookup(named, a)?),
-                std::sync::Arc::new(lookup(named, b)?),
-            ];
+            scratch.parts = vec![lookup_shared(named, a)?, lookup_shared(named, b)?];
             let part = crate::csg::boolean(&scratch, *op, a, b, Some(name))?;
             upsert(named, name, part);
         }
@@ -469,7 +470,7 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             // Take the old name out (keeping its slot) before inserting.
             if let Some(slot) = named.iter().position(|(n, _)| n == input) {
                 named.remove(slot);
-                named.insert(slot.min(named.len()), (name.clone(), part));
+                named.insert(slot.min(named.len()), (name.clone(), Arc::new(part)));
             } else {
                 upsert(named, name, part);
             }
@@ -497,7 +498,13 @@ fn load_prefab_guarded(name: &str) -> Result<crate::Model, ModelerError> {
     loaded
 }
 
-fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, ModelerError> {
+/// An owned copy of a named part, for ops that modify their input.
+fn lookup(named: &Named, name: &str) -> Result<Part, ModelerError> {
+    lookup_shared(named, name).map(|p| (*p).clone())
+}
+
+/// A shared handle to a named part, for ops that only read it.
+fn lookup_shared(named: &Named, name: &str) -> Result<Arc<Part>, ModelerError> {
     named
         .iter()
         .find(|(n, _)| n == name)
@@ -507,7 +514,11 @@ fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, ModelerError> {
 
 /// Inserts `part` under `name`, replacing an earlier op's output of the same
 /// name in place (so output order stays stable across re-issues).
-fn upsert(named: &mut Vec<(String, Part)>, name: &str, part: Part) {
+fn upsert(named: &mut Named, name: &str, part: Part) {
+    upsert_shared(named, name, Arc::new(part));
+}
+
+fn upsert_shared(named: &mut Named, name: &str, part: Arc<Part>) {
     match named.iter_mut().find(|(n, _)| n == name) {
         Some(slot) => slot.1 = part,
         None => named.push((name.to_string(), part)),

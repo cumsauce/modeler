@@ -137,17 +137,17 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
 }
 
 /// Project UVs with `projection` (default "box"). Keeps every UV in [0, 1].
-pub fn ensure_uvs(part: &mut Part, projection: Option<&str>) -> Result<(), String> {
+pub fn ensure_uvs(part: &mut Part, projection: Option<&str>) -> Result<(), crate::ModelerError> {
     project(part, projection.unwrap_or("box"))
 }
 
 /// UV-project a part in place. Returns Err for an unknown projection or a degenerate mesh.
-pub fn project(part: &mut Part, projection: &str) -> Result<(), String> {
+pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerError> {
     if part.verts.is_empty() {
-        return Err(format!("cannot project UVs of empty part `{}`", part.name));
+        return Err(format!("cannot project UVs of empty part `{}`", part.name).into());
     }
     if !matches!(projection, "planar" | "box" | "cylindrical" | "spherical") {
-        return Err(format!("unknown UV projection `{projection}`"));
+        return Err(format!("unknown UV projection `{projection}`").into());
     }
     // Box projection reads the face normals; make sure they exist.
     if part.normals.len() != part.verts.len() {
@@ -204,7 +204,7 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), String> {
             })
             .collect(),
         _ => {
-            return Err(format!("unknown UV projection `{projection}`"));
+            return Err(format!("unknown UV projection `{projection}`").into());
         }
     };
     for uv in &mut part.uvs {

@@ -146,7 +146,11 @@ fn accessor(
 
 /// Build the full glTF JSON for this model. `bin_len` is the binary's byte length and
 /// `buffer_uri` is `Some` for .gltf+.bin, `None` for an embedded .glb buffer.
-fn build_json(model: &Model, bin_len: usize, buffer_uri: Option<String>) -> Result<Value, String> {
+fn build_json(
+    model: &Model,
+    bin_len: usize,
+    buffer_uri: Option<String>,
+) -> Result<Value, crate::ModelerError> {
     let (chunks, _) = layout(model)?;
 
     let mut nodes = Vec::with_capacity(model.parts.len());
@@ -242,7 +246,7 @@ fn view_offset(view: u32, chunks: &[Chunks]) -> usize {
 }
 
 /// Write `<path>.gltf` plus a sibling `<stem>.bin` (path with the extension replaced by `bin`).
-pub fn export_gltf(model: &Model, path: &Path) -> Result<(), String> {
+pub fn export_gltf(model: &Model, path: &Path) -> Result<(), crate::ModelerError> {
     let (_, bin) = layout(model)?;
     let stem = path.with_extension("");
     let stem_name = stem
@@ -259,7 +263,7 @@ pub fn export_gltf(model: &Model, path: &Path) -> Result<(), String> {
 }
 
 /// Write a single binary `.glb`: 12-byte header, JSON chunk (space padded), BIN chunk (zero padded).
-pub fn export_glb(model: &Model, path: &Path) -> Result<(), String> {
+pub fn export_glb(model: &Model, path: &Path) -> Result<(), crate::ModelerError> {
     let (_, bin) = layout(model)?;
     let json = build_json(model, bin.len(), None)?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
@@ -278,5 +282,6 @@ pub fn export_glb(model: &Model, path: &Path) -> Result<(), String> {
     out.extend_from_slice(&(bin_chunk.len() as u32).to_le_bytes());
     out.extend_from_slice(b"BIN\0");
     out.extend_from_slice(&bin_chunk);
-    fs::write(path, out).map_err(|e| format!("writing {}: {e}", path.display()))
+    fs::write(path, out)
+        .map_err(|e| crate::ModelerError::Io(format!("writing {}: {e}", path.display())))
 }
