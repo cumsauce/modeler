@@ -226,6 +226,7 @@ fn main() -> AppExit {
         (
             drain_commands,
             quit_when_server_done(headless || offscreen),
+            autosave_tick,
             take_screenshot.run_if(windowed),
             rebuild_scene.run_if(windowed),
             draw_game_gizmos.run_if(windowed),
@@ -241,6 +242,7 @@ fn main() -> AppExit {
             update_outline_pane.run_if(windowed),
         ),
     );
+    app.add_systems(Last, autosave_on_exit);
     if headless {
         app.add_plugins(MinimalPlugins); // MinimalPlugins already runs the schedule loop
     } else {

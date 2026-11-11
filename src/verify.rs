@@ -546,17 +546,16 @@ pub fn lints(model: &Model) -> Vec<String> {
             ));
         }
     }
-    // Coincident world bounds → z-fighting.
-    for (i, a) in model.parts.iter().enumerate() {
-        if !a.visible {
-            continue;
-        }
-        for b in &model.parts[i + 1..] {
-            if !b.visible {
-                continue;
-            }
-            let (amin, amax) = a.bounds();
-            let (bmin, bmax) = b.bounds();
+    // Coincident world bounds → z-fighting. Bounds once per part (each is a
+    // full vertex scan), not once per pair.
+    let boxes: Vec<(&crate::Part, (Vec3, Vec3))> = model
+        .parts
+        .iter()
+        .filter(|p| p.visible)
+        .map(|p| (&**p, p.bounds()))
+        .collect();
+    for (i, &(a, (amin, amax))) in boxes.iter().enumerate() {
+        for &(b, (bmin, bmax)) in &boxes[i + 1..] {
             let near = |x: f32, y: f32| (x - y).abs() < 1e-4;
             if near(amin.x, bmin.x)
                 && near(amin.y, bmin.y)

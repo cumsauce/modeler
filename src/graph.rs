@@ -217,39 +217,33 @@ fn attach_occluders(named: &mut Named) {
     if wants.is_empty() {
         return;
     }
-    let world: Vec<Option<(Vec3, Vec3, Vec<[Vec3; 3]>)>> = named
+    // Bounds first (a vertex scan, no allocation); world triangles only for
+    // parts that are actually near a part that wants them.
+    let boxes: Vec<Option<(Vec3, Vec3)>> = named
         .iter()
-        .map(|(_, p)| {
-            if !p.visible || p.verts.is_empty() {
-                return None;
-            }
-            let tris = crate::contact::world_tris(p);
-            let (lo, hi) = tris
-                .iter()
-                .flatten()
-                .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
-                    (lo.min(*v), hi.max(*v))
-                });
-            Some((lo, hi, tris))
-        })
+        .map(|(_, p)| (p.visible && !p.verts.is_empty()).then(|| p.bounds()))
         .collect();
+    let mut tris_of: HashMap<usize, Vec<[Vec3; 3]>> = HashMap::new();
     for &i in &wants {
-        let Some((lo, hi, _)) = &world[i] else {
+        let Some((lo, hi)) = boxes[i] else {
             continue;
         };
-        let m = (*hi - *lo).max_element() * 0.25;
-        let (lo, hi) = (*lo - m, *hi + m);
+        let m = (hi - lo).max_element() * 0.25;
+        let (lo, hi) = (lo - m, hi + m);
+        let near: Vec<usize> = (0..named.len())
+            .filter(|&j| j != i)
+            .filter(|&j| boxes[j].is_some_and(|(l2, h2)| l2.cmple(hi).all() && h2.cmpge(lo).all()))
+            .collect();
         let part = &named[i].1;
         let r = quat_of(part.rotation).inverse();
         let t = Vec3::from(part.translation);
-        let occ: Vec<Vec<[[f32; 3]; 3]>> = world
+        let occ: Vec<Vec<[[f32; 3]; 3]>> = near
             .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .filter_map(|(_, w)| w.as_ref())
-            .filter(|(l2, h2, _)| l2.cmple(hi).all() && h2.cmpge(lo).all())
-            .map(|(_, _, tris)| {
-                tris.iter()
+            .map(|&j| {
+                tris_of
+                    .entry(j)
+                    .or_insert_with(|| crate::contact::world_tris(&named[j].1))
+                    .iter()
                     .map(|tr| tr.map(|v| (r * (v - t)).to_array()))
                     .collect()
             })
@@ -345,9 +339,13 @@ fn place_on(
         vec![moving]
     };
     let s_tris = crate::contact::world_tris(&support);
+    // Rays all run along the travel axis: bin the support's triangles across
+    // it once for every group.
+    let s_grid = crate::contact::AxisGrid::new(&s_tris, u, w);
     for moving in groups {
         place_group(
-            named, move_name, patterns, on, at, gap, toward, &support, &s_tris, &moving, d, u, w,
+            named, move_name, patterns, on, at, gap, toward, &support, &s_tris, &s_grid, &moving,
+            d, u, w,
         )?;
     }
     Ok(())
@@ -366,6 +364,7 @@ fn place_group(
     toward: &str,
     support: &Part,
     s_tris: &[[Vec3; 3]],
+    s_grid: &crate::contact::AxisGrid<'_>,
     moving: &[usize],
     d: Vec3,
     u: usize,
@@ -401,9 +400,9 @@ fn place_group(
     let at_h = |v: Vec3, hh: f32| v + d * (h(v) - hh);
     // The support's surface facing the parts, from their side; the parts'
     // leading surface, from the support's side.
-    let surface = |v: Vec3| crate::contact::ray_tris(at_h(v, top), d, s_tris).map(|t| top - t);
-    let leading =
-        |v: Vec3| crate::contact::ray_tris(at_h(v, bottom), -d, &m_tris).map(|t| bottom + t);
+    let m_grid = crate::contact::AxisGrid::new(&m_tris, u, w);
+    let surface = |v: Vec3| s_grid.cast(at_h(v, top), d).map(|t| top - t);
+    let leading = |v: Vec3| m_grid.cast(at_h(v, bottom), -d).map(|t| bottom + t);
     let mut clearance = f32::MAX;
     let samples = s_tris.iter().chain(&m_tris).flat_map(|t| {
         let c = (t[0] + t[1] + t[2]) / 3.0;

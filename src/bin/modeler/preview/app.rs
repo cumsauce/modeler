@@ -98,11 +98,34 @@ pub(crate) struct SceneBuilt {
 /// the human can keep looking at the model.
 pub(crate) fn quit_when_server_done(
     headless: bool,
-) -> impl FnMut(Res<Modeler>, MessageWriter<AppExit>) {
-    move |modeler, mut exit| {
+) -> impl FnMut(ResMut<Modeler>, MessageWriter<AppExit>) {
+    move |mut modeler, mut exit| {
         if headless && modeler.bridge.quit() {
+            modeler
+                .bypass_change_detection()
+                .session
+                .flush_autosave(true);
             exit.write(AppExit::Success);
         }
+    }
+}
+
+/// Writes pending autosaves once edits pause (every frame; cheap when
+/// nothing is due). Bypasses change detection: saving changes nothing shown.
+pub(crate) fn autosave_tick(mut modeler: ResMut<Modeler>) {
+    modeler
+        .bypass_change_detection()
+        .session
+        .flush_autosave(false);
+}
+
+/// On exit (window closed, quit), writes whatever autosave is still pending.
+pub(crate) fn autosave_on_exit(mut exits: MessageReader<AppExit>, mut modeler: ResMut<Modeler>) {
+    if exits.read().next().is_some() {
+        modeler
+            .bypass_change_detection()
+            .session
+            .flush_autosave(true);
     }
 }
 

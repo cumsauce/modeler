@@ -357,8 +357,7 @@ fn on_doc_tab(activate: On<Activate>, tabs: Query<&DocTab>, mut modeler: ResMut<
     let s = &mut modeler.session;
     match s.scene("switch", Some(&tab.0)) {
         Ok(_) => {
-            let _ = modeler::catalog::save_session_state(&s.model);
-            let _ = modeler::catalog::save_open_docs(&s.others);
+            s.mark_autosave(true, true, false);
         }
         Err(e) => eprintln!("switching document: {e}"),
     }

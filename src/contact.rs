@@ -74,9 +74,8 @@ pub(crate) fn closest_on_tri(p: Vec3, t: &[Vec3; 3]) -> Vec3 {
     a + ab * (vb * denom) + ac * (vc * denom)
 }
 
-fn boxes_near(a: &Part, b: &Part, tol: f32) -> bool {
-    let (alo, ahi) = a.bounds();
-    let (blo, bhi) = b.bounds();
+fn boxes_near(a: &Body, b: &Body, tol: f32) -> bool {
+    let ((alo, ahi), (blo, bhi)) = (a.bounds, b.bounds);
     (0..3).all(|k| alo[k] <= bhi[k] + tol && blo[k] <= ahi[k] + tol)
 }
 
@@ -98,14 +97,25 @@ pub struct Body<'a> {
     pub part: &'a Part,
     solid: Option<Manifold>,
     tris: Vec<[Vec3; 3]>,
+    /// World bounds, from the triangles (once, not per pair).
+    bounds: (Vec3, Vec3),
+    /// The solid's volume (once: Manifold recomputes it on every call).
+    volume: f64,
 }
 
 impl<'a> Body<'a> {
     pub fn new(part: &'a Part) -> Self {
+        let tris = world_tris(part);
+        // An empty part's bounds (MAX..MIN) are near nothing, as before.
+        let bounds = part.bounds();
+        let solid = crate::csg::part_to_manifold(part).ok();
+        let volume = solid.as_ref().map_or(0.0, |m| m.volume().abs());
         Self {
             part,
-            solid: crate::csg::part_to_manifold(part).ok(),
-            tris: world_tris(part),
+            solid,
+            tris,
+            bounds,
+            volume,
         }
     }
 }
@@ -113,14 +123,18 @@ impl<'a> Body<'a> {
 /// How `a` and `b` meet, if they do.
 pub fn contact(a: &Body, b: &Body) -> Option<Contact> {
     let tol = tolerance(a.part, b.part);
-    if !boxes_near(a.part, b.part, tol) {
+    if !boxes_near(a, b, tol) {
         return None;
     }
     if let (Some(ma), Some(mb)) = (&a.solid, &b.solid) {
-        let ov = ma.intersection(mb).volume().abs();
-        let small = ma.volume().abs().min(mb.volume().abs()).max(1e-30);
-        if ov > small * 1e-6 {
-            return Some(Contact::Overlap);
+        // Boxes that only meet within the tolerance can't share volume:
+        // skip the intersection, go straight to the gap.
+        if boxes_near(a, b, 0.0) {
+            let ov = ma.intersection(mb).volume().abs();
+            let small = a.volume.min(b.volume).max(1e-30);
+            if ov > small * 1e-6 {
+                return Some(Contact::Overlap);
+            }
         }
         // Manifold's min_gap is exact for the solids.
         if ma.min_gap(mb, f64::from(tol) * 2.0) > f64::from(tol) {
@@ -255,22 +269,24 @@ pub struct CollisionReport {
 
 /// Every pair of visible closed parts that share volume, deepest first.
 pub fn overlaps(model: &Model) -> Vec<Overlap> {
-    let bodies: Vec<Body> = visible(model).map(Body::new).collect();
-    let mut out = Vec::new();
-    for (i, a) in bodies.iter().enumerate() {
-        for b in &bodies[i + 1..] {
-            if let Some(o) = overlap_between(a, b) {
-                out.push(o);
-            }
-        }
-    }
+    use rayon::prelude::*;
+    let bodies = bodies_of(model);
+    let n = bodies.len();
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+        .filter(|&(i, j)| boxes_near(&bodies[i], &bodies[j], 0.0))
+        .collect();
+    let mut out: Vec<Overlap> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| overlap_between(&bodies[i], &bodies[j]))
+        .collect();
     out.sort_by(|x, y| y.fraction.total_cmp(&x.fraction));
     out
 }
 
 /// The volume `a` and `b` share, if any.
 pub fn overlap_between(a: &Body, b: &Body) -> Option<Overlap> {
-    if !boxes_near(a.part, b.part, 0.0) {
+    if !boxes_near(a, b, 0.0) {
         return None;
     }
     let (Some(ma), Some(mb)) = (&a.solid, &b.solid) else {
@@ -278,15 +294,11 @@ pub fn overlap_between(a: &Body, b: &Body) -> Option<Overlap> {
     };
     let inter = ma.intersection(mb);
     let ov = inter.volume().abs();
-    let small = ma.volume().abs().min(mb.volume().abs()).max(1e-30);
+    let small = a.volume.min(b.volume).max(1e-30);
     if ov <= small * 1e-6 {
         return None;
     }
-    let smaller = if ma.volume().abs() <= mb.volume().abs() {
-        a.part
-    } else {
-        b.part
-    };
+    let smaller = if a.volume <= b.volume { a.part } else { b.part };
     let (slo, shi) = smaller.bounds();
     let (at, depth) = inter.bounding_box().map_or(([0.0; 3], 0.0), |bb| {
         let (lo, hi) = (bb.min(), bb.max());
@@ -388,6 +400,87 @@ pub fn collisions(
 /// Parts that stay grounded only through deep overlaps: grounded normally,
 /// but floating once overlaps burying more than `deep` of the smaller part
 /// stop counting as contacts. Each with the parts it passes through.
+/// The `grounded` check in one pass: the floating parts, and the parts held
+/// up only by passing more than `deep` of the smaller part into another.
+/// Builds each solid and tests each pair once (it used to run the pairwise
+/// contact search three times).
+pub fn grounding(model: &Model, deep: f64) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+    use rayon::prelude::*;
+    let bodies = bodies_of(model);
+    let n = bodies.len();
+    // Every touching pair once; overlaps carry how deep they go.
+    // Pairs are independent: test them in parallel.
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+        .filter(|&(i, j)| {
+            boxes_near(
+                &bodies[i],
+                &bodies[j],
+                tolerance(bodies[i].part, bodies[j].part),
+            )
+        })
+        .collect();
+    let edges: Vec<(usize, usize, Option<f64>)> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| match contact(&bodies[i], &bodies[j]) {
+            None => None,
+            Some(Contact::Overlap) => {
+                let f = overlap_between(&bodies[i], &bodies[j]).map_or(0.0, |o| o.fraction);
+                Some((i, j, Some(f)))
+            }
+            Some(_) => Some((i, j, None)),
+        })
+        .collect();
+    let ground = ground_level(model);
+    let on_ground: Vec<bool> = bodies
+        .iter()
+        .map(|b| b.bounds.0.y <= ground + ground_tolerance(b.part))
+        .collect();
+    let reach = |skip_deep: bool| -> Vec<bool> {
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(i, j, f) in &edges {
+            if skip_deep && f.is_some_and(|f| f > deep) {
+                continue;
+            }
+            adj[i].push(j);
+            adj[j].push(i);
+        }
+        let mut reached = on_ground.clone();
+        let mut frontier: Vec<usize> = (0..n).filter(|&i| reached[i]).collect();
+        while let Some(i) = frontier.pop() {
+            for &j in &adj[i] {
+                if !reached[j] {
+                    reached[j] = true;
+                    frontier.push(j);
+                }
+            }
+        }
+        reached
+    };
+    let normal = reach(false);
+    let floating = (0..n)
+        .filter(|&i| !normal[i])
+        .map(|i| bodies[i].part.name.clone())
+        .collect();
+    let held = if edges.iter().any(|e| e.2.is_some_and(|f| f > deep)) {
+        let strict = reach(true);
+        (0..n)
+            .filter(|&i| normal[i] && !strict[i])
+            .map(|i| {
+                let through = edges
+                    .iter()
+                    .filter(|e| e.2.is_some_and(|f| f > deep) && (e.0 == i || e.1 == i))
+                    .map(|e| bodies[if e.0 == i { e.1 } else { e.0 }].part.name.clone())
+                    .collect();
+                (bodies[i].part.name.clone(), through)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (floating, held)
+}
+
 pub fn held_by_deep_overlaps(model: &Model, deep: f64) -> Vec<(String, Vec<String>)> {
     let deep_pairs: Vec<Overlap> = overlaps(model)
         .into_iter()
@@ -528,7 +621,7 @@ fn ground_level(model: &Model) -> f32 {
 
 /// Why a part is held up, or `None` when nothing holds it.
 fn support_of(a: &Body, bodies: &[Body], ground: f32) -> Option<String> {
-    let (lo, _) = a.part.bounds();
+    let (lo, _) = a.bounds;
     if lo.y <= ground + ground_tolerance(a.part) {
         return Some("on the ground".into());
     }
@@ -544,7 +637,7 @@ fn support_of(a: &Body, bodies: &[Body], ground: f32) -> Option<String> {
             Some(Contact::Surface(pts)) => {
                 // A flat part (a sheet lying down) is held by contact in its
                 // own plane; anything else needs contact below its centre.
-                let (plo, phi) = a.part.bounds();
+                let (plo, phi) = a.bounds;
                 let flat = phi.y - plo.y <= margin * 2.0;
                 if flat || pts.iter().any(|p| p.y < cy - margin) {
                     return Some(format!("rests on `{}`", b.part.name));
@@ -564,20 +657,30 @@ fn support_of(a: &Body, bodies: &[Body], ground: f32) -> Option<String> {
 /// ABOVE it (wedged under a shelf) or only touching beside it at its top.
 /// Each entry is `(name, what it touches, if anything)`.
 pub fn unsupported(model: &Model) -> Vec<(String, Vec<String>)> {
-    let bodies: Vec<Body> = visible(model).map(Body::new).collect();
+    use rayon::prelude::*;
+    let bodies = bodies_of(model);
     let ground = ground_level(model);
-    let mut out = Vec::new();
-    for a in &bodies {
-        if support_of(a, &bodies, ground).is_none() {
+    // Each part's support is independent: in parallel, kept in model order.
+    bodies
+        .par_iter()
+        .filter(|a| support_of(a, &bodies, ground).is_none())
+        .map(|a| {
             let touching: Vec<String> = bodies
                 .iter()
                 .filter(|b| !std::ptr::eq(b.part, a.part) && contact(a, b).is_some())
                 .map(|b| b.part.name.clone())
                 .collect();
-            out.push((a.part.name.clone(), touching));
-        }
-    }
-    out
+            (a.part.name.clone(), touching)
+        })
+        .collect()
+}
+
+/// Every visible part's [`Body`] (solid, triangles, bounds), built in
+/// parallel: the solid conversion is the expensive part.
+fn bodies_of(model: &Model) -> Vec<Body<'_>> {
+    use rayon::prelude::*;
+    let parts: Vec<&Part> = visible(model).collect();
+    parts.par_iter().map(|p| Body::new(p)).collect()
 }
 
 /// Whether `a` rests on (or is attached to) `b`: they share volume, or they
@@ -712,13 +815,96 @@ fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
     (dist > 0.0).then_some(dist as f32)
 }
 
-/// Nearest hit distance of a ray against a triangle list.
-pub(crate) fn ray_tris(o: Vec3, d: Vec3, tris: &[[Vec3; 3]]) -> Option<f32> {
-    let best = tris
-        .iter()
-        .filter_map(|t| ray_tri(o, d, t))
-        .fold(f32::MAX, f32::min);
-    (best < f32::MAX).then_some(best)
+/// Triangles binned on a 2D grid across one axis, for rays that travel
+/// along that axis (`place`): a ray tests only its own cell's triangles
+/// instead of all of them.
+pub(crate) struct AxisGrid<'a> {
+    tris: &'a [[Vec3; 3]],
+    u: usize,
+    w: usize,
+    lo: [f32; 2],
+    cell: [f32; 2],
+    n: [usize; 2],
+    bins: Vec<Vec<u32>>,
+}
+
+impl<'a> AxisGrid<'a> {
+    /// Bins `tris` over the cross axes `u` and `w`.
+    pub(crate) fn new(tris: &'a [[Vec3; 3]], u: usize, w: usize) -> AxisGrid<'a> {
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for t in tris {
+            for v in t {
+                lo = [lo[0].min(v[u]), lo[1].min(v[w])];
+                hi = [hi[0].max(v[u]), hi[1].max(v[w])];
+            }
+        }
+        // About one triangle per cell on average, capped.
+        let side = ((tris.len() as f32).sqrt().ceil() as usize).clamp(1, 256);
+        let n = [side, side];
+        let cell = [
+            ((hi[0] - lo[0]) / side as f32).max(1e-6),
+            ((hi[1] - lo[1]) / side as f32).max(1e-6),
+        ];
+        let mut g = AxisGrid {
+            tris,
+            u,
+            w,
+            lo,
+            cell,
+            n,
+            bins: vec![Vec::new(); side * side],
+        };
+        if tris.is_empty() {
+            return g;
+        }
+        for (i, t) in tris.iter().enumerate() {
+            let (mut a, mut b) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for v in t {
+                a = [a[0].min(v[u]), a[1].min(v[w])];
+                b = [b[0].max(v[u]), b[1].max(v[w])];
+            }
+            let (i0, j0) = g.index(a[0] - 1e-6, a[1] - 1e-6);
+            let (i1, j1) = g.index(b[0] + 1e-6, b[1] + 1e-6);
+            for x in i0..=i1 {
+                for z in j0..=j1 {
+                    g.bins[x * g.n[1] + z].push(i as u32);
+                }
+            }
+        }
+        g
+    }
+
+    fn index(&self, a: f32, b: f32) -> (usize, usize) {
+        let f = |x: f32, k: usize| {
+            (((x - self.lo[k]) / self.cell[k]).max(0.0) as usize).min(self.n[k] - 1)
+        };
+        (f(a, 0), f(b, 1))
+    }
+
+    /// Nearest hit of the ray from `o` along `d` (parallel to the grid's
+    /// axis), testing only the triangles binned at `o`'s cell.
+    pub(crate) fn cast(&self, o: Vec3, d: Vec3) -> Option<f32> {
+        if self.tris.is_empty() {
+            return None;
+        }
+        let (a, b) = (o[self.u], o[self.w]);
+        let (lo, hi) = (
+            self.lo,
+            [
+                self.lo[0] + self.cell[0] * self.n[0] as f32,
+                self.lo[1] + self.cell[1] * self.n[1] as f32,
+            ],
+        );
+        if a < lo[0] - 1e-5 || b < lo[1] - 1e-5 || a > hi[0] + 1e-5 || b > hi[1] + 1e-5 {
+            return None;
+        }
+        let (i, j) = self.index(a, b);
+        let best = self.bins[i * self.n[1] + j]
+            .iter()
+            .filter_map(|&t| ray_tri(o, d, &self.tris[t as usize]))
+            .fold(f32::MAX, f32::min);
+        (best < f32::MAX).then_some(best)
+    }
 }
 
 /// Casts a ray against the visible parts (or only `only`, when given): the

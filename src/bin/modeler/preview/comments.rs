@@ -116,7 +116,7 @@ fn on_delete(
             Ok(m) => m,
             Err(e) => e.to_string(),
         };
-        let _ = modeler::catalog::save_session_state(&modeler.session.model);
+        modeler.session.mark_autosave(true, false, false);
         cb.say(msg, time.elapsed_secs_f64());
         cb.dirty = true;
     }
@@ -195,7 +195,7 @@ pub(crate) fn comment_box(
                                 }
                             }
                         }
-                        let _ = modeler::catalog::save_session_state(&modeler.session.model);
+                        modeler.session.mark_autosave(true, false, false);
                         cb.say(msg, now);
                         cb.target = None;
                         cb.dirty = true;

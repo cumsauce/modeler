@@ -40,7 +40,8 @@ pub struct PbrRef {
     pub scale: f32,
     /// The graph, embedded when the item is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graph: Option<MatGraph>,
+    /// Shared: every history snapshot of the op points at one copy.
+    pub graph: Option<std::sync::Arc<MatGraph>>,
 }
 
 fn one() -> f32 {
@@ -49,7 +50,7 @@ fn one() -> f32 {
 
 impl PbrRef {
     pub fn graph(&self) -> Result<&MatGraph, String> {
-        self.graph.as_ref().ok_or_else(|| {
+        self.graph.as_deref().ok_or_else(|| {
             format!(
                 "pbr `{}`: the material graph was not resolved",
                 self.material

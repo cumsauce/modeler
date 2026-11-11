@@ -424,6 +424,14 @@ impl Doc for Model {
     }
 }
 
+/// See [`History::mark`].
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryMark {
+    len: usize,
+    current: Option<usize>,
+    children: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot<T: Doc = Model> {
     /// The document at this node (named `model` in files for compatibility).
@@ -517,6 +525,27 @@ impl<T: Doc> History<T> {
         }
         self.current = Some(id);
         id
+    }
+
+    /// A point to roll back to: the node count, the cursor and how many
+    /// children the cursor had. History only appends, so this is enough.
+    pub fn mark(&self) -> HistoryMark {
+        HistoryMark {
+            len: self.nodes.len(),
+            current: self.current,
+            children: self.current.map_or(0, |c| self.nodes[c].children.len()),
+        }
+    }
+
+    /// Drops every node recorded since `mark` and restores the cursor.
+    pub fn rollback(&mut self, mark: &HistoryMark) {
+        self.nodes.truncate(mark.len);
+        self.current = mark.current;
+        if let Some(c) = mark.current
+            && let Some(n) = self.nodes.get_mut(c)
+        {
+            n.children.truncate(mark.children);
+        }
     }
 
     /// Moves the cursor to the parent and returns its id and model (owned, so

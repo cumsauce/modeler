@@ -238,7 +238,24 @@ pub struct Session {
     batch_labels: Vec<String>,
     /// Open documents other than the active `model` (see [`Session::scene`]).
     pub others: Vec<Model>,
+    /// Autosaves waiting to be written (see [`Session::flush_autosave`]).
+    pub autosave_due: AutosaveDue,
 }
+
+/// Which autosaves are pending and since when: edits only mark them, and
+/// the app writes them once edits pause, so serializing the history never
+/// sits on a tool call's path.
+#[derive(Default, Debug)]
+pub struct AutosaveDue {
+    pub model: bool,
+    pub docs: bool,
+    pub materials: bool,
+    /// When the latest pending edit happened.
+    pub since: Option<std::time::Instant>,
+}
+
+/// How long autosaves wait after the last edit before writing.
+pub const AUTOSAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Default for Session {
     fn default() -> Self {
@@ -249,6 +266,7 @@ impl Default for Session {
             batch_depth: 0,
             batch_labels: Vec::new(),
             others: Vec::new(),
+            autosave_due: AutosaveDue::default(),
         }
     }
 }
@@ -502,9 +520,11 @@ impl Session {
         self.model.version += 1;
         // The snapshot carries no tree of its own: the live history on the
         // session model is the single source of truth for the tree shape.
-        let mut snapshot = self.model.clone();
-        snapshot.history = crate::History::default();
-        self.model.history.record(snapshot, label);
+        // Move the tree out first, so the clone doesn't copy every snapshot.
+        let mut history = std::mem::take(&mut self.model.history);
+        let snapshot = self.model.clone();
+        history.record(snapshot, label);
+        self.model.history = history;
     }
 
     /// Runs `f` as one history step: every commit inside it (including the
@@ -848,12 +868,21 @@ impl Session {
     ) -> CmdResult {
         let before = self.part_fingerprints();
         // Atomic: a failing item rolls the whole call back.
+        // The model without its history (the history only appends, so a
+        // mark rolls it back): cloning the whole tree here was most of a
+        // small edit's cost on a long session.
+        let history = std::mem::take(&mut self.model.history);
+        let mark = history.mark();
         let snapshot = self.model.clone();
+        self.model.history = history;
         let text = match self.batch(|s| s.apply_values_inner(params, items)) {
             Ok(t) => t,
             Err(e) => {
                 let version = self.model.version + 1;
+                let mut history = std::mem::take(&mut self.model.history);
+                history.rollback(&mark);
                 self.model = snapshot;
+                self.model.history = history;
                 self.model.version = version;
                 let msg = e.to_string();
                 return Err(if msg.contains("nothing was applied") {
@@ -1020,7 +1049,7 @@ impl Session {
                 }
             ));
         }
-        r.graph = Some(doc.graph());
+        r.graph = Some(std::sync::Arc::new(doc.graph()));
         Ok(())
     }
 
@@ -1815,11 +1844,9 @@ impl Session {
             _ => None,
         };
         if let Some(strict) = strict {
-            let floating: Vec<String> = crate::contact::floating(&self.model)
-                .into_iter()
-                .filter(|n| in_scope(n))
-                .collect();
-            let deep: Vec<String> = crate::contact::held_by_deep_overlaps(&self.model, 0.2)
+            let (floating, held) = crate::contact::grounding(&self.model, 0.2);
+            let floating: Vec<String> = floating.into_iter().filter(|n| in_scope(n)).collect();
+            let deep: Vec<String> = held
                 .into_iter()
                 .filter(|(n, _)| in_scope(n))
                 .map(|(n, through)| {
@@ -2097,6 +2124,70 @@ impl Session {
     }
 
     /// Deterministic scene warnings (see []).
+    /// Marks autosaves as pending; [`Session::flush_autosave`] writes them.
+    pub fn mark_autosave(&mut self, model: bool, docs: bool, materials: bool) {
+        let d = &mut self.autosave_due;
+        d.model |= model;
+        d.docs |= docs;
+        d.materials |= materials;
+        if model || docs || materials {
+            d.since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Writes the pending autosaves once edits have paused for
+    /// [`AUTOSAVE_DELAY`], or now with `force` (exit). Op-derived parts are
+    /// left out of the files (they re-derive on restore) without cloning the
+    /// model: they are moved out for the write and back.
+    pub fn flush_autosave(&mut self, force: bool) {
+        let Some(since) = self.autosave_due.since else {
+            return;
+        };
+        if !force && since.elapsed() < AUTOSAVE_DELAY {
+            return;
+        }
+        let due = std::mem::take(&mut self.autosave_due);
+        fn without_parts<R>(m: &mut Model, f: impl FnOnce(&Model) -> R) -> R {
+            if m.parts_derive_from_ops() {
+                let parts = std::mem::take(&mut m.parts);
+                let r = f(m);
+                m.parts = parts;
+                r
+            } else {
+                f(m)
+            }
+        }
+        if due.model
+            && let Err(e) = without_parts(&mut self.model, crate::catalog::save_session_state)
+        {
+            eprintln!("session autosave failed: {e}");
+        }
+        if due.docs {
+            let taken: Vec<_> = self
+                .others
+                .iter_mut()
+                .map(|m| {
+                    if m.parts_derive_from_ops() {
+                        Some(std::mem::take(&mut m.parts))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if let Err(e) = crate::catalog::save_open_docs(&self.others) {
+                eprintln!("open docs autosave failed: {e}");
+            }
+            for (m, p) in self.others.iter_mut().zip(taken) {
+                if let Some(p) = p {
+                    m.parts = p;
+                }
+            }
+        }
+        if due.materials {
+            self.materials.autosave();
+        }
+    }
+
     pub fn lints(&self) -> Vec<String> {
         crate::verify::lints(&self.model)
     }
@@ -4486,6 +4577,30 @@ mod tests {
             panic!("bad size should fail");
         };
         assert!(e.to_string().contains("repeat r=blob"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_batch_leaves_the_history_as_it_was() {
+        let mut s = Session::default();
+        let ok: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"type":"primitive","name":"a","kind":"box","size":1,"translation":[0,0.5,0]}]"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.apply_values(None, ok).unwrap_or_else(|e| panic!("{e}"));
+        let (nodes, cur) = (s.model.history.nodes.len(), s.model.history.current);
+        let kids = cur.map(|c| s.model.history.nodes[c].children.len());
+        // The second item reads a part that doesn't exist: the call fails
+        // after the first item was applied and committed inside the batch.
+        let bad: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"type":"primitive","name":"b","kind":"box","size":1},
+                {"type":"transform","name":"c","input":"nope"}]"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.apply_values(None, bad).is_err());
+        assert_eq!(s.model.history.nodes.len(), nodes);
+        assert_eq!(s.model.history.current, cur);
+        assert_eq!(cur.map(|c| s.model.history.nodes[c].children.len()), kids);
+        assert!(s.model.parts.iter().all(|p| p.name != "b"));
     }
 
     #[test]

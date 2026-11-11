@@ -81,14 +81,10 @@ impl Tools {
             // Autosave after every mutation so unnamed WIP survives a restart
             // (also when a batch fails midway: its earlier items stay applied);
             // read-only calls leave the fingerprint alone and skip the write.
-            if session.persist_fingerprint() != before
-                && let Err(e) = catalog::save_session_state(&session.model)
-            {
-                eprintln!("session autosave failed: {e}");
-            }
-            if session.materials.fingerprint() != mats_before {
-                session.materials.autosave();
-            }
+            // The writes happen once edits pause (Session::flush_autosave).
+            let model = session.persist_fingerprint() != before;
+            let mats = session.materials.fingerprint() != mats_before;
+            session.mark_autosave(model, false, mats);
             let _ = reply_tx.send(reply.clone());
             reply
         }));
@@ -827,11 +823,8 @@ Style::default()
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             let r = s.scene(&action, name.as_deref());
-            if action != "list"
-                && r.is_ok()
-                && let Err(e) = catalog::save_open_docs(&s.others)
-            {
-                eprintln!("open docs autosave failed: {e}");
+            if action != "list" && r.is_ok() {
+                s.mark_autosave(true, true, false);
             }
             r
         })

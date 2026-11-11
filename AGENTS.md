@@ -563,9 +563,11 @@ outliner groups, listed with their parts), `list_annotations`,
 `delete_annotation(id)`.
 
 **Session:** `session_log(limit?)` is the per-call record (tool, ok/error,
-ms). Every mutation autosaves the whole session (parts, ops, params, history,
-annotations) to `session.json`, restored on startup, including the earlier
-items of a batch that failed partway. `save_prefab` only names and indexes it.
+ms). Every mutation marks the session for autosave (ops, params, history,
+annotations; op-derived parts are left out and re-derive on restore), and the
+app writes `session.json` once edits pause for 0.5 s and on exit, so the write
+never sits on a tool call. It is restored on startup. `save_prefab` only
+names and indexes it.
 
 ## Style tokens
 
@@ -839,9 +841,8 @@ Material toggles match O, S and M.
 - **Restart flow** (after code changes): `cargo build`, then
   `pkill -f target/debug/modeler` — the MCP client respawns the server from
   the binary on disk on the next tool call. The respawned session AUTOSAVES
-  and RESTORES: every successful mutation writes the whole session model
-  (parts, ops, history tree, annotations) to `session.json` in the catalog
-  dir, and a server without an explicit `--model` restores it on startup, so
+  and RESTORES: mutations are written to `session.json` in the catalog dir
+  0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server without an explicit `--model` restores it on startup, so
   unnamed WIP survives restarts. `new_model` starts clean (the old model
   stays one undo away, also in the autosave). `--model <path>` skips the
   restore and loads that file instead. The MCP tool list is fixed per

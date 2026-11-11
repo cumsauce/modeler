@@ -344,8 +344,22 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
     }
     // Compact: the autosave carries every history snapshot, so pretty
     // printing would multiply its size for nobody's benefit.
-    let text = serde_json::to_string(model).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    let text = serde_json::to_string(&slim(model).as_ref())
+        .map_err(|e| ModelerError::Parse(e.to_string()))?;
     atomic_write(&path, text.as_bytes())
+}
+
+/// The model as autosaved: without its cached parts when they all derive
+/// from the ops (re-derived on restore, like prefabs). The parts were most
+/// of the bytes (3.9 of 4 MB for the duck), rewritten on every edit.
+fn slim(model: &Model) -> std::borrow::Cow<'_, Model> {
+    if model.parts_derive_from_ops() && !model.parts.is_empty() {
+        let mut m = model.clone();
+        m.parts.clear();
+        std::borrow::Cow::Owned(m)
+    } else {
+        std::borrow::Cow::Borrowed(model)
+    }
 }
 
 /// Autosaves any per-kind session state (e.g. the working materials) as
@@ -370,7 +384,8 @@ pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
     let dir = catalog_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
-    let text = serde_json::to_string(docs).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    let slim: Vec<std::borrow::Cow<'_, Model>> = docs.iter().map(slim).collect();
+    let text = serde_json::to_string(&slim).map_err(|e| ModelerError::Parse(e.to_string()))?;
     atomic_write(&dir.join(autosave_file("open_docs")), text.as_bytes())
 }
 
@@ -536,10 +551,13 @@ pub fn release_session_lock() {
 /// corrupt state just means a fresh session.
 pub fn load_session_state() -> Option<Model> {
     let text = read_autosave(&catalog_dir().ok()?, "session")?;
-    let model: Model = serde_json::from_str(&text).ok()?;
+    let mut model: Model = serde_json::from_str(&text).ok()?;
     if let Err(e) = model.check_format() {
         eprintln!("ignoring session autosave: {e}");
         return None;
+    }
+    if let Err(e) = model.restore_parts() {
+        eprintln!("session autosave: re-deriving parts failed: {e}");
     }
     Some(model)
 }
@@ -808,7 +826,12 @@ mod tests {
         let restored = load_session_state().unwrap();
         assert_eq!(restored.name, "wip");
         assert_eq!(restored.ops.len(), 1);
-        assert_eq!(restored.parts.len(), 1, "parts are kept, not re-derived");
+        assert_eq!(restored.parts.len(), 1, "parts re-derive on restore");
+        let raw = fs::read_to_string(session_state_path().unwrap()).unwrap();
+        assert!(
+            !raw.contains("\"verts\""),
+            "derivable parts are not written to the autosave"
+        );
         // Overwrite works (atomic tmp+rename).
         model.name = "wip2".into();
         save_session_state(&model).unwrap();
