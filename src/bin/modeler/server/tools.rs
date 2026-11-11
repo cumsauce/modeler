@@ -570,7 +570,7 @@ Style::default()
     /// baked textures go to the shared assets/textures/ folder as GPU-compressed,
     /// mipmapped KTX2 files named by content, so every model using a tile
     /// material shares one copy in memory. "glb" makes one self-contained
-    /// file with PNG textures inside. For a game
+    /// file with the KTX2 textures inside (no sharing between files). For a game
     /// engine pass `optimize: "game"` (material dedup, contact culling,
     /// instancing of copies, weld, u16 indices, ORM textures) or an object of
     /// overrides, e.g. `{"visible_from": [{"min": [..], "max": [..]}]}` to drop

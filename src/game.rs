@@ -314,6 +314,7 @@ mod tests {
             None,
             &crate::export_opt::Options::none(),
             None,
+            false,
         ));
         let nodes = ok(doc["nodes"].as_array().ok_or("nodes"));
         let find = |n: &str| nodes.iter().position(|x| x["name"] == json!(n));

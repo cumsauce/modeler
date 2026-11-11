@@ -215,9 +215,14 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("kind"), "{err}");
-        let (doc, _, report) =
-            crate::gltf::build_with(&s.model, None, &crate::export_opt::Options::none(), None)
-                .unwrap_or_else(|e| panic!("{e}"));
+        let (doc, _, report) = crate::gltf::build_with(
+            &s.model,
+            None,
+            &crate::export_opt::Options::none(),
+            None,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let lights = &doc["extensions"]["KHR_lights_punctual"]["lights"];
         assert_eq!(lights.as_array().map_or(0, Vec::len), 3);
         let cd = lights[0]["intensity"].as_f64().unwrap_or(0.0);

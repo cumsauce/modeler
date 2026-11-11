@@ -44,7 +44,7 @@ pub struct Options {
     /// `KHR_materials_emissive_strength` on emissive materials (bloom).
     pub emissive_strength: Option<f32>,
     /// How baked textures are written; `None` = the format's default
-    /// (.gltf: shared KTX2 files, .glb: PNG in the buffer).
+    /// (.gltf: shared KTX2 files, .glb: KTX2 in the buffer).
     pub textures: Option<TextureMode>,
 }
 
@@ -55,8 +55,10 @@ pub enum TextureMode {
     Ktx2,
     /// Shared `.png` files, named by content.
     Png,
-    /// PNG packed into the glTF buffer.
+    /// KTX2 packed into the glTF buffer (Bevy reads it by mime type).
     Embed,
+    /// PNG packed into the glTF buffer (for viewers without KTX2).
+    EmbedPng,
 }
 
 impl Options {
@@ -129,9 +131,10 @@ impl Options {
                         Some("ktx2") => TextureMode::Ktx2,
                         Some("png") | Some("shared") => TextureMode::Png,
                         Some("embed") => TextureMode::Embed,
+                        Some("embed_png") => TextureMode::EmbedPng,
                         _ => {
                             return Err(
-                                "optimize.textures: \"ktx2\" (default), \"png\" or \"embed\""
+                                "optimize.textures: \"ktx2\", \"png\", \"embed\" (KTX2 inside) or \"embed_png\""
                                     .into(),
                             );
                         }

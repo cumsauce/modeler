@@ -261,7 +261,31 @@ fn procedural_materials_export_textures_and_tangents() {
         .unwrap();
     let dir = temp_dir("pbr");
     let path = dir.join("bricks.glb");
+    // The default .glb embeds KTX2, which Bevy reads by mime type.
     modeler::gltf::export_glb(&s.model, &path).unwrap();
+    {
+        let g = gltf::Gltf::open(&path).expect("glb parses");
+        let blob = g.blob.as_deref().expect("glb buffer");
+        assert_eq!(g.images().count(), 4);
+        for img in g.images() {
+            let gltf::image::Source::View { view, mime_type } = img.source() else {
+                panic!("expected an embedded image");
+            };
+            assert_eq!(mime_type, "image/ktx2");
+            let bytes = &blob[view.offset()..view.offset() + view.length()];
+            bevy::image::ktx2_buffer_to_image(
+                bytes,
+                bevy::image::CompressedImageFormats::BC,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("bevy rejects embedded ktx2: {e:?}"));
+        }
+    }
+    // PNG embedding still works, for viewers without KTX2.
+    let png = modeler::export_opt::Options::parse(&serde_json::json!({
+        "preset": "none", "textures": "embed_png"}))
+    .unwrap();
+    modeler::gltf::export_glb_with(&s.model, &path, &png).unwrap();
     let (doc, buffers, images) = gltf::import(&path).expect("glb imports with its images");
     // One shared texture set (base, metal-rough, normal, occlusion) for both parts.
     assert_eq!(images.len(), 4);
@@ -331,7 +355,9 @@ fn game_export_dedups_instances_culls_and_packs_orm() {
         .unwrap();
     let dir = temp_dir("game");
     let path = dir.join("game.glb");
-    let opts = modeler::export_opt::Options::game();
+    // PNG so the gltf crate can decode the images below.
+    let opts =
+        modeler::export_opt::Options::parse(&serde_json::json!({"textures": "embed_png"})).unwrap();
     let report = modeler::gltf::export_glb_with(&s.model, &path, &opts).unwrap();
     let (doc, buffers, images) = gltf::import(&path).expect("game glb imports");
     // Five nodes, two meshes (floor + one post shared by its copies), two materials.

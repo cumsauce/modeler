@@ -226,6 +226,7 @@ pub(crate) fn build_with(
     buffer_uri: Option<String>,
     opts: &crate::export_opt::Options,
     tex_out: Option<&TextureOut>,
+    embed_ktx2: bool,
 ) -> Result<(Value, Vec<u8>, String), crate::ModelerError> {
     use crate::export_opt::MeshRef;
     let visible: Vec<Part> = model
@@ -276,7 +277,7 @@ pub(crate) fn build_with(
                 let per_part = r.graph().is_ok_and(|g| g.domain == "object");
                 let mut add = |px: &[u8], what: &str| -> Result<u32, String> {
                     let name = format!("{}-{what}", r.material);
-                    let (png, ext, mime) = if tex_out.is_some_and(|o| o.ktx2) {
+                    let (png, ext, mime) = if tex_out.map_or(embed_ktx2, |o| o.ktx2) {
                         use crate::ktx2::Kind;
                         let kind = match what {
                             "base_color" | "emissive" => Kind::Srgb,
@@ -322,7 +323,7 @@ pub(crate) fn build_with(
                         images.push(json!({
                             "name": name,
                             "bufferView": view,
-                            "mimeType": "image/png",
+                            "mimeType": mime,
                         }));
                     }
                     textures.push(json!({"sampler": 0, "source": images.len() - 1}));
@@ -786,7 +787,7 @@ pub(crate) fn build_with(
 
 fn texture_out(path: &Path, mode: TextureMode) -> Option<TextureOut> {
     match mode {
-        TextureMode::Embed => None,
+        TextureMode::Embed | TextureMode::EmbedPng => None,
         m => Some(TextureOut {
             ktx2: m == TextureMode::Ktx2,
             ..TextureOut::for_export(path)
@@ -816,9 +817,15 @@ pub fn export_gltf_with(
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("bad export path {}", path.display()))?
         .to_owned();
-    let tex = texture_out(path, opts.textures.unwrap_or(TextureMode::Ktx2));
-    let (json, bin, report) =
-        build_with(model, Some(format!("{stem_name}.bin")), opts, tex.as_ref())?;
+    let mode = opts.textures.unwrap_or(TextureMode::Ktx2);
+    let tex = texture_out(path, mode);
+    let (json, bin, report) = build_with(
+        model,
+        Some(format!("{stem_name}.bin")),
+        opts,
+        tex.as_ref(),
+        mode == TextureMode::Embed,
+    )?;
     let json_text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
     let bin_path = path.with_extension("bin");
     fs::write(&bin_path, &bin).map_err(|e| format!("writing {}: {e}", bin_path.display()))?;
@@ -837,8 +844,10 @@ pub fn export_glb_with(
     path: &Path,
     opts: &crate::export_opt::Options,
 ) -> Result<String, crate::ModelerError> {
-    let tex = texture_out(path, opts.textures.unwrap_or(TextureMode::Embed));
-    let (json, bin, report) = build_with(model, None, opts, tex.as_ref())?;
+    let mode = opts.textures.unwrap_or(TextureMode::Embed);
+    let tex = texture_out(path, mode);
+    let (json, bin, report) =
+        build_with(model, None, opts, tex.as_ref(), mode == TextureMode::Embed)?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
     json_chunk.resize(align4(json_chunk.len()), b' ');
     let mut bin_chunk = bin;

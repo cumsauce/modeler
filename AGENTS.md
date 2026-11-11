@@ -742,9 +742,12 @@ work, and every material has its own history tree.
   material, channel and a hash of its content
   (`stone-base_color-1a2b....ktx2`), and the .gltf points at it by uri.
   Every model using the same bake points at the same file, so Bevy's asset
-  server loads it once. `optimize: {"textures": "png"}` writes shared PNGs
-  instead, `"embed"` packs PNGs into the buffer; `.glb` (one self-contained
-  file) embeds PNGs unless told `"ktx2"` / `"png"`. Only **tile** materials
+  server loads it once. `.glb` (one self-contained file) packs the same KTX2
+  into its buffer (`mimeType: image/ktx2`, which Bevy's loader reads): still
+  GPU-compressed, but each .glb has its own copy, so prefer .gltf for a kit.
+  `optimize: {"textures": ...}` overrides: `"ktx2"` (shared files), `"png"`
+  (shared PNGs), `"embed"` (KTX2 in the buffer), `"embed_png"` (PNG in the
+  buffer, for viewers without KTX2 such as Blender). Only **tile** materials
   (the default domain: metric, repeating) can be shared across models; an
   **object** bake is fitted to one mesh, and the export report counts
   those. Use tile materials for anything a kit reuses (stone, bark, leaves,
