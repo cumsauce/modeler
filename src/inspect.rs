@@ -539,10 +539,11 @@ pub fn mass_of(
             (a.min(lo), b.max(hi))
         });
     let tol = ((mhi - mlo).length() as f64 * 2e-4).max(1e-3);
-    // The ground is y = 0 when the model sits on it (within 1 cm, so a part
-    // sunk a few mm doesn't hide every other contact); otherwise its lowest
-    // point. Everything at or below floor + tol touches.
-    let floor = if (mlo.y as f64).abs() < 0.01 {
+    // The ground is y = 0 when the model is sunk up to 1 cm into it (so a
+    // part sunk a few mm doesn't hide every other contact); otherwise its
+    // lowest point, so a table standing on a rug a few mm thick still has
+    // its feet. Everything at or below floor + tol touches.
+    let floor = if (-0.01..0.0).contains(&(mlo.y as f64)) {
         0.0
     } else {
         mlo.y as f64
@@ -720,6 +721,14 @@ mod tests {
         let (t, j) = mass(&model_of(vec![base, arm]), &dens, 1000.0);
         assert!(!j["stability"]["stable"].as_bool().unwrap_or(true), "{t}");
         assert!(t.contains("TIPS"), "{t}");
+    }
+
+    #[test]
+    fn mass_of_an_object_on_a_thin_rug_uses_its_own_feet() {
+        // A cube standing 6 mm up (on a rug): its bottom face is the footprint.
+        let m = model_of(vec![cube("box", 0.5, [0.0, 0.256, 0.0])]);
+        let (t, j) = mass(&m, &BTreeMap::new(), 1000.0);
+        assert!(j["stability"]["stable"].as_bool().unwrap_or(false), "{t}");
     }
 
     #[test]

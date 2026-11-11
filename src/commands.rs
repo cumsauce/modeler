@@ -179,8 +179,22 @@ impl Default for Session {
 /// Stable reorder so an op that reads a part produced by a LATER op in the
 /// same batch runs after it (item order inside a batch doesn't matter).
 /// In-place edits (output == input) never count as producers; non-op items
-/// keep their place relative to each other.
+/// keep their place relative to each other. Pattern hides/shows and
+/// moves/places resolve their part names when applied, so they run last
+/// (in their own order) and see every part the batch creates.
 fn producers_first<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
+    let late = |it: &BatchItem| match it {
+        BatchItem::Hide { part } | BatchItem::Show { part } => part.contains('*'),
+        BatchItem::Move { .. } => true,
+        _ => false,
+    };
+    let (tail, head): (Vec<_>, Vec<_>) = items.into_iter().partition(|(it, _)| late(it));
+    let mut out = order_producers(head);
+    out.extend(tail);
+    out
+}
+
+fn order_producers<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
     let n = items.len();
     let produces = |it: &BatchItem| -> Vec<String> {
         match it {
@@ -3313,6 +3327,25 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.model.part("pill").is_some());
+    }
+
+    #[test]
+    fn pattern_hides_and_moves_see_parts_made_later_in_the_batch() {
+        let mut s = Session::default();
+        s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "hide_part", "part": "*_raw"}),
+                serde_json::json!({"type": "move", "name": "up", "parts": ["b*"], "translation": [0, 1, 0]}),
+                serde_json::json!({"type": "primitive", "name": "top_raw", "kind": "box", "size": 1}),
+                serde_json::json!({"type": "primitive", "name": "b", "kind": "box", "size": 1, "translation": [3, 0.5, 0]}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("top_raw").is_some_and(|p| !p.visible));
+        let lo = s.model.part("b").map(|p| p.bounds().0).unwrap_or_default();
+        assert!((lo.y - 1.0).abs() < 1e-4, "b at {lo:?}");
     }
 
     #[test]

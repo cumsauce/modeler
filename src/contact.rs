@@ -184,21 +184,27 @@ fn com_y(p: &Part) -> f32 {
 pub fn floating(model: &Model) -> Vec<String> {
     let bodies: Vec<Body> = visible(model).map(Body::new).collect();
     let ground = ground_level(model);
-    let mut out = Vec::new();
-    for (i, a) in bodies.iter().enumerate() {
-        let (lo, _) = a.part.bounds();
-        if lo.y <= ground + ground_tolerance(a.part) {
-            continue;
-        }
-        let touches = bodies
-            .iter()
-            .enumerate()
-            .any(|(j, b)| i != j && contact(a, b).is_some());
-        if !touches {
-            out.push(a.part.name.clone());
+    // Grounded = connected to the ground through a chain of contacts, so two
+    // parts touching only each other in mid-air still float.
+    let mut reached: Vec<bool> = bodies
+        .iter()
+        .map(|b| b.part.bounds().0.y <= ground + ground_tolerance(b.part))
+        .collect();
+    let mut frontier: Vec<usize> = (0..bodies.len()).filter(|&i| reached[i]).collect();
+    while let Some(i) = frontier.pop() {
+        for j in 0..bodies.len() {
+            if !reached[j] && contact(&bodies[i], &bodies[j]).is_some() {
+                reached[j] = true;
+                frontier.push(j);
+            }
         }
     }
-    out
+    bodies
+        .iter()
+        .zip(&reached)
+        .filter(|(_, r)| !**r)
+        .map(|(b, _)| b.part.name.clone())
+        .collect()
 }
 
 fn visible(model: &Model) -> impl Iterator<Item = &Part> {
@@ -339,6 +345,16 @@ mod tests {
         assert!(super::rests_on(m, "book", "shelf").is_ok());
         assert!(super::rests_on(m, "wedged", "shelf").is_err());
         assert!(super::floating(m).is_empty());
+    }
+
+    #[test]
+    fn parts_touching_only_each_other_in_mid_air_float() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "base", "kind": "box", "size": 1, "translation": [0, 0.5, 0]},
+            {"type": "primitive", "name": "door", "kind": "box", "size": [0.5, 0.5, 0.02], "translation": [3, 1, 0]},
+            {"type": "primitive", "name": "knob", "kind": "box", "size": 0.04, "translation": [3, 1, 0.03]}
+        ]));
+        assert_eq!(super::floating(&s.model), ["door", "knob"]);
     }
 
     #[test]

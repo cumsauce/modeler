@@ -90,7 +90,9 @@ type, so there is no need to memorise field names.
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is
   dependency-ordered, and a batch runs an item that reads a part made later
-  in the same batch after its producer, so item order doesn't matter.
+  in the same batch after its producer, and pattern hides/shows (`"*_raw"`)
+  and moves/places run last, so they see every part the batch makes: item
+  order doesn't matter.
 - **Parsing is strict but forgiving.** All items are parsed before anything
   is applied; errors name the item and field
   (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and
@@ -219,8 +221,9 @@ name: the producer first, then in-place material/visibility/transform edits).
     unexpected names. `*` matches any run of characters (`"gz.*"` covers a
     prefab instance).
   - `includes`: these names must exist; extras are fine (`*` works too).
-  - `grounded`: every part touches the ground or another part (no floaters),
-    by real geometry: shared volume, or surfaces within 0.2% of the smaller
+  - `grounded`: every part reaches the ground through a chain of touching
+    parts (no floaters; a door and its handle touching only each other in
+    mid-air both float), by real geometry: shared volume, or surfaces within 0.2% of the smaller
     part's size (10 µm..1 mm), so a 0.8 mm gap under a laptop screen fails.
     (The `scene_summary` floating warning is a cheap bounding-box version.)
   - `supported`: nothing hangs. Each part is on the ground, shares volume
@@ -277,8 +280,9 @@ name: the producer first, then in-place material/visibility/transform edits).
     weighs one object of a scene, `*` globs, on its own footprint): per-part and total
     mass, centre of mass, the footprint, and whether it tips over (with the
     tilt it tolerates). Default density 1000. Contact is measured from
-    the ground plane y = 0 (when the model is within 1 cm of it), so a
-    part sunk a few mm doesn't hide the other contacts.
+    the ground plane y = 0 when the model is sunk up to 1 cm into it (so a
+    part sunk a few mm doesn't hide the other contacts), otherwise from its
+    lowest point (a table on a 6 mm rug stands on its feet).
 - `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,
   same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an

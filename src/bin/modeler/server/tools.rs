@@ -487,7 +487,7 @@ impl Tools {
 
     /// Deterministic checks in one call: `parts` (exact visible part names;
     /// `"gz.*"` matches a prefix), `includes` (these exist, extras fine),
-    /// `grounded` (no part floats), `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
+    /// `grounded` (every part reaches the ground through touching parts), `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
     /// closed and outward-wound) and `rebuild` (uncached re-derivation matches
     /// the cache), `stable` (the centre of mass is over the footprint). With
     /// no arguments runs validate + rebuild. Each check
@@ -889,7 +889,7 @@ impl rmcp::ServerHandler for Tools {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter. A batch is atomic: any failing item rolls the whole call back.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (pattern hides and moves/places run last, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back.
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\").
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
@@ -900,7 +900,7 @@ impl rmcp::ServerHandler for Tools {
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], stable, bounds {min,max,tol}, validate, rebuild}, or call verify. grounded = touches something (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint). probe_ray proves openings (headless too).
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], stable, bounds {min,max,tol}, validate, rebuild}, or call verify. grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint). probe_ray proves openings (headless too).
 - inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not).
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).

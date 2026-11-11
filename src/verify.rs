@@ -624,14 +624,19 @@ pub fn expect_includes(model: &Model, wanted: &[String]) -> CmdResult {
     }
 }
 
-/// Every visible part touches another or the ground, by real geometry
-/// ([`crate::contact::floating`]; the scene warning uses cheap bounds).
+/// Every visible part reaches the ground through a chain of contacts, by
+/// real geometry ([`crate::contact::floating`]; the scene warning uses cheap
+/// bounds).
 pub fn expect_grounded(model: &Model) -> CmdResult {
     let f = crate::contact::floating(model);
     if f.is_empty() {
-        Ok("every visible part touches the ground or another part".into())
+        Ok("every visible part reaches the ground through touching parts".into())
     } else {
-        Err(format!("floating: {}", f.join(", ")).into())
+        Err(format!(
+            "floating (not connected to the ground through touching parts): {}",
+            crate::compact_names(&f).join(", ")
+        )
+        .into())
     }
 }
 
