@@ -103,6 +103,8 @@ pub(crate) fn rebuild_scene(
     mut modeler: ResMut<Modeler>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut pbr_cache: ResMut<PbrCache>,
     mut orbit: ResMut<Orbit>,
     mut built: ResMut<SceneBuilt>,
     mut typing: ResMut<PinTyping>,
@@ -124,7 +126,16 @@ pub(crate) fn rebuild_scene(
         if part.verts.is_empty() || part.indices.is_empty() || !part.visible {
             continue;
         }
-        commands.spawn((part_bundle(part, &mut meshes, &mut materials), PreviewPart));
+        commands.spawn((
+            part_bundle(
+                part,
+                &mut meshes,
+                &mut materials,
+                &mut images,
+                &mut pbr_cache,
+            ),
+            PreviewPart,
+        ));
     }
     if let Some((min, max)) = modeler.session.model.bounds() {
         orbit.target = (min + max) * 0.5;
@@ -136,10 +147,110 @@ pub(crate) fn rebuild_scene(
     }
 }
 
+/// Preview materials of procedurally textured parts, by bake key, so a
+/// scene rebuild (every model change) reuses the GPU textures.
+#[derive(Resource, Default)]
+pub(crate) struct PbrCache(std::collections::HashMap<u64, Handle<StandardMaterial>>);
+
+/// Uploads one RGBA8 texture with a box-filtered mip chain and a repeating,
+/// anisotropic sampler.
+fn pbr_image(
+    w: usize,
+    h: usize,
+    px: &[u8],
+    srgb: bool,
+    images: &mut Assets<Image>,
+) -> Handle<Image> {
+    use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension};
+    let (data, levels) = modeler::material::pbr::mips(w, h, px, srgb);
+    // Built from level 0 (Image::new checks the size), then the whole chain.
+    let mut img = Image::new(
+        Extent3d {
+            width: w as u32,
+            height: h as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        px.to_vec(),
+        if srgb {
+            TextureFormat::Rgba8UnormSrgb
+        } else {
+            TextureFormat::Rgba8Unorm
+        },
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.data = Some(data);
+    img.texture_descriptor.mip_level_count = levels;
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..default()
+    });
+    images.add(img)
+}
+
+/// The textured material of a part with a procedural material (baked on
+/// first use, then cached by bake key). `None` for plain parts or when the
+/// bake fails (reported on stderr; the part falls back to its factors).
+fn pbr_material(
+    part: &Part,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    cache: &mut PbrCache,
+) -> Option<Handle<StandardMaterial>> {
+    let r = part.material.pbr.as_ref()?;
+    let key = modeler::material::pbr::bake_key(r, Some(part));
+    if let Some(h) = cache.0.get(&key) {
+        return Some(h.clone());
+    }
+    let ch = match modeler::material::pbr::bake_part(part) {
+        Ok(Some(ch)) => ch,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("{e}");
+            return None;
+        }
+    };
+    let t = modeler::material::pbr::textures(&ch);
+    let [cr, cg, cb, ca] = part.material.base_color;
+    let mut m = StandardMaterial {
+        base_color: Color::srgba(cr, cg, cb, ca),
+        perceptual_roughness: part.material.roughness,
+        metallic: part.material.metalness,
+        base_color_texture: Some(pbr_image(t.w, t.h, &t.base, true, images)),
+        metallic_roughness_texture: Some(pbr_image(t.w, t.h, &t.metal_rough, false, images)),
+        normal_map_texture: Some(pbr_image(t.w, t.h, &t.normal, false, images)),
+        ..default()
+    };
+    if let Some(ao) = &t.occlusion {
+        m.occlusion_texture = Some(pbr_image(t.w, t.h, ao, false, images));
+    }
+    if let Some(e) = &t.emissive {
+        m.emissive_texture = Some(pbr_image(t.w, t.h, e, true, images));
+        m.emissive = LinearRgba::WHITE;
+    }
+    if t.blend {
+        m.alpha_mode = AlphaMode::Blend;
+    }
+    if cache.0.len() > 256 {
+        cache.0.clear();
+    }
+    let h = materials.add(m);
+    cache.0.insert(key, h.clone());
+    Some(h)
+}
+
 pub(crate) fn part_bundle(
     part: &Part,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    cache: &mut PbrCache,
 ) -> impl Bundle {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -153,12 +264,22 @@ pub(crate) fn part_bundle(
     if !part.uvs.is_empty() {
         mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs.clone());
     }
-    let [r, g, b, a] = part.material.base_color;
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgba(r, g, b, a),
-        perceptual_roughness: part.material.roughness,
-        metallic: part.material.metalness,
-        ..default()
+    let textured = pbr_material(part, materials, images, cache);
+    if textured.is_some()
+        && !part.normals.is_empty()
+        && !part.uvs.is_empty()
+        && let Err(e) = mesh.generate_tangents()
+    {
+        eprintln!("tangents for `{}`: {e}", part.name);
+    }
+    let material = textured.unwrap_or_else(|| {
+        let [r, g, b, a] = part.material.base_color;
+        materials.add(StandardMaterial {
+            base_color: Color::srgba(r, g, b, a),
+            perceptual_roughness: part.material.roughness,
+            metallic: part.material.metalness,
+            ..default()
+        })
     });
     (
         Name::new(part.name.clone()),

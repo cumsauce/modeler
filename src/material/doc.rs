@@ -131,6 +131,17 @@ impl MatDoc {
         }
     }
 
+    /// The graph to embed in a part's material.
+    pub fn graph(&self) -> super::pbr::MatGraph {
+        super::pbr::MatGraph {
+            domain: self.domain.clone(),
+            tile: self.tile,
+            resolution: self.resolution,
+            nodes: self.nodes.clone(),
+            params: self.params.clone(),
+        }
+    }
+
     pub fn check_format(&self) -> Result<(), String> {
         if self.format_version > MAT_FORMAT_VERSION {
             return Err(format!(

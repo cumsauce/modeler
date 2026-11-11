@@ -26,7 +26,8 @@ Without --calls in client/throwaway mode, reads calls line-by-line on stdin;
 Results print as JSON lines: {"ok":..., "text": [...], "json": {...}?,
 "n_images": ..., "saved_shot": path}.
 """
-import json, subprocess, sys, base64, os, socket, threading
+import json
+import subprocess, sys, base64, os, socket, threading
 
 BINARY = "/Users/lume/modeler/target/debug/modeler"
 SOCKET = "/tmp/modeler-mcp.sock"
@@ -37,9 +38,13 @@ class ModelerSession:
 
     def __init__(self, windowed=False):
         cmd = [BINARY] + ([] if windowed else ["--headless"])
+        # MODELER_STDERR=<path> keeps the server's stderr (panics, bake
+        # errors) instead of discarding it.
+        log = os.environ.get("MODELER_STDERR")
+        err = open(log, "ab") if log else subprocess.DEVNULL
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0)
+            stderr=err, bufsize=0)
         self.next_id = 0
         self._handshake()
 

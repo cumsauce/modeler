@@ -306,6 +306,7 @@ pub(crate) fn process_agent_shot(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut pbr_cache: ResMut<PbrCache>,
     mut cameras: Query<(&mut Projection, &mut RenderTarget, &mut Transform), With<AgentCamera>>,
     modeler: Res<Modeler>,
     mut commands: Commands,
@@ -382,7 +383,13 @@ pub(crate) fn process_agent_shot(
             .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
         for (i, part) in drawable.enumerate() {
             legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
-            let bundle = part_bundle(part, &mut meshes, &mut materials);
+            let bundle = part_bundle(
+                part,
+                &mut meshes,
+                &mut materials,
+                &mut images,
+                &mut pbr_cache,
+            );
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
         }

@@ -117,6 +117,7 @@ fn main() -> AppExit {
     .insert_resource(GraphHudVisible(std::env::var_os("MODELER_GRAPH").is_some()))
     .init_resource::<GraphPanel>()
     .init_resource::<SceneBuilt>()
+    .init_resource::<PbrCache>()
     .init_resource::<PinTyping>()
     .init_resource::<PendingPinSpawn>()
     .add_systems(

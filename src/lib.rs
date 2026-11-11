@@ -87,6 +87,10 @@ pub struct Material {
     pub base_color: [f32; 4],
     pub roughness: f32,
     pub metalness: f32,
+    /// A procedural material (textures baked from a node graph); the factors
+    /// above then multiply it, glTF style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pbr: Option<material::PbrRef>,
 }
 
 impl Default for Material {
@@ -95,6 +99,7 @@ impl Default for Material {
             base_color: [0.7, 0.7, 0.7, 1.0],
             roughness: 0.6,
             metalness: 0.0,
+            pbr: None,
         }
     }
 }
@@ -885,6 +890,9 @@ pub enum Op {
         roughness: Option<f32>,
         #[serde(default)]
         metalness: Option<f32>,
+        /// A procedural material from the working set or library.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pbr: Option<material::PbrRef>,
     },
     /// Copies an earlier part in a straight line. The source is copy 0;
     /// copies 1..count are emitted as `{name}_1..{name}_{count-1}`, copy i

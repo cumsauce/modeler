@@ -221,13 +221,25 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerEr
     Ok(())
 }
 
+/// The metric uv of world-scaled point `w` on a face whose normal's
+/// dominant axis is `axis` (0 x, 1 y, 2 z) with `sign`, oriented like an
+/// image seen from outside: u right, v *down* (glTF: v = 0 is the top row),
+/// so textures read upright on walls and unmirrored on every face.
+pub fn metric_uv(axis: u8, sign: f32, w: Vec3) -> [f32; 2] {
+    match axis {
+        0 => [-sign * w.z, -w.y],
+        1 => [w.x, sign * w.z],
+        _ => [sign * w.x, -w.y],
+    }
+}
+
 /// Box projection at real scale: each triangle is projected onto the plane
 /// facing its own normal's dominant axis, with UVs in meters (the part's
 /// scale applied), so a texture tiling every `t` meters looks the same size
 /// on every face of every part. Corners shared by triangles that pick
 /// different axes are split. Negative-facing faces flip u so nothing reads
 /// mirrored from outside.
-fn metric_box(part: &mut Part) {
+pub fn metric_box(part: &mut Part) {
     use std::collections::HashMap;
     let sc = Vec3::from(part.scale);
     let count = part.verts.len();
@@ -260,11 +272,7 @@ fn metric_box(part: &mut Part) {
             let key = (k, axis * 2 + u8::from(sign < 0.0));
             let id = *remap.entry(key).or_insert_with(|| {
                 let w = p[corner];
-                let uv = match axis {
-                    0 => [-sign * w.z, w.y],
-                    1 => [w.x, -sign * w.z],
-                    _ => [sign * w.x, w.y],
-                };
+                let uv = metric_uv(axis, sign, w);
                 verts.push(part.verts[k]);
                 if has_n {
                     normals.push(part.normals[k]);

@@ -614,6 +614,16 @@ pub struct MaterialSpec {
     roughness: Option<f32>,
     #[serde(default)]
     metalness: Option<f32>,
+    /// A procedural material (material_ops / material_catalog name): its
+    /// textures, mapped at real scale (tile) or onto a packed atlas (object).
+    #[serde(default)]
+    pbr: Option<String>,
+    /// Param overrides for this use of the pbr material.
+    #[serde(default)]
+    params: Option<std::collections::BTreeMap<String, f64>>,
+    /// Pattern scale for the pbr material (2 = twice as big).
+    #[serde(default)]
+    scale: Option<f32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1012,12 +1022,28 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         }
         "material" => {
             let s: MaterialSpec = de(&ctx, &body)?;
+            if s.pbr.is_none() && (s.params.is_some() || s.scale.is_some()) {
+                return Err(format!(
+                    "{ctx}: params / scale apply to a pbr material; add \"pbr\": \"<material>\""
+                ));
+            }
+            if let Some(k) = s.scale
+                && !(k > 0.0 && k.is_finite())
+            {
+                return Err(format!("{ctx}: scale: {k}: give a factor > 0"));
+            }
             BatchItem::Op(Op::Material {
                 input: s.input.unwrap_or_else(|| s.name.clone()),
                 name: s.name,
                 base_color: s.base_color.map(|c| c.0),
                 roughness: s.roughness,
                 metalness: s.metalness,
+                pbr: s.pbr.map(|m| crate::material::PbrRef {
+                    material: m,
+                    params: s.params.unwrap_or_default(),
+                    scale: s.scale.unwrap_or(1.0),
+                    graph: None,
+                }),
             })
         }
         "hide_part" => BatchItem::Hide {

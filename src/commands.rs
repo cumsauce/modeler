@@ -638,6 +638,7 @@ impl Session {
                 base_color,
                 roughness,
                 metalness,
+                pbr: None,
             },
             &format!("op material `{name}` <- `{input}`"),
         )
@@ -922,6 +923,47 @@ impl Session {
         s
     }
 
+    /// Embeds the graph of a `material` item's `pbr` (from the working
+    /// materials first, then the library), so the model is self-contained.
+    fn resolve_pbr(&self, item: &mut BatchItem) -> Result<(), String> {
+        let BatchItem::Op(Op::Material { pbr: Some(r), .. }) = item else {
+            return Ok(());
+        };
+        let doc = match self.materials.docs.get(&r.material) {
+            Some(d) => d.clone(),
+            None => crate::catalog::load_doc::<crate::material::MatDoc>(
+                crate::catalog::Kind::Materials,
+                &r.material,
+            )
+            .map_err(|_| {
+                let working: Vec<&str> = self.materials.docs.keys().map(String::as_str).collect();
+                format!(
+                    "pbr: no material `{}` (working: {}; saved: material_catalog list)",
+                    r.material,
+                    if working.is_empty() {
+                        "none".into()
+                    } else {
+                        working.join(", ")
+                    }
+                )
+            })?,
+        };
+        if let Some(k) = r.params.keys().find(|k| !doc.params.contains_key(*k)) {
+            let known: Vec<&str> = doc.params.keys().map(String::as_str).collect();
+            return Err(format!(
+                "pbr `{}`: no param `{k}` (params: {})",
+                r.material,
+                if known.is_empty() {
+                    "none".into()
+                } else {
+                    known.join(", ")
+                }
+            ));
+        }
+        r.graph = Some(doc.graph());
+        Ok(())
+    }
+
     fn apply_values_inner(
         &mut self,
         params: Option<crate::params::Params>,
@@ -943,8 +985,10 @@ impl Session {
         for (i, raw) in items.iter().enumerate() {
             let resolved = crate::params::resolve(raw, &merged)
                 .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
-            let item = crate::spec::parse_item(i, &resolved)
+            let mut item = crate::spec::parse_item(i, &resolved)
                 .map_err(|e| format!("{e}\n(nothing was applied)"))?;
+            self.resolve_pbr(&mut item)
+                .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
             let template = (!crate::params::refs(raw).is_empty()).then(|| raw.clone());
             parsed.push((item, template));
         }
@@ -965,7 +1009,9 @@ impl Session {
             if crate::params::refs(raw).iter().any(|r| changed.contains(r)) {
                 let resolved = crate::params::resolve(raw, &merged)
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
-                let item = crate::spec::parse_item(0, &resolved)
+                let mut item = crate::spec::parse_item(0, &resolved)
+                    .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
+                self.resolve_pbr(&mut item)
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
                 stale.push((item, Some(raw.clone())));
             }
@@ -1046,8 +1092,9 @@ impl Session {
                     base_color,
                     roughness,
                     metalness,
+                    pbr,
                 }) if name == input && !self.derived_by_ops(&name) => self
-                    .set_material(&name, base_color, roughness, metalness)
+                    .set_material_with(&name, base_color, roughness, metalness, pbr)
                     .map_err(fail)?,
                 BatchItem::Op(Op::Transform {
                     name,
@@ -1680,14 +1727,45 @@ impl Session {
         roughness: Option<f32>,
         metalness: Option<f32>,
     ) -> CmdResult {
+        self.set_material_with(part, base_color, roughness, metalness, None)
+    }
+
+    /// [`Self::set_material`] with an optional procedural material (its
+    /// graph already resolved).
+    pub fn set_material_with(
+        &mut self,
+        part: &str,
+        base_color: Option<[f32; 4]>,
+        roughness: Option<f32>,
+        metalness: Option<f32>,
+        pbr: Option<crate::material::PbrRef>,
+    ) -> CmdResult {
         if self.derived_by_ops(part) {
-            self.op_material(part, part, base_color, roughness, metalness)?;
+            self.apply_op(
+                Op::Material {
+                    name: part.into(),
+                    input: part.into(),
+                    base_color,
+                    roughness,
+                    metalness,
+                    pbr,
+                },
+                &format!("op material `{part}` <- `{part}`"),
+            )?;
             return Ok(format!("material on `{part}` updated"));
         }
         let p = self
             .model
             .part_mut(part)
             .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
+        if let Some(r) = pbr {
+            r.graph()?;
+            p.material.base_color = [1.0; 4];
+            p.material.roughness = 1.0;
+            p.material.metalness = 1.0;
+            p.material.pbr = Some(r);
+            crate::material::pbr::map_part(p)?;
+        }
         if let Some(c) = base_color {
             p.material.base_color = c;
         }
@@ -2460,6 +2538,7 @@ mod tests {
                 base_color: Some([1.0, 0.0, 0.0, 1.0]),
                 roughness: None,
                 metalness: None,
+                pbr: None,
             },
         ];
         let out = s.apply_ops(ops).unwrap_or_else(|e| panic!("{e}"));
@@ -3677,6 +3756,103 @@ mod tests {
             .apply_values_as(None, items, true)
             .unwrap_or_else(|e| panic!("{e}"));
         (s, t)
+    }
+
+    #[test]
+    fn pbr_materials_map_parts_at_real_scale_and_follow_lineage() {
+        let mut s = Session::default();
+        let arr = |v: serde_json::Value| v.as_array().cloned().unwrap_or_default();
+        s.materials
+            .ops(
+                "tiles",
+                arr(serde_json::json!([
+                    {"type": "tile_grid", "name": "g", "size": [0.1, 0.1]},
+                    {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": "$gap"},
+                    {"type": "output", "name": "out", "base_color": "m"}
+                ])),
+                Some(crate::params::Params::from([("gap".to_string(), 0.004)])),
+                None,
+                Some(0.5),
+                Some(64),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.materials
+            .ops(
+                "marble",
+                arr(serde_json::json!([
+                    {"type": "input", "name": "p", "of": "position"},
+                    {"type": "noise", "name": "n", "coords": "p", "size": 0.1},
+                    {"type": "output", "name": "out", "base_color": "n"}
+                ])),
+                None,
+                Some("object".into()),
+                None,
+                Some(64),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "wall", "kind": "box", "size": [2.0, 1.0, 0.1], "translation": [0, 0.5, 0]},
+            {"type": "material", "name": "wall", "pbr": "tiles", "params": {"gap": 0.01}},
+            {"type": "linear_array", "name": "walls", "input": "wall", "count": 2, "offset": [0, 0, 1]},
+            {"type": "primitive", "name": "top", "kind": "box", "size": [0.5, 0.05, 0.5], "translation": [0, 1.2, 0]},
+            {"type": "material", "name": "top", "pbr": "marble"}
+        ]);
+        s.apply_values_as(None, arr(items), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let wall = s.model.part("walls_1").unwrap_or_else(|| panic!("walls_1"));
+        let r = wall
+            .material
+            .pbr
+            .as_ref()
+            .unwrap_or_else(|| panic!("pbr inherited"));
+        assert_eq!(r.params.get("gap"), Some(&0.01));
+        // 2 m wall / 0.5 m tile = 4 repeats across.
+        let span = wall.uvs.iter().fold((f32::MAX, f32::MIN), |(a, b), uv| {
+            (a.min(uv[0]), b.max(uv[0]))
+        });
+        assert!((span.1 - span.0 - 4.0).abs() < 1e-4, "{span:?}");
+        let ch = crate::material::pbr::bake_part(wall)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("bake"));
+        assert_eq!(ch.w, 64);
+        // Object material: atlas uvs inside 0..1 and a per-part bake.
+        let top = s.model.part("top").unwrap_or_else(|| panic!("top"));
+        assert!(
+            top.uvs
+                .iter()
+                .all(|uv| (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]))
+        );
+        assert!(
+            crate::material::pbr::bake_part(top)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_some()
+        );
+        // An unknown material or param names what exists.
+        let e = s
+            .apply_values_as(
+                None,
+                arr(serde_json::json!([{"type": "material", "name": "top", "pbr": "nope"}])),
+                false,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("working: marble, tiles"), "{e}");
+        let e = s
+            .apply_values_as(
+                None,
+                arr(serde_json::json!([{"type": "material", "name": "top", "pbr": "tiles", "params": {"gapp": 1}}])),
+                false,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("no param `gapp` (params: gap)"), "{e}");
+        // Prefab files carry the graph: a round trip keeps the material.
+        let text = serde_json::to_string(&crate::Doc::for_file(&s.model)).unwrap_or_default();
+        assert!(text.contains("tile_grid"));
     }
 
     #[test]

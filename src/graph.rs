@@ -133,6 +133,13 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             hashes.insert(n.clone(), hash_of(n.as_bytes(), &[key]));
         }
     }
+    // Procedural materials map their parts last, so cuts and copies made
+    // after the material op are mapped too (one tile = its real size).
+    for (_, part) in named.iter_mut() {
+        if part.material.pbr.is_some() {
+            crate::material::pbr::map_part(Arc::make_mut(part))?;
+        }
+    }
     // Parent transforms, applied to the finished parts in list order,
     // except that a place runs after every move/place that moves its `on`
     // part (a pot placed on a sill that is itself mounted on a wall).
@@ -621,11 +628,20 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             base_color,
             roughness,
             metalness,
+            pbr,
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
             if name != input {
                 part.visible = true;
+            }
+            if let Some(r) = pbr {
+                r.graph()?;
+                // Factors multiply the textures: white / 1 unless given.
+                part.material.base_color = [1.0; 4];
+                part.material.roughness = 1.0;
+                part.material.metalness = 1.0;
+                part.material.pbr = Some(r.clone());
             }
             if let Some(c) = base_color {
                 part.material.base_color = *c;
@@ -1108,6 +1124,7 @@ pub fn describe(ops: &[Op]) -> String {
                 base_color,
                 roughness,
                 metalness,
+                pbr,
             } => {
                 let mut s = format!("#{i} material `{name}` <- `{input}`");
                 if let Some(c) = base_color {
@@ -1118,6 +1135,15 @@ pub fn describe(ops: &[Op]) -> String {
                 }
                 if let Some(m) = metalness {
                     s += &format!(" metalness={m}");
+                }
+                if let Some(r) = pbr {
+                    s += &format!(" pbr={}", r.material);
+                    if (r.scale - 1.0).abs() > 1e-6 {
+                        s += &format!(" scale={}", r.scale);
+                    }
+                    if !r.params.is_empty() {
+                        s += &format!(" params={:?}", r.params);
+                    }
                 }
                 s
             }
@@ -1536,6 +1562,7 @@ mod tests {
                     base_color: Some([1.0, 0.0, 0.0, 1.0]),
                     roughness: None,
                     metalness: None,
+                    pbr: None,
                 },
             ]
         };
