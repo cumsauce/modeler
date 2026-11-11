@@ -113,6 +113,10 @@ type, so there is no need to memorise field names.
 
 A `material` item may also carry `pbr` (a procedural material by name, see
 **Procedural materials** below), with `params` overrides and `scale`.
+A visible part with only a flat colour (no `pbr`) is a warning in
+`scene_summary` and every `apply_ops` summary, and `verify materials:
+"pbr"` fails it. When a plain colour is what the user wants, add
+`"flat": true` to that material item and the part is left alone.
 
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is
@@ -648,8 +652,8 @@ work, and every material has its own history tree.
 - **Mesh-aware masks** (object domain on a part): `mesh_ao` (occlusion
   from the part's own mesh: creases and hollows darken) and
   `mesh_curvature` (0.5 flat, ports `convex` for edge wear and `concave`
-  for dirt in crevices), from a voxelized copy of the part. Only the part
-  itself counts, not its neighbours; without a mesh (tile domain, the
+  for dirt in crevices), from a voxelized copy of the part and the visible
+  parts near it (a wing darkens the flank under it); without a mesh (tile domain, the
   preview sphere) they read neutral.
 - **`output`** names the channels: base_color, roughness, metallic,
   height (meters; the normal is derived from it, times normal_strength,
@@ -700,7 +704,9 @@ work, and every material has its own history tree.
 
 - **In-place ops**: a material, transform or visibility op whose output is
   its own input is legal; upsert never replaces an op the new op reads from.
-  Repeated in-place ops accumulate; last wins.
+  Re-issuing an in-place transform or visibility edit replaces it (a
+  relative transform does not apply twice); in-place materials stack, and
+  the last wins.
 - **Op results are memoized** (`graph::evaluate`): a process-wide cache keyed
   by op parameters + input content hashes, holding shared (`Arc`) parts, so a
   tweak re-runs only the op and its dependents. `verify` with `rebuild`
@@ -784,6 +790,11 @@ Material toggles match O, S and M.
   stops it. The default throwaway mode spawns and kills a server per
   invocation — window flashes open/closed, state restored from autosave.
 
+- **Several agents can share one daemon.** Each client (the agent
+  session behind the calling shell, or `--client NAME`) keeps its own
+  active document: if another client switched documents in between, the
+  daemon switches back before your calls and says so in the first result.
+  `--doc NAME` pins a run to a document (opened, or new, if not open).
 - The daemon keeps the server's stderr (panics, bake errors) in
   `<catalog dir>/daemon.log` (rotated to `daemon.log.1` past 1 MB at each
   spawn; `MODELER_STDERR=<file>` overrides). The server's last line there

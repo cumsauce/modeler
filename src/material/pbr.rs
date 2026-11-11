@@ -101,6 +101,17 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
     serde_json::to_string(&r.params)
         .unwrap_or_default()
         .hash(&mut h);
+    // Image nodes: the file's mtime, so an edited PNG re-bakes.
+    if let Some(g) = &r.graph {
+        for n in &g.nodes {
+            if let Some(path) = n.get("path").and_then(|v| v.as_str()) {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .hash(&mut h);
+            }
+        }
+    }
     if let (Some(p), Some(g)) = (part, &r.graph)
         && g.domain == "object"
     {
@@ -112,8 +123,23 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
         }
         p.indices.hash(&mut h);
         p.scale.map(f32::to_bits).hash(&mut h);
+        hash_occluders(p, &mut h);
     }
     h.finish()
+}
+
+/// Folds a part's neighbouring solids into a hash (mesh-aware bakes depend
+/// on them).
+pub fn hash_occluders(p: &Part, h: &mut impl Hasher) {
+    if let Some(o) = &p.occluders {
+        for m in o.iter() {
+            for t in m {
+                for v in t {
+                    v.map(f32::to_bits).hash(h);
+                }
+            }
+        }
+    }
 }
 
 static BAKES: Mutex<Option<HashMap<u64, Arc<Channels>>>> = Mutex::new(None);

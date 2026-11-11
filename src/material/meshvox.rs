@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 #[derive(Debug)]
 pub struct MeshVox {
     pub tris: Vec<[[f32; 3]; 3]>,
+    /// Neighbouring solids (same space), voxelized into the same grid.
+    pub others: Vec<Vec<[[f32; 3]; 3]>>,
     grid: OnceLock<Grid>,
 }
 
@@ -18,6 +20,8 @@ pub struct Grid {
     pub cell: f32,
     n: [usize; 3],
     occ: Vec<bool>,
+    /// The own part's longest box edge.
+    ext: f32,
 }
 
 /// Voxels along the longest axis.
@@ -25,19 +29,25 @@ const RES: f32 = 72.0;
 
 impl MeshVox {
     pub fn new(tris: Vec<[[f32; 3]; 3]>) -> MeshVox {
+        MeshVox::with_neighbours(tris, Vec::new())
+    }
+
+    pub fn with_neighbours(tris: Vec<[[f32; 3]; 3]>, others: Vec<Vec<[[f32; 3]; 3]>>) -> MeshVox {
         MeshVox {
             tris,
+            others,
             grid: OnceLock::new(),
         }
     }
 
     pub fn grid(&self) -> &Grid {
-        self.grid.get_or_init(|| Grid::build(&self.tris))
+        self.grid
+            .get_or_init(|| Grid::build(&self.tris, &self.others))
     }
 }
 
 impl Grid {
-    fn build(tris: &[[[f32; 3]; 3]]) -> Grid {
+    fn build(tris: &[[[f32; 3]; 3]], others: &[Vec<[[f32; 3]; 3]>]) -> Grid {
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for t in tris {
             for v in t {
@@ -53,6 +63,7 @@ impl Grid {
                 cell: 1.0,
                 n: [1, 1, 1],
                 occ: vec![false],
+                ext: 1.0,
             };
         }
         let ext = (0..3)
@@ -60,9 +71,34 @@ impl Grid {
             .fold(0.0f32, f32::max)
             .max(1e-6);
         let cell = ext / RES;
-        // Two voxels of padding so samples just outside read as empty.
-        let lo = lo.map(|x| x - 2.0 * cell);
+        // Padding: two voxels so samples just outside read as empty, and a
+        // quarter of the part when neighbours are voxelized too.
+        let pad = if others.is_empty() {
+            2.0 * cell
+        } else {
+            (0.25 * ext).max(2.0 * cell)
+        };
+        let lo = lo.map(|x| x - pad);
+        let hi = hi.map(|x| x + pad - 2.0 * cell);
         let n = [0, 1, 2].map(|k| (((hi[k] - lo[k]) / cell).ceil() as usize + 3).max(1));
+        let mut occ = vec![false; n[0] * n[1] * n[2]];
+        fill(&mut occ, tris, lo, cell, n);
+        for o in others {
+            fill(&mut occ, o, lo, cell, n);
+        }
+        Grid {
+            lo,
+            cell,
+            n,
+            occ,
+            ext,
+        }
+    }
+}
+
+/// Marks the voxels inside one closed mesh (parity per xz column).
+fn fill(occ: &mut [bool], tris: &[[[f32; 3]; 3]], lo: [f32; 3], cell: f32, n: [usize; 3]) {
+    {
         // Bin triangles into the xz columns their footprint covers.
         let mut cols: Vec<Vec<u32>> = vec![Vec::new(); n[0] * n[2]];
         for (ti, t) in tris.iter().enumerate() {
@@ -72,6 +108,11 @@ impl Grid {
             let z1 = t.iter().map(|v| v[2]).fold(f32::MIN, f32::max);
             let ix = |x: f32| (((x - lo[0]) / cell - 0.5).max(0.0) as usize).min(n[0] - 1);
             let iz = |z: f32| (((z - lo[2]) / cell - 0.5).max(0.0) as usize).min(n[2] - 1);
+            let gx1 = lo[0] + n[0] as f32 * cell;
+            let gz1 = lo[2] + n[2] as f32 * cell;
+            if x1 < lo[0] || z1 < lo[2] || x0 > gx1 || z0 > gz1 {
+                continue;
+            }
             let (a0, a1) = (ix(x0), (ix(x1) + 1).min(n[0] - 1));
             let (b0, b1) = (iz(z0), (iz(z1) + 1).min(n[2] - 1));
             for x in a0..=a1 {
@@ -80,7 +121,6 @@ impl Grid {
                 }
             }
         }
-        let mut occ = vec![false; n[0] * n[1] * n[2]];
         for x in 0..n[0] {
             for z in 0..n[2] {
                 let (px, pz) = (
@@ -95,6 +135,9 @@ impl Grid {
                 ys.dedup_by(|a, b| (*a - *b).abs() < 1e-7);
                 for pair in ys.chunks(2) {
                     let [a, b] = [pair[0], *pair.get(1).unwrap_or(&pair[0])];
+                    if b < lo[1] {
+                        continue;
+                    }
                     let y0 = (((a - lo[1]) / cell) - 0.5).ceil().max(0.0) as usize;
                     let y1 = ((((b - lo[1]) / cell) - 0.5).floor().max(-1.0) + 1.0) as usize;
                     for y in y0..y1.min(n[1]) {
@@ -103,9 +146,10 @@ impl Grid {
                 }
             }
         }
-        Grid { lo, cell, n, occ }
     }
+}
 
+impl Grid {
     /// Inside the solid at this object-space point (nearest voxel).
     #[inline]
     pub fn inside(&self, p: [f32; 3]) -> bool {
@@ -122,7 +166,7 @@ impl Grid {
 
     /// The model's size: the longest box edge in meters.
     pub fn extent(&self) -> f32 {
-        self.cell * RES
+        self.ext
     }
 }
 
@@ -195,5 +239,18 @@ mod tests {
         assert!(g.inside([0.4, -0.4, 0.4]));
         assert!(!g.inside([0.6, 0.0, 0.0]));
         assert!(!g.inside([0.0, 0.7, 0.0]));
+    }
+
+    #[test]
+    fn neighbours_share_the_grid() {
+        let other: Vec<_> = cube(0.5)
+            .into_iter()
+            .map(|t| t.map(|v| [v[0] + 0.9, v[1], v[2]]))
+            .collect();
+        let m = MeshVox::with_neighbours(cube(0.5), vec![other]);
+        let g = m.grid();
+        assert!(g.inside([0.6, 0.0, 0.0]));
+        assert!(!g.inside([0.0, 0.7, 0.0]));
+        assert!((g.extent() - 1.0).abs() < 1e-5);
     }
 }

@@ -317,6 +317,7 @@ pub fn samples(part: &Part, n: usize) -> Samples {
     }
     part.indices.hash(&mut h);
     part.scale.map(f32::to_bits).hash(&mut h);
+    super::pbr::hash_occluders(part, &mut h);
     Samples {
         w: n,
         h: n,
@@ -327,7 +328,7 @@ pub fn samples(part: &Part, n: usize) -> Samples {
         period: 0.0,
         texel,
         key: h.finish(),
-        mesh: Some(Arc::new(super::meshvox::MeshVox::new(
+        mesh: Some(Arc::new(super::meshvox::MeshVox::with_neighbours(
             (0..tri_count(part))
                 .filter_map(|t| {
                     let c = [0, 1, 2].map(|k| corner(part, t * 3 + k));
@@ -336,6 +337,10 @@ pub fn samples(part: &Part, n: usize) -> Samples {
                         .then(|| c.map(|k| (Vec3::from(part.verts[k]) * sc).to_array()))
                 })
                 .collect(),
+            part.occluders
+                .as_ref()
+                .map(|o| (**o).clone())
+                .unwrap_or_default(),
         ))),
     }
 }

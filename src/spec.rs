@@ -644,6 +644,10 @@ pub struct MaterialSpec {
     /// Pattern scale for the pbr material (2 = twice as big).
     #[serde(default)]
     scale: Option<f32>,
+    /// A plain colour on purpose (the user wants it flat): no "only a flat
+    /// colour" warning for this part.
+    #[serde(default)]
+    flat: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1506,6 +1510,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     scale: s.scale.unwrap_or(1.0),
                     graph: None,
                 }),
+                flat: s.flat,
             })
         }
         "hide_part" => BatchItem::Hide {

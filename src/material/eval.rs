@@ -401,6 +401,16 @@ pub fn evaluate(
                 let p = &parsed[i];
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 (p.ty.as_str(), p.body.to_string(), s.key).hash(&mut h);
+                // An image node also keys on its file's mtime, so editing the
+                // PNG re-bakes.
+                if p.ty == "image"
+                    && let Some(path) = p.body.get("path").and_then(|v| v.as_str())
+                {
+                    std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .hash(&mut h);
+                }
                 for r in &p.reads {
                     keys.get(r).copied().unwrap_or(0).hash(&mut h);
                 }

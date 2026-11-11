@@ -512,6 +512,27 @@ pub fn lints(model: &Model) -> Vec<String> {
             ));
         }
     }
+    // Parts with only a flat colour (no procedural material), unless marked
+    // flat on purpose.
+    let flat: Vec<&str> = model
+        .parts
+        .iter()
+        .filter(|p| {
+            p.visible && !p.material.is_default() && p.material.pbr.is_none() && !p.material.flat
+        })
+        .map(|p| p.name.as_str())
+        .collect();
+    if !flat.is_empty() {
+        let mut names: Vec<String> = flat.iter().take(8).map(|n| format!("`{n}`")).collect();
+        if flat.len() > 8 {
+            names.push(format!("+{} more", flat.len() - 8));
+        }
+        out.push(format!(
+            "{} part(s) have only a flat colour, no real material: {}; give them a pbr material (material_ops, then {{\"type\": \"material\", \"name\": <part>, \"pbr\": <material>}}), or add \"flat\": true to the material item if a plain colour is wanted",
+            flat.len(),
+            names.join(", ")
+        ));
+    }
     // Parts still wearing the default material. Hidden parts are skipped:
     // they are not rendered, so their color is irrelevant noise.
     for p in &model.parts {

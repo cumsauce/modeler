@@ -67,13 +67,13 @@ pub enum PivotSpec {
 }
 
 /// Visible parts on the default material, and those with only a flat
-/// colour (no procedural `pbr` material).
+/// colour (no procedural `pbr` material, and not marked `flat: true`).
 pub fn material_gaps(model: &Model) -> (Vec<String>, Vec<String>) {
     let (mut bare, mut flat) = (Vec::new(), Vec::new());
     for p in model.parts.iter().filter(|p| p.visible) {
         if p.material.is_default() {
             bare.push(p.name.clone());
-        } else if p.material.pbr.is_none() {
+        } else if p.material.pbr.is_none() && !p.material.flat {
             flat.push(p.name.clone());
         }
     }
@@ -540,7 +540,10 @@ impl Session {
         let reads = graph::inputs(&op);
         // A visibility edit is in place by nature (reads and writes the same
         // name), yet re-issuing it must replace the previous one, not stack.
-        let replace_in_place = kind == "visibility";
+        // So is an in-place transform: re-issuing it to adjust the scale or
+        // rotation must replace it, or a relative one applies twice.
+        let replace_in_place =
+            kind == "visibility" || (kind == "transform" && reads.contains(&out.as_str()));
         // "Never replace an op this one reads from" compares the old op's
         // actual outputs: an array named after its source (`tile` -> tile_1..)
         // writes tile_1.., not `tile`, so re-issuing it replaces it.
@@ -694,6 +697,7 @@ impl Session {
                 roughness,
                 metalness,
                 pbr: None,
+                flat: false,
             },
             &format!("op material `{name}` <- `{input}`"),
         )
@@ -1424,9 +1428,21 @@ impl Session {
                     roughness,
                     metalness,
                     pbr,
-                }) if name == input && !self.derived_by_ops(&name) => self
-                    .set_material_with(&name, base_color, roughness, metalness, pbr)
-                    .map_err(fail)?,
+                    flat,
+                }) if name == input && !self.derived_by_ops(&name) => {
+                    let has_pbr = pbr.is_some();
+                    let msg = self
+                        .set_material_with(&name, base_color, roughness, metalness, pbr)
+                        .map_err(fail)?;
+                    if let Some(p) = self.model.parts.iter_mut().find(|p| p.name == name) {
+                        if flat {
+                            std::sync::Arc::make_mut(p).material.flat = true;
+                        } else if has_pbr {
+                            std::sync::Arc::make_mut(p).material.flat = false;
+                        }
+                    }
+                    msg
+                }
                 BatchItem::Op(Op::Transform {
                     name,
                     input,
@@ -2231,6 +2247,7 @@ impl Session {
                     roughness,
                     metalness,
                     pbr,
+                    flat: false,
                 },
                 &format!("op material `{part}` <- `{part}`"),
             )?;
@@ -3253,6 +3270,7 @@ mod tests {
                 roughness: None,
                 metalness: None,
                 pbr: None,
+                flat: false,
             },
         ];
         let out = s.apply_ops(ops).unwrap_or_else(|e| panic!("{e}"));
@@ -4468,6 +4486,25 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_colour_warns_unless_marked_flat() {
+        let mut s = Session::default();
+        let items = |flat: bool| -> Vec<serde_json::Value> {
+            serde_json::from_str(&format!(
+                r##"[{{"type":"primitive","name":"b","kind":"box","size":1,"translation":[0,0.5,0]}},
+                    {{"type":"material","name":"b","color":"#c33","flat":{flat}}}]"##
+            ))
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.apply_values(None, items(false))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.lints().iter().any(|l| l.contains("only a flat colour")));
+        s.apply_values(None, items(true))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!s.lints().iter().any(|l| l.contains("only a flat colour")));
+        assert!(material_gaps(&s.model).1.is_empty());
+    }
+
+    #[test]
     fn verify_materials_flags_grey_and_flat_parts() {
         let mut s = Session::default();
         run(
@@ -4498,6 +4535,37 @@ mod tests {
         assert!(check(&s, serde_json::json!(true)).1);
         let (_, ok, text) = check(&s, serde_json::json!("pbr"));
         assert!(!ok && text.contains("flat colour"), "{text}");
+    }
+
+    #[test]
+    fn reissuing_an_in_place_relative_transform_replaces_it() {
+        let mut s = Session::default();
+        let t = |deg: f32| {
+            serde_json::json!({"type": "transform", "name": "w", "input": "w", "relative": true,
+                               "scale": [1, 1, 2], "rotation": {"x": deg}})
+        };
+        run(
+            &mut s,
+            serde_json::json!([{"type": "primitive", "name": "w", "kind": "box", "size": 0.1}, t(-10.0)]),
+        );
+        run(&mut s, serde_json::json!([t(-6.0)]));
+        let n = s
+            .model
+            .ops
+            .iter()
+            .filter(|o| graph::kind(o) == "transform")
+            .count();
+        assert_eq!(n, 1, "the re-issue replaced the first transform");
+        let Some(p) = s.model.part("w") else {
+            panic!("no w");
+        };
+        assert!(
+            (p.scale[2] - 2.0).abs() < 1e-5,
+            "scaled once: {:?}",
+            p.scale
+        );
+        let want = bevy::math::Quat::from_rotation_x((-6.0f32).to_radians());
+        assert!(crate::quat_of(p.rotation).dot(want).abs() > 1.0 - 1e-5);
     }
 
     #[test]

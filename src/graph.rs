@@ -187,7 +187,75 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             )?;
         }
     }
+    attach_occluders(&mut named);
     Ok(named.into_iter().map(|(_, part)| part).collect())
+}
+
+/// Gives every visible part whose object-domain material reads the mesh
+/// (`mesh_ao`, `mesh_curvature`) the visible solids near it, in its own
+/// local space, so creases between parts darken. Runs after moves.
+fn attach_occluders(named: &mut Named) {
+    let reads_mesh = |p: &Part| {
+        p.visible
+            && p.material
+                .pbr
+                .as_ref()
+                .and_then(|r| r.graph.as_ref())
+                .is_some_and(|g| {
+                    g.domain == "object"
+                        && g.nodes.iter().any(|n| {
+                            matches!(
+                                n.get("type").and_then(|t| t.as_str()),
+                                Some("mesh_ao" | "mesh_curvature")
+                            )
+                        })
+                })
+    };
+    let wants: Vec<usize> = (0..named.len())
+        .filter(|&i| reads_mesh(&named[i].1))
+        .collect();
+    if wants.is_empty() {
+        return;
+    }
+    let world: Vec<Option<(Vec3, Vec3, Vec<[Vec3; 3]>)>> = named
+        .iter()
+        .map(|(_, p)| {
+            if !p.visible || p.verts.is_empty() {
+                return None;
+            }
+            let tris = crate::contact::world_tris(p);
+            let (lo, hi) = tris
+                .iter()
+                .flatten()
+                .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
+                    (lo.min(*v), hi.max(*v))
+                });
+            Some((lo, hi, tris))
+        })
+        .collect();
+    for &i in &wants {
+        let Some((lo, hi, _)) = &world[i] else {
+            continue;
+        };
+        let m = (*hi - *lo).max_element() * 0.25;
+        let (lo, hi) = (*lo - m, *hi + m);
+        let part = &named[i].1;
+        let r = quat_of(part.rotation).inverse();
+        let t = Vec3::from(part.translation);
+        let occ: Vec<Vec<[[f32; 3]; 3]>> = world
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .filter_map(|(_, w)| w.as_ref())
+            .filter(|(l2, h2, _)| l2.cmple(hi).all() && h2.cmpge(lo).all())
+            .map(|(_, _, tris)| {
+                tris.iter()
+                    .map(|tr| tr.map(|v| (r * (v - t)).to_array()))
+                    .collect()
+            })
+            .collect();
+        Arc::make_mut(&mut named[i].1).occluders = (!occ.is_empty()).then(|| Arc::new(occ));
+    }
 }
 
 /// The move/place ops in run order: written order, but each place after
@@ -672,6 +740,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             roughness,
             metalness,
             pbr,
+            flat,
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
@@ -694,6 +763,11 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             }
             if let Some(m) = metalness {
                 part.material.metalness = *m;
+            }
+            if *flat {
+                part.material.flat = true;
+            } else if pbr.is_some() {
+                part.material.flat = false;
             }
             upsert(named, name, part);
         }
@@ -1287,8 +1361,12 @@ pub fn describe(ops: &[Op]) -> String {
                 roughness,
                 metalness,
                 pbr,
+                flat,
             } => {
                 let mut s = format!("#{i} material `{name}` <- `{input}`");
+                if *flat {
+                    s += " flat";
+                }
                 if let Some(c) = base_color {
                     s += &format!(" color={c:?}");
                 }
@@ -1741,6 +1819,7 @@ mod tests {
                     roughness: None,
                     metalness: None,
                     pbr: None,
+                    flat: false,
                 },
             ]
         };

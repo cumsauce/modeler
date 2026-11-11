@@ -96,6 +96,10 @@ pub struct Material {
     /// above then multiply it, glTF style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pbr: Option<material::PbrRef>,
+    /// A plain colour on purpose (no procedural material wanted): silences
+    /// the flat-colour warning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flat: bool,
 }
 
 impl Material {
@@ -116,6 +120,7 @@ impl Default for Material {
             roughness: 0.6,
             metalness: 0.0,
             pbr: None,
+            flat: false,
         }
     }
 }
@@ -139,6 +144,11 @@ pub struct Part {
     /// so older prefabs load as visible.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub visible: bool,
+    /// Neighbouring solids near this part, in its local (scaled, unrotated)
+    /// space, for mesh-aware materials (`mesh_ao` sees the wing over the
+    /// flank). Derived after moves; never saved.
+    #[serde(skip)]
+    pub occluders: Option<std::sync::Arc<Vec<Vec<[[f32; 3]; 3]>>>>,
 }
 
 fn default_true() -> bool {
@@ -986,6 +996,9 @@ pub enum Op {
         /// A procedural material from the working set or library.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pbr: Option<material::PbrRef>,
+        /// A plain colour on purpose: no flat-colour warning.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flat: bool,
     },
     /// Copies an earlier part in a straight line. The source is copy 0;
     /// copies 1..count are emitted as `{name}_1..{name}_{count-1}`, copy i

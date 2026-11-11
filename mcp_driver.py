@@ -14,6 +14,12 @@ many driver invocations):
 Client (connects to the daemon, or spawns a throwaway server):
     mcp_driver.py --connect [--socket PATH] --calls calls.json [--save-shot p]
     mcp_driver.py --calls calls.json ...          # throwaway mode, as before
+Several agents may share one daemon: each client (the agent session
+behind the calling shell, or --client NAME) keeps its own active document.
+If another client switched documents in between, the daemon switches back
+before this client's calls and says so in the first result. --doc NAME
+pins the document for this run (opened from the catalog, or new, if not
+open).
 Image options: --save-shot PATH (the run's first image to PATH, every later
 image from any call of the same client run to PATH_2, PATH_3, ...),
 --save-dir DIR (every image, numbered), --b64 (also print base64; off by default).
@@ -265,6 +271,32 @@ def claim_socket(socket_path):
     sys.exit(1)
 
 
+def active_doc(session):
+    """The server's active document name (from `scene list`), or None."""
+    try:
+        out = session.call("scene", {"action": "list"})
+    except Exception:
+        return None
+    for line in "\n".join(out.get("text", [])).splitlines():
+        if line.startswith("* "):
+            return line[2:].split(" (")[0].strip()
+    return None
+
+
+def client_identity():
+    """Who is calling: the agent session behind this shell. Each agent's
+    commands run in fresh shells under one long-lived process, so the
+    shell's parent identifies the session; --client NAME overrides."""
+    if "--client" in sys.argv:
+        return sys.argv[sys.argv.index("--client") + 1]
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(os.getppid())],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        return f"pid:{int(out)}"
+    except Exception:
+        return f"pid:{os.getppid()}"
+
+
 def daemon_mode(socket_path, windowed):
     claim_socket(socket_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -279,10 +311,15 @@ def daemon_mode(socket_path, windowed):
         raise
     print(f"modeler daemon ready on {socket_path}"
           + (f" (server log: {log})" if log else ""), flush=True)
+    # Each client's own active document: several agents share one daemon,
+    # and a `scene switch` by one must not redirect another's edits.
+    client_doc = {}
     try:
         while True:
             conn, _ = srv.accept()
             shots = ShotNamer()  # one --save-shot counter per client run
+            client = None
+            pending_note = None
             with conn:
                 f = conn.makefile("r")
                 for line in f:
@@ -291,6 +328,20 @@ def daemon_mode(socket_path, windowed):
                         continue
                     try:
                         c = json.loads(line)
+                        if isinstance(c, dict) and "hello" in c:
+                            h = c["hello"]
+                            client = h.get("client")
+                            want = h.get("doc") or client_doc.get(client)
+                            now = active_doc(session) if want else None
+                            if want and now and now != want:
+                                sw = session.call("scene", {"action": "open", "name": want})
+                                if sw.get("ok"):
+                                    pending_note = (
+                                        f"daemon: the active document was `{now}` (another "
+                                        f"client switched it); switched back to your `{want}`"
+                                        if not h.get("doc") else
+                                        f"daemon: switched to `{want}` (--doc)")
+                            continue
                         is_quit = c == "quit" or (isinstance(c, dict) and c.get("name") == "quit")
                         if is_quit:
                             conn.sendall((json.dumps(
@@ -308,6 +359,9 @@ def daemon_mode(socket_path, windowed):
                         out = session.call(c["name"], c.get("args", {}),
                                            c.get("save_shot"), c.get("save_dir"),
                                            c.get("b64", False), shots)
+                        if pending_note:
+                            note = f"{note}\n{pending_note}" if note else pending_note
+                            pending_note = None
                         if note:
                             out["text"] = [note] + list(out.get("text", []))
                     except Exception as e:  # bad line or dead server
@@ -316,7 +370,12 @@ def daemon_mode(socket_path, windowed):
                             msg += f" (the modeler server exited: {session.exit_reason()})"
                         out = {"ok": False, "text": [msg], "n_images": 0, "saved_images": []}
                     conn.sendall((json.dumps(out) + "\n").encode())
-            # client disconnected: keep the modeler (and window) alive
+            # client disconnected: keep the modeler (and window) alive, and
+            # remember which document this client left active.
+            if client:
+                doc = active_doc(session)
+                if doc:
+                    client_doc[client] = doc
     finally:
         session.close()
         srv.close()
@@ -337,6 +396,10 @@ def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, js
         sys.exit(1)
     with s:
         f = s.makefile("r")
+        hello = {"client": client_identity()}
+        if "--doc" in sys.argv:
+            hello["doc"] = sys.argv[sys.argv.index("--doc") + 1]
+        s.sendall((json.dumps({"hello": hello}) + "\n").encode())
         for c in calls:
             payload = dict(c)
             if save_shot:

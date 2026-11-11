@@ -603,7 +603,7 @@ Style::default()
                         );
                     } else if !flat.is_empty() {
                         out += &format!(
-                            "\nnote: {} visible part(s) use a flat colour, no pbr material; verify {{\"materials\": \"pbr\"}} lists them",
+                            "\nwarning: {} visible part(s) have only a flat colour, no real material; give them a pbr material, or flat: true on the material item where a plain colour is wanted",
                             flat.len()
                         );
                     }
@@ -1330,7 +1330,7 @@ impl rmcp::ServerHandler for Tools {
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
-- Every model gets materials: give each visible part a material item, preferably a procedural pbr one (material_ops, then {\"type\": \"material\", \"name\": part, \"pbr\": name}); flat colours only for small details. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
+- Every model gets materials: give each visible part a material item, preferably a procedural pbr one (material_ops, then {\"type\": \"material\", \"name\": part, \"pbr\": name}); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
