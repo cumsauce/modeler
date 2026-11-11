@@ -493,14 +493,7 @@ pub fn mass_of(
     density: &BTreeMap<String, f64>,
     default_density: f64,
 ) -> (String, serde_json::Value) {
-    let picked = |p: &Part| {
-        only.is_none_or(|o| {
-            o.iter().any(|n| match n.strip_suffix('*') {
-                Some(pre) => p.name.starts_with(pre),
-                None => &p.name == n,
-            })
-        })
-    };
+    let picked = |p: &Part| only.is_none_or(|o| o.iter().any(|n| crate::name_matches(n, &p.name)));
     let mut text = String::new();
     let (mut total_m, mut total_v, mut com) = (0.0, 0.0, [0.0f64; 3]);
     let mut rows = Vec::new();

@@ -149,10 +149,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
         let t = Vec3::from(translation.unwrap_or([0.0; 3]));
         let p = Vec3::from(*pivot);
         for (name, part) in named.iter_mut() {
-            let hit = parts.iter().any(|pat| match pat.strip_suffix('*') {
-                Some(pre) => name.starts_with(pre),
-                None => name == pat,
-            });
+            let hit = parts.iter().any(|pat| crate::name_matches(pat, name));
             if !hit {
                 continue;
             }

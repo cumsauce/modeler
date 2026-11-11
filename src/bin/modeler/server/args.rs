@@ -56,7 +56,7 @@ pub(crate) struct SectionArg {
 #[derive(serde::Deserialize, schemars::JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MassArg {
-    /// Weigh only these parts (trailing `*` = prefix), e.g. one object of a
+    /// Weigh only these parts (`*` = any characters), e.g. one object of a
     /// scene; its own footprint decides stability. Default: every visible part.
     #[serde(default)]
     pub(crate) parts: Option<Vec<String>>,

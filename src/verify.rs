@@ -609,10 +609,7 @@ pub fn expect_includes(model: &Model, wanted: &[String]) -> CmdResult {
         .collect();
     let missing: Vec<&String> = wanted
         .iter()
-        .filter(|w| match w.strip_suffix('*') {
-            Some(prefix) => !vis.iter().any(|v| v.starts_with(prefix)),
-            None => !vis.contains(&w.as_str()),
-        })
+        .filter(|w| !vis.iter().any(|v| crate::name_matches(w, v)))
         .collect();
     if missing.is_empty() {
         Ok(format!(

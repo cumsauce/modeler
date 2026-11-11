@@ -55,10 +55,7 @@ fn badge(op: &Op) -> &'static str {
 }
 
 fn matches(pattern: &str, name: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(pre) => name.starts_with(pre),
-        None => pattern == name,
-    }
+    crate::name_matches(pattern, name)
 }
 
 /// Builds the view from a model's op list.

@@ -1,6 +1,27 @@
 //! MCP-driven mesh modeling: build models from primitives, boolean operations and raw
 //! triangle meshes, with correct UV mappings, export as glTF. No game code.
 
+/// Part-name pattern: `*` matches any run of characters anywhere
+/// (`"bike.*"`, `"*_raw"`, `"cut*a"`); without `*` it is an exact name.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let pieces: Vec<&str> = parts.collect();
+    let Some((last, middle)) = pieces.split_last() else {
+        return rest.is_empty();
+    };
+    for m in middle {
+        match rest.find(m) {
+            Some(i) => rest = &rest[i + m.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
 pub mod catalog;
 pub mod commands;
 pub mod csg;
@@ -256,11 +277,8 @@ impl Model {
     pub fn bounds_of(&self, names: &[String]) -> Option<(Vec3, Vec3)> {
         let mut acc: Option<(Vec3, Vec3)> = None;
         for p in &self.parts {
-            // Exact names, or a trailing `*` for a prefix (`"bike.*"`).
-            let hit = names.iter().any(|n| match n.strip_suffix('*') {
-                Some(pre) => p.name.starts_with(pre),
-                None => *n == p.name,
-            });
+            // Exact names or `*` patterns (`"bike.*"`).
+            let hit = names.iter().any(|n| name_matches(n, &p.name));
             if p.verts.is_empty() || !hit {
                 continue;
             }
@@ -845,6 +863,16 @@ pub struct Annotation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn name_patterns_take_star_anywhere() {
+        use super::name_matches as m;
+        assert!(m("bike.*", "bike.fork") && !m("bike.*", "bikes"));
+        assert!(m("*_raw", "cube_raw") && !m("*_raw", "raw_cube"));
+        assert!(m("cut*a", "cut_win_a") && !m("cut*a", "cut_b"));
+        assert!(m("*", "x") && m("a", "a") && !m("a", "ab") && m("a*b*c", "abc"));
+        assert!(!m("ab*ba", "aba"));
+    }
+
     use super::*;
 
     #[test]

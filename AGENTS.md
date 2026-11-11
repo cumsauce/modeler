@@ -80,7 +80,7 @@ type, so there is no need to memorise field names.
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
 | `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
-| `hide_part` / `show_part` | part (a trailing `*` matches a prefix: `"cut*"` hides every cutter) |
+| `hide_part` / `show_part` | part (`*` matches anything: `"cut*"` hides every cutter, `"*_raw"` every raw blank) |
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
@@ -196,7 +196,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 - `verify(parts?, includes?, grounded?, bounds?, validate?, rebuild?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `parts`: exact part names, order-insensitive; reports missing and
-    unexpected names. A trailing `*` matches a prefix (`"gz.*"` covers a
+    unexpected names. `*` matches any run of characters (`"gz.*"` covers a
     prefab instance).
   - `includes`: these names must exist; extras are fine (`*` works too).
   - `grounded`: every part touches the ground or another part (no floaters).

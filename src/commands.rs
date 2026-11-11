@@ -562,7 +562,9 @@ impl Session {
         let n = text.lines().filter(|l| l.starts_with('#')).count();
         let mut kept: Vec<&str> = text.lines().filter(|l| !routine(l)).collect();
         let applied = format!("applied {n} item(s)");
-        kept.insert(0, &applied);
+        if n > 0 || kept.is_empty() {
+            kept.insert(0, &applied);
+        }
         Ok(format!(
             "{}\n{}",
             kept.join("\n"),
@@ -871,12 +873,7 @@ impl Session {
         rotation: Option<[f32; 4]>,
         pivot: Option<[f32; 3]>,
     ) -> CmdResult {
-        let matches = |n: &str| {
-            patterns.iter().any(|p| match p.strip_suffix('*') {
-                Some(pre) => n.starts_with(pre),
-                None => n == p,
-            })
-        };
+        let matches = |n: &str| patterns.iter().any(|p| crate::name_matches(p, n));
         let names: Vec<String> = self
             .model
             .parts
@@ -931,17 +928,23 @@ impl Session {
     /// [`Self::set_visible`] on one part, or on every part matching a
     /// trailing-`*` prefix (`"book*"`, `"cut_*"`).
     pub fn set_visible_glob(&mut self, pattern: &str, visible: bool) -> CmdResult {
-        let Some(prefix) = pattern.strip_suffix('*') else {
+        if !pattern.contains('*') {
             return self.set_visible(pattern, visible);
-        };
+        }
         let names: Vec<String> = self
             .model
             .parts
             .iter()
-            .filter(|p| p.name.starts_with(prefix) && p.visible != visible)
+            .filter(|p| crate::name_matches(pattern, &p.name) && p.visible != visible)
             .map(|p| p.name.clone())
             .collect();
-        if names.is_empty() && !self.model.parts.iter().any(|p| p.name.starts_with(prefix)) {
+        if names.is_empty()
+            && !self
+                .model
+                .parts
+                .iter()
+                .any(|p| crate::name_matches(pattern, &p.name))
+        {
             return Err(format!("no part matches `{pattern}`").into());
         }
         for n in &names {
