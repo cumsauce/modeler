@@ -297,7 +297,8 @@ name: the producer first, then in-place material/visibility/transform edits).
   - Both the window and agent cameras are lit by a procedural photo
     studio (`src/material/env.rs`: soft boxes over a grey cyclorama, filtered
     on the GPU as an environment light), so glossy and metal parts show real
-    reflections, plus SSAO for contact shading (MSAA off, SMAA instead).
+    reflections. Agent views add SSAO contact shading (MSAA off, SMAA
+    instead); the window does not (SSAO froze its presentation on Metal).
     `material_view` shades its sphere with the same studio. Renders wait for
     the environment light to finish filtering, so a shot right after startup
     is never blank.

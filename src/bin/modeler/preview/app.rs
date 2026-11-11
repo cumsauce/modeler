@@ -368,7 +368,9 @@ pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Imag
             MainCamera,
             Camera3d::default(),
             studio_env(&mut images, STUDIO_INTENSITY),
-            contact_shading(),
+            // No SSAO here: on the window camera it froze presentation
+            // (the view updated only on resize) on this Metal device; the
+            // offscreen agent camera keeps it.
             AmbientLight {
                 brightness: 60.0,
                 ..default()
