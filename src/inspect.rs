@@ -58,7 +58,7 @@ pub fn measure(
             let rel = if gap.abs() < 1e-5 {
                 "rests on the ground".to_string()
             } else if gap > 0.0 {
-                format!("floats {} above the ground", fmt_m(gap))
+                format!("has its lowest point {} above the ground", fmt_m(gap))
             } else {
                 format!("sinks {} below the ground", fmt_m(-gap))
             };
@@ -81,29 +81,41 @@ pub fn measure(
                 crate::csg::part_to_manifold(pa),
                 crate::csg::part_to_manifold(pb),
             );
+            let mut overlap_at: Option<[f64; 3]> = None;
             let (relation, gap, overlap) = match (ma, mb) {
                 (Ok(ma), Ok(mb)) => {
                     let inter = ma.intersection(&mb);
                     let ov = inter.volume().abs();
                     let small = ma.volume().abs().min(mb.volume().abs()).max(1e-30);
                     if ov > small * 1e-6 {
-                        let depth = inter
+                        let (depth, at) = inter
                             .bounding_box()
                             .map(|bb| {
                                 let (lo, hi) = (bb.min(), bb.max());
-                                [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]]
+                                (
+                                    [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]],
+                                    [
+                                        (lo[0] + hi[0]) * 0.5,
+                                        (lo[1] + hi[1]) * 0.5,
+                                        (lo[2] + hi[2]) * 0.5,
+                                    ],
+                                )
                             })
-                            .unwrap_or([0.0; 3]);
+                            .unwrap_or(([0.0; 3], [0.0; 3]));
+                        overlap_at = Some(at);
                         let pen = depth.iter().cloned().fold(f64::MAX, f64::min);
                         (
                             format!(
-                                "overlap: {} shared ({:.1}% of the smaller), interpenetrating ~{} (overlap box {} x {} x {})",
+                                "overlap: {} shared ({:.1}% of the smaller), interpenetrating ~{} (overlap box {} x {} x {} centred at [{:.4}, {:.4}, {:.4}])",
                                 fmt_m3(ov),
                                 ov / small * 100.0,
                                 fmt_m(pen),
                                 fmt_m(depth[0]),
                                 fmt_m(depth[1]),
-                                fmt_m(depth[2])
+                                fmt_m(depth[2]),
+                                at[0],
+                                at[1],
+                                at[2]
                             ),
                             -pen,
                             ov,
@@ -152,7 +164,7 @@ pub fn measure(
             Ok((
                 text,
                 serde_json::json!({
-                    "a": a, "b": b, "gap": gap, "overlap_volume": overlap,
+                    "a": a, "b": b, "gap": gap, "overlap_volume": overlap, "overlap_at": overlap_at,
                     "box_gap": axis_gap, "centre_distance": centre, "relation": relation,
                 }),
             ))
@@ -665,7 +677,7 @@ mod tests {
         let ov = j["overlap_volume"].as_f64().unwrap_or(0.0);
         assert!((ov - 0.2).abs() < 1e-3, "{ov}");
         let (t, _) = measure(&m, &["d".into()]).unwrap_or_else(|e| panic!("{e}"));
-        assert!(t.contains("floats"), "{t}");
+        assert!(t.contains("above the ground"), "{t}");
     }
 
     #[test]

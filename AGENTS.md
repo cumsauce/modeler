@@ -223,7 +223,7 @@ name: the producer first, then in-place material/visibility/transform edits).
   call.
   - `measure: [["a", "b"], ["c"]]`: two parts are apart (closest-surface
     gap), touching, or overlapping (shared volume and penetration depth),
-    plus per-axis box gaps; one name gives its height above the ground.
+    plus per-axis box gaps and where an overlap is centred (so an intended joint, like a stay meeting a hub, tells apart from a collision); one name gives its height above the ground.
   - `section: {axis, at, parts?}`: cuts with the plane `axis = at` and
     reports per part the area, outlines, holes and thinnest wall, plus an
     image of the cut (y = plan, z = front, x = side). Shows hidden
