@@ -741,6 +741,16 @@ pub enum Op {
         #[serde(default)]
         segments: u32,
     },
+    /// Hollows a solid to walls `thickness` thick; each `open` face
+    /// (top/bottom/left/right/front/back) is left open. Cabinets, drawers,
+    /// boxes, tubs, planters.
+    Shell {
+        name: String,
+        input: String,
+        thickness: f32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open: Vec<String>,
+    },
     /// Merges several parts into one without a boolean: their meshes are
     /// concatenated in world space (transforms baked). For arraying or moving
     /// a set of disjoint parts as one (a row of tiles, a window with its
@@ -791,6 +801,10 @@ pub enum Op {
         /// `place`: clearance left above the surface (default 0).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gap: Option<f32>,
+        /// `place`: the direction the parts travel to reach `on`: down
+        /// (default), up, left, right, back, front.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        toward: Option<String>,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {

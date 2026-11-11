@@ -73,10 +73,11 @@ type, so there is no need to memorise field names.
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
+| `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
 | `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot: point or anchor] |
-| `place` | [name], parts, on, [at [x, z]], [gap] (drop onto `on`'s top surface) |
+| `place` | [name], parts, on, [at], [gap], [toward down] (drop onto `on`, or mount against a wall) |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset |
@@ -132,7 +133,15 @@ type, so there is no need to memorise field names.
   x -0.4, z 0.1, then moves it vertically until its underside rests on the
   desk's top surface (sloped and uneven tops work; `gap` leaves clearance).
   It is a named, post-graph move like `move`, so it re-runs on every change:
-  lower the desk with a param and the mug follows.
+  lower the desk with a param and the mug follows. `toward` sets the travel
+  direction: `down` (default), `up` (under a shelf), or `back` / `front` /
+  `left` / `right` to mount against a wall; `at` then names the two cross
+  axes: back/front `[x, y]`, left/right `[z, y]`. A frame on the left wall:
+  `{"type": "place", "name": "hang", "parts": ["frame"], "on": "wall_left",
+  "toward": "left", "at": [-0.4, 1.5]}`. A place runs after any move/place
+  that moves the part it lands on (a pot on a sill mounted on a wall),
+  whatever order they are written in. List every part that should move
+  (`"bracket*"` takes the array copies too).
 - **Anchor pivots**: a move's `pivot` may be a point or an anchor on a
   bounding box: `"bottom-back"` (the moved parts' own box) or
   `"laptop_screen:bottom-front"` (another part's box; `*` patterns work).
@@ -168,6 +177,14 @@ type, so there is no need to memorise field names.
   along the frame normal (world up to start, or +z on a vertical path).
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
+- **`shell`** hollows a closed solid: every face moves in by exactly
+  `thickness` (erosion by a ball, so convex corners stay sharp), and each
+  face named in `open` (top/bottom/left/right/front/back, world axes) is left
+  open. A cabinet carcass: `{"type": "shell", "name": "cab", "input":
+  "cab_box", "thickness": 0.018, "open": ["front", "top"]}`; a planter or
+  well: `open: "top"`; a ring or band: `open: ["top", "bottom"]`. Hide the
+  input. Doors over an open front should overlap the side panels, or they
+  touch only air and fail `grounded`.
 - **`round`** works on any closed solid:
   - `fillet` rounds convex edges by `radius` and keeps the outer size
     (Minkowski opening).
@@ -253,7 +270,11 @@ name: the producer first, then in-place material/visibility/transform edits).
     unless `allow` lists it (`*` patterns, either order). Shallow overlaps
     (a tap sunk 1 cm into a counter) pass and are listed as joints.
     `grounded`/`supported` count any overlap as a joint, so only this
-    catches a part swung or placed into another.
+    catches a part swung or placed into another. A failing pair says why
+    when the model knows: `[x is an input of y and still visible: hide it]`
+    (a blank, cutter or array source left showing) or `[entirely hidden
+    inside]`. Intended embeds (a chimney through a roof, a seat post in its
+    tube, a bulb in a shade) go in `allow`.
 
   Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:

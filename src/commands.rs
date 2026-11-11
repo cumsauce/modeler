@@ -50,6 +50,7 @@ pub enum BatchItem {
         on: Option<String>,
         at: Option<[f32; 2]>,
         gap: Option<f32>,
+        toward: Option<String>,
     },
 }
 
@@ -317,8 +318,49 @@ fn producers_first<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
     };
     let (tail, head): (Vec<_>, Vec<_>) = items.into_iter().partition(|(it, _)| late(it));
     let mut out = order_producers(head);
-    out.extend(tail);
+    out.extend(places_after_their_support(tail));
     out
+}
+
+/// Stable reorder of the late items so a place runs after any move/place
+/// in the batch that moves the part it lands on.
+fn places_after_their_support<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
+    let n = items.len();
+    let deps: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let BatchItem::Move { on: Some(on), .. } = &items[i].0 else {
+                return Vec::new();
+            };
+            (0..n)
+                .filter(|&j| {
+                    j != i
+                        && matches!(&items[j].0, BatchItem::Move { parts, .. }
+                            if parts.iter().any(|p| crate::name_matches(p, on)))
+                })
+                .collect()
+        })
+        .collect();
+    if deps.iter().all(Vec::is_empty) {
+        return items;
+    }
+    let mut state = vec![0u8; n];
+    let mut order = Vec::with_capacity(n);
+    fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[i] != 0 {
+            return;
+        }
+        state[i] = 1;
+        for &j in &deps[i] {
+            visit(j, deps, state, order);
+        }
+        state[i] = 2;
+        order.push(i);
+    }
+    for i in 0..n {
+        visit(i, &deps, &mut state, &mut order);
+    }
+    let mut slots: Vec<Option<(BatchItem, T)>> = items.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 fn order_producers<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
@@ -1046,8 +1088,16 @@ impl Session {
                     on,
                     at,
                     gap,
+                    toward,
                 } => self
-                    .move_parts(name, &parts, translation, rotation, pivot, (on, at, gap))
+                    .move_parts(
+                        name,
+                        &parts,
+                        translation,
+                        rotation,
+                        pivot,
+                        (on, at, gap, toward),
+                    )
                     .map_err(fail)?,
                 BatchItem::Uvs { part, projection } => {
                     self.set_uvs(&part, &projection).map_err(fail)?
@@ -1095,7 +1145,12 @@ impl Session {
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
         pivot: Option<PivotSpec>,
-        (on, at, gap): (Option<String>, Option<[f32; 2]>, Option<f32>),
+        (on, at, gap, toward): (
+            Option<String>,
+            Option<[f32; 2]>,
+            Option<f32>,
+            Option<String>,
+        ),
     ) -> CmdResult {
         if !self.model.derived_from_ops {
             return Err("move needs an op-built model (this one has baked parts); use transform on each part".into());
@@ -1182,13 +1237,19 @@ impl Session {
                 on: on.clone(),
                 at,
                 gap,
+                toward: toward.clone(),
             },
             &label,
         )?;
         let report = move_report(&parts_now, &self.model.parts, patterns);
         Ok(match on {
             Some(on) => format!(
-                "place `{name}`: {count} part(s) dropped onto `{on}` (re-issue name `{name}` to adjust){report}"
+                "place `{name}`: {count} part(s) {} `{on}` (re-issue name `{name}` to adjust){report}",
+                match toward.as_deref() {
+                    None | Some("down") => "dropped onto".to_string(),
+                    Some("up") => "raised against the underside of".to_string(),
+                    Some(t) => format!("moved {t} against"),
+                }
             ),
             None => format!(
                 "move `{name}`: {count} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust){report}",
@@ -1413,7 +1474,13 @@ impl Session {
                     )),
                 );
             } else {
-                let list: Vec<String> = bad.iter().map(|o| o.describe()).collect();
+                let list: Vec<String> = bad
+                    .iter()
+                    .map(|o| match crate::contact::diagnose(&self.model, o) {
+                        Some(why) => format!("{} [{why}]", o.describe()),
+                        None => o.describe(),
+                    })
+                    .collect();
                 record(
                     "collisions",
                     Err(format!(
@@ -3636,6 +3703,19 @@ mod tests {
             serde_json::json!({"collisions": {"allow": [["door", "cab*"]]}}),
         ));
         assert!(checks[0].1, "{}", checks[0].2);
+        // A blank left visible next to what was made from it says so.
+        let (s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "raw", "kind": "box", "size": 1, "translation": [0, 0.5, 0]},
+            {"type": "shell", "name": "tub", "input": "raw", "thickness": 0.05, "open": "top"}
+        ]));
+        let checks = s.verify_checks(&spec(serde_json::json!({"collisions": true})));
+        assert!(
+            checks[0]
+                .2
+                .contains("`raw` is an input of `tub` and still visible"),
+            "{}",
+            checks[0].2
+        );
     }
 
     #[test]
@@ -3680,6 +3760,80 @@ mod tests {
             l.contains("`top_raw` is an input of the boolean that makes `top`"),
             "{l}"
         );
+    }
+
+    #[test]
+    fn shell_hollows_a_box_with_exact_walls_and_an_open_face() {
+        let (s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "raw", "kind": "box", "size": [0.6, 0.8, 0.5], "translation": [0, 0.4, 0]},
+            {"type": "shell", "name": "carcass", "input": "raw", "thickness": 0.02, "open": "front"},
+            {"type": "hide_part", "part": "raw"}
+        ]));
+        let Some(p) = s.model.part("carcass") else {
+            panic!("no carcass");
+        };
+        let (v, _) = crate::inspect::volume_centroid(p);
+        // Outer minus a cavity 0.56 x 0.76 that runs out through the front.
+        let want = 0.6 * 0.8 * 0.5 - 0.56 * 0.76 * 0.48;
+        assert!((v - want).abs() < 1e-5, "volume {v} vs {want}");
+        // A ray from the front enters the opening and stops at the back wall.
+        let t = crate::contact::probe_text(&s.model, [0.0, 0.4, 2.0], [0.0, 0.0, -1.0], false)
+            .unwrap_or_else(|e| e);
+        assert!(t.contains("point [0.0000, 0.4000, -0.2300]"), "{t}");
+        // Thicker than half the box: a clear error.
+        let mut s2 = Session::default();
+        let e = s2
+            .apply_values_as(
+                None,
+                vec![
+                    serde_json::json!({"type": "primitive", "name": "raw", "kind": "box", "size": 0.1}),
+                    serde_json::json!({"type": "shell", "name": "c", "input": "raw", "thickness": 0.06}),
+                ],
+                true,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("leaves no inside"), "{e}");
+    }
+
+    #[test]
+    fn place_toward_a_wall_mounts_parts_flush() {
+        let (s, t) = batch(serde_json::json!([
+            {"type": "primitive", "name": "wall_left", "kind": "box", "size": [0.1, 2.6, 4], "translation": [-2.55, 1.3, 0]},
+            {"type": "primitive", "name": "wall_back", "kind": "box", "size": [5, 2.6, 0.1], "translation": [0, 1.3, -2.05]},
+            {"type": "primitive", "name": "frame", "kind": "box", "size": [0.04, 0.5, 0.7], "translation": [0, 0, 0]},
+            {"type": "primitive", "name": "bracket", "kind": "box", "size": [0.03, 0.15, 0.2], "translation": [0, 0, 0]},
+            {"type": "place", "name": "hang", "parts": ["frame"], "on": "wall_left", "toward": "left", "at": [-0.4, 1.5]},
+            {"type": "place", "name": "fix", "parts": ["bracket"], "on": "wall_back", "toward": "back", "at": [-1.6, 1.6]}
+        ]));
+        let b = |n: &str| s.model.part(n).map(|p| p.bounds()).unwrap_or_default();
+        let (lo, hi) = b("frame");
+        assert!((lo.x + 2.5).abs() < 1e-4, "frame {lo:?}");
+        assert!(
+            ((lo.z + hi.z) * 0.5 + 0.4).abs() < 1e-4 && ((lo.y + hi.y) * 0.5 - 1.5).abs() < 1e-4
+        );
+        let (lo, hi) = b("bracket");
+        assert!((lo.z + 2.0).abs() < 1e-4, "bracket {lo:?}");
+        assert!(((lo.x + hi.x) * 0.5 + 1.6).abs() < 1e-4, "{lo:?} {hi:?}");
+        assert!(t.contains("moved left against `wall_left`"), "{t}");
+        // A place onto a part that another place moves runs after it, in
+        // whatever order they were written.
+        let mut s = s;
+        s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "primitive", "name": "pot", "kind": "box", "size": 0.1}),
+                serde_json::json!({"type": "place", "name": "pot_on", "parts": ["pot"], "on": "shelf", "at": [-1.2, -1.9]}),
+                serde_json::json!({"type": "primitive", "name": "shelf", "kind": "box", "size": [1, 0.03, 0.25]}),
+                serde_json::json!({"type": "place", "name": "shelf_on", "parts": ["shelf"], "on": "wall_back", "toward": "back", "at": [-1.2, 1.7]}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (lo, _) = s.model.part("pot").map(|p| p.bounds()).unwrap_or_default();
+        assert!((lo.y - 1.715).abs() < 1e-4, "pot {lo:?}");
+        assert!(crate::contact::floating(&s.model).is_empty());
     }
 
     #[test]

@@ -133,8 +133,10 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             hashes.insert(n.clone(), hash_of(n.as_bytes(), &[key]));
         }
     }
-    // Parent transforms, applied to the finished parts in list order.
-    for op in ops {
+    // Parent transforms, applied to the finished parts in list order,
+    // except that a place runs after every move/place that moves its `on`
+    // part (a pot placed on a sill that is itself mounted on a wall).
+    for op in move_order(ops) {
         let Op::Move {
             name: move_name,
             parts,
@@ -144,6 +146,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             on,
             at,
             gap,
+            toward,
         } = op
         else {
             continue;
@@ -161,10 +164,59 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             part.rotation = (r * quat_of(part.rotation)).to_array();
         }
         if let Some(on) = on {
-            place_on(&mut named, move_name, parts, on, *at, gap.unwrap_or(0.0))?;
+            place_on(
+                &mut named,
+                move_name,
+                parts,
+                on,
+                *at,
+                gap.unwrap_or(0.0),
+                toward.as_deref().unwrap_or("down"),
+            )?;
         }
     }
     Ok(named.into_iter().map(|(_, part)| part).collect())
+}
+
+/// The move/place ops in run order: written order, but each place after
+/// the moves that move the part it lands on (cycles keep written order).
+fn move_order(ops: &[Op]) -> Vec<&Op> {
+    let moves: Vec<&Op> = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Move { .. }))
+        .collect();
+    let n = moves.len();
+    let deps: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let Op::Move { on: Some(on), .. } = moves[i] else {
+                return Vec::new();
+            };
+            (0..n)
+                .filter(|&j| {
+                    j != i
+                        && matches!(moves[j], Op::Move { parts, .. }
+                            if parts.iter().any(|p| crate::name_matches(p, on)))
+                })
+                .collect()
+        })
+        .collect();
+    let mut state = vec![0u8; n]; // 0 new, 1 visiting, 2 done
+    let mut order = Vec::with_capacity(n);
+    fn visit(i: usize, deps: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+        if state[i] != 0 {
+            return;
+        }
+        state[i] = 1;
+        for &j in &deps[i] {
+            visit(j, deps, state, order);
+        }
+        state[i] = 2;
+        order.push(i);
+    }
+    for i in 0..n {
+        visit(i, &deps, &mut state, &mut order);
+    }
+    order.into_iter().map(|i| moves[i]).collect()
 }
 
 /// The `place` step of a move: slide the matched parts to `at` (footprint
@@ -179,7 +231,25 @@ fn place_on(
     on: &str,
     at: Option<[f32; 2]>,
     gap: f32,
+    toward: &str,
 ) -> Result<(), ModelerError> {
+    // Travel axis k with sign, and the two cross axes `at` names.
+    let (k, sign, (u, w)) = match toward {
+        "down" => (1, -1.0, (0, 2)),
+        "up" => (1, 1.0, (0, 2)),
+        "back" => (2, -1.0, (0, 1)),
+        "front" => (2, 1.0, (0, 1)),
+        "left" => (0, -1.0, (2, 1)),
+        "right" => (0, 1.0, (2, 1)),
+        other => {
+            return Err(format!(
+                "place `{move_name}`: toward `{other}`: use down, up, left, right, back or front"
+            )
+            .into());
+        }
+    };
+    let mut d = Vec3::ZERO;
+    d[k] = sign;
     let hit = |n: &str| n != on && patterns.iter().any(|p| crate::name_matches(p, n));
     let Some(support) = named.iter().find(|(n, _)| n == on).map(|(_, p)| p.clone()) else {
         return Err(format!("place `{move_name}`: no part `{on}` to place on").into());
@@ -194,9 +264,11 @@ fn place_on(
             (lo.min(a), hi.max(b))
         })
     };
-    if let Some([x, z]) = at {
+    if let Some([a0, a1]) = at {
         let (lo, hi) = bounds(named);
-        let shift = Vec3::new(x - (lo.x + hi.x) * 0.5, 0.0, z - (lo.z + hi.z) * 0.5);
+        let mut shift = Vec3::ZERO;
+        shift[u] = a0 - (lo[u] + hi[u]) * 0.5;
+        shift[w] = a1 - (lo[w] + hi[w]) * 0.5;
         for &i in &moving {
             let p = Arc::make_mut(&mut named[i].1);
             p.translation = (Vec3::from(p.translation) + shift).to_array();
@@ -207,42 +279,41 @@ fn place_on(
         .iter()
         .flat_map(|&i| crate::contact::world_tris(&named[i].1))
         .collect();
+    // Heights are measured against the travel: h = -d . p (for "down", y).
     let (slo, shi) = support.bounds();
     let (mlo, mhi) = bounds(named);
-    let top = shi.y.max(mhi.y) + 1.0;
-    let bottom = slo.y.min(mlo.y) - 1.0;
-    // Highest surface of `tris` on the vertical line at (x, z), from above;
-    // lowest from below.
-    let first_down = |tris: &[[Vec3; 3]], x: f32, z: f32| {
-        crate::contact::ray_tris(Vec3::new(x, top, z), Vec3::NEG_Y, tris).map(|t| top - t)
-    };
-    let first_up = |tris: &[[Vec3; 3]], x: f32, z: f32| {
-        crate::contact::ray_tris(Vec3::new(x, bottom, z), Vec3::Y, tris).map(|t| bottom + t)
-    };
+    let h = |v: Vec3| -v.dot(d);
+    let corners = [slo, shi, mlo, mhi];
+    let top = corners.iter().map(|&v| h(v)).fold(f32::MIN, f32::max) + 1.0;
+    let bottom = corners.iter().map(|&v| h(v)).fold(f32::MAX, f32::min) - 1.0;
+    let at_h = |v: Vec3, hh: f32| v + d * (h(v) - hh);
+    // The support's surface facing the parts, from their side; the parts'
+    // leading surface, from the support's side.
+    let surface = |v: Vec3| crate::contact::ray_tris(at_h(v, top), d, &s_tris).map(|t| top - t);
+    let leading =
+        |v: Vec3| crate::contact::ray_tris(at_h(v, bottom), -d, &m_tris).map(|t| bottom + t);
     let mut clearance = f32::MAX;
-    let samples = s_tris
-        .iter()
-        .chain(&m_tris)
-        .flat_map(|t| {
-            let c = (t[0] + t[1] + t[2]) / 3.0;
-            [t[0], t[1], t[2], c]
-        })
-        .map(|v| (v.x, v.z));
-    for (x, z) in samples {
-        if let (Some(under), Some(surface)) = (first_up(&m_tris, x, z), first_down(&s_tris, x, z)) {
-            clearance = clearance.min(under - surface);
+    let samples = s_tris.iter().chain(&m_tris).flat_map(|t| {
+        let c = (t[0] + t[1] + t[2]) / 3.0;
+        [t[0], t[1], t[2], c]
+    });
+    for v in samples {
+        if let (Some(lead), Some(surf)) = (leading(v), surface(v)) {
+            clearance = clearance.min(lead - surf);
         }
     }
     if clearance == f32::MAX {
+        let axes = ["x", "y", "z"];
         return Err(format!(
-            "place `{move_name}`: nothing of {patterns:?} is above or below `{on}` (give at: [x, z] over it)"
+            "place `{move_name}`: nothing of {patterns:?} lines up with `{on}` travelling {toward} (give at: [{}, {}] facing it)",
+            axes[u], axes[w]
         )
         .into());
     }
-    let dy = gap - clearance;
+    let shift = d * (clearance - gap);
     for &i in &moving {
         let p = Arc::make_mut(&mut named[i].1);
-        p.translation[1] += dy;
+        p.translation = (Vec3::from(p.translation) + shift).to_array();
     }
     Ok(())
 }
@@ -424,6 +495,16 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         } => {
             let src = lookup_shared(named, input)?;
             let part = crate::csg::round(name, &src, mode, *radius, *segments)?;
+            upsert(named, name, part);
+        }
+        Op::Shell {
+            name,
+            input,
+            thickness,
+            open,
+        } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::csg::shell(name, &src, *thickness, open)?;
             upsert(named, name, part);
         }
         Op::Group { name, inputs } => {
@@ -781,6 +862,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
         | Op::Round { name, .. }
+        | Op::Shell { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
         | Op::RadialArray { name, .. }
@@ -827,6 +909,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
         Op::Round { .. } => "round",
+        Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
         Op::RadialArray { .. } => "radial",
@@ -862,6 +945,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
             inputs.iter().map(String::as_str).collect()
         }
         Op::Round { input, .. } => vec![input],
+        Op::Shell { input, .. } => vec![input],
     }
 }
 
@@ -883,6 +967,7 @@ pub fn describe(ops: &[Op]) -> String {
                 on,
                 at,
                 gap,
+                toward,
             } => {
                 let mut s = match on {
                     Some(on) => format!("#{i} place `{name}` parts={parts:?} on=`{on}`"),
@@ -893,6 +978,9 @@ pub fn describe(ops: &[Op]) -> String {
                 }
                 if let Some(g) = gap {
                     s += &format!(" gap={g}");
+                }
+                if let Some(t) = toward {
+                    s += &format!(" toward={t}");
                 }
                 if let Some(r) = rotation {
                     s += &format!(" rot={r:?}");
@@ -957,6 +1045,12 @@ pub fn describe(ops: &[Op]) -> String {
             } => format!(
                 "#{i} round `{name}` <- `{input}` {mode} radius={radius} segments={segments}"
             ),
+            Op::Shell {
+                name,
+                input,
+                thickness,
+                open,
+            } => format!("#{i} shell `{name}` <- `{input}` thickness={thickness} open={open:?}"),
             Op::Group { name, inputs } => format!(
                 "#{i} group `{name}` = {}",
                 inputs

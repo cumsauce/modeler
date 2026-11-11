@@ -425,7 +425,7 @@ impl Tools {
     }
 
     /// Build or edit the model: an array of items, each tagged with a "type"
-    /// (primitive, extrude, revolve, sweep, hull, round, group, transform,
+    /// (primitive, extrude, revolve, sweep, hull, round, shell, group, transform,
     /// boolean, radial_array, linear_array, mirror, material, prefab,
     /// hide_part, show_part, rename, delete, tri_mesh, uvs). Ops are upserts
     /// by output name (re-issue to tweak). Items are applied in order; the
@@ -889,7 +889,7 @@ impl rmcp::ServerHandler for Tools {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, shell, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall.
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\").
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.

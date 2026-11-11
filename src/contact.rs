@@ -250,6 +250,48 @@ pub fn collisions(model: &Model, allow: &[[String; 2]], max: f64) -> (Vec<Overla
         .partition(|o| o.fraction > max && !o.allowed_by(allow))
 }
 
+/// Whether `a` feeds the op graph that makes `b` (directly or through
+/// other ops): a source, cutter or blank left visible next to its result.
+pub fn derives_from(model: &Model, b: &str, a: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![b.to_string()];
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        for op in &model.ops {
+            if crate::graph::outputs(op).contains(&n) {
+                for i in crate::graph::inputs(op) {
+                    if i == a && n != a {
+                        return true;
+                    }
+                    if i != n {
+                        stack.push(i.to_string());
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Why an overlap is most likely wrong, when the graph or the numbers say.
+pub fn diagnose(model: &Model, o: &Overlap) -> Option<String> {
+    if derives_from(model, &o.b, &o.a) {
+        return Some(format!(
+            "`{}` is an input of `{}` and still visible: hide it",
+            o.a, o.b
+        ));
+    }
+    if derives_from(model, &o.a, &o.b) {
+        return Some(format!(
+            "`{}` is an input of `{}` and still visible: hide it",
+            o.b, o.a
+        ));
+    }
+    (o.fraction >= 0.99).then(|| "the smaller part is entirely hidden inside the other".to_string())
+}
+
 /// The world points of `p` touching the ground plane y = 0.
 pub fn ground_points(p: &Part) -> Vec<Vec3> {
     let tol = ground_tolerance(p);

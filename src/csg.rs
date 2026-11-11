@@ -654,6 +654,82 @@ pub fn round(
     Ok(p)
 }
 
+/// Hollows a solid to walls `t` thick: the cavity is the input eroded by a
+/// ball of radius `t` (every face moved in by exactly `t`; convex corners
+/// stay sharp), and each `open` face (top/bottom/left/right/front/back)
+/// has the cavity swept out through that wall, leaving an opening.
+pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, ModelerError> {
+    if t.is_nan() || t <= 0.0 {
+        return Err(ModelerError::Csg(format!(
+            "shell `{name}`: thickness must be > 0, got {t}"
+        )));
+    }
+    let mut dirs = Vec::new();
+    for w in open {
+        dirs.push(match w.as_str() {
+            "top" => [0.0, 1.0, 0.0],
+            "bottom" => [0.0, -1.0, 0.0],
+            "right" => [1.0, 0.0, 0.0],
+            "left" => [-1.0, 0.0, 0.0],
+            "front" => [0.0, 0.0, 1.0],
+            "back" => [0.0, 0.0, -1.0],
+            other => {
+                return Err(ModelerError::Csg(format!(
+                    "shell `{name}`: open: `{other}` is not a face; use top, bottom, left, right, front or back"
+                )));
+            }
+        });
+    }
+    let m = part_to_manifold(part)?;
+    let tris = m.num_tri();
+    if tris > 20_000 {
+        return Err(ModelerError::Csg(format!(
+            "shell `{name}`: `{}` has {tris} triangles; shell simpler inputs (lower the segment count)",
+            part.name
+        )));
+    }
+    let t = f64::from(t);
+    // 16 segments puts sphere vertices on the axes, so axis-aligned walls
+    // come out exactly `t` thick.
+    let ball = Manifold::sphere(t, 16);
+    let mut cavity = m.minkowski_difference(&ball);
+    if cavity.is_empty() || cavity.volume().abs() < 1e-15 {
+        let (lo, hi) = part.bounds();
+        let d = hi - lo;
+        return Err(ModelerError::Csg(format!(
+            "shell `{name}`: thickness {t} leaves no inside: `{}` is {:.4} x {:.4} x {:.4} m, so walls must be under half its thinnest section",
+            part.name, d.x, d.y, d.z
+        )));
+    }
+    for d in dirs {
+        // Sweep the cavity 2t outward through that wall (a thin prism as the
+        // Minkowski tool, so concave cavities sweep correctly too).
+        let e = t * 1e-6;
+        let mut pts = Vec::new();
+        for k in [0.0, 2.0 * t] {
+            for sx in [-e, e] {
+                for sy in [-e, e] {
+                    for sz in [-e, e] {
+                        pts.push([d[0] * k + sx, d[1] * k + sy, d[2] * k + sz]);
+                    }
+                }
+            }
+        }
+        cavity = cavity.minkowski_sum(&Manifold::hull_pts(&pts));
+    }
+    let out = m.difference(&cavity);
+    out.status()
+        .map_err(|e| ModelerError::Csg(format!("shell `{name}` failed: {e}")))?;
+    if out.is_empty() {
+        return Err(ModelerError::Csg(format!(
+            "shell `{name}` produced nothing"
+        )));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

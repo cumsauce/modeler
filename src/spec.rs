@@ -421,6 +421,40 @@ pub struct RoundSpec {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ShellSpec {
+    name: String,
+    /// A closed solid to hollow (a box makes a cabinet carcass or drawer).
+    input: String,
+    /// Wall thickness in meters; every face moves in by exactly this.
+    thickness: f32,
+    /// Faces left open: one word or a list of top, bottom, left, right,
+    /// front, back (world axes; front = +z). Default: closed all round.
+    #[serde(default)]
+    open: OneOrMany,
+}
+
+/// A string or a list of strings.
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    #[default]
+    None,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::None => Vec::new(),
+            Self::One(s) => vec![s],
+            Self::Many(v) => v,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GroupSpec {
     name: String,
     /// Parts to merge into one mesh (no boolean; they may be disjoint). The
@@ -487,14 +521,23 @@ pub struct PlaceSpec {
     name: Option<String>,
     /// Parts to drop (names / `*` patterns), moved as one body.
     parts: Vec<String>,
-    /// The part whose top surface they land on.
+    /// The part they land on (its top surface, or the face met when
+    /// travelling `toward`).
     on: String,
-    /// Footprint centre [x, z] to slide to first; default: where they are.
+    /// Where to slide first, across the travel direction; default: where
+    /// they are. Down/up: [x, z] (footprint centre). Back/front: [x, y].
+    /// Left/right: [z, y].
     #[serde(default)]
     at: Option<[f32; 2]>,
-    /// Clearance above the surface. Default 0 (touching).
+    /// Clearance left from the surface. Default 0 (touching).
     #[serde(default)]
     gap: Option<f32>,
+    /// Direction of travel: "down" (default: land on the top surface),
+    /// "up" (under a ceiling or shelf), or "back" / "front" / "left" /
+    /// "right" to mount against a wall (a frame on the left wall travels
+    /// "left").
+    #[serde(default)]
+    toward: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -644,6 +687,7 @@ pub enum OpSpec {
     Sweep(SweepSpec),
     Hull(HullSpec),
     Round(RoundSpec),
+    Shell(ShellSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
     Place(PlaceSpec),
@@ -669,6 +713,7 @@ pub const OP_TYPES: &[&str] = &[
     "sweep",
     "hull",
     "round",
+    "shell",
     "transform",
     "move",
     "place",
@@ -823,6 +868,26 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 segments: s.segments,
             })
         }
+        "shell" => {
+            let s: ShellSpec = de(&ctx, &body)?;
+            if s.thickness.is_nan() || s.thickness <= 0.0 {
+                return Err(format!("{ctx}: thickness: must be > 0 meters"));
+            }
+            let open = s.open.into_vec();
+            for w in &open {
+                if !["top", "bottom", "left", "right", "front", "back"].contains(&w.as_str()) {
+                    return Err(format!(
+                        "{ctx}: open: `{w}` is not a face; use top, bottom, left, right, front or back"
+                    ));
+                }
+            }
+            BatchItem::Op(Op::Shell {
+                name: s.name,
+                input: s.input,
+                thickness: s.thickness,
+                open,
+            })
+        }
         "group" => {
             let s: GroupSpec = de(&ctx, &body)?;
             if s.inputs.is_empty() {
@@ -878,12 +943,20 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 on: None,
                 at: None,
                 gap: None,
+                toward: None,
             }
         }
         "place" => {
             let s: PlaceSpec = de(&ctx, &body)?;
             if s.parts.is_empty() {
                 return Err(format!("{ctx}: parts is empty"));
+            }
+            if let Some(t) = &s.toward
+                && !["down", "up", "left", "right", "back", "front"].contains(&t.as_str())
+            {
+                return Err(format!(
+                    "{ctx}: toward: `{t}` is not a direction; use down, up, left, right, back or front"
+                ));
             }
             BatchItem::Move {
                 name: s.name,
@@ -894,6 +967,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 on: Some(s.on),
                 at: s.at,
                 gap: s.gap,
+                toward: s.toward.filter(|t| t != "down"),
             }
         }
         "boolean" => {
@@ -1042,6 +1116,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "round" => {
             json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})
         }
+        "shell" => {
+            json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
+        }
         "group" => {
             json!({"type": "group", "name": "tile_row", "inputs": ["tile", "tile_1", "tile_2", "tile_3"]})
         }
@@ -1106,6 +1183,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "sweep" => schemars::schema_for!(SweepSpec),
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
+        "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
         "place" => schemars::schema_for!(PlaceSpec),
