@@ -383,6 +383,343 @@ pub struct RevolveSpec {
     rotation: Option<RotationSpec>,
 }
 
+/// One rewrite rule: a string, or several choices picked at random per
+/// occurrence (`["F[+F]F", "F[-F]F"]` equally, or `[{"p": 3, "to": ...}]`
+/// weighted).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RuleSpec {
+    One(String),
+    Many(Vec<ChoiceSpec>),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ChoiceSpec {
+    Plain(String),
+    Weighted { p: f32, to: String },
+}
+
+/// An L-system: an axiom rewritten by rules `iterations` times, then drawn
+/// by a 3D turtle. Wood goes to `name` (one tube per branch, tapered and
+/// smooth at bends), leaves to `name_leaves`. Symbols: F/G draw, f move,
+/// +/- turn, &/^ pitch, \\ and / roll, | turn around, [ ] branch (thinner by
+/// radius_scale, shorter by length_scale), ! thin, L leaf; other letters
+/// only rewrite. Start from a `preset` and override any field.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LSystemSpec {
+    name: String,
+    /// "tree", "pine", "bush", "fern", "weed" or "roots": axiom, rules and
+    /// sizes for that shape; every other field overrides it.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The starting string, e.g. "X".
+    #[serde(default)]
+    axiom: Option<String>,
+    /// Symbol -> replacement: {"X": "F[+X][-X]FX", "F": "FF"}; a list of
+    /// choices is stochastic: {"X": ["F[+X]FX", {"p": 2, "to": "F[-X]X"}]}.
+    #[serde(default)]
+    rules: Option<std::collections::BTreeMap<String, RuleSpec>>,
+    /// Rewrites (0..12; the string grows exponentially).
+    #[serde(default)]
+    iterations: Option<u32>,
+    /// Turn angle, degrees (25).
+    #[serde(default)]
+    angle: Option<f32>,
+    /// Segment length at the trunk, meters.
+    #[serde(default)]
+    length: Option<f32>,
+    /// Segment length multiplier per branch level (0.9).
+    #[serde(default)]
+    length_scale: Option<f32>,
+    /// Trunk radius, meters.
+    #[serde(default)]
+    radius: Option<f32>,
+    /// Radius multiplier per branch level and per `!` (0.7).
+    #[serde(default)]
+    radius_scale: Option<f32>,
+    /// Radius multiplier per segment along a branch (0.97).
+    #[serde(default)]
+    taper: Option<f32>,
+    /// Roll at every branch, degrees (137.5 spreads them round the trunk).
+    #[serde(default)]
+    branch_roll: Option<f32>,
+    /// Random +- degrees on every turn (natural variation).
+    #[serde(default)]
+    jitter: Option<f32>,
+    /// Random +- share of every segment length (0.1 = 10%).
+    #[serde(default)]
+    length_jitter: Option<f32>,
+    /// Direction branches bend toward: [0, -1, 0] droops (willow, fruit
+    /// load), [0, 1, 0] reaches up (poplar).
+    #[serde(default)]
+    tropism: Option<[f32; 3]>,
+    /// How hard they bend per segment (0.05 gentle, 0.3 strong).
+    #[serde(default)]
+    tropism_strength: Option<f32>,
+    /// Random seed: the same seed grows the same plant; vary it for a forest.
+    #[serde(default)]
+    seed: Option<u64>,
+    /// Sides of each branch tube (3..32, 7).
+    #[serde(default)]
+    sides: Option<u32>,
+    /// Leaf blade [width, length], meters.
+    #[serde(default)]
+    leaf_size: Option<[f32; 2]>,
+    #[serde(default, alias = "position")]
+    translation: Option<[f32; 3]>,
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
+}
+
+/// Axiom, rules and sizes per preset (meters).
+fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
+    use crate::lsystem::{Choice, LSystem};
+    let r = |pairs: &[(char, &[(f32, &str)])]| {
+        pairs
+            .iter()
+            .map(|(k, cs)| {
+                (
+                    *k,
+                    cs.iter()
+                        .map(|(p, to)| Choice {
+                            p: *p,
+                            to: (*to).into(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let base = LSystem {
+        axiom: "X".into(),
+        rules: Default::default(),
+        iterations: 4,
+        angle: 25.0,
+        length: 0.3,
+        length_scale: 0.9,
+        radius: 0.08,
+        radius_scale: 0.7,
+        taper: 0.97,
+        branch_roll: 137.5,
+        jitter: 6.0,
+        length_jitter: 0.12,
+        tropism: [0.0, -1.0, 0.0],
+        tropism_strength: 0.03,
+        seed: 1,
+        sides: 7,
+        leaf_size: [0.08, 0.14],
+        translation: [0.0; 3],
+        rotation: None,
+    };
+    Ok(match name {
+        // A broadleaf: a trunk, then forks spreading around it (about 4-5 m).
+        "tree" => LSystem {
+            axiom: "FFFA".into(),
+            rules: r(&[
+                (
+                    'A',
+                    &[
+                        (1.0, "!F[&&BL]/////[&&BL]///////[&BL]A"),
+                        (1.0, "!F[&&BL]///////[&BL]A"),
+                    ],
+                ),
+                (
+                    'B',
+                    &[(1.0, "F[+BLL][-BLL]FBLL"), (1.0, "F[&BLL]F[^BLL]BLL")],
+                ),
+            ]),
+            iterations: 5,
+            angle: 28.0,
+            length: 0.45,
+            length_scale: 0.75,
+            radius: 0.12,
+            radius_scale: 0.72,
+            leaf_size: [0.16, 0.26],
+            ..base
+        },
+        // A conifer: a straight leader, whorls of drooping branches that
+        // shorten toward the top.
+        "pine" => LSystem {
+            axiom: "FFA[LLL]".into(),
+            rules: r(&[
+                (
+                    'A',
+                    &[(1.0, "F[&&&B]//////[&&&B]//////[&&&B]//////[&&&B]A")],
+                ),
+                ('B', &[(1.0, "F[+LL][-LL]&LBL")]),
+            ]),
+            iterations: 7,
+            angle: 22.0,
+            length: 0.35,
+            length_scale: 0.62,
+            radius: 0.12,
+            radius_scale: 0.3,
+            taper: 0.86,
+            branch_roll: 0.0,
+            tropism_strength: 0.06,
+            leaf_size: [0.05, 0.3],
+            ..base
+        },
+        // A low shrub: forks from the ground, dense leaves (about 1 m).
+        "bush" => LSystem {
+            axiom: "[A]/////[A]/////[A]".into(),
+            rules: r(&[(
+                'A',
+                &[
+                    (1.0, "F[&+AL]F[&-AL]AL"),
+                    (1.0, "F[^AL][&AL]L"),
+                    (1.0, "FAL"),
+                ],
+            )]),
+            iterations: 5,
+            angle: 30.0,
+            length: 0.12,
+            length_scale: 0.85,
+            radius: 0.02,
+            radius_scale: 0.75,
+            tropism: [0.0, 1.0, 0.0],
+            tropism_strength: 0.02,
+            leaf_size: [0.05, 0.08],
+            ..base
+        },
+        // A fern: five arching fronds of paired leaflets.
+        "fern" => LSystem {
+            axiom: "[&A]/////[&A]/////[&A]/////[&A]/////[&A]".into(),
+            rules: r(&[('A', &[(1.0, "F[+L][-L]A")])]),
+            iterations: 12,
+            angle: 60.0,
+            length: 0.06,
+            length_scale: 1.0,
+            radius: 0.006,
+            radius_scale: 1.0,
+            taper: 0.93,
+            branch_roll: 0.0,
+            jitter: 3.0,
+            tropism: [0.0, -1.0, 0.0],
+            tropism_strength: 0.04,
+            leaf_size: [0.035, 0.13],
+            ..base
+        },
+        // A weed tuft: thin stems that fork and bend over.
+        "weed" => LSystem {
+            axiom: "[&X]/////[&X]/////[&X]/////X".into(),
+            rules: r(&[
+                (
+                    'X',
+                    &[
+                        (1.0, "F[+XL]F[-XL]+XL"),
+                        (1.0, "F[-XL]F[+XL]-XL"),
+                        (1.0, "F[&XL]FXL"),
+                    ],
+                ),
+                ('F', &[(1.0, "FF")]),
+            ]),
+            iterations: 4,
+            angle: 22.0,
+            length: 0.025,
+            length_scale: 1.0,
+            radius: 0.004,
+            radius_scale: 0.8,
+            tropism_strength: 0.05,
+            leaf_size: [0.01, 0.04],
+            ..base
+        },
+        // Roots: grow down and spread (turned upside down: rotation x 180).
+        "roots" => LSystem {
+            axiom: "[A]///[A]///[A]///[A]".into(),
+            rules: r(&[(
+                'A',
+                &[(1.0, "!F[&A]F[^A]A"), (1.0, "!F[+A]FA"), (1.0, "FA")],
+            )]),
+            iterations: 5,
+            angle: 35.0,
+            length: 0.15,
+            length_scale: 0.85,
+            radius: 0.05,
+            radius_scale: 0.75,
+            tropism: [0.0, 1.0, 0.0],
+            tropism_strength: 0.06,
+            rotation: Some([1.0, 0.0, 0.0, 0.0]),
+            ..base
+        },
+        "" | "custom" => base,
+        other => {
+            return Err(format!(
+                "preset: unknown `{other}` (tree, pine, bush, fern, weed, roots)"
+            ));
+        }
+    })
+}
+
+impl LSystemSpec {
+    fn into_op(self, ctx: &str) -> Result<Op, String> {
+        let mut d = lsystem_preset(self.preset.as_deref().unwrap_or(""))
+            .map_err(|e| format!("{ctx}: {e}"))?;
+        if self.preset.is_none() && (self.axiom.is_none() || self.rules.is_none()) {
+            return Err(format!(
+                "{ctx}: give a `preset` (tree, pine, bush, fern, weed, roots) or both `axiom` and `rules`"
+            ));
+        }
+        if let Some(a) = self.axiom {
+            d.axiom = a;
+        }
+        if let Some(rules) = self.rules {
+            d.rules = rules
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut cs = k.chars();
+                    let (Some(c), None) = (cs.next(), cs.next()) else {
+                        return Err(format!("{ctx}: rules: `{k}` must be one symbol"));
+                    };
+                    let choices = match v {
+                        RuleSpec::One(to) => vec![crate::lsystem::Choice { p: 1.0, to }],
+                        RuleSpec::Many(v) => v
+                            .into_iter()
+                            .map(|c| match c {
+                                ChoiceSpec::Plain(to) => crate::lsystem::Choice { p: 1.0, to },
+                                ChoiceSpec::Weighted { p, to } => crate::lsystem::Choice { p, to },
+                            })
+                            .collect(),
+                    };
+                    Ok((c, choices))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        macro_rules! over {
+            ($($f:ident),*) => { $(if let Some(v) = self.$f { d.$f = v; })* };
+        }
+        over!(
+            iterations,
+            angle,
+            length,
+            length_scale,
+            radius,
+            radius_scale,
+            taper,
+            branch_roll,
+            jitter,
+            length_jitter,
+            tropism,
+            tropism_strength,
+            seed,
+            sides,
+            leaf_size,
+            translation
+        );
+        if self.rotation.is_some() {
+            d.rotation = rot(ctx, &self.rotation)?;
+        }
+        d.validate().map_err(|e| format!("{ctx}: {e}"))?;
+        Ok(Op::LSystem {
+            name: self.name,
+            def: Box::new(d),
+        })
+    }
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SweepSpec {
@@ -802,6 +1139,7 @@ pub enum OpSpec {
     Revolve(RevolveSpec),
     Group(GroupSpec),
     Sweep(SweepSpec),
+    Lsystem(LSystemSpec),
     Hull(HullSpec),
     Round(RoundSpec),
     Shell(ShellSpec),
@@ -835,6 +1173,7 @@ pub const OP_TYPES: &[&str] = &[
     "revolve",
     "group",
     "sweep",
+    "lsystem",
     "hull",
     "round",
     "shell",
@@ -1220,6 +1559,10 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 closed: s.closed,
                 round: s.round,
             })
+        }
+        "lsystem" => {
+            let s: LSystemSpec = de(&ctx, &body)?;
+            BatchItem::Op(s.into_op(&ctx)?)
         }
         "hull" => {
             let s: HullSpec = de(&ctx, &body)?;
@@ -1616,6 +1959,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "sweep" => {
             json!({"type": "sweep", "name": "handle", "profile": [{"arc": {"center": [0, 0], "radius": 0.012, "from": 0, "to": 360}}], "path": [[0, 0.9, 0], [0, 0.95, 0.05], [0, 1.05, 0.05], [0, 1.1, 0]]})
         }
+        "lsystem" => {
+            json!({"type": "lsystem", "name": "oak", "preset": "tree", "seed": 3, "translation": [2, 0, 0]})
+        }
         "hull" => {
             json!({"type": "hull", "name": "pill", "inputs": ["ball_a", "ball_b"]})
         }
@@ -1707,6 +2053,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "revolve" => schemars::schema_for!(RevolveSpec),
         "group" => schemars::schema_for!(GroupSpec),
         "sweep" => schemars::schema_for!(SweepSpec),
+        "lsystem" => schemars::schema_for!(LSystemSpec),
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "shell" => schemars::schema_for!(ShellSpec),

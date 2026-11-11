@@ -73,6 +73,7 @@ pub mod graph;
 pub mod inspect;
 pub mod ktx2;
 pub mod light;
+pub mod lsystem;
 pub mod material;
 pub mod outline;
 pub mod params;
@@ -839,6 +840,14 @@ pub enum Op {
         closed: bool,
         #[serde(default, skip_serializing_if = "is_zero")]
         round: f32,
+    },
+    /// An L-system grown by a 3D turtle (trees, bushes, roots, coral): wood
+    /// in `name`, leaves in `name_leaves`.
+    #[serde(rename = "lsystem")]
+    LSystem {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::lsystem::LSystem>,
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },

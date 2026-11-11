@@ -611,6 +611,14 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::csg::sweep(name, profile, path, *closed, *round)?;
             upsert(named, name, part);
         }
+        Op::LSystem { name, def } => {
+            let d =
+                crate::lsystem::build(name, def).map_err(|e| format!("lsystem `{name}`: {e}"))?;
+            upsert(named, name, d.wood);
+            if let Some(l) = d.leaves {
+                upsert(named, &format!("{name}_leaves"), l);
+            }
+        }
         Op::Hull { name, inputs } => {
             let parts: Vec<Arc<Part>> = inputs
                 .iter()
@@ -1027,6 +1035,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Group { name, .. }
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
+        | Op::LSystem { name, .. }
         | Op::Round { name, .. }
         | Op::Shell { name, .. }
         | Op::Transform { name, .. }
@@ -1059,6 +1068,13 @@ pub fn outputs(op: &Op) -> Vec<String> {
         }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
+        Op::LSystem { name, def } => {
+            let mut v = vec![name.clone()];
+            if def.has_leaves() {
+                v.push(format!("{name}_leaves"));
+            }
+            v
+        }
         other => vec![output(other).to_string()],
     }
 }
@@ -1077,6 +1093,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Group { .. } => "group",
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
+        Op::LSystem { .. } => "lsystem",
         Op::Round { .. } => "round",
         Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
@@ -1102,6 +1119,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Extrude { .. }
         | Op::Revolve { .. }
         | Op::Sweep { .. }
+        | Op::LSystem { .. }
         | Op::Prefab { .. } => Vec::new(),
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
@@ -1304,6 +1322,24 @@ pub fn describe(ops: &[Op]) -> String {
                 "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::LSystem { name, def } => format!(
+                "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
+                def.axiom,
+                def.rules
+                    .iter()
+                    .map(|(k, v)| format!(
+                        "{k}->{}",
+                        v.iter().map(|c| c.to.as_str()).collect::<Vec<_>>().join("|")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                def.iterations,
+                def.angle,
+                def.length,
+                def.radius,
+                def.seed,
+                def.translation
+            ),
             Op::Round {
                 name,
                 input,

@@ -1119,6 +1119,33 @@ impl Session {
                 && !n.contains('*')
             {
                 names.push(n.to_string());
+                // Parts an item writes besides its name (before params are
+                // read, so only literal counts): lsystem leaves, array copies.
+                let ty = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "lsystem" {
+                    let text = |k: &str| raw.get(k).map(|v| v.to_string()).unwrap_or_default();
+                    let custom = raw.get("axiom").is_some() || raw.get("rules").is_some();
+                    let preset = raw.get("preset").and_then(|v| v.as_str()).unwrap_or("");
+                    let leafy = if custom {
+                        text("axiom").contains('L') || text("rules").contains('L')
+                    } else {
+                        !preset.is_empty() && preset != "roots"
+                    };
+                    if leafy {
+                        names.push(format!("{n}_leaves"));
+                    }
+                }
+                if let Some(c) = raw.get("count").and_then(|v| v.as_u64()) {
+                    match ty {
+                        "linear_array" => names.extend((1..c).map(|i| format!("{n}_{i}"))),
+                        "radial_array" => {
+                            let first =
+                                raw.get("include_source").and_then(|v| v.as_bool()) != Some(false);
+                            names.extend((u64::from(first)..c).map(|i| format!("{n}_{i}")));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         names.sort();

@@ -94,6 +94,7 @@ type, so there is no need to memorise field names.
 | `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
+| `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
@@ -230,6 +231,27 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   handles, frames, hoses); bends are mitred to keep the thickness, and
   `closed: true` loops the path (a ring) instead of capping it. Profile u is
   along the frame normal (world up to start, or +z on a vertical path).
+- **`lsystem`** grows branching structures: trees, bushes, ferns, weeds,
+  roots, coral, antlers, cracks. A `preset` gives a ready plant at real size
+  (`tree` ~4.5 m broadleaf, `pine` conifer, `bush` ~1 m shrub, `fern` five
+  arching fronds, `weed` tuft, `roots` growing down); every field overrides
+  it, and `seed` varies the individual (same seed = same plant: a forest is
+  a `repeat` over seeds). Or write your own: `axiom` + `rules`
+  (`{"X": "F[+X][-X]FX", "F": "FF"}`; a list of choices is stochastic,
+  `[{"p": 2, "to": ...}, ...]` weighted) for `iterations` (<= 12) rewrites,
+  then a 3D turtle draws it: `F`/`G` draw a segment, `f` moves, `+`/`-`
+  turn, `&`/`^` pitch, `\`/`/` roll, `|` turn back, `[`/`]` a side branch
+  (thinner by `radius_scale`, shorter by `length_scale`, rolled by
+  `branch_roll`, 137.5 = phyllotaxis), `!` thins, `L` places a leaf; other
+  letters only rewrite. `jitter` (degrees) and `length_jitter` add natural
+  variation, `tropism` + `tropism_strength` bend growth toward a direction
+  (`[0, -1, 0]` droops, `[0, 1, 0]` reaches up), `taper` thins along a
+  branch. Each unbroken branch is ONE smooth closed tube (`sides`), so no
+  gaps at bends; branches start inside their parent. Leaves (`leaf_size`
+  [width, length]) are thin closed blades in `name_leaves`: give the two
+  parts separate materials (`"*_leaves"` patterns see them). Runaway growth
+  (over 400k symbols or 40k segments) is refused with a hint. Params work
+  in every number (`"length": "$h"`).
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`shell`** hollows a closed solid: every face moves in by exactly
