@@ -118,6 +118,9 @@ fn main() -> AppExit {
     .init_resource::<GraphPanel>()
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
+    .insert_resource(MatPane::open(
+        std::env::var_os("MODELER_MATERIALS").is_some(),
+    ))
     .init_resource::<PinTyping>()
     .init_resource::<PendingPinSpawn>()
     .add_systems(
@@ -135,6 +138,7 @@ fn main() -> AppExit {
             update_graph_hud.run_if(windowed),
             highlight_selected.run_if(windowed),
             graph_pane_viewport.run_if(windowed),
+            update_material_pane.run_if(windowed),
         ),
     );
     if headless {
@@ -147,7 +151,7 @@ fn main() -> AppExit {
             }),
             ..default()
         }))
-        .add_systems(Startup, setup_scene)
+        .add_systems(Startup, (setup_scene, setup_material_pane))
         .add_systems(Startup, setup_agent_camera)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }

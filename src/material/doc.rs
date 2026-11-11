@@ -585,7 +585,8 @@ pub fn node_image(b: &Buf, w: usize, h: usize) -> (Canvas, String) {
             let (lo, hi) = v
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(a, c), &x| (a.min(x), c.max(x)));
-            let unit = lo >= -1e-4 && hi <= 1.0001;
+            // Small ranges (a height in mm) are stretched so they read.
+            let unit = lo >= -1e-4 && hi <= 1.0001 && hi - lo >= 0.25;
             note = if unit {
                 "0..1 as grey".to_string()
             } else {
@@ -888,108 +889,8 @@ impl Library {
     ) -> Result<(String, Vec<u8>), String> {
         let doc = self.get(name)?.clone();
         self.active = Some(doc.name.clone());
-        let cell = size.unwrap_or(256).clamp(64, 768);
-        let n = (doc.resolution as usize).min(1024);
-        if let Some(node) = node {
-            let s = doc.samples(n, 0.25);
-            let ev = eval::evaluate(&doc.nodes, &doc.params, &s, true)?;
-            let (nm, port) = node.split_once('.').unwrap_or((node, ""));
-            let ports = ev.ports.get(nm).ok_or_else(|| {
-                let names: Vec<&str> = ev.nodes.iter().map(|p| p.name.as_str()).collect();
-                format!("no node `{nm}` (nodes: {})", names.join(", "))
-            })?;
-            let (pname, b) = if port.is_empty() {
-                ports
-                    .first()
-                    .map(|(p, b)| (*p, b.clone()))
-                    .ok_or("that node has no outputs (output nodes: view the material)")?
-            } else {
-                ports
-                    .iter()
-                    .find(|(p, _)| *p == port)
-                    .map(|(p, b)| (*p, b.clone()))
-                    .ok_or_else(|| {
-                        let names: Vec<&str> = ports.iter().map(|(p, _)| *p).collect();
-                        format!("`{nm}` has no port `{port}` (ports: {})", names.join(", "))
-                    })?
-            };
-            let (img, note) = node_image(&b, s.w, s.h);
-            let scale = cell as f32 / s.w.max(s.h) as f32 * 2.0;
-            let (ow, oh) = ((s.w as f32 * scale) as usize, (s.h as f32 * scale) as usize);
-            let mut out = Canvas::new(ow.max(1), oh.max(1), [0, 0, 0, 255]);
-            for y in 0..out.h {
-                for x in 0..out.w {
-                    let si = ((y * s.h / out.h) * s.w + x * s.w / out.w) * 4;
-                    let di = (y * out.w + x) * 4;
-                    out.px[di..di + 4].copy_from_slice(&img.px[si..si + 4]);
-                }
-            }
-            let label = if pname.is_empty() {
-                nm.to_string()
-            } else {
-                format!("{nm}.{pname}")
-            };
-            out.text(4, 4, &label, 2);
-            let ports_list: Vec<&str> = ports
-                .iter()
-                .map(|(p, _)| *p)
-                .filter(|p| !p.is_empty())
-                .collect();
-            return Ok((
-                format!(
-                    "node `{label}` ({}, {note}){}",
-                    b.kind(),
-                    if ports_list.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; ports: {}", ports_list.join(", "))
-                    }
-                ),
-                out.to_png()?,
-            ));
-        }
-        let ch = doc.bake(n, true)?;
-        let names: Vec<String> = match channels {
-            Some(c) => c,
-            None => {
-                let mut v: Vec<String> = vec!["base_color".into()];
-                v.extend(
-                    ch.driven
-                        .iter()
-                        .filter(|c| **c != "base_color")
-                        .map(|c| c.to_string()),
-                );
-                v
-            }
-        };
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let dia = diameter.unwrap_or(if doc.domain == "tile" {
-            doc.tile * 2.0
-        } else {
-            0.5
-        });
-        let sphere = sphere_preview(&doc, &ch, cell, dia);
-        let thumbs = ch.grid(&refs, cell / 2, refs.len().div_ceil(2).max(1))?;
-        let (w, h) = (sphere.w + thumbs.w + 4, sphere.h.max(thumbs.h));
-        let mut out = Canvas::new(w, h, [24, 24, 28, 255]);
-        for (img, x0) in [(&sphere, 0), (&thumbs, sphere.w + 4)] {
-            for y in 0..img.h {
-                let (s, d) = (y * img.w * 4, (y * w + x0) * 4);
-                out.px[d..d + img.w * 4].copy_from_slice(&img.px[s..s + img.w * 4]);
-            }
-        }
-        out.text(4, 4, &format!("{} ({:.2} m ball)", doc.name, dia), 1);
-        Ok((
-            format!(
-                "material `{}` v{}: lit {:.2} m sphere + {}\n{}",
-                doc.name,
-                doc.version,
-                dia,
-                names.join(", "),
-                channel_ranges(&ch)
-            ),
-            out.to_png()?,
-        ))
+        let (text, img) = render(&doc, node, channels, size, diameter)?;
+        Ok((text, img.to_png()?))
     }
 
     /// Saves a working material to the library.
@@ -1027,6 +928,119 @@ impl Library {
         self.active = Some(name.to_string());
         Ok(format!("loaded material `{name}`\n{text}"))
     }
+}
+
+/// The image `material_view` returns (and the M pane shows): a lit preview
+/// sphere plus channel thumbnails, or one node's output (`node`).
+pub fn render(
+    doc: &MatDoc,
+    node: Option<&str>,
+    channels: Option<Vec<String>>,
+    size: Option<usize>,
+    diameter: Option<f32>,
+) -> Result<(String, Canvas), String> {
+    let cell = size.unwrap_or(256).clamp(64, 768);
+    let n = (doc.resolution as usize).min(1024);
+    if let Some(node) = node {
+        let s = doc.samples(n, 0.25);
+        let ev = eval::evaluate(&doc.nodes, &doc.params, &s, true)?;
+        let (nm, port) = node.split_once('.').unwrap_or((node, ""));
+        let ports = ev.ports.get(nm).ok_or_else(|| {
+            let names: Vec<&str> = ev.nodes.iter().map(|p| p.name.as_str()).collect();
+            format!("no node `{nm}` (nodes: {})", names.join(", "))
+        })?;
+        let (pname, b) = if port.is_empty() {
+            ports
+                .first()
+                .map(|(p, b)| (*p, b.clone()))
+                .ok_or("that node has no outputs (output nodes: view the material)")?
+        } else {
+            ports
+                .iter()
+                .find(|(p, _)| *p == port)
+                .map(|(p, b)| (*p, b.clone()))
+                .ok_or_else(|| {
+                    let names: Vec<&str> = ports.iter().map(|(p, _)| *p).collect();
+                    format!("`{nm}` has no port `{port}` (ports: {})", names.join(", "))
+                })?
+        };
+        let (img, note) = node_image(&b, s.w, s.h);
+        let scale = cell as f32 / s.w.max(s.h) as f32 * 2.0;
+        let (ow, oh) = ((s.w as f32 * scale) as usize, (s.h as f32 * scale) as usize);
+        let mut out = Canvas::new(ow.max(1), oh.max(1), [0, 0, 0, 255]);
+        for y in 0..out.h {
+            for x in 0..out.w {
+                let si = ((y * s.h / out.h) * s.w + x * s.w / out.w) * 4;
+                let di = (y * out.w + x) * 4;
+                out.px[di..di + 4].copy_from_slice(&img.px[si..si + 4]);
+            }
+        }
+        let label = if pname.is_empty() {
+            nm.to_string()
+        } else {
+            format!("{nm}.{pname}")
+        };
+        out.text(4, 4, &label, 2);
+        let ports_list: Vec<&str> = ports
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| !p.is_empty())
+            .collect();
+        return Ok((
+            format!(
+                "node `{label}` ({}, {note}){}",
+                b.kind(),
+                if ports_list.is_empty() {
+                    String::new()
+                } else {
+                    format!("; ports: {}", ports_list.join(", "))
+                }
+            ),
+            out,
+        ));
+    }
+    let ch = doc.bake(n, true)?;
+    let names: Vec<String> = match channels {
+        Some(c) => c,
+        None => {
+            let mut v: Vec<String> = vec!["base_color".into()];
+            v.extend(
+                ch.driven
+                    .iter()
+                    .filter(|c| **c != "base_color")
+                    .map(|c| c.to_string()),
+            );
+            v
+        }
+    };
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let dia = diameter.unwrap_or(if doc.domain == "tile" {
+        doc.tile * 2.0
+    } else {
+        0.5
+    });
+    let sphere = sphere_preview(&doc, &ch, cell, dia);
+    let thumbs = ch.grid(&refs, cell / 2, refs.len().div_ceil(2).max(1))?;
+    let (w, h) = (sphere.w + thumbs.w + 4, sphere.h.max(thumbs.h));
+    let mut out = Canvas::new(w, h, [24, 24, 28, 255]);
+    for (img, x0) in [(&sphere, 0), (&thumbs, sphere.w + 4)] {
+        for y in 0..img.h {
+            let (s, d) = (y * img.w * 4, (y * w + x0) * 4);
+            out.px[d..d + img.w * 4].copy_from_slice(&img.px[s..s + img.w * 4]);
+        }
+    }
+    out.text(4, 4, &format!("{} ({:.2} m ball)", doc.name, dia), 1);
+    Ok((
+        format!(
+            "material `{}` v{}: lit {:.2} m sphere + {}\n{}",
+            doc.name,
+            doc.version,
+            dia,
+            names.join(", "),
+            channel_ranges(&ch)
+        ),
+        out,
+    ))
 }
 
 #[cfg(test)]

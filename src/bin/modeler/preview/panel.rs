@@ -87,6 +87,8 @@ pub(crate) fn update_graph_hud(
     if keys.just_pressed(KeyCode::KeyG) && typing.text.is_empty() {
         visible.0 = !visible.0;
         panel.user_view = false;
+        // Force a rebuild: the M pane may have had the left half meanwhile.
+        panel.version = None;
     }
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
@@ -333,13 +335,14 @@ pub(crate) fn update_graph_hud(
 /// drawn under the panel), so screenshots of it never include the graph.
 pub(crate) fn graph_pane_viewport(
     visible: Res<GraphHudVisible>,
+    mat: Res<MatPane>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Camera, With<MainCamera>>,
 ) {
     let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
         return;
     };
-    let want = visible.0.then(|| {
+    let want = (visible.0 || mat.visible).then(|| {
         let (w, h) = (window.physical_width(), window.physical_height());
         bevy::camera::Viewport {
             physical_position: UVec2::new(w / 2, 0),
@@ -379,6 +382,7 @@ pub(crate) fn highlight_selected(
             LinearRgba::BLACK
         };
         if let Some(m) = materials.get(&mat.0)
+            && m.emissive_texture.is_none()
             && m.emissive != want
             && let Some(mut m) = materials.get_mut(&mat.0)
         {

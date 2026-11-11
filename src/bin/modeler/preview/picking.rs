@@ -43,8 +43,9 @@ pub(crate) fn pin_on_click(
     mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
     panel: Res<GraphPanel>,
+    mat_pane: Res<MatPane>,
 ) {
-    if panel.hover {
+    if panel.hover || mat_pane.hover {
         return;
     }
     // Pins land on a click (press + release with barely any movement), never on
