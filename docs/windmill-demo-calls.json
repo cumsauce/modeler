@@ -374,27 +374,33 @@
   }
  },
  {
-  "name": "validate",
-  "args": {}
- },
- {
-  "name": "check_rebuild",
-  "args": {}
- },
- {
-  "name": "expect_bounds",
+  "name": "verify",
   "args": {
-   "min": [
-    null,
-    0,
-    null
-   ],
-   "max": [
-    null,
-    4.2,
-    null
-   ],
-   "tol": 0.05
+   "validate": true
+  }
+ },
+ {
+  "name": "verify",
+  "args": {
+   "rebuild": true
+  }
+ },
+ {
+  "name": "verify",
+  "args": {
+   "bounds": {
+    "min": [
+     null,
+     0,
+     null
+    ],
+    "max": [
+     null,
+     4.2,
+     null
+    ],
+    "tol": 0.05
+   }
   }
  },
  {
@@ -434,9 +440,8 @@
   "args": {}
  },
  {
-  "name": "agent_shot",
+  "name": "agent_views",
   "args": {
-   "view": "front",
    "width": 900,
    "height": 600,
    "focus": [
@@ -447,6 +452,9 @@
     "blades_1",
     "blades_2",
     "blades_3"
+   ],
+   "views": [
+    "front"
    ]
   }
  },

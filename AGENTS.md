@@ -29,9 +29,10 @@ array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when
 done. Typical first calls: `scene_summary` (also shows the autosaved session,
 if any), `catalog_list`, then `new_model` + `apply_ops` to build. If your
 session's MCP tool list has no `mcp__modeler__*` tools, this driver is the
-documented fallback — it speaks the same tool surface over stdio. The daemon
-keeps the preview window open; check it with `screenshot` (aim first with
-`set_camera`) and verify numerically with the Verification tools below.
+documented fallback — it speaks the same tool surface over stdio. Each
+result line is `{"ok", "text", "json"?, ...}`; `--json` drops the prose when
+structured JSON is present. The daemon keeps the preview window open; check
+it with `agent_views` / `screenshot` and verify numerically with `verify`.
 
 ## The mental model
 
@@ -49,200 +50,163 @@ Three layers, read top to bottom:
    `~/Library/Application Support/friendslop/modeler/prefabs` + a
    `catalog.json` index. Saves are non-destructive and atomic.
 
-## MCP tool surface
+## MCP tool surface (28 tools)
 
-Modeling (all op tools are **upserts**: re-issuing an op with the same output
-name *and kind* replaces it in place and re-derives — that is the parameter
-tweak path):
+**Build: one tool, `apply_ops`.** Everything that changes geometry is an
+item in `apply_ops(ops, params?, expect?)`, each tagged with a `"type"`.
+`describe_op(kind?)` returns an example payload and the JSON schema per
+type, so there is no need to memorise field names.
 
-- `add_primitive(kind, size, translation, name)` / `add_tri_mesh(...)` — baked
-  parts, no graph. Fine for one-offs; prefer `op_primitive` for anything you
-  may tweak.
+| type | fields (optional in []) |
+|---|---|
+| `primitive` | name, kind, size, [translation / position], [rotation quat] |
+| `transform` | name, input, [translation], [rotation], [scale], [relative] |
+| `boolean` | name, op (union / difference / intersection), a, b |
+| `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
+| `linear_array` | name, input, count, offset |
+| `mirror` | name, input, axis, [offset] |
+| `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
+| `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
+| `hide_part` / `show_part` | part |
+| `rename` | part, to |
+| `delete` | name (an op output, or a baked part) |
+| `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
+| `uvs` | part, projection (box / planar / cylindrical / spherical) |
+
+- **Ops are upserts**: re-issuing an item with the same name *and type*
+  replaces it and re-derives (the tweak path). Evaluation is
+  dependency-ordered, so item order inside the graph doesn't matter.
+- **Parsing is strict but forgiving.** All items are parsed before anything
+  is applied; errors name the item and field
+  (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and
+  unknown fields (typos) are rejected. Accepted forms:
+  - `size`: a number (sphere/disc radius; box/wedge cube edge), a short array
+    (`[radius]`, `[radius, height]`, `[ring, tube]`, `[inner, outer]`, box
+    `[x, y, z]`), or an object (`{radius, height}`, `{width, height, depth}`).
+    A sphere is round: flatten it with a transform's scale.
+  - colours: `[r, g, b]`, `[r, g, b, a]`, 0..1 or 0..255, or `"#rrggbb(aa)"`.
+- **Materials follow lineage.** An in-place material on X runs before every
+  op that copies or cuts X, wherever it sits in the batch, so arrays, mirrors
+  and transforms of X inherit the colour.
+- **Transforms** are absolute by default; `relative: true` makes them offsets
+  from the input (translation adds, rotation composes, scale multiplies).
+- **Radial arrays** default to `include_source: true`: the source is item 0
+  and `count` items spread evenly (copies `name_1..`). With `false`, `count`
+  new copies `name_0..` start at `start_degrees` and the source stays put.
+  `axis` "x"/"z" makes horizontal rings (windmill blades).
+- **Linear arrays**: the source is copy 0; outputs `name_1..{count-1}`.
+- **Mirror** is baked (verts reflected, winding flipped); never mirror with
+  negative scale.
 - **Booleans** run on Manifold (the kernel OpenSCAD and Blender use): outputs
-  are closed solids, coplanar faces (equal-depth cutters) are exact, and
-  curved-on-curved (cylinder−cylinder, sphere/torus anything) works. Input
-  UVs ride through the cut; normals are creased at 40°. **Both inputs must be
-  closed solids** — disc/plane/washer (open sheets) and torn meshes error
-  with "is not a closed solid". `validate` can report a few open edges on
-  curved cuts: Manifold places intersection verts closer than its 1e-5 weld
-  grid; they are not holes (`scene_summary` only warns when open edges
-  enclose real missing area).
-- `op_primitive(name, kind, size, translation, rotation?)` — `size` is
-  **always exactly `[f32; 3]`**: `box`/`plane`/`wedge` (full extents),
-  `sphere` (**radius = size[0]; [1]/[2] ignored** — flatten with a transform's
-  scale), `cylinder`/`cone`/`capsule` (size[0] = radius, size[1] = height),
-  `torus` (ring, tube; needs tube < ring), `disc`/`washer` (flat, in XY
-  plane; washer = inner < outer radius). `rotation` is an optional quaternion
-  `[x, y, z, w]`, so rotated primitives need no separate transform.
-- `op_transform(name, input, translation?, rotation? [quat xyzw], scale?)` —
-  place/rotate/scale an earlier part into a new output. The values are
-  **absolute, not additive**: a part at y=0.375 transformed with
-  `translation [0.4, 0, 0]` lands at y=0. Restate the template's full
-  position/rotation in every copy.
-- `op_boolean(name, op, a, b)` — `union`/`difference`/`intersection`; bakes
-  transforms into verts. Errors (e.g. no overlap) roll the graph back — it never stays
-  broken.
-- `op_radial_array(name, input, count, center, degrees, start_degrees,
-  axis?, include_source?)` — ring of copies about `axis` (`"y"` default; `"x"`/`"z"` make
-  horizontal rings — windmill blades, fan spokes — no manual rotation
-  needed). `include_source: true` is the easy mode: the source is copy 0 and `count`
-  items spread evenly over `degrees` (copies `name_1..name_{count-1}`).
-  Otherwise **the source part stays at its own spot**; with
-  `start_degrees = degrees/count` and `count-1` copies the source fills the
-  0° slot evenly with no overlap. Outputs `name_0..{n-1}`.
-- `op_linear_array(name, input, count, offset)` — line of copies. **The source
-  is copy 0**; outputs `name_1..{n-1}` at `input + i*offset`. Nothing overlaps
-  the input.
-- `op_mirror(name, input, axis, offset)` — reflect across the plane
-  `axis = offset[axis]`. **Baked**: verts go to world space, are reflected,
-  winding flips, normals rebuilt (negative scale would render inside-out).
-- `op_material(name, input, base_color?, roughness?, metalness?)` — color in
-  place or into a new output. `base_color` is **always RGBA `[f32; 4]`** (in
-  `op_material` and in `apply_ops` material specs alike); a 3-component RGB
-  fails deserialization.
-- **disc/washer/plane are double-sided** (a reversed twin of every triangle is
-  appended, so neither orientation culls), flat in the XY plane (vertical!).
-  Laying one flat still takes a −90° X rotation (`[-0.707, 0, 0, 0.707]`) so
-  it lies horizontally. They are two coincident sheets, so avoid placing
-  another surface exactly on one (z-fighting).
-- `op_delete(name)` / `ops` — remove a step / list the graph one line per op
-  **with full parameters** (sizes, translations, colors — enough to tweak
-  without remembering what you sent). `op_get(name)` dumps a single op.
-- `set_model_name(name)` — names the whole model; used as the prefab entry
-  name on `save_prefab`, so set it before saving.
-- `apply_ops(ops)` — a whole batch in one call: array of objects, each tagged
-  `"type"` (`primitive`, `transform`, `boolean`, `radial_array`,
-  `linear_array`, `mirror`, `material` plus the baked edits `hide_part`
-  `{"part"}`, `show_part` `{"part"}`, `rename` `{"part", "to"}`) with that
-  op's usual parameters. Applied in order with the same upsert/rollback
-  semantics; stops at the first error with per-item context (earlier items
-  stay). The result ends with the scene summary — this is the fast path for
-  building a model.
-- `new_model(name)` — fresh empty session model without restarting the
-  server; the old model is recorded in history, so one `undo` restores it.
-- `hide_part(part)` / `show_part(part)` — the argument is named `part`. Hidden
-  parts stay in the model and
-  keep deriving, but the preview and glTF export skip them. The clean way to
-  keep boolean intermediates out of an export. On op-driven models the edit
-  is recorded as a graph op (`Visibility`), so it survives later tweaks; the
-  same goes for `rename_part`, `set_material` and `transform_part` (emitted as
-  `Rename`/`Material`/`Transform` ops). Only parts that no op produces (baked
-  parts), `set_uvs` and `delete_part` stay baked and are lost on re-derivation.
+  are closed solids, coplanar and curved-on-curved cuts are exact, and input
+  UVs ride through; normals are creased at 40°. **Both inputs must be closed
+  solids**: disc/plane/washer (open sheets) error with "is not a closed
+  solid". A failed op rolls back; the graph never stays broken.
+- **disc/washer/plane** are double-sided sheets in the XY plane (vertical);
+  lay one flat with rotation `[-0.707, 0, 0, 0.707]`.
+- **Params**: `params: {"tower_h": 2}` sets named numbers before the items
+  run; any value may be `"$tower_h"` or `"=$tower_h / 2 + 0.1"`. The model
+  remembers which ops read which params, so a later
+  `apply_ops({"params": {"tower_h": 3}})` re-derives all of them in one
+  history step.
+- **Prefabs as parts**: `{"type": "prefab", "name": "lamp1", "prefab": "lamp"}`
+  instances a saved catalog model; its visible parts become `lamp1.pole`,
+  `lamp1.shade`, ... and feed later ops like any part. The part list is
+  captured when the item is applied; re-issue it after re-saving the prefab.
+- **`expect`** runs checks after the batch in the same call (fields as for
+  `verify`); any failure makes the call an error, but the batch stays applied.
+- The result ends with the scene summary; structured clients also get it as
+  JSON (`structuredContent`).
 
-Verification (all deterministic — prefer these over eyeballing renders,
-then screenshot last as the final once-over):
+Inspect: `scene_summary` (call FIRST and after anything confusing: parts,
+bounds, ops, params, annotations and **warnings**), `ops` (the graph, one
+line per op with full parameters) and `op_get(name)`.
 
-- `validate` — per-part mesh checks without a renderer: edge manifoldness
-  (welded by position) and winding via signed volume. Catches inverted
-  normals and torn geometry that a screenshot only hints at.
-- `probe_ray(origin, dir, all_hits?)` — cast a ray through the live scene and report the
-  first part hit (name, distance, point) or that it passes clean through;
-  `all_hits: true` lists every part along the ray, nearest first (what is
-  behind an opening).
-  The numeric check for openings and occlusion: cast through a window hole
-  to prove it is open, cast at a door fill to prove it is solid. Windowed
-  preview only.
-- `check_rebuild` — re-derives the graph into a scratch copy and diffs the
-  geometry against the cached parts; fails on a stale cache or
-  non-deterministic op (baked material/visibility edits are not compared —
-  a refresh legitimately resets those).
-- `expect_parts(parts)` — exact part-list assertion over **visible parts
-  only** (the argument is named `parts`); hidden templates are not counted. (order-insensitive),
-  reporting missing and unexpected names. The deterministic replacement for
-  counting parts in a screenshot; use it after arrays/booleans to catch
-  missing copies, duplicated radial sources, or stray intermediates.
-- `expect_bounds(min, max, tol)` — numeric world-bounds assertion over
-  visible parts only, per axis (`null` skips). This is "sits on the ground"
-  (min y ≈ 0), "centered" (symmetric x/z), "roof peaks at ~2.2" (max y) as
-  a checkable call instead of a squint at a render.
-- `set_camera(yaw, pitch, dist)` — point the human's orbit camera (degrees,
-  metres) before a `screenshot`. Windowed preview only.
-- `agent_shot(view, width?, height?, focus?)` / `agent_views([views], ...)` — render from
-  the agent's own offscreen camera, independent of the human's window: six
-  orthographic views (`front`/`back`/`left`/`right`/`top`/`bottom`, true
-  proportions, auto-framed to the bounds) plus `iso` (perspective
-  three-quarter). `focus: [part names]` frames just those parts. Returns PNGs; `agent_views(["front", "right", "top"])` is
-  the three-pane check, `["iso"]` the looks-right shot.
+**Verify (deterministic; prefer these over eyeballing renders):**
 
-State:
+- `verify(parts?, bounds?, validate?, rebuild?)` (all optional; no arguments
+  runs validate + rebuild). Over visible parts only:
+  - `parts`: exact part names, order-insensitive; reports missing and
+    unexpected names.
+  - `bounds: {min, max, tol}`: per-axis world bounds, `null` skips an axis
+    ("sits on the ground" = `min [null, 0, null]`); failures name the part
+    that sets the extreme.
+  - `validate`: every part closed and outward-wound.
+  - `rebuild`: an uncached re-derivation matches the cache.
 
-- `undo` / `redo` / `jump(id)` / `history` — the tree. `history` prints one
-  line per node (id, parent, label, version, `<-` cursor); jump by id, then
-  the next edit branches. Use jump to try an alternative and keep both.
-- `scene_summary` — call this FIRST and after anything confusing: parts,
-  bounds, ops, annotations, plus deterministic **warnings** (see below).
-- `set_material` / `transform_part` / `delete_part` / `rename_part` / `set_uvs`
-  — baked-part edits (record history like everything else).
-- `add_annotation(part, text, face?, vertex?, position?)` /
-  `list_annotations` / `delete_annotation(id)` — human comments pinned to
-  parts. If the human clicked a spot in the preview, omit all optional args
-  and the pending pin is consumed. Annotations ride in prefabs.
-- `save_prefab(description, tags, prompt)` — all three required, including
-  `prompt` — / `load_prefab(name)` /
-  `catalog_list` / `catalog_describe` — persistence.
-- `save_prefab` reports whether it overwrote an existing catalog entry
-  ("saved `x` — overwrote an existing catalog entry") — if you didn't mean
-  to, the old JSON is gone; check `catalog_list` and the model name first.
-- `session_log(limit?)` — the recent per-call record of every tool call (tool, ok/error, ms).
-  Self-audit a build: what failed, what was slow.
-- **Session autosave**: every successful mutation also writes the whole
-  session model (parts, ops, history tree, annotations) to `session.json`
-  in the catalog dir, and a server started without `--model` restores it.
-  Unnamed WIP therefore survives restarts and crashes without any explicit
-  save; `save_prefab` is only for naming and indexing it.
-- `export_model(path, "glb"|"gltf")`, `screenshot` — output. Render-dependent
-  tools (`screenshot`, `agent_shot(s)`, `probe_ray`, `set_camera`) time out
-  after 15s with a retry hint instead of hanging the server. **Always
-  screenshot and actually look at the image** after building something; the
-  scene data can be right while the render is wrong.
+  Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
+- `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
+  every part, nearest first). Proves openings are open and fills are solid.
+  Windowed preview only.
+- `agent_views(views, width?, height?, focus?)`: offscreen renders independent
+  of the human's window: `front`/`back`/`left`/`right`/`top`/`bottom`
+  (orthographic, auto-framed) and `iso` (perspective). `focus: [parts]`
+  frames just those. `["front", "right", "top"]` is the three-pane check.
+- `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`).
+  Render tools time out after 15 s instead of hanging. **Always look at an
+  image after building**: the data can be right while the render is wrong.
+
+**History:**
+
+- `undo` / `redo` / `jump(id)` / `history` / `history_prune(keep)`: the
+  edit tree. Editing after a jump branches.
+- `diff(from, to?)`: ops added (+), removed (-) and changed (~, with the old
+  parameters) between two nodes (default `to`: the live model), plus param
+  changes.
+- `cherry_pick(from, ops?)`: replay ops from another node onto the live model
+  (all new or changed ops, or just the named ones), templates and params
+  included. After a jump, this replaces re-issuing the old branch by hand.
+
+**Model, catalog, output:** `new_model(name)` (the old model stays one undo
+away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
+tags, prompt)` (all required; reports when it overwrote an entry),
+`load_prefab(name)`, `catalog_list`, `catalog_describe`,
+`export_model(path, "glb" | "gltf")` (skips hidden parts).
+
+**Annotations:** `add_annotation(part, text, face?, vertex?, position?)`
+(omit the optionals to consume a spot the human clicked), `list_annotations`,
+`delete_annotation(id)`.
+
+**Session:** `session_log(limit?)` is the per-call record (tool, ok/error,
+ms). Every mutation autosaves the whole session (parts, ops, params, history,
+annotations) to `session.json`, restored on startup, including the earlier
+items of a batch that failed partway. `save_prefab` only names and indexes it.
 
 ## Semantics worth knowing
 
-- **In-place ops**: `op_material("petal", "petal")` (output == input) is
-  legal — upsert never replaces an op the new op reads from (`graph::kind` +
-  `graph::inputs`). Repeated in-place ops accumulate; last wins.
-- **Op results are memoized** (`graph::evaluate`): a process-wide cache keyed by
-  op parameters + input content hashes, so tweaking one op re-runs only it and
-  its dependents. `check_rebuild` bypasses it (`evaluate_uncached`).
-- **Op evaluation is dependency-ordered.** Each op runs after the op
-  producing its inputs; where that is already consistent, written order is
-  preserved. This heals graphs where an upsert left an op positioned before
-  an input it gained later — no naming tricks needed. A true cycle fails with
-  "ops form a dependency cycle involving ...". Ops can only reference op
-  outputs, never baked parts.
-- **Op-driven snapshots store no parts** (`History::record` strips them when
-  they derive from ops); undo/redo/jump re-derive via the eval cache.
-  `history_prune(keep)` bounds long sessions (keeps newest N, cursor, root,
-  branch points; renumbers ids).
-- **History snapshots are history-less**: each node stores a model with an
-  empty tree (the live tree on the session model is the single source of
-  truth); undo/redo/jump graft the live tree onto whatever they land on.
-- **Jump restores the snapshot's op list exactly.** After `jump`, every op
-  created after that node no longer exists — re-issue all of them in the new
-  branch. "no part `x` earlier in the graph" right after a jump means this.
+- **In-place ops**: a material, transform or visibility op whose output is
+  its own input is legal; upsert never replaces an op the new op reads from.
+  Repeated in-place ops accumulate; last wins.
+- **Op results are memoized** (`graph::evaluate`): a process-wide cache keyed
+  by op parameters + input content hashes, holding shared (`Arc`) parts, so a
+  tweak re-runs only the op and its dependents. `verify` with `rebuild`
+  bypasses it.
+- **Op evaluation is dependency-ordered.** Each op runs after the op producing
+  its inputs (and, for material lineage, after in-place materials on them).
+  A true cycle fails with "ops form a dependency cycle involving ...". Ops
+  can only reference op outputs, never baked parts.
+- **Edits to op-derived parts are graph ops**: hide/show, rename, in-place
+  material and in-place absolute transform on a part an op produces are
+  recorded as ops, so they survive re-derivation. On baked parts (from
+  `tri_mesh`) they edit the part directly; `uvs` is always baked.
+- **Op-driven snapshots store no parts**; undo/redo/jump re-derive via the
+  eval cache. Snapshots are history-less (the live tree is the single source
+  of truth).
+- **Jump restores the snapshot's op list exactly**; use `diff` to see what
+  the other branch had and `cherry_pick` to bring it over.
 - **Save format is versioned** (`Model::format_version`, `FORMAT_VERSION`):
-  old files (no field) read as 0 and load; files from a newer build are
-  rejected with a clear error. Bump it when the serialized shape changes.
-- **Prefab format is non-destructive**: when every part re-derives from ops
-  (`parts_derive_from_ops()`), `parts` are NOT written — just ops, history
-  tree, annotations — and load re-evaluates. Mixed baked+ops models keep
-  their parts. Writes are `.tmp` + rename. Old/plain prefabs load unchanged.
-- **Primitive sphere radius gotcha** (above) and **winding**: never mirror via
-  negative scale; use `op_mirror`.
-- **Material before copies.** Array/mirror/transform ops clone their input at
-  eval time, so a material op that runs *after* the copy colors only the
-  source — the copies stay default-gray. Always `op_material` before the ops
-  that duplicate the part. `scene_summary` warns when it sees this ordering.
+  old files read as 0 and load; files from a newer build are rejected.
+  Fully op-derived prefabs save ops, params, templates, history and
+  annotations without parts. Writes are `.tmp` + rename.
 
-`scene_summary` appends a warnings section for exactly the traps above:
-uncolored copies (material after the copying op), full-ring radial arrays
-whose copy 0 overlaps the source, visible parts still wearing the default
-material, parts with identical world bounds (z-fighting), and boolean
+`scene_summary` warnings: full-ring radial arrays whose copy 0 overlaps the
+source (only with `include_source: false`), visible parts still wearing the
+default material, parts with identical world bounds (z-fighting), boolean
 volume sanity (a difference that didn't shrink its input = the cutter
-misses; a union whose volume exactly sums its inputs = no overlap). Hidden
-parts are excluded from all of these, so template clutter doesn't drown
-real signals. An empty warnings list means none of these fired — checking
-it is cheaper than eyeballing a render.
+misses; a union whose volume exactly sums its inputs = no overlap) and
+boolean outputs with open edges enclosing real area (a safety net; Manifold
+outputs are closed). Hidden parts are excluded. An empty list means none
+fired.
 
 ## Preview window (human side)
 
@@ -293,10 +257,14 @@ read-only ops + history panel. Click a part then type to annotate
 ## Conventions
 
 - New ops: add the variant in `lib.rs` (`Op`), an eval arm + `output`/`kind`/
-  `inputs`/`describe` arms in `graph.rs`, a session fn in `commands.rs`
-  (goes through `apply_op`, which handles upsert/rollback/history), args
-  struct + `#[tool]` fn in `src/bin/modeler/` (`server/` = MCP, `preview/` = Bevy), and a test. Validate op
-  params BEFORE the input lookup so errors report the right cause.
+  `inputs`/`describe` arms in `graph.rs`, and in `src/spec.rs` a `*Spec`
+  struct (`deny_unknown_fields`), an `OpSpec` variant, an `OP_TYPES` entry,
+  a `parse_item` arm, an `example` and a `describe_type` schema arm (the
+  `every_type_has_a_parseable_example` test enforces the last two). No new
+  MCP tool: `apply_ops` carries it. Validate op params BEFORE the input
+  lookup so errors report the right cause.
+- Keep the tool count small: every tool's schema costs context on every
+  turn. New capabilities go into `apply_ops` item types or `verify` fields.
 - Examples in `examples/` double as executable documentation of the intended
   workflow — and as the fallback for authoring procedural prefabs when the
   agent's MCP tool list predates a tool.

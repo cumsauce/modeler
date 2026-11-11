@@ -1,13 +1,13 @@
 # STATUS.md — where this repo stands
 
-Updated: 2026-11-10 (end of a two-day agent-driven build-out).
+Updated: 2026-11-11 (Manifold booleans, API trap removal, 28 tools).
 
 ## What this is
 
 **modeler** — a standalone mesh-modeling tool built specifically to be driven
 by AI agents over MCP, with a live Bevy preview window for humans. ~6.9k
-lines of Rust across 9 modules, 46 MCP tools, 16 commits, all pushed to
-origin/main.
+lines of Rust across 11 modules and 28 MCP tools, on branch
+`review-pass-fixes`.
 
 Architecture (details in AGENTS.md):
 - **Op graph** (`src/graph.rs`) — models are ordered op lists evaluated in
@@ -25,22 +25,18 @@ Architecture (details in AGENTS.md):
 
 ## Agent-facing capability
 
-Build: `apply_ops` (whole models in one call, graph ops + baked edits with
-per-item errors), `op_primitive` (with optional rotation quat),
-`op_transform`, `op_boolean`, `op_radial_array` (x/y/z axis),
-`op_linear_array`, `op_mirror`, `op_material`, `op_delete`, `op_get`,
-`ops`, `new_model`.
+Build: `apply_ops` is the one build tool: typed items (primitive,
+transform, boolean, arrays, mirror, material, prefab, hide/show, rename,
+delete, tri_mesh, uvs), lenient sizes/colours, errors that name the item
+and field, named `params` with `$refs`, and an `expect` block. Plus `ops`,
+`op_get`, `describe_op` (example + schema per item type), `new_model`.
 
-Verify (deterministic, no renderer): `validate` (manifoldness + winding),
-`expect_parts`, `expect_bounds`, `check_rebuild`, `probe_ray`,
-`session_log`. Render: `agent_shot` / `agent_views` (offscreen ortho/
-perspective camera rig, auto-framed, independent of the human window),
-`screenshot`, `set_camera`.
+Verify: `verify` (parts, bounds, validate, rebuild), `probe_ray`,
+`session_log`. Render: `agent_views`, `screenshot`, `set_camera`.
 
-State: autosave after every mutation + restore on startup (unnamed WIP
-survives restarts), `undo`/`redo`/`jump`/`history`, `save_prefab`/
-`load_prefab`/`catalog_list`/`catalog_describe`, annotations, `hide_part`/
-`show_part`, `export_model` (glb/gltf, skips hidden parts).
+State: autosave + restore, `undo`/`redo`/`jump`/`history`/`history_prune`,
+`diff`/`cherry_pick`, prefab catalog, annotations, `export_model`.
+`scene_summary`, `apply_ops` and `verify` also return structured JSON.
 
 Operating guidance rides in the MCP `initialize` response (`instructions`),
 so clients get the critical semantics in context without reading AGENTS.md,
@@ -60,10 +56,8 @@ which is the long-form reference.
 
 - Dependency-order evaluation — upsert-position staleness is healed
   automatically; true cycles fail naming the ops.
-- Booleans come from csgrs 0.3 (polygon soup) with a bounded O(n) weld
-  (1e-4 grid, degenerate drops). Known honest limitation: curved cuts can
-  keep small seam edges; `validate` reports them instead of lying, and
-  curved-on-curved booleans should be composed/faked instead (documented).
+- Booleans run on Manifold (`manifold-csg`): closed outputs, exact coplanar
+  and curved-on-curved cuts, input UVs preserved.
 - `disc`/`washer`/`plane` are double-sided; verify tools and lints skip
   hidden parts; primitive ops take rotation quats.
 - All render waits time out after 15s — a stuck frame can't wedge the
@@ -75,9 +69,6 @@ which is the long-form reference.
 
 ## Known limitations / open ideas
 
-- Boolean meshes can still carry small seam edges (honest, reported).
-- `rename_part` is baked — a graph-level rename op would survive
-  re-derivation (queued in findings-agent-shakedown.md).
 - No ground grid in the agent rig (spatial judgment aid).
 - The workspace MCP config was never pointed at this repo's binary —
   agents here use the driver; wire the MCP server in the client to get
@@ -90,4 +81,4 @@ which is the long-form reference.
 - Tests green; `cargo clippy --all-targets -- -D
   warnings` clean; `cargo fmt` applied.
 - `.zcode/` gitignored. `mcp_driver.py` committed (daemon + client modes).
-- Everything pushed to origin/main as of this writing.
+- Work is on `review-pass-fixes`; no PR opened yet.

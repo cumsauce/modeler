@@ -646,23 +646,20 @@ impl rmcp::ServerHandler for Tools {
 
     fn get_info(&self) -> rmcp::model::ServerInfo {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
-- Call scene_summary first (and after anything confusing): it shows parts, bounds, ops, annotations, plus warnings for known traps. An empty warnings list means none fired.
-- Build with apply_ops (a whole model in one call), not one op per call. Ops are upserts: re-issuing the same name and kind tweaks parameters and re-derives. Evaluation is dependency-ordered, so op positions don't matter.
-- Wire shapes are strict: size is ALWAYS [f32;3] (sphere radius = size[0], cylinder/cone/capsule radius = size[0] height = size[1]); base_color is ALWAYS RGBA [f32;4]. Wrong shapes fail deserialization with no field name.
-- op_transform values are ABSOLUTE, not additive: a part at y=0.375 transformed with translation y=0 lands at y=0. Restate the full position in every copy. op_primitive also takes an optional rotation quat [x,y,z,w].
-- hide_part/show_part take an argument named part; expect_parts takes parts; save_prefab requires prompt and warns when it overwrites an existing entry.
-- apply_ops batches can also include baked edits: type hide_part/show_part with part, or rename with part and to - they run in batch position.
-- radial_array takes an optional axis (y default, x or z for horizontal rings like windmill blades - no manual rotation needed). Pass include_source=true to space `count` items evenly with the source as copy 0 (copies name_1..).
-- probe_ray all_hits=true lists every part along the ray; agent_shot/agent_views take focus=[part names] to frame just those parts.
-- Booleans run on Manifold: outputs are closed solids, coplanar and curved-on-curved cuts are exact. Both inputs must be closed solids (disc/plane/washer error). Verify pockets with probe_ray.
-- session_log shows the recent per-call record (tool, ok/error, ms) for self-auditing.
-- Color parts with op_material BEFORE ops that copy them (arrays/mirror/transform clone the input, so later materials leave copies default-gray - the warnings section catches this).
-- Full-ring radial arrays duplicate the source unless you pass count-1 copies with start_degrees = degrees/count.
-- undo/redo/jump move a history tree cursor; jump restores that snapshot's op list exactly, so re-issue every op created after the jump point. Editing after a jump branches.
-- Verify deterministically before screenshots: validate (manifold/winding), expect_parts (visible parts only), expect_bounds (visible bounds), check_rebuild (stale-cache diff), probe_ray (openings/occlusion; windowed preview only). Then screenshot or agent_shot/agent_views (independent offscreen camera; front/right/top/iso need no camera setup).
-- Every mutation autosaves the session (parts, ops, history) and it is restored on restart; save_prefab only names and indexes it. Prefab names come from set_model_name.
-- export_model skips hidden parts; hide boolean intermediates instead of deleting them (later ops may still derive from them).
-- Render waits time out after 15s with an error; a stuck frame can't wedge the server.
+- Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, transform, boolean, radial_array, linear_array, mirror, material, prefab, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); graph order doesn't matter.
+- Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rrggbb\"; material input defaults to its name (in place).
+- Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
+- transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
+- radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
+- Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
+- params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
+- prefab items instance a catalog model; its visible parts become name.part.
+- Verify in the same call with apply_ops expect {parts, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings; agent_views renders front/right/top/iso independent of the human's window. Look at an image after building.
+- undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
+- scene_summary, apply_ops and verify also return structuredContent JSON.
+- Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
+- Render waits time out after 15s with an error.
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
