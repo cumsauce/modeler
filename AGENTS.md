@@ -334,8 +334,8 @@ captures only the 3D pane, never the graph; `MODELER_GRAPH=1` opens it at start)
 geometry op, coloured by kind, with edges from each input to its reader. In-place
 edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, and
 a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A
-spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, right-drag
-pans, and clicking a box makes its parts pulse in 3D (`src/graph_view.rs` holds
+spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, any drag
+pans, clicking a box makes its parts pulse in 3D and double-clicking frames them (`src/graph_view.rs` holds
 the view and layout; the panel lives in `preview/panel.rs`). Click a part then type to annotate
 (Enter commits, Esc cancels; Backspace deletes; spaces work).
 

@@ -36,6 +36,10 @@ pub(crate) struct GraphPanel {
     /// The human zoomed or panned: stop auto-fitting.
     user_view: bool,
     drag: Option<Vec2>,
+    /// Pixels moved since the button went down (a click stays under 4).
+    drag_moved: f32,
+    /// Time and box of the last click, for double-click focus.
+    last_click: Option<(f64, usize)>,
     pub(crate) selected: Option<usize>,
     /// Cursor is over the panel: the 3D camera and pins ignore the mouse.
     pub(crate) hover: bool,
@@ -56,8 +60,8 @@ fn kind_color(kind: &str) -> Color {
 
 /// G toggles the node panel. Rebuilds the boxes when the model changes, steps
 /// the spring layout every frame, auto-fits the view (until the human zooms
-/// with the wheel or pans with a right/middle drag), and a left click on a box
-/// selects it so its parts glow in the 3D view.
+/// with the wheel or drags the canvas), a click on a box selects it so its
+/// parts glow in the 3D view, and a double click frames them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_graph_hud(
     keys: Res<ButtonInput<KeyCode>>,
@@ -78,6 +82,7 @@ pub(crate) fn update_graph_hud(
     >,
     mut edges: Query<(&GraphEdge, &mut Node, &mut UiTransform), Without<GraphBox>>,
     mut commands: Commands,
+    mut orbit: ResMut<Orbit>,
 ) {
     if keys.just_pressed(KeyCode::KeyG) && typing.text.is_empty() {
         visible.0 = !visible.0;
@@ -170,7 +175,7 @@ pub(crate) fn update_graph_hud(
         if let Ok(mut t) = footer.single_mut() {
             let h = &model.history;
             t.0 = format!(
-                "{} ops, {} boxes{} | history {} nodes, at {}\nwheel zoom | right-drag pan | click a box",
+                "{} ops, {} boxes{} | history {} nodes, at {}\nwheel zoom | drag to pan | click a box to highlight, double-click to focus",
                 model.ops.len(),
                 panel.view.nodes.len(),
                 if panel.view.global_moves.is_empty() {
@@ -231,24 +236,54 @@ pub(crate) fn update_graph_hud(
             panel.pan = (c - origin) / panel.zoom - before;
             panel.user_view = true;
         }
-        if mouse.just_pressed(MouseButton::Right) || mouse.just_pressed(MouseButton::Middle) {
+        // Any button drags the canvas; a left press that barely moves is a click.
+        if [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+            .iter()
+            .any(|b| mouse.just_pressed(*b))
+        {
             panel.drag = Some(c);
+            panel.drag_moved = 0.0;
         }
-        if mouse.just_pressed(MouseButton::Left) {
+        if mouse.just_released(MouseButton::Left) && panel.drag_moved < 4.0 {
             let g = (c - origin) / zoom - pan;
-            panel.selected = panel.view.nodes.iter().position(|n| {
+            let hit = panel.view.nodes.iter().position(|n| {
                 panel.layout.pos.get(&n.key).is_some_and(|p| {
                     let d = (g - Vec2::from_array(*p)).abs();
                     d.x <= BOX_W * 0.5 && d.y <= BOX_H * 0.5
                 })
             });
+            let now = time.elapsed_secs_f64();
+            if let Some(i) = hit
+                && panel
+                    .last_click
+                    .is_some_and(|(t, j)| j == i && now - t < 0.4)
+            {
+                // Double click: frame that box's parts in the 3D view.
+                if let Some(n) = panel.view.nodes.get(i)
+                    && let Some((min, max)) = modeler.session.model.bounds_of(&n.outputs)
+                {
+                    orbit.target = (min + max) * 0.5;
+                    orbit.dist = ((max - min).length() * 0.5 * 2.4).max(0.3);
+                    orbit.user = true;
+                }
+                panel.last_click = None;
+            } else {
+                panel.last_click = hit.map(|i| (now, i));
+            }
+            panel.selected = hit;
         }
     }
     if let (Some(last), Some(c)) = (panel.drag, cursor) {
-        if mouse.pressed(MouseButton::Right) || mouse.pressed(MouseButton::Middle) {
-            panel.pan += (c - last) / panel.zoom;
+        if [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+            .iter()
+            .any(|b| mouse.pressed(*b))
+        {
+            panel.drag_moved += (c - last).length();
+            if panel.drag_moved >= 4.0 {
+                panel.pan += (c - last) / panel.zoom;
+                panel.user_view = true;
+            }
             panel.drag = Some(c);
-            panel.user_view = true;
         } else {
             panel.drag = None;
         }
