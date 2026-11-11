@@ -588,6 +588,18 @@ impl Axis {
     }
 }
 
+fn is_zero(x: &f32) -> bool {
+    *x == 0.0
+}
+
+fn one2() -> [f32; 2] {
+    [1.0, 1.0]
+}
+
+fn deg360() -> f32 {
+    360.0
+}
+
 /// One step of the procedural graph behind the parts. Ops are upserted by
 /// output name: re-issuing an op with the same `name` replaces it, which is
 /// how a parameter gets tweaked without rebuilding the whole graph.
@@ -602,6 +614,36 @@ pub enum Op {
         translation: [f32; 3],
         /// Optional rotation, quaternion [x, y, z, w]. Saves a
         /// primitive + transform pair for rotated primitives.
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+    },
+    /// A 2D footprint extruded straight up (y = 0..height) via Manifold.
+    /// `profile` rings are [x, z]; inner rings are holes.
+    Extrude {
+        name: String,
+        profile: Vec<Vec<[f32; 2]>>,
+        height: f32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        twist: f32,
+        #[serde(default = "one2")]
+        scale_top: [f32; 2],
+        #[serde(default)]
+        slices: u32,
+        #[serde(default)]
+        translation: [f32; 3],
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+    },
+    /// A 2D profile of [radius, y] points revolved around the y axis.
+    Revolve {
+        name: String,
+        profile: Vec<Vec<[f32; 2]>>,
+        #[serde(default = "deg360")]
+        degrees: f32,
+        #[serde(default)]
+        segments: u32,
+        #[serde(default)]
+        translation: [f32; 3],
         #[serde(default)]
         rotation: Option<[f32; 4]>,
     },

@@ -113,13 +113,24 @@ fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
 /// A Manifold back into a triangle `Part`: positions and interpolated UVs from
 /// the properties, creased normals (40°, so cut edges stay hard), `material`.
 fn manifold_to_part(m: &Manifold, name: &str, material: crate::Material) -> Part {
+    manifold_to_part_mapped(m, name, material, |v| v)
+}
+
+/// [`manifold_to_part`] with every position passed through `map` first.
+fn manifold_to_part_mapped(
+    m: &Manifold,
+    name: &str,
+    material: crate::Material,
+    map: impl Fn([f32; 3]) -> [f32; 3],
+) -> Part {
     let mesh = m.to_meshgl64();
     let n = mesh.num_prop().max(3);
     let props = mesh.vert_properties();
     let mut part = Part::new(name);
     part.material = material;
     for v in props.chunks(n) {
-        part.verts.push([v[0] as f32, v[1] as f32, v[2] as f32]);
+        part.verts
+            .push(map([v[0] as f32, v[1] as f32, v[2] as f32]));
         if n >= N_PROPS {
             part.uvs.push([v[3] as f32, v[4] as f32]);
         }
@@ -167,6 +178,130 @@ pub fn boolean(
     part.rotation = Quat::IDENTITY.to_array();
     part.scale = [1.0; 3];
     Ok(part)
+}
+
+/// Manifold builds sweeps Z-up; the modeler is Y-up. (x, y, z) -> (x, z, -y)
+/// is a proper rotation (-90° about X), so winding stays outward.
+fn z_up_to_y_up(v: [f32; 3]) -> [f32; 3] {
+    [v[0], v[2], -v[1]]
+}
+
+fn check_profile(profile: &[Vec<[f32; 2]>]) -> Result<(), ModelerError> {
+    if profile.is_empty() {
+        return Err(ModelerError::Csg("profile has no rings".into()));
+    }
+    for (i, ring) in profile.iter().enumerate() {
+        if ring.len() < 3 {
+            return Err(ModelerError::Csg(format!(
+                "profile ring {i} has {} points; a ring needs at least 3",
+                ring.len()
+            )));
+        }
+        if ring.iter().flatten().any(|c| !c.is_finite()) {
+            return Err(ModelerError::Csg(format!(
+                "profile ring {i} has a non-finite coordinate"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cross_section(rings: Vec<Vec<[f64; 2]>>) -> manifold_csg::CrossSection {
+    // Even-odd: ring orientation doesn't matter, and an inner ring is a hole.
+    manifold_csg::CrossSection::from_polygons_with_fill_rule(
+        &rings,
+        manifold_csg::FillRule::EvenOdd,
+    )
+}
+
+fn finish_sweep(m: &Manifold, name: &str, what: &str) -> Result<Part, ModelerError> {
+    m.status()
+        .map_err(|e| ModelerError::Csg(format!("{what} `{name}` failed: {e}")))?;
+    if m.is_empty() || m.volume().abs() < 1e-12 {
+        return Err(ModelerError::Csg(format!(
+            "{what} `{name}` is empty (degenerate or self-cancelling profile)"
+        )));
+    }
+    Ok(manifold_to_part_mapped(
+        m,
+        name,
+        crate::Material::default(),
+        z_up_to_y_up,
+    ))
+}
+
+/// Extrudes a 2D footprint straight up. `profile` rings are [x, z] points on
+/// the ground plane (inner rings are holes); the solid spans y = 0..height,
+/// optionally twisting (degrees) and scaling the top ring ([sx, sz]); twist
+/// and scale act about the profile origin [0, 0], so centre the footprint on
+/// it for a symmetric taper.
+pub fn extrude(
+    name: &str,
+    profile: &[Vec<[f32; 2]>],
+    height: f32,
+    twist: f32,
+    scale_top: [f32; 2],
+    slices: u32,
+) -> Result<Part, ModelerError> {
+    check_profile(profile)?;
+    if height.is_nan() || height <= 0.0 {
+        return Err(ModelerError::Csg(format!(
+            "extrude `{name}`: height must be > 0, got {height}"
+        )));
+    }
+    if scale_top.iter().any(|s| s.is_nan() || *s < 0.0) {
+        return Err(ModelerError::Csg(format!(
+            "extrude `{name}`: scale_top must be >= 0, got {scale_top:?}"
+        )));
+    }
+    // Footprint (x, z) -> Manifold (x, -z) so it lands at world z after the
+    // Z-up -> Y-up rotation.
+    let rings = profile
+        .iter()
+        .map(|r| r.iter().map(|p| [p[0] as f64, -p[1] as f64]).collect())
+        .collect();
+    let cs = cross_section(rings);
+    // Twist runs the other way after the axis swap; negate so positive
+    // twist is counter-clockwise seen from above, like a y-axis rotation.
+    let m = Manifold::extrude_with_options(
+        &cs,
+        height as f64,
+        slices as i32,
+        -(twist as f64),
+        scale_top[0] as f64,
+        scale_top[1] as f64,
+    );
+    finish_sweep(&m, name, "extrude")
+}
+
+/// Revolves a 2D profile around the y axis. `profile` rings are
+/// [radius, y] points (radius >= 0); `degrees` < 360 leaves an open wedge
+/// with flat end caps. `segments` 0 picks a smooth default.
+pub fn revolve(
+    name: &str,
+    profile: &[Vec<[f32; 2]>],
+    degrees: f32,
+    segments: u32,
+) -> Result<Part, ModelerError> {
+    check_profile(profile)?;
+    if let Some(p) = profile.iter().flatten().find(|p| p[0] < 0.0) {
+        return Err(ModelerError::Csg(format!(
+            "revolve `{name}`: profile points are [radius, y] with radius >= 0, got {p:?}"
+        )));
+    }
+    if degrees.is_nan() || degrees <= 0.0 || degrees > 360.0 {
+        return Err(ModelerError::Csg(format!(
+            "revolve `{name}`: degrees must be in (0, 360], got {degrees}"
+        )));
+    }
+    let rings = profile
+        .iter()
+        .map(|r| r.iter().map(|p| [p[0] as f64, p[1] as f64]).collect())
+        .collect();
+    let cs = cross_section(rings);
+    let segs = if segments == 0 { 48 } else { segments.max(3) } as i32;
+    let m = Manifold::revolve(&cs, segs, degrees as f64);
+    finish_sweep(&m, name, "revolve")
 }
 
 #[cfg(test)]
@@ -533,5 +668,120 @@ mod tests {
             }
         }
         best.map(|t| o.z - t)
+    }
+
+    fn signed_volume(p: &Part) -> f64 {
+        p.indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| Vec3::from(p.verts[i as usize]).as_dvec3());
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum()
+    }
+
+    fn bounds(p: &Part) -> (Vec3, Vec3) {
+        p.verts.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
+            (lo.min(Vec3::from(*v)), hi.max(Vec3::from(*v)))
+        })
+    }
+
+    #[test]
+    fn extrude_square_with_hole_is_a_closed_upright_tube() {
+        let outer = vec![[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        // Clockwise inner ring: even-odd makes it a hole regardless.
+        let inner = vec![[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]];
+        let p = extrude("tube", &[outer, inner], 2.0, 0.0, [1.0, 1.0], 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&p), 0);
+        // (4 - 1) * 2 = 6, positive = outward-wound.
+        assert!(
+            (signed_volume(&p) - 6.0).abs() < 1e-4,
+            "{}",
+            signed_volume(&p)
+        );
+        let (lo, hi) = bounds(&p);
+        assert!(
+            (lo - Vec3::new(-1.0, 0.0, -1.0)).abs().max_element() < 1e-5,
+            "{lo}"
+        );
+        assert!(
+            (hi - Vec3::new(1.0, 2.0, 1.0)).abs().max_element() < 1e-5,
+            "{hi}"
+        );
+    }
+
+    #[test]
+    fn extrude_footprint_keeps_its_z_side() {
+        // A footprint entirely at +z must stay at +z (no mirror on the swap).
+        let ring = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]];
+        let p = extrude("f", &[ring], 0.5, 0.0, [0.0, 0.0], 0).unwrap_or_else(|e| panic!("{e}"));
+        let (lo, hi) = bounds(&p);
+        assert!(
+            lo.z > -1e-5 && (hi.z - 2.0).abs() < 1e-5 && hi.y < 0.51,
+            "{lo} {hi}"
+        );
+        // Tapered to a point (the profile origin): a pyramid, 1/3 * base * h.
+        assert!((signed_volume(&p) - 0.5 / 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn revolve_makes_a_closed_y_axis_solid() {
+        // Rectangle r 0..1, y 0..2 -> cylinder of volume ~ pi * 2.
+        let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 2.0], [0.0, 2.0]];
+        let p = revolve("cyl", std::slice::from_ref(&ring), 360.0, 64)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&p), 0);
+        let v = signed_volume(&p);
+        assert!(v > 6.1 && v < 6.29, "{v}");
+        let (lo, hi) = bounds(&p);
+        assert!(lo.y.abs() < 1e-5 && (hi.y - 2.0).abs() < 1e-5, "{lo} {hi}");
+        // A half turn is half the volume, still closed.
+        let half = revolve("half", &[ring], 180.0, 64).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&half), 0);
+        assert!((signed_volume(&half) - v / 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn sweep_errors_are_clear() {
+        let tri = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let e = |r: Result<Part, ModelerError>| match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e(extrude(
+                "x",
+                &[vec![[0.0, 0.0], [1.0, 0.0]]],
+                1.0,
+                0.0,
+                [1.0, 1.0],
+                0
+            ))
+            .contains("at least 3")
+        );
+        assert!(
+            e(extrude(
+                "x",
+                std::slice::from_ref(&tri),
+                0.0,
+                0.0,
+                [1.0, 1.0],
+                0
+            ))
+            .contains("height")
+        );
+        assert!(
+            e(revolve(
+                "x",
+                &[vec![[-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]],
+                360.0,
+                0
+            ))
+            .contains("radius >= 0")
+        );
+        assert!(e(revolve("x", &[tri], 400.0, 0)).contains("degrees"));
     }
 }

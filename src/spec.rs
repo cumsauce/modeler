@@ -236,6 +236,74 @@ pub struct PrimitiveSpec {
     rotation: Option<[f32; 4]>,
 }
 
+/// A 2D profile: one ring of [a, b] points, or a list of rings (inner rings
+/// cut holes; orientation doesn't matter).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ProfileArg {
+    Ring(Vec<[f32; 2]>),
+    Rings(Vec<Vec<[f32; 2]>>),
+}
+
+impl ProfileArg {
+    fn rings(self) -> Vec<Vec<[f32; 2]>> {
+        match self {
+            ProfileArg::Ring(r) => vec![r],
+            ProfileArg::Rings(r) => r,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExtrudeSpec {
+    name: String,
+    /// Footprint on the ground: [[x, z], ...], or several rings (inner rings
+    /// are holes). The solid spans y = 0..height before translation.
+    profile: ProfileArg,
+    height: f32,
+    /// Degrees the top turns about the profile origin (counter-clockwise from above).
+    #[serde(default)]
+    twist: f32,
+    /// Top ring scale [sx, sz] about the profile origin [0, 0]; [0, 0] tapers
+    /// to a point there. Default [1, 1].
+    #[serde(default = "one2")]
+    scale_top: [f32; 2],
+    /// Intermediate slices for twist; 0 picks automatically.
+    #[serde(default)]
+    slices: u32,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// Quaternion [x, y, z, w].
+    #[serde(default)]
+    rotation: Option<[f32; 4]>,
+}
+
+fn one2() -> [f32; 2] {
+    [1.0, 1.0]
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevolveSpec {
+    name: String,
+    /// Half cross-section: [[radius, y], ...] with radius >= 0, revolved
+    /// around the y axis (a vase, bowl, column, bottle). Several rings: inner
+    /// ones are holes (a ring torus).
+    profile: ProfileArg,
+    /// Sweep angle, (0, 360]; under 360 leaves flat end caps.
+    #[serde(default = "default_tool_degrees")]
+    degrees: f32,
+    /// Segments around the axis; 0 = 48.
+    #[serde(default)]
+    segments: u32,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// Quaternion [x, y, z, w].
+    #[serde(default)]
+    rotation: Option<[f32; 4]>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransformSpec {
@@ -396,6 +464,8 @@ pub struct PrefabSpec {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OpSpec {
     Primitive(PrimitiveSpec),
+    Extrude(ExtrudeSpec),
+    Revolve(RevolveSpec),
     Transform(TransformSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
@@ -413,6 +483,8 @@ pub enum OpSpec {
 
 pub const OP_TYPES: &[&str] = &[
     "primitive",
+    "extrude",
+    "revolve",
     "transform",
     "boolean",
     "radial_array",
@@ -493,6 +565,30 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 kind: s.kind,
                 size,
+                translation: s.translation,
+                rotation: s.rotation,
+            })
+        }
+        "extrude" => {
+            let s: ExtrudeSpec = de(&ctx, &body)?;
+            BatchItem::Op(Op::Extrude {
+                name: s.name,
+                profile: s.profile.rings(),
+                height: s.height,
+                twist: s.twist,
+                scale_top: s.scale_top,
+                slices: s.slices,
+                translation: s.translation,
+                rotation: s.rotation,
+            })
+        }
+        "revolve" => {
+            let s: RevolveSpec = de(&ctx, &body)?;
+            BatchItem::Op(Op::Revolve {
+                name: s.name,
+                profile: s.profile.rings(),
+                degrees: s.degrees,
+                segments: s.segments,
                 translation: s.translation,
                 rotation: s.rotation,
             })
@@ -639,6 +735,12 @@ pub fn example(ty: &str) -> Option<Value> {
         "primitive" => {
             json!({"type": "primitive", "name": "leg", "kind": "cylinder", "size": {"radius": 0.05, "height": 0.8}, "translation": [0.4, 0.4, 0.3]})
         }
+        "extrude" => {
+            json!({"type": "extrude", "name": "flag", "profile": [[0, 0], [0.6, 0.05], [0.6, 0.35], [0, 0.4]], "height": 0.02, "rotation": [-0.707, 0, 0, 0.707], "translation": [0.03, 7.6, 0.01]})
+        }
+        "revolve" => {
+            json!({"type": "revolve", "name": "vase", "profile": [[0, 0], [0.3, 0], [0.4, 0.3], [0.15, 0.7], [0.2, 0.8], [0, 0.8]]})
+        }
         "transform" => {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
         }
@@ -688,6 +790,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
     };
     let schema = match ty {
         "primitive" => schemars::schema_for!(PrimitiveSpec),
+        "extrude" => schemars::schema_for!(ExtrudeSpec),
+        "revolve" => schemars::schema_for!(RevolveSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),

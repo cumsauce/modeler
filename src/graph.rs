@@ -245,6 +245,39 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             }
             upsert(named, name, part);
         }
+        Op::Extrude {
+            name,
+            profile,
+            height,
+            twist,
+            scale_top,
+            slices,
+            translation,
+            rotation,
+        } => {
+            let mut part =
+                crate::csg::extrude(name, profile, *height, *twist, *scale_top, *slices)?;
+            part.translation = *translation;
+            if let Some(r) = rotation {
+                part.rotation = *r;
+            }
+            upsert(named, name, part);
+        }
+        Op::Revolve {
+            name,
+            profile,
+            degrees,
+            segments,
+            translation,
+            rotation,
+        } => {
+            let mut part = crate::csg::revolve(name, profile, *degrees, *segments)?;
+            part.translation = *translation;
+            if let Some(r) = rotation {
+                part.rotation = *r;
+            }
+            upsert(named, name, part);
+        }
         Op::Transform {
             name,
             input,
@@ -529,6 +562,8 @@ fn upsert_shared(named: &mut Named, name: &str, part: Arc<Part>) {
 pub fn output(op: &Op) -> &str {
     match op {
         Op::Primitive { name, .. }
+        | Op::Extrude { name, .. }
+        | Op::Revolve { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
         | Op::RadialArray { name, .. }
@@ -566,6 +601,8 @@ pub fn outputs(op: &Op) -> Vec<String> {
 pub fn kind(op: &Op) -> &'static str {
     match op {
         Op::Primitive { .. } => "primitive",
+        Op::Extrude { .. } => "extrude",
+        Op::Revolve { .. } => "revolve",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
         Op::RadialArray { .. } => "radial",
@@ -581,7 +618,9 @@ pub fn kind(op: &Op) -> &'static str {
 /// The part names an op reads.
 pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
-        Op::Primitive { .. } | Op::Prefab { .. } => Vec::new(),
+        Op::Primitive { .. } | Op::Extrude { .. } | Op::Revolve { .. } | Op::Prefab { .. } => {
+            Vec::new()
+        }
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
@@ -612,6 +651,30 @@ pub fn describe(ops: &[Op]) -> String {
                 rotation,
             } => format!(
                 "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}",
+                rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+            ),
+            Op::Extrude {
+                name,
+                profile,
+                height,
+                twist,
+                scale_top,
+                slices,
+                translation,
+                rotation,
+            } => format!(
+                "#{i} extrude `{name}` profile={profile:?} height={height} twist={twist} scale_top={scale_top:?} slices={slices} at={translation:?}{}",
+                rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+            ),
+            Op::Revolve {
+                name,
+                profile,
+                degrees,
+                segments,
+                translation,
+                rotation,
+            } => format!(
+                "#{i} revolve `{name}` profile={profile:?} degrees={degrees} segments={segments} at={translation:?}{}",
                 rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
             ),
             Op::Transform {

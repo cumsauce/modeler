@@ -60,6 +60,8 @@ type, so there is no need to memorise field names.
 | type | fields (optional in []) |
 |---|---|
 | `primitive` | name, kind, size, [translation / position], [rotation quat] |
+| `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [translation], [rotation] |
+| `revolve` | name, profile, [degrees 360], [segments 48], [translation], [rotation] |
 | `transform` | name, input, [translation], [rotation], [scale], [relative] |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
@@ -95,6 +97,18 @@ type, so there is no need to memorise field names.
   new copies `name_0..` start at `start_degrees` and the source stays put.
   `axis` "x"/"z" makes horizontal rings (windmill blades).
 - **Linear arrays**: the source is copy 0; outputs `name_1..{count-1}`.
+- **Extrude / revolve** build closed solids from 2D profiles (Manifold),
+  ready for booleans. `profile` is one ring `[[a, b], ...]` or a list of
+  rings; inner rings are holes, orientation doesn't matter (even-odd).
+  - `extrude`: footprint points are `[x, z]` on the ground, extruded up
+    y = 0..height. `twist` (degrees) and `scale_top` act about the profile
+    origin `[0, 0]`, so centre the footprint there for a symmetric taper
+    (`scale_top: [0, 0]` = pyramid/spire). A flat cut-out shape (flag, sign,
+    gear) is a thin extrude stood up with rotation `[-0.707, 0, 0, 0.707]`
+    (footprint z becomes height, thickness goes to -z).
+  - `revolve`: points are `[radius, y]` (radius >= 0) around the y axis:
+    vases, bowls, columns, bottles. `degrees` < 360 leaves flat end caps.
+    Hollow a vessel by revolving an inner profile and taking a `difference`.
 - **Mirror** is baked (verts reflected, winding flipped); never mirror with
   negative scale.
 - **Booleans** run on Manifold (the kernel OpenSCAD and Blender use): outputs
