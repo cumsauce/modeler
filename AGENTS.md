@@ -361,8 +361,10 @@ lists its knobs: params with values and named moves/places, read from the
 file),
 `export_model(path, "glb" | "gltf")` (skips hidden parts).
 
-**Annotations:** `add_annotation(part, text, face?, vertex?, position?)`
-(omit the optionals to consume a spot the human clicked), `list_annotations`,
+**Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
+(omit the optionals to consume a spot the human clicked; `material` + optional `node`
+comments on a procedural material or one of its nodes; humans also comment on
+outliner groups, listed with their parts), `list_annotations`,
 `delete_annotation(id)`.
 
 **Session:** `session_log(limit?)` is the per-call record (tool, ok/error,
@@ -495,8 +497,13 @@ pans, clicking a box makes its parts pulse in 3D and double-clicking frames them
 the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the material pane in the same left pane (G and M replace each other;
 `MODELER_MATERIALS=1` opens it at start): the active material's graph by dependency level with a live
 thumbnail per node, a lit sphere and the channels, and clicking a node shows its
-output large (click again for the material). Click a part then type to annotate
-(Enter commits, Esc cancels; Backspace deletes; spaces work). **O** toggles the outliner in the same left pane (`MODELER_OUTLINE=1` opens it at start): the scene as a hierarchy (`src/outline.rs`): prefab instances and array runs fold into expandable groups, hidden parts (cutters, blanks, sources) sink into one dimmed group, each row shows its material. Click a row to select it (its parts pulse in 3D), click a selected group or its chevron to open it, double-click to frame it; the wheel scrolls. The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Outliner / Graph / Material toggles match O, G and M.
+output large (click again for the material). Layout: the outliner (O) on the left, open by default (G swaps the op graph
+into that spot), the material strip (M, open by default; `MODELER_OUTLINE=0` /
+`MODELER_MATERIALS=0` close them) along the bottom under both, the 3D view in
+the rest (`ui::apply_layout`). Comments use a Feathers popup
+(`preview/comments.rs`) listing the target's existing comments (each deletable):
+click a part in 3D, right-click an outliner row (a group comments on all its
+parts) or a material node / the preview sphere; Enter commits, Esc cancels. **O** toggles the outliner in the same left pane (`MODELER_OUTLINE=1` opens it at start): the scene as a hierarchy (`src/outline.rs`): prefab instances and array runs fold into expandable groups, hidden parts (cutters, blanks, sources) sink into one dimmed group, each row shows its material. Click a row to select it (its parts pulse in 3D), click a selected group or its chevron to open it, double-click to frame it; the wheel scrolls. The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Outliner / Graph / Material toggles match O, G and M.
 
 ## Dev notes / gotchas
 

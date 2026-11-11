@@ -93,7 +93,7 @@ fn type_color(ty: &str) -> Color {
     }
 }
 
-/// M toggles the pane (G's graph pane closes; they share the left half).
+/// M toggles the strip along the window's bottom (open by default).
 /// Rebuilds when the active material changes or a box is clicked.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_material_pane(
@@ -103,7 +103,6 @@ pub(crate) fn update_material_pane(
     typing: Res<PinTyping>,
     modeler: Res<Modeler>,
     mut pane: ResMut<MatPane>,
-    mut graph: ResMut<GraphHudVisible>,
     mut hud: Query<(&mut Visibility, &ComputedNode), With<MatHud>>,
     canvas: Query<Entity, With<MatCanvas>>,
     mut title: Query<&mut Text, With<MatTitle>>,
@@ -111,16 +110,10 @@ pub(crate) fn update_material_pane(
     mut boxes: Query<(&MatBox, &mut BorderColor)>,
     mut images: ResMut<Assets<Image>>,
     mut commands: Commands,
-    assets: Res<AssetServer>,
+    (assets, mut comment): (Res<AssetServer>, ResMut<CommentBox>),
 ) {
-    if keys.just_pressed(KeyCode::KeyM) && typing.text.is_empty() {
+    if keys.just_pressed(KeyCode::KeyM) && !typing.open {
         pane.visible = !pane.visible;
-        if pane.visible {
-            graph.0 = false;
-        }
-    }
-    if graph.0 && pane.visible {
-        pane.visible = false;
     }
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
@@ -145,27 +138,53 @@ pub(crate) fn update_material_pane(
         pane.laid_out = size.round().as_uvec2();
         pane.shown = None;
     }
-    let cursor = windows.single().ok().and_then(|w| w.cursor_position());
-    pane.hover = cursor.is_some_and(|c| c.x < size.x && c.y < size.y);
+    // The strip sits along the window's bottom: pane-local cursor.
+    let win_h = windows.single().map_or(size.y, |w| w.height());
+    let cursor = windows
+        .single()
+        .ok()
+        .and_then(|w| w.cursor_position())
+        .map(|c| c - Vec2::new(0.0, win_h - size.y));
+    pane.hover = cursor.is_some_and(|c| c.x >= 0.0 && c.y >= 0.0 && c.x < size.x && c.y < size.y);
 
+    // Left: the lit preview; right of it: the node graph.
+    let body_h = (size.y - HEADER_H - 12.0).max(10.0);
+    let left = (body_h * 1.5).min(size.x * 0.5) + 20.0;
+    let graph_origin = Vec2::new(left, HEADER_H + 8.0);
     // Click a box: inspect that node (click again: back to the material).
-    let top = size.y * 0.45;
-    if let Some(c) = cursor.filter(|_| pane.hover)
-        && mouse.just_pressed(MouseButton::Left)
-        && c.y > top
+    // Right-click a box: comment on that node; on the preview: the material.
+    let pressed_l = mouse.just_pressed(MouseButton::Left);
+    let pressed_r = mouse.just_pressed(MouseButton::Right);
+    if let Some(c) = cursor.filter(|_| pane.hover && (pressed_l || pressed_r))
+        && c.y > HEADER_H
     {
         let z = pane.zoom.max(0.1);
-        let g = (c - Vec2::new(10.0, top + 10.0)) / z;
-        let hit = pane.boxes.iter().position(|(_, p)| {
-            g.x >= p.x && g.x <= p.x + BOX_W && g.y >= p.y && g.y <= p.y + BOX_H
-        });
-        pane.selected = if hit == pane.selected { None } else { hit };
+        let g = (c - graph_origin) / z;
+        let hit = (c.x > left)
+            .then(|| {
+                pane.boxes.iter().position(|(_, p)| {
+                    g.x >= p.x && g.x <= p.x + BOX_W && g.y >= p.y && g.y <= p.y + BOX_H
+                })
+            })
+            .flatten();
+        if pressed_l && c.x > left {
+            pane.selected = if hit == pane.selected { None } else { hit };
+        }
+        if pressed_r && let Ok(d) = modeler.session.materials.get(None) {
+            let node = hit.and_then(|i| pane.boxes.get(i)).map(|b| b.0.clone());
+            if node.is_some() || c.x <= left {
+                comment.request(modeler::AnnotationTarget::Material {
+                    material: d.name.clone(),
+                    node,
+                });
+            }
+        }
     }
 
     let mats = &modeler.session.materials;
     let Ok(d) = mats.get(None) else {
         if let Ok(mut t) = title.single_mut() {
-            t.0 = "no material yet: material_ops creates one (M closes)".into();
+            t.0 = "No material yet: material_ops creates one".into();
         }
         return;
     };
@@ -201,7 +220,7 @@ pub(crate) fn update_material_pane(
         let ext = pos
             .iter()
             .fold(Vec2::ZERO, |a, p| a.max(*p + Vec2::new(BOX_W, BOX_H)));
-        let avail = Vec2::new(size.x - 20.0, size.y - top - 20.0);
+        let avail = Vec2::new(size.x - left - 10.0, size.y - graph_origin.y - 10.0);
         pane.zoom = (avail.x / ext.x.max(1.0))
             .min(avail.y / ext.y.max(1.0))
             .clamp(0.3, 1.0);
@@ -225,7 +244,7 @@ pub(crate) fn update_material_pane(
             .enumerate()
             .map(|(i, p)| (p.name.as_str(), i))
             .collect();
-        let origin = Vec2::new(10.0, top + 10.0);
+        let origin = graph_origin;
         commands.entity(canvas).with_children(|c| {
             for (i, p) in ev.nodes.iter().enumerate() {
                 for r in &p.reads {
@@ -317,8 +336,8 @@ pub(crate) fn update_material_pane(
         Err(e) => (e, Canvas::new(8, 8, [0, 0, 0, 255])),
     };
     if let Ok((mut im, mut n)) = preview.single_mut() {
-        let scale = ((size.x - 20.0) / img.w as f32)
-            .min((top - 56.0) / img.h as f32)
+        let scale = ((left - 20.0) / img.w as f32)
+            .min(body_h / img.h as f32)
             .min(1.5);
         n.width = Val::Px(img.w as f32 * scale);
         n.height = Val::Px(img.h as f32 * scale);
@@ -326,7 +345,7 @@ pub(crate) fn update_material_pane(
     }
     if let Ok(mut t) = title.single_mut() {
         t.0 = format!(
-            "Material `{}` v{}  ·  {} nodes  ·  click a node to inspect",
+            "Material `{}` v{}  ·  {} nodes  ·  click a node to inspect, right-click to comment",
             d.name,
             d.version,
             d.nodes.len()
@@ -351,10 +370,10 @@ pub(crate) fn setup_material_pane(mut commands: Commands, assets: Res<AssetServe
             Visibility::Hidden,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
                 left: Val::Px(0.0),
-                width: Val::Percent(PANE_FRACTION * 100.0),
-                height: Val::Percent(100.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(STRIP_FRACTION * 100.0),
                 overflow: Overflow::clip(),
                 ..default()
             },
@@ -366,7 +385,7 @@ pub(crate) fn setup_material_pane(mut commands: Commands, assets: Res<AssetServe
                 ImageNode::default(),
                 Node {
                     position_type: PositionType::Absolute,
-                    top: Val::Px(52.0),
+                    top: Val::Px(HEADER_H + 6.0),
                     left: Val::Px(10.0),
                     ..default()
                 },

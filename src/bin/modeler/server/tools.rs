@@ -1011,14 +1011,22 @@ impl Tools {
         &self,
         Parameters(AddAnnotationArgs {
             part,
+            material,
+            node,
             text,
             face,
             vertex,
             position,
         }): Parameters<AddAnnotationArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.add_annotation(&part, &text, face, vertex, position))
-            .await
+        self.run(move |s| match material {
+            Some(material) => s.annotate(
+                &modeler::AnnotationTarget::Material { material, node },
+                &text,
+            ),
+            None => s.add_annotation(&part, &text, face, vertex, position),
+        })
+        .await
     }
 
     /// Read every annotation on the model: one line per comment with its id, part,

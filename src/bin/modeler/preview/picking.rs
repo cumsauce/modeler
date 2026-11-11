@@ -8,10 +8,10 @@ pub(crate) struct AnnotationPin;
 #[derive(Component)]
 pub(crate) struct PinCommitted;
 
-/// The text being typed for the pending pin, shown in the bottom HUD line.
+/// A comment box is open: single-letter shortcuts (G, M, O) stay off.
 #[derive(Resource, Default)]
 pub(crate) struct PinTyping {
-    pub(crate) text: String,
+    pub(crate) open: bool,
 }
 
 /// A click hit to turn into a pin marker, deferred to a spawn system because
@@ -45,6 +45,7 @@ pub(crate) fn pin_on_click(
     panel: Res<GraphPanel>,
     mat_pane: Res<MatPane>,
     outline: Res<OutlinePane>,
+    mut comment: ResMut<CommentBox>,
 ) {
     if panel.hover || mat_pane.hover || outline.hover {
         return;
@@ -86,6 +87,7 @@ pub(crate) fn pin_on_click(
     // Deferred: MeshRayCast already borrows Assets<Mesh>, so the pin mesh is
     // spawned by the following system.
     spawn.point = Some((hit.point, id));
+    comment.request_spot(name.to_string());
     modeler.session.pending_pin = Some(PendingPin {
         part: name.to_string(),
         face: hit.triangle_index.map(|i| i as u32),
@@ -149,83 +151,4 @@ pub(crate) fn spawn_pin(
         Transform::from_xyz(0.0, radius * 3.0, 0.0),
     ));
     pin
-}
-
-/// Typing for the pending pin: characters collect into a buffer shown at the bottom
-/// of the window; Enter commits the annotation, Escape cancels the text, Backspace
-/// deletes a character. Always on (no focus to track), but inert without a pin.
-#[allow(clippy::type_complexity)]
-pub(crate) fn pin_typing(
-    mut key_events: MessageReader<KeyboardInput>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut modeler: ResMut<Modeler>,
-    mut typing: ResMut<PinTyping>,
-    mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    uncommitted: Query<
-        (Entity, &AnnotationPin, &MeshMaterial3d<StandardMaterial>),
-        Without<PinCommitted>,
-    >,
-) {
-    if modeler.session.pending_pin.is_none() {
-        typing.text.clear();
-        return;
-    }
-    if keys.just_pressed(KeyCode::Backspace) {
-        typing.text.pop();
-    }
-    if keys.just_pressed(KeyCode::Escape) {
-        // Escape cancels annotation mode entirely: drop the pending pin and
-        // its on-screen marker, not just the text typed so far.
-        typing.text.clear();
-        if modeler.session.pending_pin.take().is_some() {
-            for (entity, _, _) in &uncommitted {
-                commands.entity(entity).despawn();
-            }
-        }
-        return;
-    }
-    if keys.just_pressed(KeyCode::Enter) {
-        let Some(pin) = modeler.session.pending_pin.take() else {
-            return;
-        };
-        let text = std::mem::take(&mut typing.text);
-        let position = pin.position;
-        let face = pin.face;
-        let vertex = pin.vertex;
-        let part = pin.part.clone();
-        let result = modeler
-            .session
-            .add_annotation(&part, &text, face, vertex, Some(position));
-        if result.is_ok()
-            && let Some((entity, _, material)) = uncommitted.iter().next()
-        {
-            commands.entity(entity).insert(PinCommitted);
-            if let Some(mut mat) = materials.get_mut(&material.0) {
-                mat.base_color = Color::srgb(0.2, 0.9, 0.3);
-                mat.emissive = LinearRgba::rgb(0.2, 0.9, 0.3);
-            }
-        } else {
-            // Keep the pin alive for another try if the commit failed.
-            modeler.session.pending_pin = Some(pin);
-        }
-        return;
-    }
-    for ev in key_events.read() {
-        if ev.state != ButtonState::Pressed {
-            continue;
-        }
-        // Space arrives as `Key::Space`, not a character, on winit.
-        match &ev.logical_key {
-            Key::Character(c) => {
-                if let Some(ch) = c.chars().next()
-                    && !ch.is_control()
-                {
-                    typing.text.push(ch);
-                }
-            }
-            Key::Space => typing.text.push(' '),
-            _ => {}
-        }
-    }
 }

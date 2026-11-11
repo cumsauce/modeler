@@ -84,7 +84,7 @@ pub(crate) fn update_graph_hud(
     mut commands: Commands,
     (mut orbit, assets): (ResMut<Orbit>, Res<AssetServer>),
 ) {
-    if keys.just_pressed(KeyCode::KeyG) && typing.text.is_empty() {
+    if keys.just_pressed(KeyCode::KeyG) && !typing.open {
         visible.0 = !visible.0;
         panel.user_view = false;
         // Force a rebuild: the M pane may have had the left half meanwhile.
@@ -325,43 +325,6 @@ pub(crate) fn update_graph_hud(
     }
 }
 
-/// A side pane's width in physical pixels.
-fn pane_w(w: u32) -> u32 {
-    (w as f32 * PANE_FRACTION).round() as u32
-}
-
-/// With the panel open the 3D view is a separate pane on the right (not
-/// drawn under the panel), so screenshots of it never include the graph.
-pub(crate) fn graph_pane_viewport(
-    visible: Res<GraphHudVisible>,
-    mat: Res<MatPane>,
-    outline: Res<OutlinePane>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    mut cameras: Query<&mut Camera, With<MainCamera>>,
-) {
-    let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
-        return;
-    };
-    let want = (visible.0 || mat.visible || outline.visible).then(|| {
-        let (w, h) = (window.physical_width(), window.physical_height());
-        bevy::camera::Viewport {
-            physical_position: UVec2::new(pane_w(w), 0),
-            physical_size: UVec2::new((w - pane_w(w)).max(1), h.max(1)),
-            ..default()
-        }
-    });
-    let same = match (&camera.viewport, &want) {
-        (Some(a), Some(b)) => {
-            a.physical_position == b.physical_position && a.physical_size == b.physical_size
-        }
-        (None, None) => true,
-        _ => false,
-    };
-    if !same {
-        camera.viewport = want;
-    }
-}
-
 /// The selected box's parts pulse in the 3D view.
 pub(crate) fn highlight_selected(
     time: Res<Time>,
@@ -391,22 +354,4 @@ pub(crate) fn highlight_selected(
             m.emissive = want;
         }
     }
-}
-
-/// The bottom HUD line: what pin is being typed for and the text so far.
-pub(crate) fn update_typing_hud(
-    modeler: Res<Modeler>,
-    typing: Res<PinTyping>,
-    mut hud: Query<&mut Text, With<TypingHud>>,
-) {
-    let Ok(mut text) = hud.single_mut() else {
-        return;
-    };
-    text.0 = match &modeler.session.pending_pin {
-        Some(pin) => format!(
-            "pin #{} on `{}`: {}_  (Enter to comment, Esc to clear)",
-            modeler.session.model.next_annotation_id, pin.part, typing.text
-        ),
-        None => String::new(),
-    };
 }

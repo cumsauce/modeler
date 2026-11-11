@@ -118,13 +118,15 @@ fn main() -> AppExit {
     .init_resource::<GraphPanel>()
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
+    // The outliner and material strip are open unless set to 0.
     .insert_resource(MatPane::open(
-        std::env::var_os("MODELER_MATERIALS").is_some(),
+        std::env::var("MODELER_MATERIALS").map_or(true, |v| v != "0"),
     ))
     .insert_resource(OutlinePane::open(
-        std::env::var_os("MODELER_OUTLINE").is_some(),
+        std::env::var("MODELER_OUTLINE").map_or(true, |v| v != "0"),
     ))
     .init_resource::<PinTyping>()
+    .init_resource::<CommentBox>()
     .init_resource::<PendingPinSpawn>()
     .add_systems(
         Update,
@@ -136,11 +138,11 @@ fn main() -> AppExit {
             orbit_camera.run_if(windowed),
             pin_on_click.run_if(windowed),
             spawn_pin_markers.run_if(windowed),
-            pin_typing.run_if(windowed),
+            comment_box.run_if(windowed),
             update_typing_hud.run_if(windowed),
             update_graph_hud.run_if(windowed),
             highlight_selected.run_if(windowed),
-            graph_pane_viewport.run_if(windowed),
+            apply_layout.run_if(windowed),
             update_material_pane.run_if(windowed),
             update_outline_pane.run_if(windowed),
         ),

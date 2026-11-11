@@ -18,6 +18,63 @@ use crate::prelude::*;
 /// view gets the rest.
 pub(crate) const PANE_FRACTION: f32 = 0.4;
 
+/// Share of the window height the material strip takes along the bottom.
+pub(crate) const STRIP_FRACTION: f32 = 0.3;
+
+/// Window layout: the outliner (or the graph, G) on the left, the material
+/// strip (M) along the bottom under both, the 3D view in what is left. The
+/// 3D camera renders to that rectangle only, so screenshots never include a
+/// pane.
+pub(crate) fn apply_layout(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    graph: Res<GraphHudVisible>,
+    mat: Res<MatPane>,
+    outline: Res<OutlinePane>,
+    mut left: Query<&mut Node, Or<(With<GraphHud>, With<OutlineHud>)>>,
+    mut cameras: Query<&mut Camera, With<MainCamera>>,
+) {
+    let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
+        return;
+    };
+    let left_open = graph.0 || outline.visible;
+    let h_pct = if mat.visible {
+        100.0 - STRIP_FRACTION * 100.0
+    } else {
+        100.0
+    };
+    for mut n in &mut left {
+        if n.height != Val::Percent(h_pct) {
+            n.height = Val::Percent(h_pct);
+        }
+    }
+    let (w, h) = (window.physical_width(), window.physical_height());
+    let x = if left_open {
+        (w as f32 * PANE_FRACTION).round() as u32
+    } else {
+        0
+    };
+    let bottom = if mat.visible {
+        (h as f32 * STRIP_FRACTION).round() as u32
+    } else {
+        0
+    };
+    let want = (left_open || mat.visible).then(|| bevy::camera::Viewport {
+        physical_position: UVec2::new(x, 0),
+        physical_size: UVec2::new((w - x.min(w)).max(1), (h - bottom.min(h)).max(1)),
+        ..default()
+    });
+    let same = match (&camera.viewport, &want) {
+        (Some(a), Some(b)) => {
+            a.physical_position == b.physical_position && a.physical_size == b.physical_size
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        camera.viewport = want;
+    }
+}
+
 /// Height of a pane header row.
 pub(crate) const HEADER_H: f32 = 30.0;
 
@@ -63,26 +120,21 @@ fn toggle(
 ) {
     match which {
         PaneToggle::Outline => {
-            outline.visible = !outline.visible;
-            if outline.visible {
+            // The graph shares the left side: O over it brings the outliner back.
+            if graph.0 {
                 graph.0 = false;
-                mat.visible = false;
+                outline.visible = true;
+            } else {
+                outline.visible = !outline.visible;
             }
         }
         PaneToggle::Graph => {
             graph.0 = !graph.0;
             panel.user_view = false;
             panel.version = None;
-            if graph.0 {
-                mat.visible = false;
-            }
         }
         PaneToggle::Material => {
             mat.visible = !mat.visible;
-            if mat.visible {
-                graph.0 = false;
-                panel.version = None;
-            }
         }
     }
 }
@@ -206,7 +258,7 @@ pub(crate) fn sync_toolbar(
         let open = match which {
             PaneToggle::Graph => graph.0,
             PaneToggle::Material => mat.visible,
-            PaneToggle::Outline => outline.visible,
+            PaneToggle::Outline => outline.visible && !graph.0,
         };
         let want = ButtonVariant::selected(open);
         if *variant != want {

@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use bevy::feathers::constants::icons;
+use modeler::AnnotationTarget;
 use modeler::outline::{self, Row};
 
 use crate::prelude::*;
@@ -66,34 +67,30 @@ pub(crate) fn update_outline_pane(
     typing: Res<PinTyping>,
     modeler: Res<Modeler>,
     mut pane: ResMut<OutlinePane>,
-    (mut graph, mut mat): (ResMut<GraphHudVisible>, ResMut<MatPane>),
-    mut prev: Local<(bool, bool)>,
+    mut graph: ResMut<GraphHudVisible>,
     mut hud: Query<(&mut Visibility, &ComputedNode), With<OutlineHud>>,
     mut list: Query<(Entity, &mut ScrollPosition), With<OutlineList>>,
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
-    if keys.just_pressed(KeyCode::KeyO) && typing.text.is_empty() {
-        pane.visible = !pane.visible;
-        if pane.visible {
+    if keys.just_pressed(KeyCode::KeyO) && !typing.open {
+        if graph.0 {
             graph.0 = false;
-            mat.visible = false;
+            pane.visible = true;
+        } else {
+            pane.visible = !pane.visible;
         }
     }
-    // Another pane opened (G, M, toolbar): give it the left side.
-    if (graph.0 && !prev.0) || (mat.visible && !prev.1) {
-        pane.visible = false;
-    }
-    *prev = (graph.0, mat.visible);
+    let shown = pane.visible && !graph.0;
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
     };
-    *vis = if pane.visible {
+    *vis = if shown {
         Visibility::Inherited
     } else {
         Visibility::Hidden
     };
-    if !pane.visible {
+    if !shown {
         pane.hover = false;
         return;
     }
@@ -244,14 +241,30 @@ fn on_row_click(
     modeler: Res<Modeler>,
     mut pane: ResMut<OutlinePane>,
     mut orbit: ResMut<Orbit>,
+    mut comment: ResMut<CommentBox>,
 ) {
-    if click.button != PointerButton::Primary {
-        return;
-    }
     let target = click.original_event_target();
     let Ok(row) = rows.get(click.event_target()) else {
         return;
     };
+    // Right-click: comment on the row (a group comments on all its parts).
+    if click.button == PointerButton::Secondary {
+        let found = outline::flatten(&pane.tree, &|_| true)
+            .into_iter()
+            .find(|(_, r)| r.key == row.key)
+            .map(|(_, r)| (r.label.clone(), r.parts.clone()));
+        if let Some((label, parts)) = found {
+            comment.request(if row.group {
+                AnnotationTarget::Group { label, parts }
+            } else {
+                AnnotationTarget::Part(parts.into_iter().next().unwrap_or_default())
+            });
+        }
+        return;
+    }
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let key = row.key.clone();
     pane.generation += 1;
     if let Ok(ch) = chevrons.get(target) {

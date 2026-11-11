@@ -96,8 +96,13 @@ pub(crate) struct NameArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AddAnnotationArgs {
-    /// The part the comment is about.
+    /// The part the comment is about ("" with `material`).
+    #[serde(default)]
     pub(crate) part: String,
+    /// Comment on a procedural material instead of a part (working set or
+    /// library name), optionally on one of its nodes with `node`.
+    pub(crate) material: Option<String>,
+    pub(crate) node: Option<String>,
     /// The comment text.
     pub(crate) text: String,
     /// Optional triangle index to pin the comment to.

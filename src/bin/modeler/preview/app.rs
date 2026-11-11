@@ -107,7 +107,6 @@ pub(crate) fn rebuild_scene(
     mut pbr_cache: ResMut<PbrCache>,
     mut orbit: ResMut<Orbit>,
     mut built: ResMut<SceneBuilt>,
-    mut typing: ResMut<PinTyping>,
     existing: Query<Entity, With<PreviewPart>>,
     pins: Query<Entity, With<AnnotationPin>>,
 ) {
@@ -121,7 +120,6 @@ pub(crate) fn rebuild_scene(
     }
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
-    typing.text.clear();
     for part in &modeler.session.model.parts {
         if part.verts.is_empty() || part.indices.is_empty() || !part.visible {
             continue;

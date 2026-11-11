@@ -1590,6 +1590,7 @@ impl Session {
             "warnings": self.lints(),
             "annotations": self.model.annotations.iter().map(|a| json!({
                 "id": a.id, "part": a.part, "text": a.text, "face": a.face, "vertex": a.vertex,
+                "group": a.group, "material": a.material, "node": a.node,
             })).collect::<Vec<_>>(),
         })
     }
@@ -2067,12 +2068,71 @@ impl Session {
             vertex,
             position,
             text: text.to_string(),
+            group: None,
+            material: None,
+            node: None,
         };
         self.model.annotations.push(annotation);
         Ok(format!(
             "annotation #{id} on `{part}`: '{text}'{}",
             face.map(|f| format!(" @face {f}")).unwrap_or_default()
         ))
+    }
+
+    /// Comment on an outliner group or a material (node). Group comments sit
+    /// at the group's centre; material comments have no position.
+    pub fn annotate(&mut self, target: &crate::AnnotationTarget, text: &str) -> CmdResult {
+        use crate::AnnotationTarget as T;
+        let (part, group, material, node, position) = match target {
+            T::Part(p) => return self.add_annotation(p, text, None, None, None),
+            T::Group { label, parts } => {
+                let Some((lo, hi)) = self.model.bounds_of(parts) else {
+                    return Err(format!("group `{label}`: none of its parts exist").into());
+                };
+                let c = (lo + hi) * 0.5;
+                (
+                    parts.first().cloned().unwrap_or_default(),
+                    Some(label.clone()),
+                    None,
+                    None,
+                    c.to_array(),
+                )
+            }
+            T::Material { material, node } => {
+                let doc = self.materials.get(Some(material))?;
+                if let Some(n) = node
+                    && !doc
+                        .nodes
+                        .iter()
+                        .any(|v| v.get("name").and_then(|x| x.as_str()) == Some(n.as_str()))
+                {
+                    return Err(format!("material `{material}` has no node `{n}`").into());
+                }
+                (
+                    String::new(),
+                    None,
+                    Some(material.clone()),
+                    node.clone(),
+                    [0.0; 3],
+                )
+            }
+        };
+        let id = self.model.next_annotation_id;
+        self.model.next_annotation_id += 1;
+        let a = Annotation {
+            id,
+            part,
+            face: None,
+            vertex: None,
+            position,
+            text: text.to_string(),
+            group,
+            material,
+            node,
+        };
+        let msg = format!("annotation #{id} on {}: '{text}'", a.target());
+        self.model.annotations.push(a);
+        Ok(msg)
     }
 
     /// Every annotation, one line each, so the AI can read the human's comments.
@@ -2083,9 +2143,9 @@ impl Session {
         let mut out = format!("{} annotations\n", self.model.annotations.len());
         for a in &self.model.annotations {
             out += &format!(
-                "#{} `{}` '{}'{}{}\n",
+                "#{} {} '{}'{}{}\n",
                 a.id,
-                a.part,
+                a.target(),
                 a.text,
                 a.face.map(|f| format!(" @face {f}")).unwrap_or_default(),
                 a.vertex
@@ -2207,9 +2267,9 @@ impl Session {
             s += &format!("annotations ({})\n", self.model.annotations.len());
             for a in &self.model.annotations {
                 s += &format!(
-                    "- #{} `{}` '{}'{}{}\n",
+                    "- #{} {} '{}'{}{}\n",
                     a.id,
-                    a.part,
+                    a.target(),
                     a.text,
                     a.face.map(|f| format!(" @face {f}")).unwrap_or_default(),
                     a.vertex
@@ -4145,5 +4205,54 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn comments_on_groups_and_material_nodes() {
+        let mut s = Session::default();
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "book", "kind": "box", "size": [0.03, 0.2, 0.15], "translation": [0, 0.1, 0]},
+            {"type": "linear_array", "name": "book", "input": "book", "count": 3, "offset": [0.04, 0, 0]}
+        ]);
+        s.apply_values_as(None, items.as_array().cloned().unwrap_or_default(), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.materials
+            .ops(
+                "stone",
+                vec![serde_json::json!({"type": "output", "name": "out", "base_color": "#808080"})],
+                None,
+                None,
+                None,
+                Some(32),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let g = crate::AnnotationTarget::Group {
+            label: "book ×3".into(),
+            parts: vec!["book".into(), "book_1".into(), "book_2".into()],
+        };
+        let r = s
+            .annotate(&g, "spines too even")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.contains("group `book ×3`"), "{r}");
+        let a = &s.model.annotations[0];
+        assert!((a.position[0] - 0.04).abs() < 1e-4, "{:?}", a.position);
+        let m = crate::AnnotationTarget::Material {
+            material: "stone".into(),
+            node: Some("out".into()),
+        };
+        s.annotate(&m, "too grey").unwrap_or_else(|e| panic!("{e}"));
+        let bad = crate::AnnotationTarget::Material {
+            material: "stone".into(),
+            node: Some("nope".into()),
+        };
+        assert!(s.annotate(&bad, "x").is_err());
+        let list = s.list_annotations();
+        assert!(
+            list.contains("material `stone` node `out` 'too grey'"),
+            "{list}"
+        );
+        assert!(s.model.annotations[1].is_on(&m) && !s.model.annotations[0].is_on(&m));
+        assert!(s.model.annotations[0].is_on(&g));
     }
 }

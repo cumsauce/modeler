@@ -971,6 +971,60 @@ pub struct Annotation {
     pub vertex: Option<u32>,
     pub position: [f32; 3],
     pub text: String,
+    /// A comment on a group of parts (an outliner group: `book ×14`); `part`
+    /// is then its first part and `position` the group's centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// A comment on a procedural material (`part` is empty), optionally on
+    /// one of its nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+impl Annotation {
+    /// What the comment is on, for listings: `part`, `group (parts)` or
+    /// `material m node n`.
+    pub fn target(&self) -> String {
+        match (&self.material, &self.group) {
+            (Some(m), _) => match &self.node {
+                Some(n) => format!("material `{m}` node `{n}`"),
+                None => format!("material `{m}`"),
+            },
+            (None, Some(g)) => format!("group `{g}`"),
+            (None, None) => format!("`{}`", self.part),
+        }
+    }
+
+    /// Whether this comment is on the given outliner row / material target.
+    pub fn is_on(&self, target: &AnnotationTarget) -> bool {
+        match target {
+            AnnotationTarget::Part(p) => {
+                self.material.is_none() && self.group.is_none() && self.part == *p
+            }
+            AnnotationTarget::Group { label, .. } => {
+                self.material.is_none() && self.group.as_deref() == Some(label.as_str())
+            }
+            AnnotationTarget::Material { material, node } => {
+                self.material.as_deref() == Some(material.as_str()) && self.node == *node
+            }
+        }
+    }
+}
+
+/// What a new comment is about (besides a clicked spot, which is a part).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnnotationTarget {
+    Part(String),
+    Group {
+        label: String,
+        parts: Vec<String>,
+    },
+    Material {
+        material: String,
+        node: Option<String>,
+    },
 }
 
 #[cfg(test)]

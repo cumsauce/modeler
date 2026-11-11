@@ -8,6 +8,8 @@ mod camera;
 pub(crate) use camera::*;
 mod capture;
 pub(crate) use capture::*;
+mod comments;
+pub(crate) use comments::*;
 mod material_pane;
 pub(crate) use material_pane::*;
 mod outline_pane;
