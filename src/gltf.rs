@@ -188,6 +188,7 @@ pub(crate) fn build(
     }
     let prepared = crate::export_opt::prepare(visible, opts);
     let exported = &prepared.parts;
+    crate::material::pbr::prebake(exported.iter());
     let mut b = Builder::default();
     let (mut nodes, mut meshes, mut materials) = (Vec::new(), Vec::new(), Vec::new());
     let (mut images, mut textures) = (Vec::new(), Vec::new());

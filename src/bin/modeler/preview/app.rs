@@ -240,6 +240,16 @@ pub(crate) fn rebuild_scene(
     spawn_lights(&mut commands, &modeler.session.model);
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
+    // Bake every part's material at once (in parallel) before spawning.
+    modeler::material::pbr::prebake(
+        modeler
+            .session
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.visible && !p.verts.is_empty())
+            .map(|p| &**p),
+    );
     for part in &modeler.session.model.parts {
         if part.verts.is_empty() || part.indices.is_empty() || !part.visible {
             continue;

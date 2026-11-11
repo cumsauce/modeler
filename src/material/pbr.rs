@@ -143,7 +143,64 @@ pub fn hash_occluders(p: &Part, h: &mut impl Hasher) {
     }
 }
 
-static BAKES: Mutex<Option<HashMap<u64, Arc<Channels>>>> = Mutex::new(None);
+/// Baked materials by bake key, least recently used evicted past
+/// [`BAKE_BUDGET`] bytes. (A fixed entry count cleared wholesale used to
+/// rebake every part of a scene with more parts than entries on every edit.)
+struct BakeCache {
+    map: HashMap<u64, (Arc<Channels>, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+static BAKES: Mutex<Option<BakeCache>> = Mutex::new(None);
+
+/// Memory the bake cache may hold (about a hundred 512² object atlases).
+const BAKE_BUDGET: usize = 1 << 30;
+
+fn bake_bytes(ch: &Channels) -> usize {
+    // base 12 + rough 4 + metal 4 + normal 12 + height 4 + ao 4 + emissive 12 + opacity 4
+    ch.w * ch.h * 56
+}
+
+fn cache_get(key: u64) -> Option<Arc<Channels>> {
+    let mut g = BAKES.lock().ok()?;
+    let c = g.as_mut()?;
+    c.tick += 1;
+    let t = c.tick;
+    let e = c.map.get_mut(&key)?;
+    e.1 = t;
+    Some(e.0.clone())
+}
+
+fn cache_put(key: u64, ch: Arc<Channels>) {
+    let Ok(mut g) = BAKES.lock() else {
+        return;
+    };
+    let c = g.get_or_insert_with(|| BakeCache {
+        map: HashMap::new(),
+        bytes: 0,
+        tick: 0,
+    });
+    c.tick += 1;
+    let size = bake_bytes(&ch);
+    if let Some((old, _)) = c.map.insert(key, (ch, c.tick)) {
+        c.bytes -= bake_bytes(&old);
+    }
+    c.bytes += size;
+    while c.bytes > BAKE_BUDGET && c.map.len() > 1 {
+        let Some((&k, _)) = c
+            .map
+            .iter()
+            .filter(|(k, _)| **k != key)
+            .min_by_key(|(_, v)| v.1)
+        else {
+            break;
+        };
+        if let Some((old, _)) = c.map.remove(&k) {
+            c.bytes -= bake_bytes(&old);
+        }
+    }
+}
 
 /// Bakes a part's material (cached).
 pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
@@ -151,11 +208,7 @@ pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
         return Ok(None);
     };
     let key = bake_key(r, Some(part));
-    if let Some(hit) = BAKES
-        .lock()
-        .ok()
-        .and_then(|c| c.as_ref().and_then(|m| m.get(&key).cloned()))
-    {
+    if let Some(hit) = cache_get(key) {
         return Ok(Some(hit));
     }
     let g = r.graph()?;
@@ -168,14 +221,35 @@ pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
         bake::bake(&g.nodes, &r.params(g), &s, true)
             .map_err(|e| format!("material `{}` on `{}`: {e}", r.material, part.name))?,
     );
-    if let Ok(mut c) = BAKES.lock() {
-        let m = c.get_or_insert_with(HashMap::new);
-        if m.len() >= 64 {
-            m.clear();
-        }
-        m.insert(key, ch.clone());
-    }
+    cache_put(key, ch.clone());
     Ok(Some(ch))
+}
+
+/// Bakes every part's material in parallel (parts at once, not just the
+/// samples inside one bake), so a scene of small object atlases uses every
+/// core; later [`bake_part`] calls hit the cache. Parts sharing a bake key
+/// (tile materials) bake once. Errors are left for `bake_part` to report.
+pub fn prebake<'a>(parts: impl IntoIterator<Item = &'a Part>) {
+    use rayon::prelude::*;
+    let mut seen = std::collections::HashSet::new();
+    let todo: Vec<&Part> = parts
+        .into_iter()
+        .filter(|p| {
+            p.material
+                .pbr
+                .as_ref()
+                .is_some_and(|r| seen.insert(bake_key(r, Some(p))))
+        })
+        .filter(|p| {
+            p.material
+                .pbr
+                .as_ref()
+                .is_some_and(|r| cache_get(bake_key(r, Some(p))).is_none())
+        })
+        .collect();
+    todo.par_iter().for_each(|p| {
+        let _ = bake_part(p);
+    });
 }
 
 /// RGBA8 images of a bake, laid out the way glTF / Bevy sample them.

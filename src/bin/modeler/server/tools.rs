@@ -670,12 +670,24 @@ Style::default()
     }
 
     /// Describe one catalog entry in full: description, tags and the prompt that made it.
+    /// `delete: true` removes the entry instead (the file moves to
+    /// `prefabs/removed/`).
     #[tool]
     async fn catalog_describe(
         &self,
-        Parameters(CatalogNameArgs { name }): Parameters<CatalogNameArgs>,
+        Parameters(CatalogDescribeArgs { name, delete }): Parameters<CatalogDescribeArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |_s| catalog::describe(&name)).await
+        self.run(move |_s| {
+            if delete {
+                catalog::delete_doc(catalog::Kind::Prefabs, &name)?;
+                Ok(format!(
+                    "removed prefab `{name}` from the catalog (its file is in prefabs/removed/)"
+                ))
+            } else {
+                catalog::describe(&name)
+            }
+        })
+        .await
     }
 
     /// Grab the current preview render as a PNG image so you can see the model.
@@ -1356,7 +1368,7 @@ impl rmcp::ServerHandler for Tools {
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
-- scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"); a material_ops edit re-applies itself to the parts using it.
+- scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"); a material_ops edit re-applies itself to the parts using it. catalog_describe(name, delete: true) removes a prefab.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
 - scene(open/switch/list/close) keeps several documents open; a prefab item naming an open doc instances it live (re-synced on switch); prefab style: \"scene\" re-themes a piece with the scene's tokens.

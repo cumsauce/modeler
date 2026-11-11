@@ -146,3 +146,75 @@ fn edits_place_verify_and_autosave_stay_fast() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Object-domain bakes with mesh AO on 82 parts: more parts than the old
+/// fixed-size bake cache held, which rebaked everything on every edit.
+#[test]
+fn material_bakes_stay_cached_and_parallel() {
+    use modeler::material::pbr::{bake_part, prebake};
+    let mut s = Session::default();
+    s.materials
+        .ops(
+            "grime",
+            vec![
+                json!({"type": "input", "name": "p", "of": "position"}),
+                json!({"type": "noise", "name": "n", "size": 0.05, "coords": "p"}),
+                json!({"type": "mesh_ao", "name": "ao"}),
+                json!({"type": "math", "name": "c", "op": "mul", "a": "n", "b": "ao"}),
+                json!({"type": "output", "name": "out", "base_color": "c", "ao": "ao"}),
+            ],
+            None,
+            Some("object".into()),
+            None,
+            Some(256),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    apply(
+        &mut s,
+        vec![
+            json!({"type": "primitive", "name": "floor", "kind": "box", "size": [10, 0.2, 10],
+                   "translation": [0, 0.1, 0]}),
+            json!({"type": "repeat", "var": "r", "count": 9, "items": [
+                {"type": "repeat", "var": "c", "count": 9, "items": [
+                    {"type": "primitive", "name": "b{r}_{c}", "kind": "box", "size": 0.5,
+                     "translation": ["=$r * 1.1 - 4.5", 0.45, "=$c * 1.1 - 4.5"]}
+                ]}
+            ]}),
+            json!({"type": "material", "name": "*", "pbr": "grime"}),
+        ],
+    );
+    let bake_all = |s: &Session| {
+        let parts: Vec<_> = s
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.visible)
+            .cloned()
+            .collect();
+        prebake(parts.iter().map(|p| &**p));
+        for p in &parts {
+            bake_part(p).unwrap_or_else(|e| panic!("{e}"));
+        }
+    };
+    let t0 = Instant::now();
+    bake_all(&s);
+    budget(
+        "cold bake, 82 object parts with mesh_ao",
+        t0.elapsed(),
+        2500,
+    );
+    let t0 = Instant::now();
+    bake_all(&s);
+    budget("unchanged re-bake (all cached)", t0.elapsed(), 30);
+    apply(
+        &mut s,
+        vec![
+            json!({"type": "primitive", "name": "b0_0", "kind": "box", "size": 0.5,
+                    "translation": [-4.6, 0.45, -4.5]}),
+        ],
+    );
+    let t0 = Instant::now();
+    bake_all(&s);
+    budget("re-bake after moving one part", t0.elapsed(), 400);
+}

@@ -449,7 +449,8 @@ name: the producer first, then in-place material/visibility/transform edits).
 away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
 tags, prompt)` (all required; reports when it overwrote an entry),
 `load_prefab(name)` (answers with a brief: counts, visible parts, params,
-named moves, warnings), `catalog_list` and `catalog_describe` (each entry also
+named moves, warnings), `catalog_list` and `catalog_describe` (`delete: true` removes an entry;
+its file moves to `prefabs/removed/`; each entry also
 lists its knobs: params with values and named moves/places, read from the
 file),
 `export_model(path, "glb" | "gltf")` (skips hidden parts).
@@ -722,6 +723,10 @@ work, and every material has its own history tree.
   shared per bake) and a TANGENT attribute.
 - **History:** `undo` / `redo` / `jump` / `history` take `doc:
   "material:<name>"` (or `"material"` for the active one).
+- **Bake cache:** bakes are cached by key (material, params, and for
+  object materials the part's mesh and neighbours), least recently used
+  evicted past 1 GB; the preview and exports bake all parts in parallel
+  first, so only parts whose key changed re-bake after an edit.
 - **Parallelism:** a level's nodes run in parallel, every kernel is
   data-parallel over samples (rayon), results are deterministic at any
   thread count, and a memo cache keyed by node + input keys + domain

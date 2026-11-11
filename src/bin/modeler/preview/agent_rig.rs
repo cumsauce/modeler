@@ -428,7 +428,9 @@ pub(crate) fn process_agent_shot(
             .parts
             .iter()
             .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
-        for (i, part) in drawable.enumerate() {
+        let drawable: Vec<_> = drawable.collect();
+        modeler::material::pbr::prebake(drawable.iter().map(|p| &***p));
+        for (i, part) in drawable.into_iter().enumerate() {
             legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
             let bundle = part_bundle(
                 part,

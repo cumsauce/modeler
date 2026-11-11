@@ -244,6 +244,16 @@ pub(crate) struct CatalogNameArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct CatalogDescribeArgs {
+    /// The prefab/catalog entry name.
+    pub(crate) name: String,
+    /// true: remove this entry from the catalog instead of describing it.
+    /// The file moves to `prefabs/removed/`, so it can be restored by hand.
+    #[serde(default)]
+    pub(crate) delete: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetCameraArgs {
     /// Horizontal angle in degrees: 0 = from +z (front view), 90 = from +x (right).
     pub(crate) yaw: f32,
