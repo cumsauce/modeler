@@ -173,10 +173,11 @@ It enables structured MCP errors and lets tests match variants instead of
 substrings. Lower priority; do it after B4.
 
 ### B8. `mcp_driver.py` is a workaround for a config gap
-The STATUS notes that the MCP client was never pointed at the binary. Add a
-checked-in `.mcp.json` (project-scoped Claude Code MCP config) that runs
-`target/debug/modeler` (or `cargo run --quiet`). Agents then get native tools,
-and the driver becomes a test harness rather than the main path.
+Done through user config rather than the repo: register the binary once with
+`claude mcp add -s user modeler -- <repo>/target/debug/modeler` (and in the
+Claude app's `claude_desktop_config.json`). A checked-in `.mcp.json` was tried
+and removed: with the user entry too, Claude Code warned about the same server
+in two scopes. Agents get native tools; the driver is the fallback.
 
 ## C. Smaller cleanups
 - `graph::upsert` returns `Result` but can never fail. Make it return `()`.
