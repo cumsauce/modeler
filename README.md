@@ -41,10 +41,18 @@ Point your agent's MCP config at the `modeler` binary
   stable), `inspect` (gaps/overlaps between parts, cross-sections, mass and
   tipping), and `agent_views` renders: several views tiled into one image,
   part-ID colouring, dimension overlays and before/after diffs.
+- **Procedural PBR materials**: node graphs of 2D/3D SDFs, noise (value,
+  gradient, worley), maths and colour, evaluated in parallel on the CPU and
+  baked to base colour / roughness / metallic / normal / AO textures. Tileable
+  (real-size tiles mapped by metric uvs) or object-space (3D fields on a
+  per-part atlas). Their own history trees, a `materials/` library next to the
+  prefabs, deterministic checks, and textured glTF export.
+  `cargo run --example procedural_material` walks through it.
 - **Annotations**: comments pinned to a part/face, typed in the preview
   window or via tools.
 
 ## Preview window controls
 
 Mouse drag orbits / pans, scroll zooms, `G` toggles the graph + history
-panel, click a part then type to annotate (Enter commits, Esc cancels).
+panel, `M` the material pane (the active material's nodes with live
+thumbnails and a lit preview), click a part then type to annotate (Enter commits, Esc cancels).

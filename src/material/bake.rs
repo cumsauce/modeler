@@ -194,35 +194,34 @@ impl Channels {
         Ok(out)
     }
 
-    /// How seamy the tile's wrap edges are: per edge texel, the jump across
-    /// the wrap over the mean jump just inside on both sides, and the median
-    /// of that over every edge texel. ~1 when the tile repeats cleanly (the
-    /// seam looks like any other texel step, even for fine noise); a
-    /// pattern that does not wrap lands well above 2.
-    pub fn seam_ratio(&self, name: &str) -> Result<f32, String> {
-        let img = self.image(name)?;
-        let (w, h) = (img.w, img.h);
-        if w < 3 || h < 3 {
-            return Ok(0.0);
+    /// Share of texels (worst over the given channels) where this bake and
+    /// `shifted` (the same graph baked half a tile over) disagree once
+    /// `shifted` is rolled back by half a tile: 0 for a graph that is truly
+    /// periodic on the tile, large for one that is not.
+    pub fn periodic_mismatch(
+        &self,
+        shifted: &Channels,
+        names: &[&str],
+    ) -> Result<(f32, &'static str), String> {
+        let (w, h) = (self.w, self.h);
+        let mut worst = (0.0f32, "");
+        for &name in CHANNELS.iter().filter(|c| names.contains(c)) {
+            let (a, b) = (self.image(name)?, shifted.image(name)?);
+            let bad = (0..w * h)
+                .into_par_iter()
+                .filter(|&i| {
+                    let (x, y) = (i % w, i / w);
+                    // shifted texel (x, y) sits at original (x + w/2, y + h/2).
+                    let j = ((y + h / 2) % h) * w + (x + w / 2) % w;
+                    (0..3).any(|k| (a.px[j * 4 + k] as i32 - b.px[i * 4 + k] as i32).abs() > 12)
+                })
+                .count();
+            let f = bad as f32 / (w * h).max(1) as f32;
+            if f > worst.0 {
+                worst = (f, name);
+            }
         }
-        let g = |x: usize, y: usize| -> [f32; 3] {
-            let i = (y * w + x) * 4;
-            [img.px[i] as f32, img.px[i + 1] as f32, img.px[i + 2] as f32]
-        };
-        let d = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f32::max);
-        let mut r = Vec::with_capacity(w + h);
-        for y in 0..h {
-            let seam = d(g(w - 1, y), g(0, y));
-            let local = 0.5 * (d(g(w - 2, y), g(w - 1, y)) + d(g(0, y), g(1, y)));
-            r.push(seam / (local + 2.0));
-        }
-        for x in 0..w {
-            let seam = d(g(x, h - 1), g(x, 0));
-            let local = 0.5 * (d(g(x, h - 2), g(x, h - 1)) + d(g(x, 0), g(x, 1)));
-            r.push(seam / (local + 2.0));
-        }
-        r.sort_by(f32::total_cmp);
-        Ok(r[r.len() / 2])
+        Ok(worst)
     }
 }
 
@@ -254,10 +253,12 @@ mod tests {
         let s = Samples::tile(512, 1.0);
         let p = Params::new();
         let a = bake(&bricks(), &p, &s, false).unwrap_or_else(|e| panic!("{e}"));
-        for ch in ["base_color", "roughness", "normal"] {
-            let r = a.seam_ratio(ch).unwrap_or_else(|e| panic!("{e}"));
-            assert!(r <= 1.5, "{ch} seam ratio {r}");
-        }
+        let shifted = bake(&bricks(), &p, &Samples::tile_shifted(512, 1.0, 256), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (m, ch) = a
+            .periodic_mismatch(&shifted, CHANNELS)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(m < 0.002, "{ch} mismatch {m}");
         assert!(a.roughness.iter().all(|r| (0.7..=0.95).contains(r)));
         assert!(a.driven.contains(&"normal"));
         // Bricks cover most of the area, mortar the rest.

@@ -1117,7 +1117,7 @@ impl rmcp::ServerHandler for Tools {
 - scene_summary, apply_ops and verify also return structuredContent JSON.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
-- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. undo/redo/jump/history take doc \"material:<name>\".
+- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size; object materials wrap a per-part atlas; export_model writes the textures). undo/redo/jump/history take doc \"material:<name>\".
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()

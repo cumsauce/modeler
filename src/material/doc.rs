@@ -254,23 +254,36 @@ impl MatDoc {
         let parsed = eval::parse(&next.nodes, &next.params)?;
         let ch = next.bake(next.resolution as usize, true)?;
         let lv = eval::levels(&parsed)?;
-        next.version = self.version + 1;
-        next.format_version = MAT_FORMAT_VERSION;
-        let label = {
-            let mut l: Vec<String> = Vec::new();
-            l.extend(added.iter().map(|n| format!("+{n}")));
-            l.extend(changed.iter().map(|n| format!("~{n}")));
-            l.extend(removed.iter().map(|n| format!("-{n}")));
-            if l.is_empty() {
-                "material settings".to_string()
-            } else {
-                l.join(" ")
-            }
-        };
-        let mut history = std::mem::take(&mut self.history);
-        history.record(next.clone(), label);
-        *self = next;
-        self.history = history;
+        // A call that changes nothing (a re-check with `expect`, a re-sent
+        // identical node) reports and checks but records no history step.
+        let same = self.version > 0
+            && next.nodes == self.nodes
+            && next.params == self.params
+            && next.domain == self.domain
+            && next.tile == self.tile
+            && next.resolution == self.resolution;
+        if same {
+            next.history = std::mem::take(&mut self.history);
+            *self = next;
+        } else {
+            next.version = self.version + 1;
+            next.format_version = MAT_FORMAT_VERSION;
+            let label = {
+                let mut l: Vec<String> = Vec::new();
+                l.extend(added.iter().map(|n| format!("+{n}")));
+                l.extend(changed.iter().map(|n| format!("~{n}")));
+                l.extend(removed.iter().map(|n| format!("-{n}")));
+                if l.is_empty() {
+                    "material settings".to_string()
+                } else {
+                    l.join(" ")
+                }
+            };
+            let mut history = std::mem::take(&mut self.history);
+            history.record(next.clone(), label);
+            *self = next;
+            self.history = history;
+        }
         let mut out = format!(
             "material `{}` v{} ({} domain{}, {}²): {} node(s) in {} level(s); {} computed, rest cached; {:.0} ms\n",
             self.name,
@@ -323,27 +336,27 @@ impl MatDoc {
                     "an object-domain material is not a tile".into(),
                 ));
             } else {
-                let mut worst = (0.0f32, "");
-                for &c in CHANNELS {
-                    if c == "height" && !ch.driven.contains(&"height") {
-                        continue;
-                    }
-                    let r = ch.seam_ratio(c)?;
-                    if r > worst.0 {
-                        worst = (r, c);
-                    }
-                }
-                let pass = worst.0 <= 2.0;
+                // Bake the tile shifted by half a tile: a periodic graph gives
+                // the same image rolled by half; anything else differs.
+                let n = ch.w;
+                let shifted = bake::bake(
+                    &self.nodes,
+                    &self.params,
+                    &Samples::tile_shifted(n, self.tile, n / 2),
+                    true,
+                )?;
+                let (frac, worst) = ch.periodic_mismatch(&shifted, &ch.driven)?;
+                let pass = frac <= 0.01;
                 out.push((
                     "tileable".into(),
                     pass,
                     if pass {
-                        "every channel wraps with no seam".into()
+                        "every channel repeats exactly across the tile".into()
                     } else {
                         format!(
-                            "`{}` steps {:.1}x more across the tile edge than inside (median): a node is not periodic \
+                            "`{worst}` changes on {:.0}% of the tile when it is moved by half a tile: a node is not periodic \
                              (rotated or non-integer-scaled coords, or a size that does not divide the tile)",
-                            worst.1, worst.0
+                            frac * 100.0
                         )
                     },
                 ));
@@ -1019,7 +1032,7 @@ pub fn render(
     } else {
         0.5
     });
-    let sphere = sphere_preview(&doc, &ch, cell, dia);
+    let sphere = sphere_preview(doc, &ch, cell, dia);
     let thumbs = ch.grid(&refs, cell / 2, refs.len().div_ceil(2).max(1))?;
     let (w, h) = (sphere.w + thumbs.w + 4, sphere.h.max(thumbs.h));
     let mut out = Canvas::new(w, h, [24, 24, 28, 255]);
@@ -1101,6 +1114,20 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(lib.docs["stone"].version, 2);
+        // Re-sending the same node is not a history step.
+        let steps = lib.docs["stone"].history.nodes.len();
+        lib.ops(
+            "stone",
+            arr(json!([{"type": "output", "name": "out", "base_color": "col", "roughness": 0.3}])),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lib.docs["stone"].version, 2);
+        assert_eq!(lib.docs["stone"].history.nodes.len(), steps);
         lib.undo(Some("stone")).unwrap_or_else(|e| panic!("{e}"));
         let d = &lib.docs["stone"];
         assert_eq!(d.version, 1);

@@ -58,7 +58,7 @@ Three layers, read top to bottom:
    `~/Library/Application Support/friendslop/modeler/prefabs` + a
    `catalog.json` index. Saves are non-destructive and atomic.
 
-## MCP tool surface (29 tools)
+## MCP tool surface (32 tools)
 
 **Build: one tool, `apply_ops`.** Everything that changes geometry is an
 item in `apply_ops(ops, params?, expect?)`, each tagged with a `"type"`.
@@ -89,6 +89,9 @@ type, so there is no need to memorise field names.
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
+
+A `material` item may also carry `pbr` (a procedural material by name, see
+**Procedural materials** below), with `params` overrides and `scale`.
 
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is
@@ -356,6 +359,73 @@ ms). Every mutation autosaves the whole session (parts, ops, params, history,
 annotations) to `session.json`, restored on startup, including the earlier
 items of a batch that failed partway. `save_prefab` only names and indexes it.
 
+## Procedural materials
+
+Materials are node graphs (SDFs, noise, maths, colour) evaluated on the CPU
+in parallel and baked into PBR textures. Same app, same server, same
+structures as models: nodes are upserts by name, batches are atomic, params
+work, and every material has its own history tree.
+
+- `material_ops(material, ops, params?, domain?, tile?, resolution?, expect?)`
+  edits (or creates) a working material. Each node is `{"type", "name",
+  ...}`; `{"type": "delete", "name"}` removes one. Inputs are numbers,
+  `[r, g, b]`, `"#rrggbb"` (sRGB, stored linear) or another node by name
+  (`"bricks"`, or a port: `"bricks.id"`). Coordinate inputs (`coords`)
+  default to the sample's uv in meters, so warping is "transform the coords,
+  feed them on". `describe_op("nodes")` lists every node type with an
+  example; `describe_op("node:<type>")` gives one schema.
+- **Domains.** `tile` (default): a seamless square `tile` meters wide.
+  Noise lattices snap to a whole number of cells per tile so it repeats
+  exactly; on parts it is mapped by metric uvs, so a 0.25 m brick is 0.25 m
+  everywhere. `object`: evaluated at points on the surface (`input` of
+  `position` / `normal`, object space, meters): 3D noise and SDFs run through
+  the solid and wrap edges with no seams. Each part gets a packed atlas
+  (box-unwrapped islands at one texel density, dilated gutter).
+- **Node families.** Coords: input, transform, combine, split, polar,
+  kaleido, warp, tile_grid (ports local / cell / id / edge), repeat,
+  triplanar. 2D SDFs: circle, rect, segment, polygon, star, hexagon, arc,
+  rings. 3D SDFs: sphere, box, torus, capsule, cylinder, plane. SDF ops:
+  sdf_op (union / intersect / subtract and smooth_ versions), sdf_round,
+  onion, displace, mask (fill / stroke / glow, anti-aliased). Noise: noise
+  (value / gradient; fbm / ridged / turbulence), worley (f1 / f2 / edge /
+  id). Maths and colour: math, remap, random (per id), color, ramp, hsv,
+  blend, levels. Neighbourhood: blur, normal_from_height, ao_from_height,
+  curvature, dilate.
+- **`output`** names the channels: base_color, roughness, metallic,
+  height (meters; the normal is derived from it, times normal_strength,
+  unless `normal` is given), ao, emissive, opacity. Missing channels use
+  defaults. Normals are in the glTF convention (+y up the image).
+- **`expect`** checks: `tileable` (bakes the tile shifted by half a tile and
+  compares: a non-periodic node fails, naming the channel), `ranges` (finite,
+  0..1), `albedo` (non-metal luminance in 0.02..0.9 at the 1st / 99th
+  percentile, or your range), `normals` (unit, facing out), `coverage`
+  ([{node, min, max}]: share of the area where that node is above 0.5).
+- `material_view(material?, node?, channels?, size?, diameter?)`: one
+  image, rendered on the CPU from the bake that gets exported (works
+  headless): a lit sphere plus channel thumbnails, or one node's output
+  (`"g.id"`), with the value range in the text.
+- `material_catalog(action, ...)`: `list` (the library), `working` (this
+  session's materials), `describe`, `save` (name, description, tags,
+  prompt), `load`, `delete`. The library is `materials/` next to the
+  prefabs, shared by every model. Working materials autosave apart from the
+  model (`materials/session.json`).
+- **On parts:** `{"type": "material", "name": "wall", "pbr": "bricks",
+  "params": {"mortar": 0.012}, "scale": 1.5}`. The graph is embedded in
+  the op, so models and prefabs bake identically without the library (re-issue
+  the item after changing the material). Materials follow lineage like
+  colours; the uv mapping runs after the whole graph, so cut faces and copies
+  are mapped too (it replaces any `uvs` projection on those parts). Factors
+  become 1 (white) unless given, then multiply the textures.
+- **Export:** `export_model` writes the baked textures (PNG in the buffer:
+  base colour, metallic-roughness, normal, occlusion / emissive when driven;
+  shared per bake) and a TANGENT attribute.
+- **History:** `undo` / `redo` / `jump` / `history` take `doc:
+  "material:<name>"` (or `"material"` for the active one).
+- **Parallelism:** a level's nodes run in parallel, every kernel is
+  data-parallel over samples (rayon), results are deterministic at any
+  thread count, and a memo cache keyed by node + input keys + domain
+  re-runs only what a tweak touches (results report "N computed").
+
 ## Semantics worth knowing
 
 - **In-place ops**: a material, transform or visibility op whose output is
@@ -411,7 +481,10 @@ edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, a
 a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A
 spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, any drag
 pans, clicking a box makes its parts pulse in 3D and double-clicking frames them (`src/graph_view.rs` holds
-the view and layout; the panel lives in `preview/panel.rs`). Click a part then type to annotate
+the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the material pane in the same left half (G and M replace each other;
+`MODELER_MATERIALS=1` opens it at start): the active material's graph by dependency level with a live
+thumbnail per node, a lit sphere and the channels, and clicking a node shows its
+output large (click again for the material). Click a part then type to annotate
 (Enter commits, Esc cancels; Backspace deletes; spaces work).
 
 ## Dev notes / gotchas
@@ -424,6 +497,8 @@ the view and layout; the panel lives in `preview/panel.rs`). Click a part then t
   stops it. The default throwaway mode spawns and kills a server per
   invocation — window flashes open/closed, state restored from autosave.
 
+- `MODELER_STDERR=<file>` on the daemon keeps the server's stderr (panics,
+  bake errors); it is discarded otherwise.
 - rmcp 1.8 server runs a tokio current-thread on a spawned thread; the Bevy
   app owns the main thread (winit on macOS). Bridge = tokio mpsc + oneshot.
 - `--headless` uses MinimalPlugins — don't add ScheduleRunnerPlugin again.

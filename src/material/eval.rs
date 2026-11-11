@@ -44,14 +44,26 @@ impl Samples {
     /// 0..tile along +x (columns) and +y (rows, top row first, so the image
     /// reads like the uv layout glTF samples); pos = (u, v, 0), normal +z.
     pub fn tile(n: usize, tile: f32) -> Samples {
+        Samples::tile_shifted(n, tile, 0)
+    }
+
+    /// [`Samples::tile`] with every coordinate moved by `shift` texels on
+    /// both axes (the tileable check bakes a half-tile shift and compares).
+    pub fn tile_shifted(n: usize, tile: f32, shift: usize) -> Samples {
         let n = n.max(1);
         let t = tile.max(1e-6) / n as f32;
+        let k = shift as f32;
         let uv: Vec<[f32; 2]> = (0..n * n)
-            .map(|i| [((i % n) as f32 + 0.5) * t, ((i / n) as f32 + 0.5) * t])
+            .map(|i| {
+                [
+                    ((i % n) as f32 + 0.5 + k) * t,
+                    ((i / n) as f32 + 0.5 + k) * t,
+                ]
+            })
             .collect();
         let pos = uv.iter().map(|p| [p[0], p[1], 0.0]).collect();
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        ("tile", n, tile.to_bits()).hash(&mut h);
+        ("tile", n, tile.to_bits(), shift).hash(&mut h);
         Samples {
             w: n,
             h: n,
