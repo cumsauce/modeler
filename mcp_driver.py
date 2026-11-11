@@ -6,8 +6,9 @@ Two modes:
 
 Daemon (keeps ONE modeler process — and its preview window — alive across
 many driver invocations):
-    mcp_driver.py --daemon [--windowed] [--socket PATH]
-        spawns the modeler server, listens on a unix socket, executes tool
+    mcp_driver.py --daemon [--windowed | --headless] [--socket PATH]
+        spawns the modeler server (offscreen by default: agent_views render,
+        no window; --windowed adds the preview window, --headless no renderer), listens on a unix socket, executes tool
         calls from any connecting client (one at a time). Stays up when
         clients disconnect; `quit` as a call shuts it down.
 
@@ -88,8 +89,15 @@ class ShotNamer:
 class ModelerSession:
     """Owns the modeler process and the JSON-RPC conversation."""
 
-    def __init__(self, windowed=False, log=None):
-        cmd = [BINARY] + ([] if windowed else ["--headless"])
+    def __init__(self, mode="headless", log=None, slot=None):
+        # mode: "windowed" (preview window), "offscreen" (renders agent views,
+        # no window), "headless" (no renderer at all).
+        cmd = [BINARY] + {"windowed": [], "offscreen": ["--offscreen"]}.get(mode, ["--headless"])
+        env = dict(os.environ)
+        if slot:
+            # A server that does not own the main autosave writes
+            # session.<slot>.json; a stable slot lets a restart find it.
+            env["MODELER_SLOT"] = slot
         # `log` (the daemon's daemon.log, or MODELER_STDERR=<path>) keeps the
         # server's stderr (panics, bake errors, the exit reason) instead of
         # discarding it.
@@ -103,12 +111,29 @@ class ModelerSession:
             err = subprocess.DEVNULL
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=err, bufsize=0)
+            stderr=err, bufsize=0, env=env)
         if log:
             err.close()  # the child holds its own handle
         self.next_id = 0
         self.shots = ShotNamer()
         self._handshake()
+        self.slot_note = self._slot_note()
+
+    def _slot_note(self):
+        """When another server owns the main autosave, the server says so on
+        stderr at startup ("modeler: autosave SLOT ..."): return a note."""
+        if not self.log:
+            return None
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self.log_start)
+                for line in f.read().decode("utf-8", "replace").splitlines():
+                    if line.startswith("modeler: autosave SLOT"):
+                        return ("daemon: " + line[len("modeler: "):]
+                                + " (restored on restart; save_prefab to share work)")
+        except OSError:
+            pass
+        return None
 
     def exit_reason(self):
         """Why the server exited: its own "modeler: exit:" line from this
@@ -297,14 +322,20 @@ def client_identity():
         return f"pid:{os.getppid()}"
 
 
-def daemon_mode(socket_path, windowed):
+def daemon_slot(socket_path):
+    """A stable autosave slot per daemon socket."""
+    import hashlib
+    return "d" + hashlib.sha1(os.path.abspath(socket_path).encode()).hexdigest()[:8]
+
+
+def daemon_mode(socket_path, mode):
     claim_socket(socket_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(socket_path)  # before spawning: a racing second daemon fails here
     srv.listen(16)
     log = daemon_log_path()
     try:
-        session = ModelerSession(windowed=windowed, log=log)
+        session = ModelerSession(mode=mode, log=log, slot=daemon_slot(socket_path))
     except Exception:
         srv.close()
         os.unlink(socket_path)
@@ -314,6 +345,7 @@ def daemon_mode(socket_path, windowed):
     # Each client's own active document: several agents share one daemon,
     # and a `scene switch` by one must not redirect another's edits.
     client_doc = {}
+    told_slot = set()  # clients already told this server autosaves to a slot
     try:
         while True:
             conn, _ = srv.accept()
@@ -331,12 +363,15 @@ def daemon_mode(socket_path, windowed):
                         if isinstance(c, dict) and "hello" in c:
                             h = c["hello"]
                             client = h.get("client")
+                            if session.slot_note and (client, session.proc.pid) not in told_slot:
+                                told_slot.add((client, session.proc.pid))
+                                pending_note = session.slot_note
                             want = h.get("doc") or client_doc.get(client)
                             now = active_doc(session) if want else None
                             if want and now and now != want:
                                 sw = session.call("scene", {"action": "open", "name": want})
                                 if sw.get("ok"):
-                                    pending_note = (
+                                    pending_note = ((pending_note + "\n") if pending_note else "") + (
                                         f"daemon: the active document was `{now}` (another "
                                         f"client switched it); switched back to your `{want}`"
                                         if not h.get("doc") else
@@ -353,9 +388,11 @@ def daemon_mode(socket_path, windowed):
                             # The modeler exited (killed, crashed, rebuilt):
                             # respawn it; autosave restores the session.
                             why = session.exit_reason()
-                            session = ModelerSession(windowed=windowed, log=daemon_log_path())
+                            session = ModelerSession(mode=mode, log=daemon_log_path(),
+                                                     slot=daemon_slot(socket_path))
                             note = (f"daemon: the modeler server had exited ({why}); "
-                                    "restarted it, session restored from autosave")
+                                    "restarted it, session restored from autosave"
+                                    + (" (its own slot file)" if session.slot_note else ""))
                         out = session.call(c["name"], c.get("args", {}),
                                            c.get("save_shot"), c.get("save_dir"),
                                            c.get("b64", False), shots)
@@ -391,7 +428,7 @@ def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, js
     except OSError as e:
         print(json.dumps({"ok": False, "text": [
             f"no modeler daemon on {socket_path} ({e.strerror}). Start one with: "
-            "python3 mcp_driver.py --daemon --windowed &"], "n_images": 0,
+            "python3 mcp_driver.py --daemon --windowed &  (or without --windowed: agent views, no window)"], "n_images": 0,
             "saved_images": []}), flush=True)
         sys.exit(1)
     with s:
@@ -421,6 +458,9 @@ def main():
     daemon = "--daemon" in argv
     connect = "--connect" in argv
     windowed = "--windowed" in argv
+    # The daemon renders agent views by default (offscreen, no window);
+    # --windowed adds the preview window, --headless drops rendering.
+    mode = "windowed" if windowed else ("headless" if "--headless" in argv else "offscreen")
     socket_path = SOCKET
     if "--socket" in argv:
         socket_path = argv[argv.index("--socket") + 1]
@@ -437,12 +477,12 @@ def main():
         calls_path = argv[argv.index("--calls") + 1]
 
     if daemon:
-        daemon_mode(socket_path, windowed)
+        daemon_mode(socket_path, mode)
     elif connect:
         client_mode(socket_path, calls_path, save_shot, save_dir, b64, json_only)
     else:
         # Throwaway mode: own server, dies with this invocation.
-        session = ModelerSession(windowed=windowed)
+        session = ModelerSession(mode="windowed" if windowed else "headless")
         print(json.dumps({"tools": session.tool_names()}), flush=True)
         try:
             if calls_path:

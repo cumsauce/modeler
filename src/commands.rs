@@ -2745,6 +2745,9 @@ impl Session {
             self.model.version,
             self.model.parts.len()
         );
+        if let Some(note) = crate::catalog::autosave_note() {
+            s += &format!("autosave: {note}\n");
+        }
         if !self.others.is_empty() {
             s += &format!(
                 "other open documents (scene switch): {}\n",

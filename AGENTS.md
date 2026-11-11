@@ -24,6 +24,10 @@ cargo build                # or skip if target/debug/modeler is current
 python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
 ```
 
+Without `--windowed` the daemon runs `--offscreen`: the full renderer with no
+window, so `agent_views` works but `screenshot` / `set_camera` (the human's
+view) don't. `--headless` drops rendering entirely.
+
 Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
 array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when
 done. If the daemon's server has died (killed, crashed), the next call
@@ -800,15 +804,23 @@ Material toggles match O, S and M.
   spawn; `MODELER_STDERR=<file>` overrides). The server's last line there
   is `modeler: exit: <reason>` (window closed / stdin EOF (MCP client gone)
   / panic in thread ...), which the restart note quotes.
-- **One autosaver per catalog dir**: at startup the server writes
-  `<catalog dir>/session.lock` with its pid; a second live server finds it
-  held, logs "autosave OFF" and skips the `session.json` / `open_docs.json`
-  / materials autosaves (`catalog::autosave_owner()` names the owner), so
-  servers don't clobber each other. A dead holder's lock is taken over, also
-  mid-session; a clean exit removes it.
+- **One main autosaver per catalog dir**: at startup the server writes
+  `<catalog dir>/session.lock` with its pid. A second live server finds it
+  held and autosaves to its own **slot** instead: `session.<slot>.json`,
+  `open_docs.<slot>.json` and the materials' `session.<slot>.json`
+  (`MODELER_SLOT`, which the driver sets per daemon socket, else
+  `pid<pid>`). On startup it restores from its slot when that exists, so a
+  restarted second daemon gets its work back. Its stderr says "autosave
+  SLOT", `scene_summary` has an `autosave:` line, and the driver tells each
+  client once in its first result. A dead holder's lock is taken over, also
+  mid-session (from then on it writes the main files); a clean exit removes
+  it.
 - rmcp 1.8 server runs a tokio current-thread on a spawned thread; the Bevy
   app owns the main thread (winit on macOS). Bridge = tokio mpsc + oneshot.
 - `--headless` uses MinimalPlugins — don't add ScheduleRunnerPlugin again.
+  `--offscreen` is DefaultPlugins with no primary window and WinitPlugin
+  disabled, driven by ScheduleRunnerPlugin at 60 Hz; it exits on stdin EOF
+  like headless.
 - Lints: `clippy::unwrap_used` and `expect_err` are denied — use
   `let Ok(..) = .. else`, `unwrap_or_else(|e| panic!("{e}"))` in tests, and
   return ids from APIs instead of unwrapping options.

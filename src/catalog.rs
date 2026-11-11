@@ -118,7 +118,7 @@ fn ensure_project_gitignore() {
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */session.json\n*/open_docs.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
+         */session.json\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
          *.tmp\n*/*.tmp\n",
     );
 }
@@ -280,9 +280,54 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), M
     fs::rename(&tmp, path).map_err(|e| ModelerError::Io(format!("renaming {}: {e}", tmp.display())))
 }
 
-/// Where the session autosave lives: `session.json` next to the prefabs.
+/// Where the session autosave lives: `session.json` next to the prefabs, or
+/// `session.<slot>.json` while another server owns the main autosave.
 fn session_state_path() -> Result<PathBuf, ModelerError> {
-    Ok(catalog_dir()?.join("session.json"))
+    Ok(catalog_dir()?.join(autosave_file("session")))
+}
+
+/// This server's own autosave name while another server holds the session
+/// lock: `MODELER_SLOT` (the driver passes one per daemon socket, so a
+/// restarted daemon finds its work again), else `pid<pid>`.
+pub fn autosave_slot() -> String {
+    std::env::var("MODELER_SLOT")
+        .ok()
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("pid{}", std::process::id()))
+}
+
+/// `<stem>.json` for the autosave owner, `<stem>.<slot>.json` otherwise.
+fn autosave_file(stem: &str) -> String {
+    match autosave_owner() {
+        None => format!("{stem}.json"),
+        Some(_) => format!("{stem}.{}.json", autosave_slot()),
+    }
+}
+
+/// Reads an autosave: this server's slot file when it does not own the main
+/// autosave and the slot file exists (a restarted secondary daemon), else
+/// the main file.
+fn read_autosave(dir: &std::path::Path, stem: &str) -> Option<String> {
+    if autosave_owner().is_some()
+        && let Ok(t) = fs::read_to_string(dir.join(format!("{stem}.{}.json", autosave_slot())))
+    {
+        return Some(t);
+    }
+    fs::read_to_string(dir.join(format!("{stem}.json"))).ok()
+}
+
+/// Where this server autosaves, for notes: `None` = the main `session.json`.
+pub fn autosave_note() -> Option<String> {
+    let owner = autosave_owner()?;
+    Some(format!(
+        "server pid {owner} owns the main autosave, so this server autosaves to its own session.{}.json (restored when this server restarts with the same slot); save_prefab to share work",
+        autosave_slot()
+    ))
 }
 
 /// Autosaves the whole session model — parts, ops, history tree, annotations,
@@ -291,9 +336,6 @@ fn session_state_path() -> Result<PathBuf, ModelerError> {
 /// Failures are reported but never fatal: losing an autosave must not break
 /// the tool call that triggered it.
 pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
-    if autosave_owner().is_some() {
-        return Ok(()); // another live server owns the autosave
-    }
     ensure_project_gitignore();
     let path = session_state_path()?;
     if let Some(parent) = path.parent() {
@@ -309,33 +351,27 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
 /// Autosaves any per-kind session state (e.g. the working materials) as
 /// `session.json` in that kind's folder.
 pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), ModelerError> {
-    if autosave_owner().is_some() {
-        return Ok(());
-    }
     let dir = kind_dir(kind)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
     let text = serde_json::to_string(state).map_err(|e| ModelerError::Parse(e.to_string()))?;
-    atomic_write(&dir.join("session.json"), text.as_bytes())
+    atomic_write(&dir.join(autosave_file("session")), text.as_bytes())
 }
 
 /// The autosaved per-kind session state, if present and parseable.
 pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> {
-    let text = fs::read_to_string(kind_dir(kind).ok()?.join("session.json")).ok()?;
+    let text = read_autosave(&kind_dir(kind).ok()?, "session")?;
     serde_json::from_str(&text).ok()
 }
 
 /// Autosaves the inactive open documents (`open_docs.json`), so a restart
 /// restores every open scene, not just the active one.
 pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
-    if autosave_owner().is_some() {
-        return Ok(());
-    }
     let dir = catalog_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
     let text = serde_json::to_string(docs).map_err(|e| ModelerError::Parse(e.to_string()))?;
-    atomic_write(&dir.join("open_docs.json"), text.as_bytes())
+    atomic_write(&dir.join(autosave_file("open_docs")), text.as_bytes())
 }
 
 /// The autosaved inactive documents (empty when missing or unreadable).
@@ -343,7 +379,7 @@ pub fn load_open_docs() -> Vec<Model> {
     let Ok(dir) = catalog_dir() else {
         return Vec::new();
     };
-    let Ok(text) = fs::read_to_string(dir.join("open_docs.json")) else {
+    let Some(text) = read_autosave(&dir, "open_docs") else {
         return Vec::new();
     };
     let docs: Vec<Model> = serde_json::from_str(&text).unwrap_or_default();
@@ -499,8 +535,7 @@ pub fn release_session_lock() {
 /// The last autosaved session model, if one exists and parses. Missing or
 /// corrupt state just means a fresh session.
 pub fn load_session_state() -> Option<Model> {
-    let path = session_state_path().ok()?;
-    let text = fs::read_to_string(path).ok()?;
+    let text = read_autosave(&catalog_dir().ok()?, "session")?;
     let model: Model = serde_json::from_str(&text).ok()?;
     if let Err(e) = model.check_format() {
         eprintln!("ignoring session autosave: {e}");

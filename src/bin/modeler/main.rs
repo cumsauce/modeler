@@ -57,12 +57,14 @@ fn install_panic_hook() {
 
 fn main() -> AppExit {
     let mut headless = false;
+    let mut offscreen = false;
     let mut print_catalog_dir = false;
     let mut model_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--headless" => headless = true,
+            "--offscreen" => offscreen = true,
             "--model" => model_path = args.next().map(PathBuf::from),
             "--print-catalog-dir" => print_catalog_dir = true,
             "--project" => {
@@ -75,7 +77,7 @@ fn main() -> AppExit {
                 unsafe { std::env::set_var("MODELER_PROJECT", dir) };
             }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless] [--model <path.json>] [--project <game dir>] [--print-catalog-dir])"
+                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json>] [--project <game dir>] [--print-catalog-dir])"
             ),
         }
     }
@@ -99,8 +101,10 @@ fn main() -> AppExit {
     match catalog::acquire_session_lock() {
         Ok(catalog::LockOutcome::Owner) => {}
         Ok(catalog::LockOutcome::HeldBy(pid)) => eprintln!(
-            "modeler: autosave OFF: server pid {pid} holds the session lock in this catalog dir \
-             (this server's work is not autosaved; save_prefab still works)"
+            "modeler: autosave SLOT {}: server pid {pid} holds the session lock in this catalog dir, \
+             so this server autosaves to session.{}.json instead",
+            catalog::autosave_slot(),
+            catalog::autosave_slot()
         ),
         Err(e) => eprintln!("modeler: could not take the session lock: {e}"),
     }
@@ -196,6 +200,7 @@ fn main() -> AppExit {
         bridge: Arc::clone(&bridge),
     })
     .insert_resource(Headless(headless))
+    .insert_resource(Offscreen(offscreen && !headless))
     .insert_resource(PendingShots::default())
     .insert_resource(PendingAgentShots::default())
     .insert_resource(AgentRig::default())
@@ -220,7 +225,7 @@ fn main() -> AppExit {
         Update,
         (
             drain_commands,
-            quit_when_server_done(headless),
+            quit_when_server_done(headless || offscreen),
             take_screenshot.run_if(windowed),
             rebuild_scene.run_if(windowed),
             draw_game_gizmos.run_if(windowed),
@@ -243,35 +248,50 @@ fn main() -> AppExit {
         // variant waits for it instead of skipping those meshes, so a render
         // right after startup (or after a new material kind appears) never
         // comes back empty or missing parts. Costs a short stall, once.
-        app.add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "modeler".into(),
+        let plugins = DefaultPlugins.set(bevy::render::RenderPlugin {
+            synchronous_pipeline_compilation: true,
+            ..default()
+        });
+        if offscreen {
+            // Full renderer, no window: no winit, so a runner drives frames.
+            app.add_plugins(
+                plugins
+                    .set(WindowPlugin {
+                        primary_window: None,
+                        exit_condition: bevy::window::ExitCondition::DontExit,
+                        close_when_requested: false,
                         ..default()
-                    }),
-                    ..default()
-                })
-                .set(bevy::render::RenderPlugin {
-                    synchronous_pipeline_compilation: true,
+                    })
+                    .disable::<bevy::winit::WinitPlugin>(),
+            )
+            .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
+                std::time::Duration::from_secs_f64(1.0 / 60.0),
+            ));
+        } else {
+            app.add_plugins(plugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "modeler".into(),
                     ..default()
                 }),
-        )
-        // Deferred by default so screen-space reflections work; cameras
-        // without a deferred prepass (the window) still render forward.
-        .insert_resource(bevy::pbr::DefaultOpaqueRendererMethod::deferred())
-        .add_systems(Startup, (setup_scene, setup_material_pane))
-        .add_systems(Startup, setup_agent_camera)
-        .add_plugins(bevy::feathers::FeathersPlugins)
-        .insert_resource(bevy::feathers::theme::UiTheme(
-            bevy::feathers::dark_theme::create_dark_theme(),
-        ))
-        .add_systems(
-            Startup,
-            (setup_toolbar, setup_outline_pane, setup_style_pane),
-        )
-        .add_systems(Update, (sync_toolbar, sync_doc_tabs))
-        .add_systems(Update, (process_agent_shot.run_if(windowed),));
+                ..default()
+            }));
+        }
+        app
+            // Deferred by default so screen-space reflections work; cameras
+            // without a deferred prepass (the window) still render forward.
+            .insert_resource(bevy::pbr::DefaultOpaqueRendererMethod::deferred())
+            .add_systems(Startup, (setup_scene, setup_material_pane))
+            .add_systems(Startup, setup_agent_camera)
+            .add_plugins(bevy::feathers::FeathersPlugins)
+            .insert_resource(bevy::feathers::theme::UiTheme(
+                bevy::feathers::dark_theme::create_dark_theme(),
+            ))
+            .add_systems(
+                Startup,
+                (setup_toolbar, setup_outline_pane, setup_style_pane),
+            )
+            .add_systems(Update, (sync_toolbar, sync_doc_tabs))
+            .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }
     // Catch a main-thread panic so the exit line and lock cleanup still run.
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.run()));
@@ -279,7 +299,7 @@ fn main() -> AppExit {
     match run {
         Ok(exit) => {
             let mcp = MCP_STOP.get().cloned();
-            let reason = match (headless, mcp) {
+            let reason = match (headless || offscreen, mcp) {
                 (true, Some(why)) => why,
                 (false, Some(why)) => format!("window closed (after {why})"),
                 (false, None) => "window closed".to_string(),

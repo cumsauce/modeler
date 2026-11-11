@@ -9,6 +9,11 @@ pub(crate) struct Modeler {
 #[derive(Resource)]
 pub(crate) struct Headless(pub(crate) bool);
 
+/// Rendering without a window (`--offscreen`): agent views work, the human
+/// view (screenshot, set_camera) does not.
+#[derive(Resource)]
+pub(crate) struct Offscreen(pub(crate) bool);
+
 pub(crate) fn windowed(headless: Option<Res<Headless>>) -> bool {
     !headless.map(|h| h.0).unwrap_or(false)
 }
@@ -104,6 +109,7 @@ pub(crate) fn quit_when_server_done(
 /// Drains MCP commands every frame and executes them against the session.
 pub(crate) fn drain_commands(
     headless: Res<Headless>,
+    offscreen: Res<Offscreen>,
     mut modeler: ResMut<Modeler>,
     mut pending: ResMut<PendingShots>,
     mut agent_shots: ResMut<PendingAgentShots>,
@@ -122,6 +128,10 @@ pub(crate) fn drain_commands(
             Cmd::Screenshot(reply) => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no screenshot".into()));
+                } else if offscreen.0 {
+                    let _ = reply.send(Err(
+                        "offscreen: no window, so no human view to capture; agent_views renders (start the daemon with --windowed for a window)".into(),
+                    ));
                 } else {
                     pending.0.push(Mutex::new(Some(reply)));
                 }
@@ -132,8 +142,10 @@ pub(crate) fn drain_commands(
                 dist,
                 reply,
             } => {
-                if headless.0 {
-                    let _ = reply.send(Err("headless: no camera to move".into()));
+                if headless.0 || offscreen.0 {
+                    let _ = reply.send(Err(
+                        "no window camera to move (headless/offscreen); agent_views takes its own camera".into(),
+                    ));
                 } else {
                     // Same convention as agent custom cameras: yaw 0 = on +z looking -z.
                     orbit.yaw = (90.0 - yaw).to_radians();
@@ -152,7 +164,9 @@ pub(crate) fn drain_commands(
                 reply,
             } => {
                 if headless.0 {
-                    let _ = reply.send(Err("headless: no renderer, no agent view".into()));
+                    let _ = reply.send(Err(
+                        "headless: no renderer, no agent view (run with --offscreen, or the daemon without --headless)".into(),
+                    ));
                 } else {
                     agent_shots
                         .0
