@@ -575,7 +575,10 @@ annotations; op-derived parts are left out and re-derive on restore), and the
 app writes `session.json` once edits pause for 0.5 s and on exit, so the write
 never sits on a tool call. A server started with `--restore` (or
 `MODELER_RESTORE=1`) restores it on startup; a plain `modeler` (what the
-MCP config runs) starts empty, and its first edit starts a new autosave.
+MCP config runs) starts empty and first moves the last autosave aside to
+`session.prev.json` (+ `.prev.history.jsonl`, `open_docs.prev.json`, the
+materials' `session.prev.json`), so its edits never overwrite it; a later
+`--restore` brings the kept one back when nothing newer was written.
 `mcp_driver.py` always passes `--restore`, so daemon restarts keep the work. The history tree goes to an append-only
 journal beside it (`session.history.jsonl`, one node per line): a save
 appends only the new nodes, and rewrites the file only after undo branches

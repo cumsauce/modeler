@@ -486,6 +486,68 @@ fn slim(model: &Model) -> std::borrow::Cow<'_, Model> {
     }
 }
 
+/// The autosave files this server writes, paired with their `.prev` names:
+/// the session, its history journal, the open docs and the working
+/// materials.
+fn autosave_files() -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    let prev = |p: PathBuf| {
+        let n = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let to = if let Some(stem) = n.strip_suffix(".history.jsonl") {
+            format!("{stem}.prev.history.jsonl")
+        } else {
+            n.trim_end_matches(".json").to_string() + ".prev.json"
+        };
+        let q = p.with_file_name(to);
+        (p, q)
+    };
+    if let Ok(p) = session_state_path() {
+        out.push(prev(p));
+    }
+    if let Ok(p) = journal_path() {
+        out.push(prev(p));
+    }
+    if let Ok(d) = catalog_dir() {
+        out.push(prev(d.join(autosave_file("open_docs"))));
+    }
+    if let Ok(d) = kind_dir(Kind::Materials) {
+        out.push(prev(d.join(autosave_file("session"))));
+    }
+    out
+}
+
+/// A server starting empty (no `--restore`) moves the last autosave aside
+/// to `*.prev.*` instead of letting its first edit overwrite it. Returns
+/// how many files were kept.
+pub fn keep_previous_session() -> usize {
+    autosave_files()
+        .into_iter()
+        .filter(|(from, to)| {
+            fs::metadata(from).is_ok_and(|m| m.len() > 0) && fs::rename(from, to).is_ok()
+        })
+        .count()
+}
+
+/// Before a `--restore`: when there is no current autosave but a kept
+/// `*.prev.*` one (an empty-started server made no edits), bring it back.
+pub fn reclaim_previous_session() -> usize {
+    let files = autosave_files();
+    if files
+        .iter()
+        .any(|(from, _)| fs::metadata(from).is_ok_and(|m| m.len() > 0))
+    {
+        return 0;
+    }
+    files
+        .into_iter()
+        .filter(|(from, to)| to.exists() && fs::rename(to, from).is_ok())
+        .count()
+}
+
 /// Autosaves any per-kind session state (e.g. the working materials) as
 /// `session.json` in that kind's folder.
 pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), ModelerError> {
@@ -979,6 +1041,38 @@ mod tests {
         model.name = "wip2".into();
         save_session_state(&model).unwrap();
         assert_eq!(load_session_state().unwrap().name, "wip2");
+    }
+
+    #[test]
+    fn an_empty_start_keeps_the_previous_autosave() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("prev")) };
+        let mut m = Model {
+            name: "arena".into(),
+            ..Default::default()
+        };
+        let mut st = JournalState::default();
+        save_session_journaled(&mut m, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        let session = session_state_path().unwrap_or_else(|e| panic!("{e}"));
+        assert!(session.exists());
+        // An empty start moves it aside...
+        assert!(keep_previous_session() >= 1);
+        assert!(!session.exists());
+        assert!(session.with_file_name("session.prev.json").exists());
+        // ...and a later --restore, with nothing newer written, reclaims it.
+        assert!(reclaim_previous_session() >= 1);
+        assert_eq!(load_session_state().map(|m| m.name), Some("arena".into()));
+        // A newer autosave is never replaced by the kept one.
+        assert!(keep_previous_session() >= 1);
+        let mut n = Model {
+            name: "newer".into(),
+            ..Default::default()
+        };
+        save_session_journaled(&mut n, &mut JournalState::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(reclaim_previous_session(), 0);
+        assert_eq!(load_session_state().map(|m| m.name), Some("newer".into()));
     }
 
     #[test]

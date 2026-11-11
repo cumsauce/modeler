@@ -130,7 +130,20 @@ fn main() -> AppExit {
             }
             Err(e) => eprintln!("could not load {}: {e}", path.display()),
         }
-    } else if restore {
+    } else if !restore {
+        // Starting empty: keep the last autosave as *.prev.* so this
+        // server's first edit can't overwrite it (`--restore` reclaims it).
+        let n = catalog::keep_previous_session();
+        if n > 0 {
+            eprintln!(
+                "kept the previous autosave as {n} *.prev.* file(s); `--restore` brings it back"
+            );
+        }
+    } else {
+        let n = catalog::reclaim_previous_session();
+        if n > 0 {
+            eprintln!("reclaimed the previous autosave from {n} *.prev.* file(s)");
+        }
         // Restore the last session's autosave so unnamed WIP (ops, parts,
         // history tree, annotations) survives a restart.
         if let Some(model) = catalog::load_session_state() {
