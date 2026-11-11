@@ -46,9 +46,11 @@ pub(crate) fn orbit_camera(
     mut orbit: ResMut<Orbit>,
     mut drag: ResMut<CameraDrag>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
+    panel: Res<GraphPanel>,
 ) {
-    if scroll.delta.y != 0.0 {
-        orbit.dist = (orbit.dist * (1.0 - 0.12 * scroll.delta.y)).clamp(0.2, 200.0);
+    let scroll_y = if panel.hover { 0.0 } else { scroll.delta.y };
+    if scroll_y != 0.0 {
+        orbit.dist = (orbit.dist * (1.0 - 0.12 * scroll_y)).clamp(0.2, 200.0);
         orbit.user = true;
     }
     if keys.pressed(KeyCode::PageUp) {
@@ -65,7 +67,9 @@ pub(crate) fn orbit_camera(
     };
     let dragging = [MouseButton::Left, MouseButton::Middle, MouseButton::Right]
         .into_iter()
-        .find(|b| mouse.pressed(*b));
+        .find(|b| mouse.pressed(*b))
+        // A drag that starts over the node panel belongs to the panel.
+        .filter(|_| drag.button.is_some() || !panel.hover);
     if let Some(button) = dragging {
         if let Some(cursor) = window.cursor_position() {
             if drag.button != Some(button) {

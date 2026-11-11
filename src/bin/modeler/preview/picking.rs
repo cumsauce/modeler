@@ -42,7 +42,11 @@ pub(crate) fn pin_on_click(
     mut commands: Commands,
     mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
+    panel: Res<GraphPanel>,
 ) {
+    if panel.hover {
+        return;
+    }
     // Pins land on a click (press + release with barely any movement), never on
     // the end of a left-drag orbit.
     if !mouse.just_released(MouseButton::Left) || drag.moved > 6.0 {

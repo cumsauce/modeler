@@ -108,7 +108,8 @@ fn main() -> AppExit {
     .insert_resource(AgentRig::default())
     .insert_resource(Orbit::default())
     .init_resource::<CameraDrag>()
-    .init_resource::<GraphHudVisible>()
+    .insert_resource(GraphHudVisible(std::env::var_os("MODELER_GRAPH").is_some()))
+    .init_resource::<GraphPanel>()
     .init_resource::<SceneBuilt>()
     .init_resource::<PinTyping>()
     .init_resource::<PendingPinSpawn>()
@@ -126,6 +127,7 @@ fn main() -> AppExit {
             pin_typing.run_if(windowed),
             update_typing_hud.run_if(windowed),
             update_graph_hud.run_if(windowed),
+            highlight_selected.run_if(windowed),
         ),
     );
     if headless {

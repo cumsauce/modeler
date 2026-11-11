@@ -235,21 +235,48 @@ pub(crate) fn setup_scene(mut commands: Commands) {
             ..default()
         },
     ));
-    commands.spawn((
-        Name::new("graph hud"),
-        GraphHud,
-        Visibility::Hidden,
-        Text::new(String::new()),
-        TextFont {
-            font_size: FontSize::Px(14.0),
-            ..default()
-        },
-        TextColor(Color::WHITE),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(8.0),
-            ..default()
-        },
-    ));
+    commands
+        .spawn((
+            Name::new("graph hud"),
+            GraphHud,
+            Visibility::Hidden,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(50.0),
+                height: Val::Percent(100.0),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.06, 0.08, 0.88)),
+        ))
+        .with_children(|p| {
+            p.spawn((
+                GraphCanvas,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(0.0),
+                    left: Val::Px(0.0),
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+            ));
+            p.spawn((
+                GraphFooter,
+                Text::new(String::new()),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::srgba(0.8, 0.83, 0.88, 0.8)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    bottom: Val::Px(8.0),
+                    left: Val::Px(10.0),
+                    ..default()
+                },
+            ));
+        });
 }

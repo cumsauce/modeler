@@ -7,6 +7,7 @@ pub mod csg;
 pub mod error;
 pub mod gltf;
 pub mod graph;
+pub mod graph_view;
 pub mod inspect;
 pub mod params;
 pub mod primitives;

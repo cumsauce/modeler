@@ -326,7 +326,13 @@ fired.
 Left/middle/right-drag = orbit/pan, scroll = zoom, arrows + PageUp/Down too.
 Auto-drift stops once the human steers; a model change re-frames the camera
 around true world bounds (bounds include part transforms). **G** toggles the
-read-only ops + history panel. Click a part then type to annotate
+node-graph panel (left half; `MODELER_GRAPH=1` opens it at start). It has one box per
+geometry op, coloured by kind, with edges from each input to its reader. In-place
+edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, and
+a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A
+spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, right-drag
+pans, and clicking a box makes its parts pulse in 3D (`src/graph_view.rs` holds
+the view and layout; the panel lives in `preview/panel.rs`). Click a part then type to annotate
 (Enter commits, Esc cancels; Backspace deletes; spaces work).
 
 ## Dev notes / gotchas
