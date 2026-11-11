@@ -2,6 +2,7 @@
 //! unit-testable, wiring-free API used by both the MCP tools and tests.
 
 use crate::{Annotation, Axis, BoolOp, Model, ModelerError, Op, Part, PrimitiveKind, graph};
+use crate::{Quat, Vec3};
 
 pub type CmdResult = Result<String, ModelerError>;
 
@@ -36,6 +37,13 @@ pub enum BatchItem {
     Uvs {
         part: String,
         projection: String,
+    },
+    /// One rigid relative transform over many parts (names / `*` globs).
+    Move {
+        parts: Vec<String>,
+        translation: Option<[f32; 3]>,
+        rotation: Option<[f32; 4]>,
+        pivot: Option<[f32; 3]>,
     },
 }
 
@@ -276,6 +284,7 @@ impl Session {
                 rotation,
                 scale,
                 relative: false,
+                pivot: None,
             },
             &format!("op transform `{name}` <- `{input}`"),
         )
@@ -723,6 +732,7 @@ impl Session {
                     rotation,
                     scale,
                     relative: false,
+                    ..
                 }) if name == input && !self.derived_by_ops(&name) => self
                     .transform_part(&name, translation, rotation, scale)
                     .map_err(fail)?,
@@ -747,6 +757,14 @@ impl Session {
                     uvs,
                 } => self
                     .add_tri_mesh(&name, verts, indices, normals, uvs)
+                    .map_err(fail)?,
+                BatchItem::Move {
+                    parts,
+                    translation,
+                    rotation,
+                    pivot,
+                } => self
+                    .move_parts(&parts, translation, rotation, pivot)
                     .map_err(fail)?,
                 BatchItem::Uvs { part, projection } => {
                     self.set_uvs(&part, &projection).map_err(fail)?
@@ -779,6 +797,70 @@ impl Session {
                 .ops
                 .iter()
                 .any(|o| graph::outputs(o).iter().any(|n| n == name))
+    }
+
+    /// Moves every visible part matching `patterns` (exact or trailing-`*`)
+    /// as one rigid body: rotation about `pivot` (default: centre of their
+    /// combined bottom face), then translation. Op-derived parts get a
+    /// relative in-place transform op each (so it survives re-derivation);
+    /// baked parts are edited directly.
+    pub fn move_parts(
+        &mut self,
+        patterns: &[String],
+        translation: Option<[f32; 3]>,
+        rotation: Option<[f32; 4]>,
+        pivot: Option<[f32; 3]>,
+    ) -> CmdResult {
+        let matches = |n: &str| {
+            patterns.iter().any(|p| match p.strip_suffix('*') {
+                Some(pre) => n.starts_with(pre),
+                None => n == p,
+            })
+        };
+        let names: Vec<String> = self
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.visible && matches(&p.name))
+            .map(|p| p.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Err(format!("move: no visible part matches {patterns:?}").into());
+        }
+        let pivot = pivot.unwrap_or_else(|| {
+            let (lo, hi) = self.model.bounds_of(&names).unwrap_or_default();
+            [(lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5]
+        });
+        let r = rotation.map(crate::quat_of).unwrap_or(Quat::IDENTITY);
+        let t = Vec3::from(translation.unwrap_or([0.0; 3]));
+        let p = Vec3::from(pivot);
+        for n in &names {
+            if self.derived_by_ops(n) {
+                self.model.ops.push(Op::Transform {
+                    name: n.clone(),
+                    input: n.clone(),
+                    translation,
+                    rotation,
+                    scale: None,
+                    relative: true,
+                    pivot: rotation.map(|_| pivot),
+                });
+            } else if let Some(part) = self.model.parts.iter_mut().find(|q| &q.name == n) {
+                let part = std::sync::Arc::make_mut(part);
+                let tr = p + r * (Vec3::from(part.translation) - p) + t;
+                part.translation = tr.to_array();
+                part.rotation = (r * crate::quat_of(part.rotation)).to_array();
+            }
+        }
+        self.model.refresh()?;
+        self.commit(&format!("move {} part(s)", names.len()));
+        Ok(format!(
+            "moved {} part(s) as one body (pivot [{:.4}, {:.4}, {:.4}])",
+            names.len(),
+            pivot[0],
+            pivot[1],
+            pivot[2]
+        ))
     }
 
     /// [`Self::set_visible`] on one part, or on every part matching a
@@ -2454,6 +2536,7 @@ mod tests {
                     rotation: None,
                     scale: None,
                     relative: false,
+                    pivot: None,
                 },
                 Op::Transform {
                     name: "b".into(),
@@ -2462,6 +2545,7 @@ mod tests {
                     rotation: None,
                     scale: None,
                     relative: false,
+                    pivot: None,
                 },
             ]),
             Err(ModelerError::Cycle(_))
@@ -2871,5 +2955,72 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         let r = s.apply_values(None, ops);
         assert!(r.is_err(), "the array still reads `cut`");
+    }
+
+    #[test]
+    fn move_turns_a_set_of_parts_as_one_body() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let v = |j: serde_json::Value| -> Vec<serde_json::Value> {
+            serde_json::from_value(j).unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.apply_values(
+            None,
+            v(serde_json::json!([
+                {"type": "primitive", "name": "a", "kind": "box", "size": 1, "translation": [0, 0.5, 0]},
+                {"type": "linear_array", "name": "a", "input": "a", "count": 2, "offset": [2, 0, 0]}
+            ])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Shift everything up 1: the copy must move once, not twice.
+        s.apply_values(
+            None,
+            v(serde_json::json!([{"type": "move", "parts": ["*"], "translation": [0, 1, 0]}])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for n in ["a", "a_1"] {
+            let (lo, _) = s.model.part(n).map(|p| p.bounds()).unwrap_or_default();
+            assert!((lo.y - 1.0).abs() < 1e-4, "{n} at {lo:?}");
+        }
+        // Quarter turn about z through [1, 0, 0]: the pair stands up.
+        s.apply_values(
+            None,
+            v(serde_json::json!([{"type": "move", "parts": ["a*"], "axis": [0, 0, 1], "degrees": 90, "pivot": [-0.5, 1, 0]}])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (lo, hi) = s.model.bounds().unwrap_or_default();
+        assert!((hi.x - lo.x - 1.0).abs() < 1e-3, "{lo:?}..{hi:?}");
+        assert!((hi.y - lo.y - 3.0).abs() < 1e-3, "{lo:?}..{hi:?}");
+        assert!((lo.y - 1.0).abs() < 1e-3, "{lo:?}");
+    }
+
+    #[test]
+    fn move_tilts_a_mirror_once() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let v = |j: serde_json::Value| -> Vec<serde_json::Value> {
+            serde_json::from_value(j).unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.apply_values(
+            None,
+            v(serde_json::json!([
+                {"type": "primitive", "name": "a", "kind": "box", "size": [0.1, 1, 0.1], "translation": [0, 0.5, 0.3]},
+                {"type": "mirror", "name": "a_m", "input": "a", "axis": "z"},
+                {"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 10, "pivot": [0, 0, 0]}
+            ])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (alo, ahi) = s.model.part("a").map(|p| p.bounds()).unwrap_or_default();
+        let (mlo, mhi) = s.model.part("a_m").map(|p| p.bounds()).unwrap_or_default();
+        // Rigid: both lean by the same 10° (a double tilt would widen the
+        // mirror's z extent), and the mirror's foot lifts as it swings.
+        assert!(
+            ((ahi.z - alo.z) - (mhi.z - mlo.z)).abs() < 1e-4,
+            "a {alo:?}..{ahi:?} m {mlo:?}..{mhi:?}"
+        );
+        assert!(
+            mlo.y > 0.04 && alo.y < -0.06,
+            "a {alo:?}..{ahi:?} m {mlo:?}..{mhi:?}"
+        );
     }
 }

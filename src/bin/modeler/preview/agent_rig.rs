@@ -339,6 +339,14 @@ pub(crate) fn process_agent_shot(
         },
         _ => None,
     };
+    // Perspective: pixels per metre on the plane through the look-at point.
+    let ppm_at_target = match &new_projection {
+        Projection::Perspective(p) => {
+            let d = (eye - target).length();
+            Some(height as f32 / (2.0 * d * (p.fov * 0.5).tan()))
+        }
+        _ => None,
+    };
     let Ok((mut projection, mut render_target, mut transform)) = cameras.get_mut(camera_entity)
     else {
         let _ = reply.send(Err("agent camera missing".into()));
@@ -397,6 +405,7 @@ pub(crate) fn process_agent_shot(
         let (lo, hi) = bounds.unwrap_or((Vec3::ZERO, Vec3::ZERO));
         DimsOverlay {
             ppm,
+            ppm_at_target,
             right: cam.right().as_vec3(),
             up: cam.up().as_vec3(),
             target,
@@ -440,6 +449,7 @@ pub(crate) fn process_agent_shot(
 /// framed world box.
 struct DimsOverlay {
     ppm: Option<f32>,
+    ppm_at_target: Option<f32>,
     right: Vec3,
     up: Vec3,
     target: Vec3,
@@ -451,12 +461,23 @@ impl DimsOverlay {
     fn draw(&self, c: &mut Canvas) {
         let size = self.hi - self.lo;
         let Some(ppm) = self.ppm else {
-            // Perspective: no true scale, so just the overall size.
+            // Perspective has no single scale: say the size is the framed
+            // model's (not what is in view), and give a scale bar valid only
+            // at the look-at point's depth.
             let t = format!(
-                "SIZE {:.3} X {:.3} X {:.3} M (X Y Z)",
+                "MODEL {:.2} X {:.2} X {:.2} M (NOT THE VIEW)",
                 size.x, size.y, size.z
             );
             c.text(6, c.h.saturating_sub(24), &t, 2);
+            if let Some(k) = self.ppm_at_target {
+                c.text(
+                    c.w.saturating_sub(190),
+                    c.h.saturating_sub(88),
+                    "AT TARGET DEPTH",
+                    2,
+                );
+                modeler::inspect::scale_bar(c, k as f64, c.w - 10, c.h - 34);
+            }
             return;
         };
         let (w, h) = (c.w as f32, c.h as f32);

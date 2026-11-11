@@ -446,6 +446,33 @@ pub struct TransformSpec {
     /// composes, scale multiplies). false (default): absolute values.
     #[serde(default)]
     relative: bool,
+    /// With relative: rotate/scale about this world point (not the part's
+    /// origin), e.g. a tyre contact point to tip a whole model.
+    #[serde(default)]
+    pivot: Option<[f32; 3]>,
+}
+
+/// One relative transform applied to many parts at once (a whole model or a
+/// sub-assembly): every visible part matching `parts` (exact names or
+/// trailing-`*` prefixes; `["*"]` = everything) moves as one rigid body.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MoveSpec {
+    parts: Vec<String>,
+    #[serde(default, alias = "position")]
+    translation: Option<[f32; 3]>,
+    /// Quaternion [x, y, z, w]; or give axis + degrees instead.
+    #[serde(default)]
+    rotation: Option<[f32; 4]>,
+    /// Rotation axis for `degrees`, e.g. [1, 0, 0].
+    #[serde(default)]
+    axis: Option<[f32; 3]>,
+    #[serde(default)]
+    degrees: Option<f32>,
+    /// Point the rotation turns about. Default: the centre of the moved
+    /// parts' bottom face.
+    #[serde(default)]
+    pivot: Option<[f32; 3]>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -596,6 +623,7 @@ pub enum OpSpec {
     Hull(HullSpec),
     Round(RoundSpec),
     Transform(TransformSpec),
+    Move(MoveSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
     LinearArray(LinearArraySpec),
@@ -619,6 +647,7 @@ pub const OP_TYPES: &[&str] = &[
     "hull",
     "round",
     "transform",
+    "move",
     "boolean",
     "radial_array",
     "linear_array",
@@ -789,7 +818,39 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 rotation: s.rotation,
                 scale: s.scale,
                 relative: s.relative,
+                pivot: s.pivot,
             })
+        }
+        "move" => {
+            let s: MoveSpec = de(&ctx, &body)?;
+            let rotation = match (s.rotation, s.axis, s.degrees) {
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                    return Err(format!(
+                        "{ctx}: give rotation (a quaternion) or axis + degrees, not both"
+                    ));
+                }
+                (Some(q), None, None) => Some(q),
+                (None, Some(a), Some(d)) => {
+                    let a = crate::Vec3::from(a);
+                    if a.length() < 1e-9 {
+                        return Err(format!("{ctx}: axis is zero"));
+                    }
+                    Some(crate::Quat::from_axis_angle(a.normalize(), d.to_radians()).to_array())
+                }
+                (None, None, None) => None,
+                _ => return Err(format!("{ctx}: axis and degrees go together")),
+            };
+            if s.parts.is_empty() {
+                return Err(format!(
+                    "{ctx}: parts is empty (use [\"*\"] for everything)"
+                ));
+            }
+            BatchItem::Move {
+                parts: s.parts,
+                translation: s.translation,
+                rotation,
+                pivot: s.pivot,
+            }
         }
         "boolean" => {
             let s: BooleanSpec = de(&ctx, &body)?;
@@ -943,6 +1004,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "transform" => {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
         }
+        "move" => {
+            json!({"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]})
+        }
         "boolean" => {
             json!({"type": "boolean", "name": "wall_cut", "op": "difference", "a": "wall", "b": "door_cutter"})
         }
@@ -996,6 +1060,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "transform" => schemars::schema_for!(TransformSpec),
+        "move" => schemars::schema_for!(MoveSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),
         "linear_array" => schemars::schema_for!(LinearArraySpec),

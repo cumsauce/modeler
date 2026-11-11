@@ -697,6 +697,10 @@ pub enum Op {
         /// absolute: translation adds, rotation composes, scale multiplies.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         relative: bool,
+        /// Relative only: rotate (and scale) about this world point instead
+        /// of the part's own origin, so a set of parts turns as one body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pivot: Option<[f32; 3]>,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {

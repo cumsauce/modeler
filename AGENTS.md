@@ -72,7 +72,8 @@ type, so there is no need to memorise field names.
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `group` | name, inputs |
-| `transform` | name, input, [translation], [rotation], [scale], [relative] |
+| `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
+| `move` | parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot] |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset |
@@ -102,6 +103,14 @@ type, so there is no need to memorise field names.
   and transforms of X inherit the colour.
 - **Transforms** are absolute by default; `relative: true` makes them offsets
   from the input (translation adds, rotation composes, scale multiplies).
+  With `pivot`, a relative rotation/scale turns about that world point
+  instead of the part's own origin.
+- **`move`** applies one rigid relative transform to many parts at once (a
+  whole model or a sub-assembly), about `pivot` (default: the centre of
+  their bottom face). Lean a bike onto its kickstand with
+  `{"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]}`.
+  Each part gets its own in-place relative transform op, so the move
+  survives re-derivation and copies (arrays, mirrors) still move once.
 - **Radial arrays** default to `include_source: true`: the source is item 0
   and `count` items spread evenly (copies `name_1..`). With `false`, `count`
   new copies `name_0..` start at `start_degrees` and the source stays put.
@@ -215,7 +224,9 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `style: "ids"`: each part a flat, unlit, distinct colour with a legend
     (and the colour order in the text), to tell which shape is which part.
   - `dims: true`: the framed box's width and height and a scale bar, at true
-    scale in orthographic views (overall size in perspective ones).
+    scale in orthographic views. Perspective views have no single scale:
+    they state the model's box size ("not the view") and a scale bar valid
+    only at the look-at point's depth.
   - `diff: true`: compares with the previous render of the same view, size,
     focus and style: magenta where something now is, cyan where something
     was, the rest greyed, plus the changed share and pixel box.
@@ -231,7 +242,9 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `mass: {parts?, density?: {part: kg/m3}, default_density?}` (`parts`
     weighs one object of a scene, `*` globs, on its own footprint): per-part and total
     mass, centre of mass, the footprint, and whether it tips over (with the
-    tilt it tolerates). Default density 1000.
+    tilt it tolerates). Default density 1000. Contact is measured from
+    the ground plane y = 0 (when the model is within 1 cm of it), so a
+    part sunk a few mm doesn't hide the other contacts.
 - `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,
   same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an

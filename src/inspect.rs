@@ -545,8 +545,15 @@ pub fn mass_of(
         .fold((Vec3::MAX, Vec3::MIN), |(a, b), (lo, hi)| {
             (a.min(lo), b.max(hi))
         });
-    let tol = ((mhi - mlo).length() as f64 * 2e-4).max(1e-5);
-    let floor = mlo.y as f64;
+    let tol = ((mhi - mlo).length() as f64 * 2e-4).max(1e-3);
+    // The ground is y = 0 when the model sits on it (within 1 cm, so a part
+    // sunk a few mm doesn't hide every other contact); otherwise its lowest
+    // point. Everything at or below floor + tol touches.
+    let floor = if (mlo.y as f64).abs() < 0.01 {
+        0.0
+    } else {
+        mlo.y as f64
+    };
     let mut pts: Vec<[f64; 2]> = Vec::new();
     for p in visible(model).filter(|p| picked(p)) {
         for i in 0..p.verts.len() {

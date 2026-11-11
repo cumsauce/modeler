@@ -333,6 +333,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             rotation,
             scale,
             relative,
+            pivot,
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
@@ -342,6 +343,18 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             if *relative {
                 // Offsets from the input: translation adds, rotation composes
                 // on top, scale multiplies.
+                // About a pivot: the part's origin swings around it too.
+                if let Some(p) = pivot {
+                    let p = Vec3::from(*p);
+                    let mut off = Vec3::from(part.translation) - p;
+                    if let Some(s) = scale {
+                        off *= Vec3::from(*s);
+                    }
+                    if let Some(r) = rotation {
+                        off = quat_of(*r) * off;
+                    }
+                    part.translation = (p + off).to_array();
+                }
                 if let Some(t) = translation {
                     part.translation = (Vec3::from(part.translation) + Vec3::from(*t)).to_array();
                 }
@@ -810,8 +823,12 @@ pub fn describe(ops: &[Op]) -> String {
                 rotation,
                 scale,
                 relative,
+                pivot,
             } => {
                 let mut s = format!("#{i} transform `{name}` <- `{input}`");
+                if let Some(p) = pivot {
+                    s += &format!(" pivot={p:?}");
+                }
                 if let Some(t) = translation {
                     s += &format!(" t={t:?}");
                 }
@@ -954,6 +971,7 @@ mod tests {
                 rotation: None,
                 scale: None,
                 relative: false,
+                pivot: None,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -986,6 +1004,7 @@ mod tests {
                 rotation: None,
                 scale: None,
                 relative: false,
+                pivot: None,
             },
             Op::Primitive {
                 name: "leg_template".into(),
@@ -1014,6 +1033,7 @@ mod tests {
                 rotation: None,
                 scale: None,
                 relative: false,
+                pivot: None,
             },
             Op::Transform {
                 name: "b".into(),
@@ -1022,6 +1042,7 @@ mod tests {
                 rotation: None,
                 scale: None,
                 relative: false,
+                pivot: None,
             },
         ]) else {
             panic!("a true cycle must fail")
@@ -1173,6 +1194,7 @@ mod tests {
             rotation: None,
             scale: None,
             relative: false,
+            pivot: None,
         }]) {
             Err(e) => e,
             Ok(_) => panic!("missing input must fail"),
@@ -1237,6 +1259,7 @@ mod tests {
                 rotation: None,
                 scale: None,
                 relative: false,
+                pivot: None,
             },
             prim("p"),
             Op::LinearArray {
@@ -1262,6 +1285,7 @@ mod tests {
                     rotation: None,
                     scale: None,
                     relative: false,
+                    pivot: None,
                 },
                 Op::Material {
                     name: "cache_c".into(),
@@ -1307,6 +1331,7 @@ mod tests {
                 rotation: None,
                 scale: Some([2.0, 2.0, 2.0]),
                 relative: true,
+                pivot: None,
             },
         ];
         let parts = evaluate_uncached(&ops).unwrap_or_else(|e| panic!("{e}"));
