@@ -44,9 +44,16 @@ pub enum BatchItem {
 #[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerifySpec {
-    /// Exact visible part names (order-insensitive).
+    /// Exact visible part names (order-insensitive); a trailing `*` matches
+    /// a prefix (`"gz.*"`).
     #[serde(default)]
     pub parts: Option<Vec<String>>,
+    /// Names that must be visible parts; extras are fine. Trailing `*` = prefix.
+    #[serde(default)]
+    pub includes: Option<Vec<String>>,
+    /// Every visible part touches the ground (y = 0) or another part.
+    #[serde(default)]
+    pub grounded: Option<bool>,
     /// World bounds of visible parts; `null` entries skip an axis.
     #[serde(default)]
     pub bounds: Option<BoundsSpec>,
@@ -89,6 +96,10 @@ pub struct Session {
     pub model: Model,
     /// The human's last click on the model, if it hasn't been commented yet.
     pub pending_pin: Option<PendingPin>,
+    /// Nesting depth of [`Session::batch`]; while > 0, commits are collected
+    /// into one history step recorded when the outermost batch ends.
+    batch_depth: usize,
+    batch_labels: Vec<String>,
 }
 
 impl Default for Session {
@@ -96,6 +107,8 @@ impl Default for Session {
         Self {
             model: Model::named("model"),
             pending_pin: None,
+            batch_depth: 0,
+            batch_labels: Vec::new(),
         }
     }
 }
@@ -117,12 +130,44 @@ impl Session {
     /// Records the just-mutated model in the history tree under `label`. The
     /// tree lives on the model, so it travels with saves and prefab loads.
     fn commit(&mut self, label: &str) {
+        if self.batch_depth > 0 {
+            self.model.version += 1;
+            self.batch_labels.push(label.to_string());
+            return;
+        }
+        self.record(label);
+    }
+
+    fn record(&mut self, label: &str) {
         self.model.version += 1;
         // The snapshot carries no tree of its own: the live history on the
         // session model is the single source of truth for the tree shape.
         let mut snapshot = self.model.clone();
         snapshot.history = crate::History::default();
         self.model.history.record(snapshot, label);
+    }
+
+    /// Runs `f` as one history step: every commit inside it (including the
+    /// earlier items when a later one fails) lands as a single undoable node.
+    pub fn batch<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ModelerError>,
+    ) -> Result<T, ModelerError> {
+        self.batch_depth += 1;
+        let r = f(self);
+        self.batch_depth -= 1;
+        if self.batch_depth == 0 && !self.batch_labels.is_empty() {
+            let labels = std::mem::take(&mut self.batch_labels);
+            let label = match labels.as_slice() {
+                [one] => one.clone(),
+                [first, .., last] => format!("{} edits: {first} … {last}", labels.len()),
+                [] => String::new(),
+            };
+            // The counter already advanced per edit; record() bumps it once more.
+            self.model.version -= 1;
+            self.record(&label);
+        }
+        r
     }
 
     /// Upserts one op into the graph, re-derives the parts and records history.
@@ -136,10 +181,16 @@ impl Session {
         // A visibility edit is in place by nature (reads and writes the same
         // name), yet re-issuing it must replace the previous one, not stack.
         let replace_in_place = kind == "visibility";
+        // "Never replace an op this one reads from" compares the old op's
+        // actual outputs: an array named after its source (`tile` -> tile_1..)
+        // writes tile_1.., not `tile`, so re-issuing it replaces it.
         let prev = self.model.ops.iter().rposition(|o| {
             graph::output(o) == out
                 && graph::kind(o) == kind
-                && (replace_in_place || !reads.contains(&graph::output(o)))
+                && (replace_in_place
+                    || !graph::outputs(o)
+                        .iter()
+                        .any(|x| reads.contains(&x.as_str())))
         });
         // Reject outputs that collide with another op's outputs (e.g. a
         // primitive `ring_0` vs a radial array `ring`); in-place chains (an op
@@ -406,6 +457,14 @@ impl Session {
         params: Option<crate::params::Params>,
         items: Vec<serde_json::Value>,
     ) -> CmdResult {
+        self.batch(|s| s.apply_values_inner(params, items))
+    }
+
+    fn apply_values_inner(
+        &mut self,
+        params: Option<crate::params::Params>,
+        items: Vec<serde_json::Value>,
+    ) -> CmdResult {
         // Drop templates whose op is gone (deleted, or failed to apply).
         let live: Vec<String> = self.model.ops.iter().map(Self::template_key).collect();
         self.model.templates.retain(|k, _| live.contains(k));
@@ -663,6 +722,8 @@ impl Session {
     /// The checks behind [`Self::verify`] as (name, passed, detail).
     pub fn verify_checks(&self, spec: &VerifySpec) -> Vec<(String, bool, String)> {
         let empty = spec.parts.is_none()
+            && spec.includes.is_none()
+            && spec.grounded.is_none()
             && spec.bounds.is_none()
             && spec.validate.is_none()
             && spec.rebuild.is_none();
@@ -673,6 +734,18 @@ impl Session {
         };
         if let Some(parts) = &spec.parts {
             record("parts", self.expect_parts(parts).map_err(|e| e.to_string()));
+        }
+        if let Some(w) = &spec.includes {
+            record(
+                "includes",
+                crate::verify::expect_includes(&self.model, w).map_err(|e| e.to_string()),
+            );
+        }
+        if spec.grounded == Some(true) {
+            record(
+                "grounded",
+                crate::verify::expect_grounded(&self.model).map_err(|e| e.to_string()),
+            );
         }
         if let Some(b) = &spec.bounds {
             record(
@@ -1029,15 +1102,30 @@ impl Session {
     pub fn cherry_pick(&mut self, from: usize, only: Option<Vec<String>>) -> CmdResult {
         let src = self.model_at(Some(from))?.clone();
         let mut picks = Self::ops_changed_between(&self.model, &src);
+        // Params that differ at `from`; they can be picked by name too.
+        let param_diff: crate::params::Params = src
+            .params
+            .iter()
+            .filter(|(k, v)| self.model.params.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut params = crate::params::Params::new();
         if let Some(names) = &only {
             let missing: Vec<&String> = names
                 .iter()
-                .filter(|n| !picks.iter().any(|o| graph::output(o) == n.as_str()))
+                .filter(|n| {
+                    !picks.iter().any(|o| graph::output(o) == n.as_str())
+                        && !param_diff.contains_key(n.as_str())
+                })
                 .collect();
             if !missing.is_empty() {
-                let available: Vec<&str> = picks.iter().map(graph::output).collect();
+                let mut available: Vec<String> =
+                    picks.iter().map(|o| graph::output(o).to_string()).collect();
+                available.sort();
+                available.dedup();
+                available.extend(param_diff.keys().map(|k| format!("param {k}")));
                 return Err(format!(
-                    "node #{from} has no new/changed op named {} (available: {})",
+                    "node #{from} has no new/changed op or param named {} (available: {})",
                     missing
                         .iter()
                         .map(|n| format!("`{n}`"))
@@ -1052,24 +1140,48 @@ impl Session {
                 .into());
             }
             picks.retain(|o| names.iter().any(|n| n == graph::output(o)));
+            for n in names {
+                if let Some(v) = param_diff.get(n) {
+                    params.insert(n.clone(), *v);
+                }
+            }
+        } else {
+            params = param_diff.clone();
         }
-        if picks.is_empty() {
+        // A picked op brings the param values it was derived with, so the
+        // live graph stays consistent with its params.
+        let templates: Vec<Option<serde_json::Value>> = picks
+            .iter()
+            .map(|op| src.templates.get(&Self::template_key(op)).cloned())
+            .collect();
+        for t in templates.iter().flatten() {
+            for r in crate::params::refs(t) {
+                if let Some(v) = src.params.get(&r) {
+                    params.insert(r, *v);
+                }
+            }
+        }
+        if picks.is_empty() && params.is_empty() {
             return Ok(format!(
-                "nothing to pick: node #{from} has no ops that differ from the live graph"
+                "nothing to pick: node #{from} has no ops or params that differ from the live graph"
             ));
         }
-        for (k, v) in &src.params {
-            self.model.params.entry(k.clone()).or_insert(*v);
-        }
-        let items = picks
-            .into_iter()
-            .map(|op| {
-                let t = src.templates.get(&Self::template_key(&op)).cloned();
-                (BatchItem::Op(op), t)
-            })
-            .collect();
-        let out = self.apply_items(items, false)?;
-        Ok(format!("cherry-picked from #{from}:\n{out}"))
+        let mut out = Vec::new();
+        self.batch(|s| {
+            if !params.is_empty() {
+                out.push(s.apply_values(Some(params.clone()), Vec::new())?);
+            }
+            if !picks.is_empty() {
+                let items = picks
+                    .into_iter()
+                    .zip(templates)
+                    .map(|(op, t)| (BatchItem::Op(op), t))
+                    .collect();
+                out.push(s.apply_items(items, false)?);
+            }
+            Ok(())
+        })?;
+        Ok(format!("cherry-picked from #{from}:\n{}", out.join("\n")))
     }
 
     /// Prunes old history, keeping the newest `keep` snapshots, the cursor,
@@ -1083,9 +1195,26 @@ impl Session {
         ))
     }
 
-    /// The whole history tree, one line per snapshot.
-    pub fn history(&self) -> String {
-        self.model.history.describe()
+    /// The history tree, one line per snapshot: the newest `limit` (default
+    /// 30) plus the cursor line, with a count of the elided older nodes.
+    pub fn history(&self, limit: Option<usize>) -> String {
+        let all = self.model.history.describe();
+        let lines: Vec<&str> = all.lines().collect();
+        let limit = limit.unwrap_or(30).max(1);
+        if lines.len() <= limit {
+            return all;
+        }
+        let tail_start = lines.len() - limit;
+        let mut out = vec![format!(
+            "{} history nodes; showing the newest {limit} (history limit=N for more)",
+            lines.len()
+        )];
+        if let Some(cur) = lines[..tail_start].iter().find(|l| l.ends_with("<-")) {
+            out.push(format!("{cur}  (cursor)"));
+            out.push("…".into());
+        }
+        out.extend(lines[tail_start..].iter().map(|l| l.to_string()));
+        out.join("\n")
     }
 
     /// Comment on a part (optionally a specific face or vertex). Face, vertex and
@@ -1328,7 +1457,7 @@ mod tests {
         assert_eq!(s.model.parts[0].name, "leg");
         s.redo().unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts[0].name, "leg2");
-        assert!(s.history().contains('#'));
+        assert!(s.history(None).contains('#'));
     }
 
     #[test]
@@ -1339,7 +1468,7 @@ mod tests {
         // A new edit while back at the older state: the rename stays reachable.
         s.rename_part("leg", "c").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.model.parts[0].name, "c");
-        assert!(s.history().contains("`rename `leg` -> `b`"));
+        assert!(s.history(None).contains("`rename `leg` -> `b`"));
         // Jump to the abandoned branch's snapshot and the name comes back.
         let id = s
             .model
@@ -2365,5 +2494,150 @@ mod tests {
         let t = s.model.part("t").unwrap_or_else(|| panic!("t"));
         assert!((t.bounds().1.y - 2.0).abs() < 1e-5, "height must follow h");
         assert_eq!(t.material.base_color, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn an_apply_ops_call_is_one_undo_step() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let before = s.model.history.nodes.len();
+        s.apply_values(
+            Some([("h".to_string(), 1.0)].into()),
+            vec![
+                json!({"type": "primitive", "name": "a", "kind": "box", "size": "$h"}),
+                json!({"type": "primitive", "name": "b", "kind": "box", "size": 1, "translation": [3, 0, 0]}),
+                json!({"type": "material", "name": "a", "color": "#f00"}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            s.model.history.nodes.len(),
+            before + 1,
+            "{}",
+            s.history(None)
+        );
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.parts.is_empty(), "one undo reverts the whole call");
+    }
+
+    #[test]
+    fn cherry_pick_brings_the_params_its_ops_were_built_with() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.apply_values(
+            Some([("h".to_string(), 1.0)].into()),
+            vec![json!({"type": "primitive", "name": "a", "kind": "box", "size": [1, "$h", 1]})],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let base = s
+            .model
+            .history
+            .current
+            .unwrap_or_else(|| panic!("no cursor"));
+        s.apply_values(Some([("h".to_string(), 3.0)].into()), vec![])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let tip = s
+            .model
+            .history
+            .current
+            .unwrap_or_else(|| panic!("no cursor"));
+        s.jump(base).unwrap_or_else(|e| panic!("{e}"));
+        s.apply_values(
+            None,
+            vec![json!({"type": "primitive", "name": "z", "kind": "box", "size": 1, "translation": [5, 0, 0]})],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Picking the param by name works, and the op re-derives with it.
+        s.cherry_pick(tip, Some(vec!["h".into()]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.model.params.get("h"), Some(&3.0));
+        let a = s.model.part("a").unwrap_or_else(|| panic!("no a"));
+        let (lo, hi) = a.bounds();
+        assert!((hi.y - lo.y - 3.0).abs() < 1e-5, "{lo} {hi}");
+    }
+
+    #[test]
+    fn group_merges_disjoint_parts_and_arrays_as_one() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "t", "kind": "box", "size": 0.5}),
+                json!({"type": "linear_array", "name": "t", "input": "t", "count": 3, "offset": [1, 0, 0]}),
+                json!({"type": "group", "name": "row", "inputs": ["t", "t_1", "t_2"]}),
+                json!({"type": "linear_array", "name": "rows", "input": "row", "count": 2, "offset": [0, 0, 1]}),
+                json!({"type": "hide_part", "part": "t"}),
+                json!({"type": "hide_part", "part": "t_1"}),
+                json!({"type": "hide_part", "part": "t_2"}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let row = s.model.part("row").unwrap_or_else(|| panic!("no row"));
+        assert_eq!(
+            row.verts.len(),
+            3 * s.model.part("t").map_or(0, |p| p.verts.len())
+        );
+        assert!(s.model.part("rows_1").is_some());
+        let (_, hi) = s
+            .model
+            .part("rows_1")
+            .unwrap_or_else(|| panic!("x"))
+            .bounds();
+        assert!(
+            (hi.x - 2.25).abs() < 1e-5 && (hi.z - 1.25).abs() < 1e-5,
+            "{hi}"
+        );
+        assert!(
+            s.lints().iter().all(|l| !l.contains("no overlap")),
+            "{:?}",
+            s.lints()
+        );
+        let spec: VerifySpec = serde_json::from_value(
+            json!({"parts": ["row", "rows_*"], "includes": ["rows_1"], "grounded": true, "validate": true}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let checks = s.verify_checks(&spec);
+        assert!(checks.iter().all(|c| c.1), "{checks:?}");
+    }
+
+    #[test]
+    fn a_part_hanging_in_the_air_is_flagged() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "pole", "kind": "cylinder", "size": [0.03, 2], "translation": [0, 1, 0]}),
+                json!({"type": "primitive", "name": "cap", "kind": "box", "size": 0.1, "translation": [0, 2.05, 0]}),
+                json!({"type": "transform", "name": "stray", "input": "pole", "translation": [0.5, 3, 0]}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let lints = s.lints();
+        assert!(
+            lints.iter().any(|l| l.contains("`stray` floats")),
+            "{lints:?}"
+        );
+        assert!(
+            !lints.iter().any(|l| l.contains("`cap` floats")),
+            "{lints:?}"
+        );
+    }
+
+    #[test]
+    fn reissuing_an_array_named_after_its_source_replaces_it() {
+        use serde_json::json;
+        let mut s = Session::default();
+        let batch = vec![
+            json!({"type": "primitive", "name": "tile", "kind": "box", "size": 0.2}),
+            json!({"type": "linear_array", "name": "tile", "input": "tile", "count": 3, "offset": [0.3, 0, 0]}),
+        ];
+        s.apply_values(None, batch.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.apply_values(None, batch)
+            .unwrap_or_else(|e| panic!("re-issue failed: {e}"));
+        assert_eq!(s.model.ops.len(), 2, "{}", s.describe_ops());
     }
 }

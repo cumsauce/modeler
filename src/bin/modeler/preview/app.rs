@@ -69,7 +69,8 @@ pub(crate) fn drain_commands(
                 if headless.0 {
                     let _ = reply.send(Err("headless: no camera to move".into()));
                 } else {
-                    orbit.yaw = yaw.to_radians();
+                    // Same convention as agent custom cameras: yaw 0 = on +z looking -z.
+                    orbit.yaw = (90.0 - yaw).to_radians();
                     orbit.pitch = pitch.clamp(-89.0, 89.0).to_radians();
                     orbit.dist = dist.clamp(0.2, 200.0);
                     orbit.user = true;
@@ -182,23 +183,35 @@ pub(crate) fn part_bundle(
 
 /// Camera and lights (no floor: the camera may orbit below the model).
 pub(crate) fn setup_scene(mut commands: Commands) {
-    commands.spawn((
-        Name::new("camera"),
-        MainCamera,
-        Camera3d::default(),
-        Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.spawn((
-        Name::new("ambient light"),
-        AmbientLight {
-            brightness: 900.0,
-            ..default()
-        },
-    ));
+    // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
+    // entity does nothing), so faces turned from the sun went black. A dim
+    // camera-aligned fill keeps every side readable as the human orbits.
+    commands
+        .spawn((
+            Name::new("camera"),
+            MainCamera,
+            Camera3d::default(),
+            AmbientLight {
+                brightness: 900.0,
+                ..default()
+            },
+            Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
+        ))
+        .with_children(|c| {
+            c.spawn((
+                Name::new("view fill"),
+                DirectionalLight {
+                    illuminance: 1500.0,
+                    ..default()
+                },
+                Transform::default(),
+            ));
+        });
     commands.spawn((
         Name::new("sun"),
         DirectionalLight {
             illuminance: 8000.0,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.5, 0.0)),

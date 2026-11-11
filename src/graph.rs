@@ -252,11 +252,12 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             twist,
             scale_top,
             slices,
+            round,
             translation,
             rotation,
         } => {
             let mut part =
-                crate::csg::extrude(name, profile, *height, *twist, *scale_top, *slices)?;
+                crate::csg::extrude(name, profile, *height, *twist, *scale_top, *slices, *round)?;
             part.translation = *translation;
             if let Some(r) = rotation {
                 part.rotation = *r;
@@ -268,15 +269,62 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             profile,
             degrees,
             segments,
+            round,
             translation,
             rotation,
         } => {
-            let mut part = crate::csg::revolve(name, profile, *degrees, *segments)?;
+            let mut part = crate::csg::revolve(name, profile, *degrees, *segments, *round)?;
             part.translation = *translation;
             if let Some(r) = rotation {
                 part.rotation = *r;
             }
             upsert(named, name, part);
+        }
+        Op::Sweep {
+            name,
+            profile,
+            path,
+            closed,
+            round,
+        } => {
+            let part = crate::csg::sweep(name, profile, path, *closed, *round)?;
+            upsert(named, name, part);
+        }
+        Op::Hull { name, inputs } => {
+            let parts: Vec<Arc<Part>> = inputs
+                .iter()
+                .map(|i| lookup_shared(named, i))
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&Part> = parts.iter().map(|p| p.as_ref()).collect();
+            let part = crate::csg::hull(name, &refs)?;
+            upsert(named, name, part);
+        }
+        Op::Round {
+            name,
+            input,
+            mode,
+            radius,
+            segments,
+        } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::csg::round(name, &src, mode, *radius, *segments)?;
+            upsert(named, name, part);
+        }
+        Op::Group { name, inputs } => {
+            if inputs.is_empty() {
+                return Err(ModelerError::Invalid(format!(
+                    "group `{name}` has no inputs"
+                )));
+            }
+            let mut out = Part::new(name);
+            for (k, input) in inputs.iter().enumerate() {
+                let p = lookup_shared(named, input)?;
+                if k == 0 {
+                    out.material = p.material.clone();
+                }
+                append_baked(&mut out, &p);
+            }
+            upsert(named, name, out);
         }
         Op::Transform {
             name,
@@ -547,6 +595,41 @@ fn lookup_shared(named: &Named, name: &str) -> Result<Arc<Part>, ModelerError> {
 
 /// Inserts `part` under `name`, replacing an earlier op's output of the same
 /// name in place (so output order stays stable across re-issues).
+/// Appends `p`'s mesh to `out` with `p`'s transform baked into positions and
+/// normals (inverse-transpose for non-uniform scale).
+fn append_baked(out: &mut Part, p: &Part) {
+    let rot = crate::quat_of(p.rotation);
+    let scale = crate::Vec3::from(p.scale);
+    let t = crate::Vec3::from(p.translation);
+    let base = out.verts.len() as u32;
+    let n = p.verts.len();
+    out.verts.extend(
+        p.verts
+            .iter()
+            .map(|v| (rot * (crate::Vec3::from(*v) * scale) + t).to_array()),
+    );
+    let normals_ok = p.normals.len() == n && (out.normals.len() == base as usize);
+    if normals_ok {
+        out.normals.extend(p.normals.iter().map(|v| {
+            (rot * (crate::Vec3::from(*v) / scale))
+                .normalize_or_zero()
+                .to_array()
+        }));
+    } else {
+        out.normals.clear();
+    }
+    if p.uvs.len() == n && out.uvs.len() == base as usize {
+        out.uvs.extend_from_slice(&p.uvs);
+    } else {
+        out.uvs.clear();
+    }
+    if p.indices.is_empty() {
+        out.indices.extend(base..base + (n - n % 3) as u32);
+    } else {
+        out.indices.extend(p.indices.iter().map(|i| i + base));
+    }
+}
+
 fn upsert(named: &mut Named, name: &str, part: Part) {
     upsert_shared(named, name, Arc::new(part));
 }
@@ -564,6 +647,10 @@ pub fn output(op: &Op) -> &str {
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
         | Op::Revolve { name, .. }
+        | Op::Group { name, .. }
+        | Op::Sweep { name, .. }
+        | Op::Hull { name, .. }
+        | Op::Round { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
         | Op::RadialArray { name, .. }
@@ -603,6 +690,10 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
         Op::Revolve { .. } => "revolve",
+        Op::Group { .. } => "group",
+        Op::Sweep { .. } => "sweep",
+        Op::Hull { .. } => "hull",
+        Op::Round { .. } => "round",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
         Op::RadialArray { .. } => "radial",
@@ -618,9 +709,11 @@ pub fn kind(op: &Op) -> &'static str {
 /// The part names an op reads.
 pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
-        Op::Primitive { .. } | Op::Extrude { .. } | Op::Revolve { .. } | Op::Prefab { .. } => {
-            Vec::new()
-        }
+        Op::Primitive { .. }
+        | Op::Extrude { .. }
+        | Op::Revolve { .. }
+        | Op::Sweep { .. }
+        | Op::Prefab { .. } => Vec::new(),
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
@@ -631,6 +724,10 @@ pub fn inputs(op: &Op) -> Vec<&str> {
             vec![input]
         }
         Op::Boolean { a, b, .. } => vec![a, b],
+        Op::Group { inputs, .. } | Op::Hull { inputs, .. } => {
+            inputs.iter().map(String::as_str).collect()
+        }
+        Op::Round { input, .. } => vec![input],
     }
 }
 
@@ -660,10 +757,11 @@ pub fn describe(ops: &[Op]) -> String {
                 twist,
                 scale_top,
                 slices,
+                round,
                 translation,
                 rotation,
             } => format!(
-                "#{i} extrude `{name}` profile={profile:?} height={height} twist={twist} scale_top={scale_top:?} slices={slices} at={translation:?}{}",
+                "#{i} extrude `{name}` profile={profile:?} height={height} twist={twist} scale_top={scale_top:?} slices={slices} round={round} at={translation:?}{}",
                 rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
             ),
             Op::Revolve {
@@ -671,11 +769,39 @@ pub fn describe(ops: &[Op]) -> String {
                 profile,
                 degrees,
                 segments,
+                round,
                 translation,
                 rotation,
             } => format!(
-                "#{i} revolve `{name}` profile={profile:?} degrees={degrees} segments={segments} at={translation:?}{}",
+                "#{i} revolve `{name}` profile={profile:?} degrees={degrees} segments={segments} round={round} at={translation:?}{}",
                 rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+            ),
+            Op::Sweep {
+                name,
+                profile,
+                path,
+                closed,
+                round,
+            } => format!(
+                "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
+            ),
+            Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::Round {
+                name,
+                input,
+                mode,
+                radius,
+                segments,
+            } => format!(
+                "#{i} round `{name}` <- `{input}` {mode} radius={radius} segments={segments}"
+            ),
+            Op::Group { name, inputs } => format!(
+                "#{i} group `{name}` = {}",
+                inputs
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
             ),
             Op::Transform {
                 name,
@@ -790,13 +916,21 @@ pub fn describe(ops: &[Op]) -> String {
 /// The full describe line for a single op, looked up by output part name (the
 /// newest op wins, matching upsert semantics). For the `op_get` tool.
 pub fn describe_one(ops: &[Op], name: &str) -> Option<String> {
-    ops.iter().rev().find(|op| output(op) == name).map(|op| {
-        let d = describe(std::slice::from_ref(op));
-        d.lines()
-            .nth(1)
-            .map(|l| l.replacen("#0 ", "", 1).to_string())
-            .unwrap_or(d)
-    })
+    // Every op writing `name`, in graph order: the producing op first, then
+    // in-place edits (material, visibility, transform) that share its name.
+    let lines: Vec<String> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| output(op) == name)
+        .map(|(i, op)| {
+            let d = describe(std::slice::from_ref(op));
+            d.lines()
+                .nth(1)
+                .map(|l| l.replacen("#0 ", &format!("#{i} "), 1))
+                .unwrap_or(d)
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ Point your agent's MCP config at the `modeler` binary
 
 - **Primitives**: box, sphere, cylinder, cone, torus, capsule, plane,
   wedge, disc, washer; raw triangle meshes.
-- **Op graph**: an ordered list of steps (primitive, extrude, revolve, transform, boolean,
+- **Op graph**: an ordered list of steps (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean,
   radial/linear array, mirror, material) that derive the parts. Ops are
   upserted by output name, so re-issuing one is a parameter tweak, and
   the whole model re-derives. `mirror` bakes the reflection so it

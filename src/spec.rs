@@ -236,20 +236,82 @@ pub struct PrimitiveSpec {
     rotation: Option<[f32; 4]>,
 }
 
-/// A 2D profile: one ring of [a, b] points, or a list of rings (inner rings
+/// One entry of a profile ring: a point [a, b], or an arc that expands to
+/// points: {"arc": {"center": [a, b], "radius": r, "from": deg, "to": deg}}
+/// (degrees counter-clockwise from +a; `segments` optional).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RingItem {
+    Point([f32; 2]),
+    Arc { arc: ArcSpec },
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArcSpec {
+    center: [f32; 2],
+    radius: f32,
+    /// Start angle, degrees counter-clockwise from +a.
+    from: f32,
+    /// End angle; to > from runs counter-clockwise. A full circle is 0 -> 360.
+    to: f32,
+    /// Points along the arc; default one per ~7.5 degrees.
+    #[serde(default)]
+    segments: Option<u32>,
+}
+
+/// A 2D profile: one ring of points/arcs, or a list of rings (inner rings
 /// cut holes; orientation doesn't matter).
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ProfileArg {
-    Ring(Vec<[f32; 2]>),
-    Rings(Vec<Vec<[f32; 2]>>),
+    Ring(Vec<RingItem>),
+    Rings(Vec<Vec<RingItem>>),
+}
+
+fn expand_ring(items: Vec<RingItem>) -> Result<Vec<[f32; 2]>, String> {
+    let mut out = Vec::new();
+    for it in items {
+        match it {
+            RingItem::Point(p) => out.push(p),
+            RingItem::Arc { arc } => {
+                if arc.radius.is_nan() || arc.radius <= 0.0 {
+                    return Err(format!("arc radius must be > 0, got {}", arc.radius));
+                }
+                let sweep = arc.to - arc.from;
+                let full = (sweep.abs() - 360.0).abs() < 1e-3;
+                let n = arc
+                    .segments
+                    .unwrap_or_else(|| (sweep.abs() / 7.5).ceil().max(2.0) as u32)
+                    .max(2);
+                // A full circle repeats its start point; drop the duplicate.
+                let last = if full { n - 1 } else { n };
+                for k in 0..=last {
+                    let a = (arc.from + sweep * k as f32 / n as f32).to_radians();
+                    out.push([
+                        arc.center[0] + arc.radius * a.cos(),
+                        arc.center[1] + arc.radius * a.sin(),
+                    ]);
+                }
+            }
+        }
+    }
+    // Drop consecutive duplicates (an arc that starts where a point ended).
+    out.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-7 && (a[1] - b[1]).abs() < 1e-7);
+    if out.len() > 2 && {
+        let (f, l) = (out[0], out[out.len() - 1]);
+        (f[0] - l[0]).abs() < 1e-7 && (f[1] - l[1]).abs() < 1e-7
+    } {
+        out.pop();
+    }
+    Ok(out)
 }
 
 impl ProfileArg {
-    fn rings(self) -> Vec<Vec<[f32; 2]>> {
+    fn rings(self) -> Result<Vec<Vec<[f32; 2]>>, String> {
         match self {
-            ProfileArg::Ring(r) => vec![r],
-            ProfileArg::Rings(r) => r,
+            ProfileArg::Ring(r) => Ok(vec![expand_ring(r)?]),
+            ProfileArg::Rings(r) => r.into_iter().map(expand_ring).collect(),
         }
     }
 }
@@ -272,6 +334,9 @@ pub struct ExtrudeSpec {
     /// Intermediate slices for twist; 0 picks automatically.
     #[serde(default)]
     slices: u32,
+    /// Round every profile corner with this radius (meters). Default 0.
+    #[serde(default)]
+    round: f32,
     #[serde(default, alias = "position")]
     translation: [f32; 3],
     /// Quaternion [x, y, z, w].
@@ -297,11 +362,71 @@ pub struct RevolveSpec {
     /// Segments around the axis; 0 = 48.
     #[serde(default)]
     segments: u32,
+    /// Round every profile corner with this radius (meters). Default 0.
+    #[serde(default)]
+    round: f32,
     #[serde(default, alias = "position")]
     translation: [f32; 3],
     /// Quaternion [x, y, z, w].
     #[serde(default)]
     rotation: Option<[f32; 4]>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SweepSpec {
+    name: String,
+    /// Cross-section [[u, v], ...] (points or arcs, one ring) centred on the
+    /// path: u along the frame normal (starts as world up, or +z for a
+    /// vertical path), v across. A circle: [{"arc": {"center": [0, 0],
+    /// "radius": 0.02, "from": 0, "to": 360}}].
+    profile: Vec<RingItem>,
+    /// World points [[x, y, z], ...] the profile travels along. Use many
+    /// points for curves (bends are mitred to keep thickness).
+    path: Vec<[f32; 3]>,
+    /// Join the end back to the start (a ring); otherwise both ends are capped.
+    #[serde(default)]
+    closed: bool,
+    /// Round the profile's corners with this radius.
+    #[serde(default)]
+    round: f32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HullSpec {
+    name: String,
+    /// Parts whose convex hull to take (e.g. two spheres = a capsule between
+    /// them; eight small spheres = a rounded box). First input's material.
+    inputs: Vec<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoundSpec {
+    name: String,
+    /// A closed solid to round.
+    input: String,
+    /// "fillet" (round convex edges by radius, outer size kept), "chamfer"
+    /// (45° bevel of radius on axis-aligned edges) or "smooth" (subdivision
+    /// rounding of sharp edges; radius ignored).
+    mode: String,
+    /// Fillet/chamfer size in meters.
+    #[serde(default)]
+    radius: f32,
+    /// Fillet sphere segments (default 16) or smooth refinement steps (default 3).
+    #[serde(default)]
+    segments: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSpec {
+    name: String,
+    /// Parts to merge into one mesh (no boolean; they may be disjoint). The
+    /// result takes the first input's material; hide the inputs if only the
+    /// group should render.
+    inputs: Vec<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -466,6 +591,10 @@ pub enum OpSpec {
     Primitive(PrimitiveSpec),
     Extrude(ExtrudeSpec),
     Revolve(RevolveSpec),
+    Group(GroupSpec),
+    Sweep(SweepSpec),
+    Hull(HullSpec),
+    Round(RoundSpec),
     Transform(TransformSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
@@ -485,6 +614,10 @@ pub const OP_TYPES: &[&str] = &[
     "primitive",
     "extrude",
     "revolve",
+    "group",
+    "sweep",
+    "hull",
+    "round",
     "transform",
     "boolean",
     "radial_array",
@@ -573,7 +706,11 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let s: ExtrudeSpec = de(&ctx, &body)?;
             BatchItem::Op(Op::Extrude {
                 name: s.name,
-                profile: s.profile.rings(),
+                profile: s
+                    .profile
+                    .rings()
+                    .map_err(|e| format!("{ctx}: profile: {e}"))?,
+                round: s.round,
                 height: s.height,
                 twist: s.twist,
                 scale_top: s.scale_top,
@@ -586,11 +723,61 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let s: RevolveSpec = de(&ctx, &body)?;
             BatchItem::Op(Op::Revolve {
                 name: s.name,
-                profile: s.profile.rings(),
+                profile: s
+                    .profile
+                    .rings()
+                    .map_err(|e| format!("{ctx}: profile: {e}"))?,
+                round: s.round,
                 degrees: s.degrees,
                 segments: s.segments,
                 translation: s.translation,
                 rotation: s.rotation,
+            })
+        }
+        "sweep" => {
+            let s: SweepSpec = de(&ctx, &body)?;
+            BatchItem::Op(Op::Sweep {
+                name: s.name,
+                profile: expand_ring(s.profile).map_err(|e| format!("{ctx}: profile: {e}"))?,
+                path: s.path,
+                closed: s.closed,
+                round: s.round,
+            })
+        }
+        "hull" => {
+            let s: HullSpec = de(&ctx, &body)?;
+            if s.inputs.is_empty() {
+                return Err(format!("{ctx}: inputs: a hull needs at least one part"));
+            }
+            BatchItem::Op(Op::Hull {
+                name: s.name,
+                inputs: s.inputs,
+            })
+        }
+        "round" => {
+            let s: RoundSpec = de(&ctx, &body)?;
+            if !["fillet", "chamfer", "smooth"].contains(&s.mode.as_str()) {
+                return Err(format!(
+                    "{ctx}: mode: must be fillet, chamfer or smooth, got `{}`",
+                    s.mode
+                ));
+            }
+            BatchItem::Op(Op::Round {
+                name: s.name,
+                input: s.input,
+                mode: s.mode,
+                radius: s.radius,
+                segments: s.segments,
+            })
+        }
+        "group" => {
+            let s: GroupSpec = de(&ctx, &body)?;
+            if s.inputs.is_empty() {
+                return Err(format!("{ctx}: inputs: a group needs at least one part"));
+            }
+            BatchItem::Op(Op::Group {
+                name: s.name,
+                inputs: s.inputs,
             })
         }
         "transform" => {
@@ -741,6 +928,18 @@ pub fn example(ty: &str) -> Option<Value> {
         "revolve" => {
             json!({"type": "revolve", "name": "vase", "profile": [[0, 0], [0.3, 0], [0.4, 0.3], [0.15, 0.7], [0.2, 0.8], [0, 0.8]]})
         }
+        "sweep" => {
+            json!({"type": "sweep", "name": "handle", "profile": [{"arc": {"center": [0, 0], "radius": 0.012, "from": 0, "to": 360}}], "path": [[0, 0.9, 0], [0, 0.95, 0.05], [0, 1.05, 0.05], [0, 1.1, 0]]})
+        }
+        "hull" => {
+            json!({"type": "hull", "name": "pill", "inputs": ["ball_a", "ball_b"]})
+        }
+        "round" => {
+            json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})
+        }
+        "group" => {
+            json!({"type": "group", "name": "tile_row", "inputs": ["tile", "tile_1", "tile_2", "tile_3"]})
+        }
         "transform" => {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
         }
@@ -792,6 +991,10 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "primitive" => schemars::schema_for!(PrimitiveSpec),
         "extrude" => schemars::schema_for!(ExtrudeSpec),
         "revolve" => schemars::schema_for!(RevolveSpec),
+        "group" => schemars::schema_for!(GroupSpec),
+        "sweep" => schemars::schema_for!(SweepSpec),
+        "hull" => schemars::schema_for!(HullSpec),
+        "round" => schemars::schema_for!(RoundSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),
@@ -879,6 +1082,19 @@ mod tests {
         assert_eq!(parse_color(&json!([255, 0, 0])), Ok([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(parse_color(&json!("#ff0000")), Ok([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(parse_color(&json!("#f00")), Ok([1.0, 0.0, 0.0, 1.0]));
+        // Arcs expand to points; a full circle has no duplicate seam point.
+        let ring = expand_ring(
+            serde_json::from_value(json!([{"arc": {"center": [0, 0], "radius": 1, "from": 0, "to": 360, "segments": 8}}]))
+                .unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ring.len(), 8);
+        let d = expand_ring(
+            serde_json::from_value(json!([[1, 0], {"arc": {"center": [0, 0], "radius": 1, "from": 0, "to": 90, "segments": 2}}, [0, 0]]))
+                .unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(d.len(), 4, "{d:?}");
         assert!(parse_color(&json!([1, 0])).is_err());
     }
 

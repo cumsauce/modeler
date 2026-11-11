@@ -629,6 +629,9 @@ pub enum Op {
         scale_top: [f32; 2],
         #[serde(default)]
         slices: u32,
+        /// Corner radius applied to the profile (0 = sharp).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        round: f32,
         #[serde(default)]
         translation: [f32; 3],
         #[serde(default)]
@@ -642,11 +645,42 @@ pub enum Op {
         degrees: f32,
         #[serde(default)]
         segments: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        round: f32,
         #[serde(default)]
         translation: [f32; 3],
         #[serde(default)]
         rotation: Option<[f32; 4]>,
     },
+    /// A closed 2D profile swept along a 3D polyline (pipes, rails, handles,
+    /// frames). `closed` loops the path instead of capping the ends.
+    Sweep {
+        name: String,
+        profile: Vec<[f32; 2]>,
+        path: Vec<[f32; 3]>,
+        #[serde(default)]
+        closed: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        round: f32,
+    },
+    /// Convex hull of several parts.
+    Hull { name: String, inputs: Vec<String> },
+    /// Rounds a solid's edges: `fillet` / `chamfer` by `radius`, or
+    /// subdivision `smooth`.
+    Round {
+        name: String,
+        input: String,
+        mode: String,
+        #[serde(default)]
+        radius: f32,
+        #[serde(default)]
+        segments: u32,
+    },
+    /// Merges several parts into one without a boolean: their meshes are
+    /// concatenated in world space (transforms baked). For arraying or moving
+    /// a set of disjoint parts as one (a row of tiles, a window with its
+    /// frame). Takes the first input's material.
+    Group { name: String, inputs: Vec<String> },
     /// Places/rotates/scales an earlier part into a new output.
     Transform {
         name: String,

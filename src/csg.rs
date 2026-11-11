@@ -65,11 +65,23 @@ fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
     }
     // Weld by position (1e-5 grid): verts split only for UV/normal seams become
     // merge pairs, so Manifold sees one topological vertex but keeps both UVs.
+    // The grid scales with the part (1e-6 of its size, so 1e-5 at 10 m and
+    // 1e-7 at 10 cm): seam duplicates differ only in the last f32 bits, while
+    // real features of small (real-scale) parts stay apart.
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for v in props.chunks(N_PROPS) {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v[k]);
+            hi[k] = hi[k].max(v[k]);
+        }
+    }
+    let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+    let inv = 1.0 / (diag * 1e-6).clamp(1e-9, 1e-5);
     let key = |i: usize| -> [i64; 3] {
         [
-            (props[i * N_PROPS] * 1e5).round() as i64,
-            (props[i * N_PROPS + 1] * 1e5).round() as i64,
-            (props[i * N_PROPS + 2] * 1e5).round() as i64,
+            (props[i * N_PROPS] * inv).round() as i64,
+            (props[i * N_PROPS + 1] * inv).round() as i64,
+            (props[i * N_PROPS + 2] * inv).round() as i64,
         ]
     };
     let mut first: std::collections::HashMap<[i64; 3], usize> = Default::default();
@@ -242,6 +254,7 @@ pub fn extrude(
     twist: f32,
     scale_top: [f32; 2],
     slices: u32,
+    round: f32,
 ) -> Result<Part, ModelerError> {
     check_profile(profile)?;
     if height.is_nan() || height <= 0.0 {
@@ -260,7 +273,7 @@ pub fn extrude(
         .iter()
         .map(|r| r.iter().map(|p| [p[0] as f64, -p[1] as f64]).collect())
         .collect();
-    let cs = cross_section(rings);
+    let cs = round_cross_section(cross_section(rings), round);
     // Twist runs the other way after the axis swap; negate so positive
     // twist is counter-clockwise seen from above, like a y-axis rotation.
     let m = Manifold::extrude_with_options(
@@ -282,6 +295,7 @@ pub fn revolve(
     profile: &[Vec<[f32; 2]>],
     degrees: f32,
     segments: u32,
+    round: f32,
 ) -> Result<Part, ModelerError> {
     check_profile(profile)?;
     if let Some(p) = profile.iter().flatten().find(|p| p[0] < 0.0) {
@@ -298,10 +312,290 @@ pub fn revolve(
         .iter()
         .map(|r| r.iter().map(|p| [p[0] as f64, p[1] as f64]).collect())
         .collect();
-    let cs = cross_section(rings);
+    // Rounding can push points past the axis; clip them back to radius >= 0.
+    let cs = round_cross_section(cross_section(rings), round);
+    let cs = if round > 0.0 {
+        let clipped: Vec<Vec<[f64; 2]>> = cs
+            .to_polygons()
+            .into_iter()
+            .map(|r| r.into_iter().map(|p| [p[0].max(0.0), p[1]]).collect())
+            .collect();
+        cross_section(clipped)
+    } else {
+        cs
+    };
     let segs = if segments == 0 { 48 } else { segments.max(3) } as i32;
     let m = Manifold::revolve(&cs, segs, degrees as f64);
     finish_sweep(&m, name, "revolve")
+}
+
+/// Rounds every corner of a 2D region by `r` (concave and convex): grow,
+/// shrink twice as far, grow back, all with round joins.
+fn round_cross_section(cs: manifold_csg::CrossSection, r: f32) -> manifold_csg::CrossSection {
+    if r <= 0.0 {
+        return cs;
+    }
+    let r = r as f64;
+    let j = manifold_csg::JoinType::Round;
+    // 64 segments per full turn: the automatic count is coarse at small radii.
+    cs.offset(r, j, 2.0, 64)
+        .offset(-2.0 * r, j, 2.0, 64)
+        .offset(r, j, 2.0, 64)
+}
+
+/// A profile's rings after optional corner rounding (for sweep, which
+/// builds its own rings).
+fn rounded_rings(profile: &[Vec<[f32; 2]>], round: f32) -> Vec<Vec<[f64; 2]>> {
+    let rings: Vec<Vec<[f64; 2]>> = profile
+        .iter()
+        .map(|r| r.iter().map(|p| [p[0] as f64, p[1] as f64]).collect())
+        .collect();
+    if round <= 0.0 {
+        return rings;
+    }
+    round_cross_section(cross_section(rings), round).to_polygons()
+}
+
+/// Sweeps a closed 2D `profile` ([u, v] around the path, u along the
+/// frame's normal, v along its binormal) along a 3D polyline `path`, with
+/// rotation-minimising frames. `closed` joins the path end to its start (a
+/// ring) instead of capping both ends.
+pub fn sweep(
+    name: &str,
+    profile: &[[f32; 2]],
+    path: &[[f32; 3]],
+    closed: bool,
+    round: f32,
+) -> Result<Part, ModelerError> {
+    check_profile(&[profile.to_vec()])?;
+    let min_pts = if closed { 3 } else { 2 };
+    if path.len() < min_pts {
+        return Err(ModelerError::Csg(format!(
+            "sweep `{name}`: path needs at least {min_pts} points, got {}",
+            path.len()
+        )));
+    }
+    let ring2: Vec<[f64; 2]> = match rounded_rings(&[profile.to_vec()], round).as_slice() {
+        [one] => one.clone(),
+        _ => {
+            return Err(ModelerError::Csg(format!(
+                "sweep `{name}`: the profile must be one simple ring (round may have split it)"
+            )));
+        }
+    };
+    let pts: Vec<Vec3> = path.iter().map(|p| Vec3::from(*p)).collect();
+    if pts.windows(2).any(|w| (w[1] - w[0]).length() < 1e-9) {
+        return Err(ModelerError::Csg(format!(
+            "sweep `{name}`: path has repeated points"
+        )));
+    }
+    let n = pts.len();
+    // Tangents: bisectors at interior points (wrapping when closed).
+    let tangent = |i: usize| -> Vec3 {
+        let prev = if i > 0 {
+            Some(pts[i] - pts[i - 1])
+        } else if closed {
+            Some(pts[0] - pts[n - 1])
+        } else {
+            None
+        };
+        let next = if i + 1 < n {
+            Some(pts[i + 1] - pts[i])
+        } else if closed {
+            Some(pts[0] - pts[n - 1])
+        } else {
+            None
+        };
+        match (prev, next) {
+            (Some(a), Some(b)) => (a.normalize() + b.normalize()).normalize_or(b.normalize()),
+            (Some(a), None) => a.normalize(),
+            (None, Some(b)) => b.normalize(),
+            (None, None) => Vec3::Z,
+        }
+    };
+    // Rotation-minimising frames by parallel transport.
+    let t0 = tangent(0);
+    let seed = if t0.y.abs() < 0.9 { Vec3::Y } else { Vec3::Z };
+    let mut normal = (seed - t0 * seed.dot(t0)).normalize();
+    let mut frames = Vec::with_capacity(n);
+    let mut prev_t = t0;
+    for i in 0..n {
+        let t = tangent(i);
+        let rot = bevy::math::Quat::from_rotation_arc(prev_t, t);
+        normal = (rot * normal - t * (rot * normal).dot(t)).normalize_or(normal);
+        // Scale the profile at bends so the wall keeps its thickness.
+        let miter = if i > 0 && (i + 1 < n || closed) {
+            let a = (pts[i] - pts[if i == 0 { n - 1 } else { i - 1 }]).normalize();
+            1.0 / a.dot(t).clamp(0.3, 1.0)
+        } else {
+            1.0
+        };
+        frames.push((t, normal, t.cross(normal), miter));
+        prev_t = t;
+    }
+    let m = ring2.len();
+    let mut part = Part::new(name);
+    for (i, p) in pts.iter().enumerate() {
+        let (t, nrm, bin, miter) = frames[i];
+        for q in &ring2 {
+            let (u, v) = (q[0] as f32, q[1] as f32);
+            // Miter scaling only along the bend (the component along the
+            // previous segment's direction within the profile plane).
+            let off = nrm * u + bin * v;
+            let a = if i > 0 {
+                (pts[i] - pts[i - 1]).normalize()
+            } else {
+                t
+            };
+            let bend = (a - t * a.dot(t)).normalize_or_zero();
+            let along = off.dot(bend);
+            let pos = *p + off + bend * along * (miter - 1.0);
+            part.verts.push(pos.to_array());
+        }
+    }
+    let segs = if closed { n } else { n - 1 };
+    for i in 0..segs {
+        let (a, b) = (i * m, ((i + 1) % n) * m);
+        for j in 0..m {
+            let k = (j + 1) % m;
+            let (p0, p1, p2, p3) = (
+                (a + j) as u32,
+                (a + k) as u32,
+                (b + k) as u32,
+                (b + j) as u32,
+            );
+            part.indices.extend([p0, p1, p2, p0, p2, p3]);
+        }
+    }
+    if !closed {
+        let tris = manifold_csg::triangulate_polygons(std::slice::from_ref(&ring2), 1e-9)
+            .ok_or_else(|| {
+                ModelerError::Csg(format!("sweep `{name}`: could not triangulate the profile"))
+            })?;
+        let last = ((n - 1) * m) as u32;
+        for t in &tris {
+            // Start cap faces back along the path, end cap forward.
+            part.indices.extend([t[0], t[2], t[1]]);
+            part.indices.extend([last + t[0], last + t[1], last + t[2]]);
+        }
+    }
+    // Orientation depends on the profile's winding: make it outward.
+    let vol: f32 = part
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|i| Vec3::from(part.verts[i as usize]));
+            a.dot(b.cross(c))
+        })
+        .sum();
+    if vol < 0.0 {
+        for t in part.indices.as_chunks_mut::<3>().0 {
+            t.swap(1, 2);
+        }
+    }
+    // Through Manifold: proves it closed and gives creased normals.
+    let man = part_to_manifold(&part).map_err(|e| {
+        ModelerError::Csg(format!("sweep `{name}`: {e} (does the path cross itself?)"))
+    })?;
+    Ok(manifold_to_part(&man, name, crate::Material::default()))
+}
+
+/// Convex hull of several parts (world space), with the first's material.
+pub fn hull(name: &str, parts: &[&Part]) -> Result<Part, ModelerError> {
+    let mut pts = Vec::new();
+    for p in parts {
+        let rot = quat_of(p.rotation);
+        let (sc, t) = (Vec3::from(p.scale), Vec3::from(p.translation));
+        pts.extend(p.verts.iter().map(|v| {
+            let w = rot * (Vec3::from(*v) * sc) + t;
+            [w.x as f64, w.y as f64, w.z as f64]
+        }));
+    }
+    let m = Manifold::hull_pts(&pts);
+    if m.is_empty() || m.volume().abs() < 1e-15 {
+        return Err(ModelerError::Csg(format!(
+            "hull `{name}` is flat or empty (its inputs lie in a plane)"
+        )));
+    }
+    let material = parts
+        .first()
+        .map(|p| p.material.clone())
+        .unwrap_or_default();
+    Ok(manifold_to_part(&m, name, material))
+}
+
+/// Rounds a solid's edges. `fillet`: convex edges get a radius-`r` round
+/// (morphological opening with a sphere: erode by r, dilate by r), so the
+/// outer size is kept. `chamfer`: the same with an octahedron, a 45° bevel on
+/// axis-aligned edges. `smooth`: subdivision smoothing of edges sharper than
+/// 60°, `segments` refinement steps (radius ignored).
+pub fn round(
+    name: &str,
+    part: &Part,
+    mode: &str,
+    r: f32,
+    segments: u32,
+) -> Result<Part, ModelerError> {
+    let m = part_to_manifold(part)?;
+    let out = match mode {
+        "fillet" | "chamfer" => {
+            if r.is_nan() || r <= 0.0 {
+                return Err(ModelerError::Csg(format!(
+                    "round `{name}`: radius must be > 0, got {r}"
+                )));
+            }
+            let r = r as f64;
+            let tool = if mode == "fillet" {
+                let segs = if segments == 0 {
+                    16
+                } else {
+                    segments.clamp(4, 64)
+                } as i32;
+                Manifold::sphere(r, segs)
+            } else {
+                Manifold::hull_pts(&[
+                    [r, 0.0, 0.0],
+                    [-r, 0.0, 0.0],
+                    [0.0, r, 0.0],
+                    [0.0, -r, 0.0],
+                    [0.0, 0.0, r],
+                    [0.0, 0.0, -r],
+                ])
+            };
+            let eroded = m.minkowski_difference(&tool);
+            if eroded.is_empty() {
+                return Err(ModelerError::Csg(format!(
+                    "round `{name}`: radius {r} is larger than half the part's thinnest section"
+                )));
+            }
+            eroded.minkowski_sum(&tool)
+        }
+        "smooth" => {
+            let n = if segments == 0 {
+                3
+            } else {
+                segments.clamp(1, 8)
+            } as i32;
+            m.smooth_out(60.0, 0.0).refine(n)
+        }
+        other => {
+            return Err(ModelerError::Csg(format!(
+                "round `{name}`: mode must be fillet, chamfer or smooth, got `{other}`"
+            )));
+        }
+    };
+    out.status()
+        .map_err(|e| ModelerError::Csg(format!("round `{name}` failed: {e}")))?;
+    if out.is_empty() {
+        return Err(ModelerError::Csg(format!(
+            "round `{name}` produced nothing"
+        )));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
 }
 
 #[cfg(test)]
@@ -693,7 +987,7 @@ mod tests {
         let outer = vec![[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
         // Clockwise inner ring: even-odd makes it a hole regardless.
         let inner = vec![[-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [0.5, -0.5]];
-        let p = extrude("tube", &[outer, inner], 2.0, 0.0, [1.0, 1.0], 0)
+        let p = extrude("tube", &[outer, inner], 2.0, 0.0, [1.0, 1.0], 0, 0.0)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&p), 0);
         // (4 - 1) * 2 = 6, positive = outward-wound.
@@ -717,7 +1011,8 @@ mod tests {
     fn extrude_footprint_keeps_its_z_side() {
         // A footprint entirely at +z must stay at +z (no mirror on the swap).
         let ring = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]];
-        let p = extrude("f", &[ring], 0.5, 0.0, [0.0, 0.0], 0).unwrap_or_else(|e| panic!("{e}"));
+        let p =
+            extrude("f", &[ring], 0.5, 0.0, [0.0, 0.0], 0, 0.0).unwrap_or_else(|e| panic!("{e}"));
         let (lo, hi) = bounds(&p);
         assert!(
             lo.z > -1e-5 && (hi.z - 2.0).abs() < 1e-5 && hi.y < 0.51,
@@ -731,7 +1026,7 @@ mod tests {
     fn revolve_makes_a_closed_y_axis_solid() {
         // Rectangle r 0..1, y 0..2 -> cylinder of volume ~ pi * 2.
         let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 2.0], [0.0, 2.0]];
-        let p = revolve("cyl", std::slice::from_ref(&ring), 360.0, 64)
+        let p = revolve("cyl", std::slice::from_ref(&ring), 360.0, 64, 0.0)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&p), 0);
         let v = signed_volume(&p);
@@ -739,7 +1034,7 @@ mod tests {
         let (lo, hi) = bounds(&p);
         assert!(lo.y.abs() < 1e-5 && (hi.y - 2.0).abs() < 1e-5, "{lo} {hi}");
         // A half turn is half the volume, still closed.
-        let half = revolve("half", &[ring], 180.0, 64).unwrap_or_else(|e| panic!("{e}"));
+        let half = revolve("half", &[ring], 180.0, 64, 0.0).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&half), 0);
         assert!((signed_volume(&half) - v / 2.0).abs() < 0.05);
     }
@@ -758,7 +1053,8 @@ mod tests {
                 1.0,
                 0.0,
                 [1.0, 1.0],
-                0
+                0,
+                0.0
             ))
             .contains("at least 3")
         );
@@ -769,7 +1065,8 @@ mod tests {
                 0.0,
                 0.0,
                 [1.0, 1.0],
-                0
+                0,
+                0.0
             ))
             .contains("height")
         );
@@ -778,10 +1075,160 @@ mod tests {
                 "x",
                 &[vec![[-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]],
                 360.0,
-                0
+                0,
+                0.0
             ))
             .contains("radius >= 0")
         );
-        assert!(e(revolve("x", &[tri], 400.0, 0)).contains("degrees"));
+        assert!(e(revolve("x", &[tri], 400.0, 0, 0.0)).contains("degrees"));
+    }
+
+    #[test]
+    fn real_scale_chess_king_union_is_closed() {
+        // A 10 cm king: revolve + box cross whose corners land on body
+        // vertices. Manifold keeps the touching seams as separate verts;
+        // validation must still see a closed solid.
+        let k = 0.15f32;
+        let prof: Vec<[f32; 2]> = [
+            [0.0, 0.0],
+            [0.2, 0.0],
+            [0.2, 0.05],
+            [0.15, 0.09],
+            [0.1, 0.12],
+            [0.07, 0.45],
+            [0.12, 0.5],
+            [0.07, 0.53],
+            [0.09, 0.62],
+            [0.0, 0.65],
+        ]
+        .iter()
+        .map(|p| [p[0] * k, p[1] * k])
+        .collect();
+        let mut body = revolve("body", &[prof], 360.0, 0, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        body.translation = [0.01875, 0.017, -0.13125];
+        let mut cv =
+            crate::primitives::primitive(crate::PrimitiveKind::Box, [0.006, 0.03, 0.006], "cv")
+                .unwrap_or_else(|e| panic!("{e}"));
+        cv.translation = [0.01875, 0.117, -0.13125];
+        let m = Model {
+            parts: vec![body.into(), cv.into()],
+            ..Default::default()
+        };
+        let out =
+            boolean(&m, BoolOp::Union, "body", "cv", Some("k1")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&out), 0);
+        // And a 2 mm pip cut out of a 16 mm die really shrinks it.
+        let mut die = crate::primitives::primitive(crate::PrimitiveKind::Box, [0.016; 3], "die")
+            .unwrap_or_else(|e| panic!("{e}"));
+        die.translation = [0.0, 0.008, 0.0];
+        let mut pip =
+            crate::primitives::primitive(crate::PrimitiveKind::Sphere, [0.0018, 0.0, 0.0], "pip")
+                .unwrap_or_else(|e| panic!("{e}"));
+        pip.translation = [0.0, 0.016, 0.0];
+        let m = Model {
+            parts: vec![die.into(), pip.into()],
+            ..Default::default()
+        };
+        let cut =
+            boolean(&m, BoolOp::Difference, "die", "pip", None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&cut), 0);
+        assert!(signed_volume(&cut) < 0.016f64.powi(3) - 1e-9);
+    }
+
+    fn unit_box() -> Part {
+        crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "b")
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn sweep_open_pipe_and_closed_ring_are_solid() {
+        let circle: Vec<[f32; 2]> = (0..16)
+            .map(|k| {
+                let a = k as f32 / 16.0 * std::f32::consts::TAU;
+                [0.1 * a.cos(), 0.1 * a.sin()]
+            })
+            .collect();
+        // An L-shaped pipe: straight, bend, straight.
+        let path = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
+        let p = sweep("pipe", &circle, &path, false, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&p), 0);
+        let v = signed_volume(&p);
+        // ~ pi r^2 * 2 m of centreline.
+        let want = std::f64::consts::PI * 0.01 * 2.0;
+        assert!(v > 0.0 && (v - want).abs() < want * 0.1, "{v} vs {want}");
+        // A square loop: a closed ring with no caps.
+        let sq = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 0.0, 2.0],
+            [0.0, 0.0, 2.0],
+        ];
+        let r = sweep("loop", &circle, &sq, true, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::verify::open_edge_count(&r), 0);
+        assert!(signed_volume(&r) > 0.0);
+        // Too short a path errors clearly.
+        assert!(sweep("x", &circle, &path[..1], false, 0.0).is_err());
+    }
+
+    #[test]
+    fn fillet_and_chamfer_keep_the_outer_size() {
+        let b = unit_box();
+        let start = std::time::Instant::now();
+        let f = round("f", &b, "fillet", 0.1, 12).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            start.elapsed().as_secs_f32() < 5.0,
+            "fillet took {:?}",
+            start.elapsed()
+        );
+        let (lo, hi) = bounds(&f);
+        assert!(
+            (hi - lo - Vec3::ONE).abs().max_element() < 1e-3,
+            "{lo} {hi}"
+        );
+        let v = signed_volume(&f);
+        assert!(v < 1.0 - 1e-3 && v > 0.9, "{v}");
+        assert_eq!(crate::verify::open_edge_count(&f), 0);
+        let c = round("c", &b, "chamfer", 0.1, 0).unwrap_or_else(|e| panic!("{e}"));
+        let vc = signed_volume(&c);
+        assert!(vc < v, "a chamfer removes more than a fillet: {vc} vs {v}");
+        let s = round("s", &b, "smooth", 0.0, 2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(signed_volume(&s) < 1.0 && s.verts.len() > b.verts.len());
+        assert!(
+            round("x", &b, "fillet", 0.6, 0).is_err(),
+            "radius beyond half the box"
+        );
+    }
+
+    #[test]
+    fn hull_of_two_spheres_is_a_capsule() {
+        let mut a =
+            crate::primitives::primitive(crate::PrimitiveKind::Sphere, [0.5, 0.0, 0.0], "a")
+                .unwrap_or_else(|e| panic!("{e}"));
+        let mut b = a.clone();
+        a.translation = [0.0, 0.0, 0.0];
+        b.translation = [0.0, 2.0, 0.0];
+        let h = hull("pill", &[&a, &b]).unwrap_or_else(|e| panic!("{e}"));
+        let (lo, hi) = bounds(&h);
+        assert!(
+            (lo.y + 0.5).abs() < 1e-3 && (hi.y - 2.5).abs() < 1e-3,
+            "{lo} {hi}"
+        );
+        assert_eq!(crate::verify::open_edge_count(&h), 0);
+    }
+
+    #[test]
+    fn rounded_profile_corners_shrink_the_area() {
+        let sq = vec![[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
+        let sharp = extrude("s", std::slice::from_ref(&sq), 1.0, 0.0, [1.0, 1.0], 0, 0.0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let soft =
+            extrude("r", &[sq], 1.0, 0.0, [1.0, 1.0], 0, 0.1).unwrap_or_else(|e| panic!("{e}"));
+        let (vs, vr) = (signed_volume(&sharp), signed_volume(&soft));
+        // Four corners lose (1 - pi/4) r^2 each.
+        let want = 1.0 - 4.0 * (1.0 - std::f64::consts::FRAC_PI_4) * 0.01;
+        assert!(
+            (vs - 1.0).abs() < 1e-4 && (vr - want).abs() < 2e-3,
+            "{vs} {vr} {want}"
+        );
     }
 }

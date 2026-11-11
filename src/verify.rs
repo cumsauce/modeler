@@ -71,9 +71,25 @@ pub fn expect_parts(model: &Model, expected: &[String]) -> CmdResult {
         .filter(|p| !p.visible)
         .map(|p| p.name.as_str())
         .collect();
-    let expected: std::collections::BTreeSet<&str> = expected.iter().map(String::as_str).collect();
-    let missing: Vec<_> = expected.difference(&actual).collect();
-    let extra: Vec<_> = actual.difference(&expected).collect();
+    // `prefix*` entries match (and cover) every part with that prefix.
+    let (globs, exact): (Vec<&str>, Vec<&str>) = expected
+        .iter()
+        .map(String::as_str)
+        .partition(|e| e.ends_with('*'));
+    let prefixes: Vec<&str> = globs.iter().map(|g| g.trim_end_matches('*')).collect();
+    let expected: std::collections::BTreeSet<&str> = exact.into_iter().collect();
+    let mut missing: Vec<&str> = expected.difference(&actual).copied().collect();
+    missing.extend(
+        globs
+            .iter()
+            .zip(&prefixes)
+            .filter(|(_, p)| !actual.iter().any(|a| a.starts_with(**p)))
+            .map(|(g, _)| *g),
+    );
+    let extra: Vec<_> = actual
+        .difference(&expected)
+        .filter(|a| !prefixes.iter().any(|p| a.starts_with(p)))
+        .collect();
     if missing.is_empty() && extra.is_empty() {
         let suffix = if hidden.is_empty() {
             String::new()
@@ -150,17 +166,26 @@ pub fn expect_bounds(
     }
 }
 
+/// Weld grid for a part: 1e-6 of its size, clamped to [1e-9, 1e-5], so
+/// real-scale centimetre parts keep their features apart.
+fn weld_grid(p: &Part) -> f64 {
+    let (lo, hi) = p.bounds();
+    let d = (hi - lo).length() as f64;
+    (d * 1e-6).clamp(1e-9, 1e-5)
+}
+
 /// Edges of a part that are not shared by exactly two triangles, after
 /// welding coincident vertices. Two welds are tried and the smaller count
 /// wins: a 1e-5 grid (primitives emit per-face vertices whose positions differ
 /// in the last bits) and exact positions (Manifold outputs keep distinct
 /// vertices closer than any grid). A genuinely open mesh is open under both.
 pub fn open_edge_count(p: &Part) -> usize {
+    let inv = 1.0 / weld_grid(p);
     let grid = open_edges_with(p, |v| {
         [
-            (v[0] as f64 * 1e5).round() as i64,
-            (v[1] as f64 * 1e5).round() as i64,
-            (v[2] as f64 * 1e5).round() as i64,
+            (v[0] as f64 * inv).round() as i64,
+            (v[1] as f64 * inv).round() as i64,
+            (v[2] as f64 * inv).round() as i64,
         ]
     });
     if grid == 0 {
@@ -187,14 +212,23 @@ fn open_edges_with(p: &Part, key: impl Fn(&[f32; 3]) -> [i64; 3]) -> usize {
             *ids.entry(key(v)).or_insert(next)
         })
         .collect();
-    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    // Net directed count per undirected edge: +1 a->b, -1 b->a. A closed,
+    // consistently wound surface uses every edge once each way (net 0). Two
+    // surfaces touching along a line (Manifold keeps them as separate
+    // vertices at one position) give 4 uses, still net 0; an open edge or a
+    // flipped neighbour leaves a non-zero net.
+    let mut edges: std::collections::HashMap<(u32, u32), i32> = std::collections::HashMap::new();
     for t in p.indices.as_chunks::<3>().0 {
         for e in 0..3 {
             let (a, b) = (welded[t[e] as usize], welded[t[(e + 1) % 3] as usize]);
-            *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            if a == b {
+                continue;
+            }
+            let (k, s) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+            *edges.entry(k).or_insert(0) += s;
         }
     }
-    edges.values().filter(|c| **c != 2).count()
+    edges.values().filter(|c| **c != 0).count()
 }
 
 /// Area enclosed by a part's unmatched (boundary) half-edges, as a fraction of
@@ -205,11 +239,12 @@ pub fn boundary_gap_area(p: &Part) -> (f64, f64) {
     use std::collections::HashMap;
     let mut ids: HashMap<[i64; 3], u32> = HashMap::new();
     let mut welded = Vec::with_capacity(p.verts.len());
+    let inv = 1.0 / weld_grid(p);
     for v in &p.verts {
         let key = [
-            (v[0] * 1e5).round() as i64,
-            (v[1] * 1e5).round() as i64,
-            (v[2] * 1e5).round() as i64,
+            (v[0] as f64 * inv).round() as i64,
+            (v[1] as f64 * inv).round() as i64,
+            (v[2] as f64 * inv).round() as i64,
         ];
         let next = ids.len() as u32;
         welded.push(*ids.entry(key).or_insert(next));
@@ -305,7 +340,7 @@ pub fn validate(model: &Model) -> String {
         let open = open_edge_count(p);
         if open > 0 {
             lines.push(format!(
-                "- `{}`: not manifold ({open} edges not shared by exactly 2 triangles)",
+                "- `{}`: not closed ({open} open or inconsistently wound edges)",
                 p.name
             ));
         }
@@ -333,6 +368,15 @@ pub fn validate(model: &Model) -> String {
     }
 }
 
+/// A volume in m³ with enough significant digits at any scale.
+fn fmt_vol(v: f64) -> String {
+    if v.abs() >= 0.01 {
+        format!("{v:.4} m³")
+    } else {
+        format!("{v:.3e} m³")
+    }
+}
+
 /// True when `part` only gathers cutters: it (or a union it feeds) is the
 /// `b` of a difference. Disjoint cutters are unioned on purpose.
 fn is_cutter(ops: &[Op], part: &str) -> bool {
@@ -351,6 +395,9 @@ fn is_cutter(ops: &[Op], part: &str) -> bool {
         } if a == part || b == part => {
             let out = graph::output(op);
             out != part && is_cutter(ops, out)
+        }
+        Op::Group { name, inputs } if inputs.iter().any(|i| i == part) => {
+            name != part && is_cutter(ops, name)
         }
         _ => false,
     })
@@ -384,23 +431,27 @@ pub fn lints(model: &Model) -> Vec<String> {
             world_signed_volume(pb),
             world_signed_volume(po),
         );
-        let tol = (va.abs().max(vb.abs()).max(vo.abs()) * 1e-3).max(1e-6);
+        let tol = (va.abs().max(vb.abs()).max(vo.abs()) * 1e-3).max(1e-15);
         match kind.as_str() {
             "difference" => {
                 if vo > va - tol {
                     out.push(format!(
-                        "difference `{name}` left `{a}` at its original volume ({vo:.4} vs {va:.4}) — the cutter `{b}` probably misses it"
+                        "difference `{name}` left `{a}` at its original volume ({} vs {}) — the cutter `{b}` probably misses it",
+                        fmt_vol(vo),
+                        fmt_vol(va)
                     ));
                 }
             }
             "union" => {
                 if vo < va.abs().max(vb.abs()) - tol {
                     out.push(format!(
-                        "union `{name}` is smaller than its larger input ({vo:.4}) — inverted or torn result"
+                        "union `{name}` is smaller than its larger input ({}) — inverted or torn result",
+                        fmt_vol(vo)
                     ));
                 } else if (vo - (va + vb)).abs() <= tol && !is_cutter(&model.ops, out_name) {
                     out.push(format!(
-                        "union `{name}` volume is exactly `{a}` + `{b}` ({vo:.4}) — the inputs have no overlap"
+                        "union `{name}` volume is exactly `{a}` + `{b}` ({}) — the inputs have no overlap",
+                        fmt_vol(vo)
                     ));
                 }
             }
@@ -494,7 +545,89 @@ pub fn lints(model: &Model) -> Vec<String> {
             }
         }
     }
+    out.extend(floating_parts(model).into_iter().map(|n| {
+        format!("part `{n}` floats: it is off the ground and touches no other visible part")
+    }));
     out
+}
+
+/// Visible parts that are off the ground (min y above 0) and whose world
+/// bounds touch no other visible part: a copy moved instead of its
+/// neighbour, a cap that missed its column. Bounds are conservative (a
+/// touching pair may be reported as touching while not quite), so a part
+/// named here truly hangs in the air.
+pub fn floating_parts(model: &Model) -> Vec<String> {
+    let vis: Vec<(&str, Vec3, Vec3)> = model
+        .parts
+        .iter()
+        .filter(|p| p.visible && !p.verts.is_empty())
+        .map(|p| {
+            let (lo, hi) = p.bounds();
+            (p.name.as_str(), lo, hi)
+        })
+        .collect();
+    if vis.len() < 2 {
+        return Vec::new();
+    }
+    let (mlo, mhi) = vis
+        .iter()
+        .fold((Vec3::MAX, Vec3::MIN), |(a, b), (_, lo, hi)| {
+            (a.min(*lo), b.max(*hi))
+        });
+    let tol = ((mhi - mlo).length() * 1e-4).max(1e-5);
+    let ground = mlo.y.min(0.0);
+    vis.iter()
+        .filter(|(_, lo, _)| lo.y > ground + tol)
+        .filter(|(name, lo, hi)| {
+            !vis.iter().any(|(other, olo, ohi)| {
+                other != name
+                    && lo.x <= ohi.x + tol
+                    && olo.x <= hi.x + tol
+                    && lo.y <= ohi.y + tol
+                    && olo.y <= hi.y + tol
+                    && lo.z <= ohi.z + tol
+                    && olo.z <= hi.z + tol
+            })
+        })
+        .map(|(n, _, _)| n.to_string())
+        .collect()
+}
+
+/// Non-strict part-list assertion: every name in `wanted` is a visible part
+/// (extras allowed). A trailing `*` matches a prefix (`gz.*`).
+pub fn expect_includes(model: &Model, wanted: &[String]) -> CmdResult {
+    let vis: Vec<&str> = model
+        .parts
+        .iter()
+        .filter(|p| p.visible)
+        .map(|p| p.name.as_str())
+        .collect();
+    let missing: Vec<&String> = wanted
+        .iter()
+        .filter(|w| match w.strip_suffix('*') {
+            Some(prefix) => !vis.iter().any(|v| v.starts_with(prefix)),
+            None => !vis.contains(&w.as_str()),
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(format!(
+            "all {} wanted parts present ({} visible)",
+            wanted.len(),
+            vis.len()
+        ))
+    } else {
+        Err(format!("missing: {missing:?}").into())
+    }
+}
+
+/// Every visible part touches another or the ground (see [`floating_parts`]).
+pub fn expect_grounded(model: &Model) -> CmdResult {
+    let f = floating_parts(model);
+    if f.is_empty() {
+        Ok("every visible part touches the ground or another part".into())
+    } else {
+        Err(format!("floating: {}", f.join(", ")).into())
+    }
 }
 
 #[cfg(test)]

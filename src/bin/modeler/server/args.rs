@@ -90,7 +90,7 @@ pub(crate) struct CatalogNameArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetCameraArgs {
-    /// Horizontal angle in degrees (0 looks down -z).
+    /// Horizontal angle in degrees: 0 = from +z (front view), 90 = from +x (right).
     pub(crate) yaw: f32,
     /// Vertical angle in degrees, -89..89.
     pub(crate) pitch: f32,
@@ -98,29 +98,57 @@ pub(crate) struct SetCameraArgs {
     pub(crate) dist: f32,
 }
 
+/// A view: a name ("front", "back", "left", "right", "top", "bottom", "iso")
+/// or a camera you place.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum ViewArg {
+    Name(String),
+    Camera(CameraArg),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CameraArg {
+    /// Degrees around y: 0 = from +z (front), 90 = from +x (right), 180 = back.
+    pub(crate) yaw: f32,
+    /// Degrees above the horizon (-89..89); 30 is a typical three-quarter view.
+    #[serde(default)]
+    pub(crate) pitch: f32,
+    /// Distance from the target in meters; default auto-fits the framed bounds.
+    #[serde(default)]
+    pub(crate) dist: Option<f32>,
+    /// World point to look at; default the centre of the framed bounds.
+    #[serde(default)]
+    pub(crate) target: Option<[f32; 3]>,
+    /// Orthographic (true proportions) instead of perspective.
+    #[serde(default)]
+    pub(crate) ortho: bool,
+    /// Vertical field of view in degrees (perspective). Default 45.
+    #[serde(default)]
+    pub(crate) fov: Option<f32>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AgentViewsArgs {
-    /// Views: "front", "back", "left", "right", "top", "bottom" (orthographic,
-    /// auto-framed) or "iso" (perspective). E.g. ["front", "right", "top"] or
-    /// ["iso"]. Each returns its own image.
-    pub(crate) views: Vec<String>,
-    /// Pixel width per view. Default 1280.
-    #[serde(default = "default_shot_width")]
-    pub(crate) width: u32,
-    /// Pixel height per view. Default 720.
-    #[serde(default = "default_shot_height")]
-    pub(crate) height: u32,
+    /// 1..9 views, each a name ("front", "back", "left", "right", "top",
+    /// "bottom" are orthographic and auto-framed; "iso" is perspective) or a
+    /// camera {yaw, pitch, dist?, target?, ortho?, fov?}. E.g.
+    /// ["front", "right", "top", "iso"] or [{"yaw": 30, "pitch": 20}, ...].
+    pub(crate) views: Vec<ViewArg>,
+    /// Pixel width per view. Default 1280 (640 per cell in a grid).
+    #[serde(default)]
+    pub(crate) width: Option<u32>,
+    /// Pixel height per view. Default 720 (480 per cell in a grid).
+    #[serde(default)]
+    pub(crate) height: Option<u32>,
     /// Frame only these parts (hidden ones included) instead of the whole model.
     #[serde(default)]
     pub(crate) focus: Option<Vec<String>>,
-}
-
-pub(crate) fn default_shot_width() -> u32 {
-    1280
-}
-
-pub(crate) fn default_shot_height() -> u32 {
-    720
+    /// Tile all views into ONE labelled image (row-major). Default true when
+    /// there is more than one view; false returns one image per view.
+    #[serde(default)]
+    pub(crate) grid: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -172,4 +200,11 @@ pub(crate) struct HistoryPruneArgs {
     /// How many of the newest snapshots to keep (cursor, root and branch
     /// points are always kept as well).
     pub(crate) keep: usize,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct HistoryArgs {
+    /// Show only the newest N nodes (plus the cursor). Default 30.
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
 }

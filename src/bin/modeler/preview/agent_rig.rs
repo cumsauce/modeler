@@ -32,6 +32,44 @@ pub(crate) enum AgentView {
     Top,
     Bottom,
     Iso,
+    Custom(CustomCam),
+}
+
+/// An agent-placed camera. yaw 0 = on +z looking toward -z (the front
+/// view), 90 = on +x (the right view); pitch up from the horizon.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CustomCam {
+    pub(crate) yaw: f32,
+    pub(crate) pitch: f32,
+    /// Distance from the target; None auto-fits the framed bounds.
+    pub(crate) dist: Option<f32>,
+    /// Look-at point; None = centre of the framed bounds.
+    pub(crate) target: Option<[f32; 3]>,
+    pub(crate) ortho: bool,
+    /// Vertical field of view in degrees (perspective only).
+    pub(crate) fov: f32,
+}
+
+impl std::fmt::Display for AgentView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentView::Custom(c) => write!(
+                f,
+                "{} yaw {:.0} pitch {:.0}",
+                if c.ortho { "ortho" } else { "cam" },
+                c.yaw,
+                c.pitch
+            ),
+            other => write!(f, "{}", format!("{other:?}").to_lowercase()),
+        }
+    }
+}
+
+/// Unit vector from the target toward the eye for a yaw/pitch in degrees
+/// (yaw 0 = +z, 90 = +x). Shared with `set_camera`.
+pub(crate) fn yaw_pitch_dir(yaw: f32, pitch: f32) -> Vec3 {
+    let (y, p) = (yaw.to_radians(), pitch.clamp(-89.0, 89.0).to_radians());
+    Vec3::new(y.sin() * p.cos(), p.sin(), y.cos() * p.cos())
 }
 
 pub(crate) fn parse_agent_view(s: &str) -> Result<AgentView, String> {
@@ -70,18 +108,27 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
             AgentCamera,
             Camera3d::default(),
             Projection::from(PerspectiveProjection::default()),
+            AmbientLight {
+                brightness: 300.0,
+                ..default()
+            },
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
         ))
         .with_children(|c| {
             // Key + fill: dimmer than the scene's sun so low-roughness parts
             // don't blow out to white in agent views (a hot highlight reads
             // as solid geometry to an agent that cannot orbit to check).
+            // The key comes from above-left of the view, with shadows, so
+            // depth reads even in flat orthographic views: a door or window
+            // opening shows the shadowed interior instead of a back wall lit
+            // exactly like the facade.
             c.spawn((
                 DirectionalLight {
                     illuminance: 350.0,
+                    shadow_maps_enabled: true,
                     ..default()
                 },
-                Transform::default(),
+                Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.45, -0.55, 0.0)),
             ));
             c.spawn((
                 DirectionalLight {
@@ -109,14 +156,71 @@ pub(crate) fn agent_view_projection(
     let (min, max) = bounds.unwrap_or((Vec3::splat(-1.0), Vec3::splat(1.0)));
     let center = (min + max) * 0.5;
     let half = (max - min) * 0.5;
-    let radius = half.length().max(0.5);
+    let radius = half.length().max(1e-3);
     let margin = 1.2;
     match view {
+        AgentView::Custom(c) => {
+            let target = c.target.map_or(center, Vec3::from);
+            // Fit the bounds' sphere around the (possibly off-centre) target.
+            let reach = radius + (center - target).length();
+            let dir = yaw_pitch_dir(c.yaw, c.pitch);
+            // Straight up/down: keep a valid up vector.
+            let up = if dir.y.abs() > 0.99 {
+                -Vec3::Z * dir.y.signum()
+            } else {
+                Vec3::Y
+            };
+            if c.ortho {
+                let mut hh = reach * margin;
+                let mut hw = hh;
+                if hw / hh < aspect {
+                    hw = hh * aspect;
+                } else {
+                    hh = hw / aspect;
+                }
+                let dist = c.dist.unwrap_or(reach * 3.0 + 1.0);
+                (
+                    target + dir * dist,
+                    target,
+                    up,
+                    Projection::from(OrthographicProjection {
+                        near: 0.0,
+                        far: dist * 2.0 + reach * 4.0 + 1.0,
+                        scaling_mode: ScalingMode::Fixed {
+                            width: hw * 2.0,
+                            height: hh * 2.0,
+                        },
+                        ..OrthographicProjection::default_3d()
+                    }),
+                )
+            } else {
+                let fov = c.fov.clamp(5.0, 150.0).to_radians();
+                // The tighter half-angle is vertical unless the frame is tall.
+                let half = if aspect < 1.0 {
+                    ((fov * 0.5).tan() * aspect).atan()
+                } else {
+                    fov * 0.5
+                };
+                let dist = c.dist.unwrap_or(reach * margin / half.sin()).max(1e-3);
+                (
+                    target + dir * dist,
+                    target,
+                    up,
+                    Projection::from(PerspectiveProjection {
+                        fov,
+                        aspect_ratio: aspect,
+                        near: (dist * 0.01).max(1e-4),
+                        far: (dist + reach * 4.0) * 2.0,
+                        ..default()
+                    }),
+                )
+            }
+        }
         AgentView::Iso => {
             // The bounding sphere fits the vertical half-fov (22.5°, the
             // tighter axis) at radius / sin(22.5°) ≈ 2.61 r; 3.0 r adds margin
             // so tall models' tips aren't cropped.
-            let dist = (radius * 3.0).max(2.0);
+            let dist = (radius * 3.0).max(0.05);
             let dir = Vec3::new(1.0, 0.75, 1.0).normalize();
             (
                 center + dir * dist,
@@ -125,8 +229,9 @@ pub(crate) fn agent_view_projection(
                 Projection::from(PerspectiveProjection {
                     fov: 45.0_f32.to_radians(),
                     aspect_ratio: aspect,
-                    near: 0.05,
-                    far: (dist * 4.0 + radius * 10.0).max(10.0),
+                    // Scale-aware so a 2 cm part still fills the frame.
+                    near: (dist * 0.01).max(1e-4),
+                    far: (dist * 4.0 + radius * 10.0).max(1.0),
                     ..default()
                 }),
             )
@@ -137,12 +242,13 @@ pub(crate) fn agent_view_projection(
                 AgentView::Back => (-Vec3::Z, Vec3::Y, (half.x, half.y)),
                 AgentView::Right => (Vec3::X, Vec3::Y, (half.z, half.y)),
                 AgentView::Left => (-Vec3::X, Vec3::Y, (half.z, half.y)),
-                AgentView::Top => (Vec3::Y, Vec3::Z, (half.x, half.z)),
+                // Plan view: +x right, -z (north) up.
+                AgentView::Top => (Vec3::Y, -Vec3::Z, (half.x, half.z)),
                 AgentView::Bottom => (-Vec3::Y, Vec3::Z, (half.x, half.z)),
-                AgentView::Iso => unreachable!(),
+                AgentView::Iso | AgentView::Custom(_) => unreachable!(),
             };
-            hw *= margin;
-            hh *= margin;
+            hw = hw.max(1e-3) * margin;
+            hh = hh.max(1e-3) * margin;
             // Fit the world span into the requested pixel aspect.
             if hw / hh < aspect {
                 hw = hh * aspect;

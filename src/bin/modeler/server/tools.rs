@@ -138,7 +138,7 @@ impl Tools {
         let png = Self::await_reply(reply_rx)
             .await
             .map_err(|e| ErrorData::internal_error(e, None))?;
-        Ok((png, format!("{view:?} {width}x{height}")))
+        Ok((png, format!("{view} {width}x{height}")))
     }
 }
 
@@ -282,10 +282,14 @@ impl Tools {
     }
 
     /// Show the history tree: one line per snapshot with its id, parent, label
-    /// and model version. The cursor marks where you are.
+    /// and model version; the cursor is marked `<-`. Each apply_ops / cherry_pick
+    /// call is one node. Shows the newest `limit` nodes (default 30).
     #[tool]
-    async fn history(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| Ok(s.history())).await
+    async fn history(
+        &self,
+        Parameters(HistoryArgs { limit }): Parameters<HistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| Ok(s.history(limit))).await
     }
 
     /// Prune old history to bound memory and autosave size: keeps the newest
@@ -423,8 +427,9 @@ impl Tools {
         .await
     }
 
-    /// Deterministic checks in one call: `parts` (exact visible part names),
-    /// `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
+    /// Deterministic checks in one call: `parts` (exact visible part names;
+    /// `"gz.*"` matches a prefix), `includes` (these exist, extras fine),
+    /// `grounded` (no part floats), `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
     /// closed and outward-wound) and `rebuild` (uncached re-derivation matches
     /// the cache). With no arguments runs validate + rebuild. Each check
     /// reports PASS/FAIL; any FAIL makes the call an error.
@@ -516,10 +521,11 @@ impl Tools {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    /// Render several agent views in one call — e.g. ["front", "right", "top"]
-    /// as a three-pane check, or ["front", "iso"] for proportions plus the
-    /// looks-right shot. Returns one image per view, in order. Windowed
-    /// preview only.
+    /// Render agent views: named ("front", "back", "left", "right", "top",
+    /// "bottom" orthographic; "iso" perspective) or cameras you place
+    /// ({yaw, pitch, dist?, target?, ortho?, fov?}; yaw 0 = from +z/front, 90 =
+    /// from +x/right). Several views come back tiled into ONE labelled image
+    /// (grid: false for separate images). Windowed preview only.
     #[tool]
     async fn agent_views(
         &self,
@@ -528,24 +534,63 @@ impl Tools {
             width,
             height,
             focus,
+            grid,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if views.is_empty() || views.len() > 6 {
-            return Err(ErrorData::internal_error(
-                "give 1..6 views, e.g. [\"front\", \"right\", \"top\"]",
+        if views.is_empty() || views.len() > 9 {
+            return Err(ErrorData::invalid_params(
+                "give 1..9 views, e.g. [\"front\", \"right\", \"top\", \"iso\"]",
                 None,
             ));
         }
         let mut parsed = Vec::with_capacity(views.len());
-        for v in &views {
-            parsed.push(parse_agent_view(v).map_err(|e| ErrorData::internal_error(e, None))?);
+        for v in views {
+            parsed.push(match v {
+                ViewArg::Name(n) => {
+                    parse_agent_view(&n).map_err(|e| ErrorData::invalid_params(e, None))?
+                }
+                ViewArg::Camera(c) => AgentView::Custom(CustomCam {
+                    yaw: c.yaw,
+                    pitch: c.pitch,
+                    dist: c.dist,
+                    target: c.target,
+                    ortho: c.ortho,
+                    fov: c.fov.unwrap_or(45.0),
+                }),
+            });
         }
-        let mut content = Vec::with_capacity(parsed.len() * 2);
-        for (i, view) in parsed.iter().enumerate() {
+        let grid = grid.unwrap_or(parsed.len() > 1);
+        let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
+        let (width, height) = (
+            width.unwrap_or(dw).clamp(64, 4096),
+            height.unwrap_or(dh).clamp(64, 4096),
+        );
+        let mut shots = Vec::with_capacity(parsed.len());
+        for view in &parsed {
             let (png, _) = self
                 .agent_render(*view, width, height, focus.clone())
                 .await?;
-            content.push(Content::text(format!("view {}: {view:?}", i + 1)));
+            shots.push((png, view.to_string()));
+        }
+        if grid {
+            let labels: Vec<String> = shots
+                .iter()
+                .enumerate()
+                .map(|(i, (_, l))| format!("{}: {l}", i + 1))
+                .collect();
+            let png = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
+            return Ok(CallToolResult::success(vec![
+                Content::text(format!(
+                    "{} views in one image, row-major: {}",
+                    shots.len(),
+                    labels.join(", ")
+                )),
+                Content::image(B64.encode(png), "image/png"),
+            ]));
+        }
+        let mut content = Vec::with_capacity(shots.len() * 2);
+        for (i, (png, label)) in shots.into_iter().enumerate() {
+            content.push(Content::text(format!("view {}: {label}", i + 1)));
             content.push(Content::image(B64.encode(png), "image/png"));
         }
         Ok(CallToolResult::success(content))
@@ -648,16 +693,17 @@ impl rmcp::ServerHandler for Tools {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, transform, boolean, radial_array, linear_array, mirror, material, prefab, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); graph order doesn't matter.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); graph order doesn't matter.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
-- extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes.
+- extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
+- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings); hull = convex hull of parts; round fillets/chamfers/smooths a solid's edges; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings; agent_views renders front/right/top/iso independent of the human's window. Look at an image after building.
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, bounds {min,max,tol}, validate, rebuild}, or call verify. probe_ray proves openings. agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image: [\"front\", \"right\", \"top\", \"iso\"] is one read. Look at an image after building.\n- Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - scene_summary, apply_ops and verify also return structuredContent JSON.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.

@@ -66,8 +66,12 @@ type, so there is no need to memorise field names.
 | type | fields (optional in []) |
 |---|---|
 | `primitive` | name, kind, size, [translation / position], [rotation quat] |
-| `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [translation], [rotation] |
-| `revolve` | name, profile, [degrees 360], [segments 48], [translation], [rotation] |
+| `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
+| `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
+| `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
+| `hull` | name, inputs |
+| `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
+| `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative] |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
@@ -115,6 +119,28 @@ type, so there is no need to memorise field names.
   - `revolve`: points are `[radius, y]` (radius >= 0) around the y axis:
     vases, bowls, columns, bottles. `degrees` < 360 leaves flat end caps.
     Hollow a vessel by revolving an inner profile and taking a `difference`.
+- **Profiles** (extrude/revolve/sweep): ring entries are points or arcs,
+  `{"arc": {"center": [a, b], "radius": r, "from": deg, "to": deg}}`
+  (counter-clockwise from +a; 0 -> 360 is a full circle), so curves need no
+  hand-made point lists. `round: r` fillets every profile corner.
+- **`sweep`** runs a closed profile along a 3D polyline (pipes, rails,
+  handles, frames, hoses); bends are mitred to keep the thickness, and
+  `closed: true` loops the path (a ring) instead of capping it. Profile u is
+  along the frame normal (world up to start, or +z on a vertical path).
+- **`hull`**: the convex hull of several parts. Two spheres make a pill,
+  eight small spheres at a box's corners make a rounded box.
+- **`round`** works on any closed solid:
+  - `fillet` rounds convex edges by `radius` and keeps the outer size
+    (Minkowski opening).
+  - `chamfer` is a 45° bevel on axis-aligned edges.
+  - `smooth` does subdivision rounding.
+
+  Large or concave inputs make fillet/chamfer slower, so round parts before
+  combining them.
+- **`group`** merges parts into one mesh without a boolean (they may be
+  disjoint), so a set of parts can be arrayed or moved as one. Use it
+  instead of chained unions: a union of separate parts warns "no overlap".
+  It takes the first input's material.
 - **Mirror** is baked (verts reflected, winding flipped); never mirror with
   negative scale.
 - **Booleans** run on Manifold (the kernel OpenSCAD and Blender use): outputs
@@ -140,14 +166,18 @@ type, so there is no need to memorise field names.
 
 Inspect: `scene_summary` (call FIRST and after anything confusing: parts,
 bounds, ops, params, annotations and **warnings**), `ops` (the graph, one
-line per op with full parameters) and `op_get(name)`.
+line per op with full parameters) and `op_get(name)` (every op writing that
+name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, bounds?, validate?, rebuild?)` (all optional; no arguments
-  runs validate + rebuild). Over visible parts only:
+- `verify(parts?, includes?, grounded?, bounds?, validate?, rebuild?)` (all
+  optional; no arguments runs validate + rebuild). Over visible parts only:
   - `parts`: exact part names, order-insensitive; reports missing and
-    unexpected names.
+    unexpected names. A trailing `*` matches a prefix (`"gz.*"` covers a
+    prefab instance).
+  - `includes`: these names must exist; extras are fine (`*` works too).
+  - `grounded`: every part touches the ground or another part (no floaters).
   - `bounds: {min, max, tol}`: per-axis world bounds, `null` skips an axis
     ("sits on the ground" = `min [null, 0, null]`); failures name the part
     that sets the extreme.
@@ -158,24 +188,35 @@ line per op with full parameters) and `op_get(name)`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
   every part, nearest first). Proves openings are open and fills are solid.
   Windowed preview only.
-- `agent_views(views, width?, height?, focus?)`: offscreen renders independent
-  of the human's window: `front`/`back`/`left`/`right`/`top`/`bottom`
-  (orthographic, auto-framed) and `iso` (perspective). `focus: [parts]`
-  frames just those. `["front", "right", "top"]` is the three-pane check.
-- `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`).
+- `agent_views(views, width?, height?, focus?, grid?)`: offscreen renders,
+  independent of the human's window.
+  - Up to 9 views: `front`/`back`/`left`/`right`/`top`/`bottom`
+    (orthographic, auto-framed), `iso` (perspective), or a camera you place,
+    `{yaw, pitch, dist?, target?, ortho?, fov?}` (yaw 0 = from +z/front,
+    90 = from +x/right).
+  - Several views come back tiled into ONE labelled image (`grid: false` for
+    separate images), so `["front", "right", "top", "iso"]` is one read.
+  - The top view is a plan: +x right, -z up.
+  - `focus: [parts]` frames just those, and framing works at any scale.
+  - A shadowed key light makes openings read even in orthographic views.
+- `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,
+  same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an
   image after building**: the data can be right while the render is wrong.
 
 **History:**
 
-- `undo` / `redo` / `jump(id)` / `history` / `history_prune(keep)`: the
-  edit tree. Editing after a jump branches.
+- `undo` / `redo` / `jump(id)` / `history(limit?)` / `history_prune(keep)`:
+  the edit tree. Each `apply_ops` (or `cherry_pick`) call is ONE node, so
+  one undo reverts the whole call. `history` shows the newest 30 nodes plus
+  the cursor by default. Editing after a jump branches.
 - `diff(from, to?)`: ops added (+), removed (-) and changed (~, with the old
   parameters) between two nodes (default `to`: the live model), plus param
   changes.
 - `cherry_pick(from, ops?)`: replay ops from another node onto the live model
-  (all new or changed ops, or just the named ones), templates and params
-  included. After a jump, this replaces re-issuing the old branch by hand.
+  (all new or changed ops and params, or just the named ops/params). A
+  picked op brings the param values it was built with, so the graph stays
+  consistent. After a jump, this replaces re-issuing the old branch by hand.
 
 **Model, catalog, output:** `new_model(name)` (the old model stays one undo
 away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
@@ -225,7 +266,10 @@ default material, parts with identical world bounds (z-fighting), boolean
 volume sanity (a difference that didn't shrink its input = the cutter
 misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
-outputs are closed). Hidden parts are excluded. An empty list means none
+outputs are closed), and **floating parts** (off the ground and touching no
+other part, e.g. a copy transformed instead of its neighbour). Volume checks
+and welds scale with the part, so centimetre-scale models validate
+correctly. Hidden parts are excluded. An empty list means none
 fired.
 
 ## Preview window (human side)

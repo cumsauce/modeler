@@ -125,3 +125,153 @@ pub(crate) fn encode_png(image: &Image) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+
+/// 5x7 bitmap glyphs (rows top to bottom, 5 low bits) for grid labels.
+fn glyph(c: char) -> [u8; 7] {
+    match c.to_ascii_uppercase() {
+        'A' => [14, 17, 17, 31, 17, 17, 17],
+        'B' => [30, 17, 17, 30, 17, 17, 30],
+        'C' => [14, 17, 16, 16, 16, 17, 14],
+        'D' => [30, 17, 17, 17, 17, 17, 30],
+        'E' => [31, 16, 16, 30, 16, 16, 31],
+        'F' => [31, 16, 16, 30, 16, 16, 16],
+        'G' => [14, 17, 16, 23, 17, 17, 15],
+        'H' => [17, 17, 17, 31, 17, 17, 17],
+        'I' => [14, 4, 4, 4, 4, 4, 14],
+        'J' => [7, 2, 2, 2, 2, 18, 12],
+        'K' => [17, 18, 20, 24, 20, 18, 17],
+        'L' => [16, 16, 16, 16, 16, 16, 31],
+        'M' => [17, 27, 21, 21, 17, 17, 17],
+        'N' => [17, 17, 25, 21, 19, 17, 17],
+        'O' => [14, 17, 17, 17, 17, 17, 14],
+        'P' => [30, 17, 17, 30, 16, 16, 16],
+        'Q' => [14, 17, 17, 17, 21, 18, 13],
+        'R' => [30, 17, 17, 30, 20, 18, 17],
+        'S' => [15, 16, 16, 14, 1, 1, 30],
+        'T' => [31, 4, 4, 4, 4, 4, 4],
+        'U' => [17, 17, 17, 17, 17, 17, 14],
+        'V' => [17, 17, 17, 17, 17, 10, 4],
+        'W' => [17, 17, 17, 21, 21, 21, 10],
+        'X' => [17, 17, 10, 4, 10, 17, 17],
+        'Y' => [17, 17, 10, 4, 4, 4, 4],
+        'Z' => [31, 1, 2, 4, 8, 16, 31],
+        '0' => [14, 17, 19, 21, 25, 17, 14],
+        '1' => [4, 12, 4, 4, 4, 4, 14],
+        '2' => [14, 17, 1, 2, 4, 8, 31],
+        '3' => [31, 2, 4, 2, 1, 17, 14],
+        '4' => [2, 6, 10, 18, 31, 2, 2],
+        '5' => [31, 16, 30, 1, 1, 17, 14],
+        '6' => [6, 8, 16, 30, 17, 17, 14],
+        '7' => [31, 1, 2, 4, 8, 8, 8],
+        '8' => [14, 17, 17, 14, 17, 17, 14],
+        '9' => [14, 17, 17, 15, 1, 2, 12],
+        '-' => [0, 0, 0, 31, 0, 0, 0],
+        '.' => [0, 0, 0, 0, 0, 12, 12],
+        ':' => [0, 12, 12, 0, 12, 12, 0],
+        _ => [0; 7],
+    }
+}
+
+fn draw_text(buf: &mut [u8], stride: usize, x0: usize, y0: usize, text: &str, scale: usize) {
+    let h = buf.len() / (stride * 4);
+    // Dark backing box so the label reads on any background.
+    let (bw, bh) = ((text.chars().count() * 6 + 2) * scale, 9 * scale);
+    for y in y0..(y0 + bh).min(h) {
+        for x in x0..(x0 + bw).min(stride) {
+            let i = (y * stride + x) * 4;
+            buf[i..i + 3].iter_mut().for_each(|c| *c /= 4);
+            buf[i + 3] = 255;
+        }
+    }
+    for (k, ch) in text.chars().enumerate() {
+        let g = glyph(ch);
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..5 {
+                if bits & (16 >> col) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = x0 + (1 + k * 6 + col) * scale + dx;
+                        let y = y0 + (1 + row) * scale + dy;
+                        if x < stride && y < h {
+                            let i = (y * stride + x) * 4;
+                            buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png decode: {e}"))?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png: size overflow")?];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("png decode: {e}"))?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err("png decode: expected 8-bit RGBA".into());
+    }
+    buf.truncate(info.buffer_size());
+    Ok((info.width, info.height, buf))
+}
+
+/// Tiles same-sized PNG shots row-major into one PNG, each cell labelled
+/// "N: label" in its top-left corner, with 2 px separators.
+pub(crate) fn compose_grid(shots: &[(Vec<u8>, String)]) -> Result<Vec<u8>, String> {
+    let imgs: Vec<(u32, u32, Vec<u8>)> = shots
+        .iter()
+        .map(|(png, _)| decode_png(png))
+        .collect::<Result<_, _>>()?;
+    let Some((w, h, _)) = imgs.first() else {
+        return Err("no shots to tile".into());
+    };
+    let (w, h) = (*w as usize, *h as usize);
+    let n = imgs.len();
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = n.div_ceil(cols);
+    let gap = 2;
+    let (gw, gh) = (cols * w + (cols - 1) * gap, rows * h + (rows - 1) * gap);
+    let mut out = vec![0u8; gw * gh * 4];
+    for px in out.as_chunks_mut::<4>().0 {
+        *px = [90, 90, 96, 255];
+    }
+    let scale = (h / 240).max(1) * 2;
+    for (k, ((iw, ih, data), (_, label))) in imgs.iter().zip(shots).enumerate() {
+        if *iw as usize != w || *ih as usize != h {
+            return Err("grid shots differ in size".into());
+        }
+        let (cx, cy) = ((k % cols) * (w + gap), (k / cols) * (h + gap));
+        for y in 0..h {
+            let src = &data[y * w * 4..(y + 1) * w * 4];
+            let dst = ((cy + y) * gw + cx) * 4;
+            out[dst..dst + w * 4].copy_from_slice(src);
+        }
+        draw_text(
+            &mut out,
+            gw,
+            cx + 4,
+            cy + 4,
+            &format!("{}: {label}", k + 1),
+            scale,
+        );
+    }
+    let mut png_out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_out, gw as u32, gh as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("png header: {e}"))?;
+        writer
+            .write_image_data(&out)
+            .map_err(|e| format!("png body: {e}"))?;
+    }
+    Ok(png_out)
+}
