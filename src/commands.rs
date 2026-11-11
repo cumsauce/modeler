@@ -350,6 +350,7 @@ impl Session {
             .into());
         }
         self.model.ops.retain(|o| graph::output(o) != name);
+        self.model.templates.remove(name);
         self.model.refresh()?;
         self.commit(&format!("op delete `{name}`"));
         Ok(format!("deleted op `{name}`"))
@@ -394,12 +395,130 @@ impl Session {
         self.apply_batch(ops.into_iter().map(BatchItem::Op).collect())
     }
 
+    /// The `apply_ops` entry point: raw JSON items plus optional parameter
+    /// updates. Parameters are merged first; every item is resolved against
+    /// them and parsed before anything is applied (a malformed batch changes
+    /// nothing). Ops whose items reference parameters keep their raw item as a
+    /// template, so a later parameter change re-derives them.
+    pub fn apply_values(
+        &mut self,
+        params: Option<crate::params::Params>,
+        items: Vec<serde_json::Value>,
+    ) -> CmdResult {
+        // Drop templates whose op is gone (deleted, or failed to apply).
+        let live: Vec<String> = self
+            .model
+            .ops
+            .iter()
+            .map(|o| graph::output(o).to_string())
+            .collect();
+        self.model.templates.retain(|k, _| live.contains(k));
+        let mut merged = self.model.params.clone();
+        let mut changed: Vec<String> = Vec::new();
+        for (k, v) in params.unwrap_or_default() {
+            if merged.get(&k) != Some(&v) {
+                changed.push(k.clone());
+            }
+            merged.insert(k, v);
+        }
+        // Parse everything first, against the merged parameters.
+        let mut parsed = Vec::with_capacity(items.len());
+        for (i, raw) in items.iter().enumerate() {
+            let resolved = crate::params::resolve(raw, &merged)
+                .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+            let item = crate::spec::parse_item(i, &resolved)
+                .map_err(|e| format!("{e}\n(nothing was applied)"))?;
+            let template = (!crate::params::refs(raw).is_empty()).then(|| raw.clone());
+            parsed.push((item, template));
+        }
+        // Templated ops already in the graph that read a changed parameter
+        // (and are not re-issued by this batch) are re-derived first.
+        let reissued: Vec<String> = parsed
+            .iter()
+            .filter_map(|(it, _)| match it {
+                BatchItem::Op(op) => Some(graph::output(op).to_string()),
+                _ => None,
+            })
+            .collect();
+        let mut stale = Vec::new();
+        for (name, raw) in &self.model.templates {
+            if reissued.contains(name) {
+                continue;
+            }
+            if crate::params::refs(raw).iter().any(|r| changed.contains(r)) {
+                let resolved = crate::params::resolve(raw, &merged)
+                    .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
+                let item = crate::spec::parse_item(0, &resolved)
+                    .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
+                stale.push((item, Some(raw.clone())));
+            }
+        }
+        let mut lines = Vec::new();
+        if !changed.is_empty() {
+            // One history step for the whole change: swap the dependent ops in
+            // place, re-derive once, commit once (undo restores both).
+            let before = self.model.clone();
+            self.model.params = merged;
+            let n = stale.len();
+            for (item, _) in stale {
+                if let BatchItem::Op(op) = item
+                    && let Some(slot) = self.model.ops.iter_mut().find(|o| {
+                        graph::output(o) == graph::output(&op) && graph::kind(o) == graph::kind(&op)
+                    })
+                {
+                    *slot = op;
+                }
+            }
+            if let Err(e) = self.model.refresh() {
+                self.model = before;
+                return Err(format!("re-deriving ops for changed params failed: {e}").into());
+            }
+            self.commit(&format!("params {}", changed.join(", ")));
+            lines.push(format!(
+                "params: {}",
+                self.model
+                    .params
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            if n > 0 {
+                lines.push(format!("re-derived {n} op(s) that read changed params"));
+            }
+        }
+        lines.push(self.apply_items(parsed, true)?);
+        Ok(lines.join("\n"))
+    }
+
     /// Applies a mixed batch: graph ops and baked edits (hide/show/rename),
     /// each running in its listed position with per-item error reporting.
     /// Graph ops keep the upsert/rollback semantics of `apply_op`.
     pub fn apply_batch(&mut self, items: Vec<BatchItem>) -> CmdResult {
+        self.apply_items(items.into_iter().map(|i| (i, None)).collect(), true)
+    }
+
+    /// `apply_batch` with an optional parameter template per item: an op item
+    /// stores its template (or drops a stale one) so parameter changes can
+    /// re-derive it.
+    fn apply_items(
+        &mut self,
+        items: Vec<(BatchItem, Option<serde_json::Value>)>,
+        with_summary: bool,
+    ) -> CmdResult {
         let mut lines = Vec::with_capacity(items.len());
-        for (i, item) in items.into_iter().enumerate() {
+        for (i, (item, template)) in items.into_iter().enumerate() {
+            if let BatchItem::Op(op) = &item {
+                let key = graph::output(op).to_string();
+                match template {
+                    Some(t) => {
+                        self.model.templates.insert(key, t);
+                    }
+                    None => {
+                        self.model.templates.remove(&key);
+                    }
+                }
+            }
             let fail = |e: ModelerError| format!("batch item #{i} failed: {e}");
             let msg = match item {
                 // In-place material/transform on a baked part: a baked edit.
@@ -459,7 +578,9 @@ impl Session {
             };
             lines.push(format!("#{i} {msg}"));
         }
-        lines.push(self.summary());
+        if with_summary {
+            lines.push(self.summary());
+        }
         Ok(lines.join("\n"))
     }
 
@@ -1950,5 +2071,43 @@ mod tests {
         // Manifold outputs are closed, so the open-edge lint stays silent.
         assert_eq!(crate::verify::open_edge_count(part), 0);
         assert!(!s.lints().iter().any(|l| l.contains("open edges")));
+    }
+
+    #[test]
+    fn params_rederive_dependent_ops() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.apply_values(
+            Some([("h".to_string(), 2.0)].into()),
+            vec![
+                json!({"type": "primitive", "name": "tower", "kind": "cylinder",
+                       "size": [0.5, "$h"], "translation": [0, "=$h/2", 0]}),
+                json!({"type": "primitive", "name": "roof", "kind": "cone",
+                       "size": [0.6, 0.5], "translation": [0, "=$h + 0.25", 0]}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let top = |s: &Session| s.model.bounds().map(|(_, max)| max.y).unwrap_or(0.0);
+        assert!((top(&s) - 2.5).abs() < 1e-4, "{}", top(&s));
+        // One parameter change moves both ops.
+        let out = s
+            .apply_values(Some([("h".to_string(), 3.0)].into()), vec![])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(out.contains("re-derived 2 op(s)"), "{out}");
+        assert!((top(&s) - 3.5).abs() < 1e-4, "{}", top(&s));
+        let tower = s.model.part("tower").unwrap_or_else(|| panic!("tower"));
+        assert!((tower.translation[1] - 1.5).abs() < 1e-5);
+        // Undo restores the old parameter with its geometry.
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.model.params.get("h"), Some(&2.0));
+        // Unknown parameter: clear error, nothing applied.
+        let Err(e) = s.apply_values(
+            None,
+            vec![json!({"type": "primitive", "name": "x", "kind": "box", "size": "$nope"})],
+        ) else {
+            panic!("unknown param should fail");
+        };
+        assert!(e.to_string().contains("unknown parameter `$nope`"), "{e}");
+        assert!(s.model.part("x").is_none());
     }
 }

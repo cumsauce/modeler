@@ -7,7 +7,9 @@ pub mod csg;
 pub mod error;
 pub mod gltf;
 pub mod graph;
+pub mod params;
 pub mod primitives;
+pub mod spec;
 pub mod uv;
 pub mod verify;
 
@@ -132,6 +134,13 @@ pub struct Model {
     /// recursion.
     #[serde(default, skip_serializing_if = "History::is_empty")]
     pub history: History,
+    /// Named parameters that `apply_ops` values reference as `"$name"`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: crate::params::Params,
+    /// The unresolved `apply_ops` item of every op that references a
+    /// parameter, keyed by op output name: re-resolved when a parameter changes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub templates: std::collections::BTreeMap<String, serde_json::Value>,
     /// Set by a successful `refresh` on an op-driven model: the cached parts
     /// are exactly the graph's derivation, so saves can omit them. Baked-part
     /// edits clear it (the cache then carries information the ops don't).
@@ -691,6 +700,24 @@ pub enum Op {
     /// every op that reads the old name still sees it (the rename runs after
     /// them).
     Rename { name: String, input: String },
+    /// Instances a saved catalog prefab: each of its visible parts becomes
+    /// `{name}.{part}`, placed by this op's transform on top of the part's
+    /// own. `parts` and `digest` are captured when the op is issued (so the
+    /// outputs are known without loading the file); re-issue the op to pick
+    /// up a re-saved prefab.
+    Prefab {
+        name: String,
+        prefab: String,
+        #[serde(default)]
+        translation: [f32; 3],
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+        parts: Vec<String>,
+        #[serde(default)]
+        digest: u64,
+    },
 }
 
 fn default_axis() -> Axis {

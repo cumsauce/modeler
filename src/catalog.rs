@@ -354,4 +354,46 @@ mod tests {
         assert_eq!(list().unwrap().len(), 1);
         assert_eq!(list().unwrap()[0].description, "Still a red box");
     }
+
+    #[test]
+    fn prefab_op_instances_a_saved_model() {
+        use serde_json::json;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, serialized by ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("prefab-op")) };
+        let mut s = crate::commands::Session::default();
+        s.model.name = "lamp".into();
+        s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "pole", "kind": "cylinder", "size": [0.05, 1], "translation": [0, 0.5, 0]}),
+                json!({"type": "primitive", "name": "shade", "kind": "cone", "size": [0.3, 0.3], "translation": [0, 1.1, 0]}),
+                json!({"type": "material", "name": "shade", "color": [1, 0.9, 0.5]}),
+            ],
+        )
+        .unwrap();
+        save_prefab(&s.model, "a lamp", &["test"], "lamp").unwrap();
+        let mut scene = crate::commands::Session::default();
+        scene
+            .apply_values(
+                None,
+                vec![
+                    json!({"type": "prefab", "name": "l1", "prefab": "lamp", "translation": [2, 0, 0]}),
+                    json!({"type": "prefab", "name": "l2", "prefab": "lamp", "translation": [-2, 0, 0], "scale": [2, 2, 2]}),
+                ],
+            )
+            .unwrap();
+        let shade = scene.model.part("l2.shade").unwrap();
+        assert_eq!(shade.translation, [-2.0, 2.2, 0.0]);
+        assert_eq!(shade.material.base_color, [1.0, 0.9, 0.5, 1.0]);
+        assert!(scene.model.part("l1.pole").is_some());
+        // Instanced parts feed later ops like any other part.
+        scene
+            .apply_values(
+                None,
+                vec![json!({"type": "linear_array", "name": "row", "input": "l1.pole", "count": 3, "offset": [0, 0, 1]})],
+            )
+            .unwrap();
+        assert!(scene.model.part("row_2").is_some());
+    }
 }

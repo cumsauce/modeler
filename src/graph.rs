@@ -431,6 +431,38 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             part.visible = *visible;
             upsert(named, name, part);
         }
+        Op::Prefab {
+            name,
+            prefab,
+            translation,
+            rotation,
+            scale,
+            parts,
+            ..
+        } => {
+            let model = load_prefab_guarded(prefab)?;
+            let (it, ir) = (
+                Vec3::from(*translation),
+                quat_of(rotation.unwrap_or([0.0, 0.0, 0.0, 1.0])),
+            );
+            let is = Vec3::from(scale.unwrap_or([1.0; 3]));
+            for p in parts {
+                let Some(src) = model.part(p) else {
+                    return Err(format!(
+                        "{name}: prefab `{prefab}` no longer has part `{p}`; re-issue the prefab op"
+                    )
+                    .into());
+                };
+                let mut part = (*src).clone();
+                let out = format!("{name}.{p}");
+                part.name = out.clone();
+                part.visible = true;
+                part.translation = (it + ir * (is * Vec3::from(part.translation))).to_array();
+                part.rotation = (ir * quat_of(part.rotation)).to_array();
+                part.scale = (is * Vec3::from(part.scale)).to_array();
+                upsert(named, &out, part);
+            }
+        }
         Op::Rename { name, input } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
@@ -444,6 +476,25 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
         }
     }
     Ok(())
+}
+
+thread_local! {
+    static PREFAB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Loads a catalog prefab for instancing, refusing runaway nesting (a prefab
+/// that instances itself, directly or not).
+fn load_prefab_guarded(name: &str) -> Result<crate::Model, ModelerError> {
+    let depth = PREFAB_DEPTH.with(|d| d.get());
+    if depth >= 8 {
+        return Err(
+            format!("prefab `{name}`: nested more than 8 deep (does it instance itself?)").into(),
+        );
+    }
+    PREFAB_DEPTH.with(|d| d.set(depth + 1));
+    let loaded = crate::catalog::load_prefab(name);
+    PREFAB_DEPTH.with(|d| d.set(depth));
+    loaded
 }
 
 fn lookup(named: &[(String, Part)], name: &str) -> Result<Part, ModelerError> {
@@ -474,7 +525,8 @@ pub fn output(op: &Op) -> &str {
         | Op::LinearArray { name, .. }
         | Op::Mirror { name, .. }
         | Op::Visibility { name, .. }
-        | Op::Rename { name, .. } => name,
+        | Op::Rename { name, .. }
+        | Op::Prefab { name, .. } => name,
     }
 }
 
@@ -493,6 +545,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
             (first..*count).map(|i| format!("{name}_{i}")).collect()
         }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
+        Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
         other => vec![output(other).to_string()],
     }
 }
@@ -510,13 +563,14 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Mirror { .. } => "mirror",
         Op::Visibility { .. } => "visibility",
         Op::Rename { .. } => "rename",
+        Op::Prefab { .. } => "prefab",
     }
 }
 
 /// The part names an op reads.
 pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
-        Op::Primitive { .. } => Vec::new(),
+        Op::Primitive { .. } | Op::Prefab { .. } => Vec::new(),
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
@@ -632,6 +686,28 @@ pub fn describe(ops: &[Op]) -> String {
                 if *visible { "shown" } else { "hidden" }
             ),
             Op::Rename { name, input } => format!("#{i} rename `{input}` -> `{name}`"),
+            Op::Prefab {
+                name,
+                prefab,
+                translation,
+                rotation,
+                scale,
+                parts,
+                ..
+            } => {
+                let mut s = format!(
+                    "#{i} prefab `{name}` = catalog `{prefab}` at={translation:?} ({} parts: {name}.{})",
+                    parts.len(),
+                    parts.join(&format!(", {name}."))
+                );
+                if let Some(r) = rotation {
+                    s += &format!(" rot={r:?}");
+                }
+                if let Some(sc) = scale {
+                    s += &format!(" scale={sc:?}");
+                }
+                s
+            }
         });
     }
     lines.join("\n")

@@ -318,14 +318,14 @@ impl Tools {
     #[tool]
     async fn apply_ops(
         &self,
-        Parameters(ApplyOpsArgs { ops, expect }): Parameters<ApplyOpsArgs>,
+        Parameters(ApplyOpsArgs {
+            ops,
+            params,
+            expect,
+        }): Parameters<ApplyOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let items = match parse_ops(&ops) {
-            Ok(items) => items,
-            Err(e) => return Ok(err_result(format!("{e}\n(nothing was applied)"))),
-        };
         self.run(move |s| {
-            let text = s.apply_batch(items)?;
+            let text = s.apply_values(params, ops)?;
             let Some(spec) = expect else {
                 return Ok(text);
             };
