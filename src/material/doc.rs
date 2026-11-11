@@ -472,16 +472,53 @@ impl MatDoc {
                 let inside = (0..n).into_par_iter().filter(|&i| f.f(i) > 0.5).count();
                 let frac = inside as f32 / n.max(1) as f32;
                 let (lo, hi) = (c.min.unwrap_or(0.0), c.max.unwrap_or(1.0));
-                out.push((
-                    format!("coverage {}", c.node),
-                    (lo..=hi).contains(&frac),
-                    format!(
-                        "{:.1}% of the area (want {:.1}..{:.1}%)",
-                        frac * 100.0,
-                        lo * 100.0,
-                        hi * 100.0
-                    ),
-                ));
+                let pass = (lo..=hi).contains(&frac);
+                let mut detail = format!(
+                    "{:.1}% of the area (want {:.1}..{:.1}%)",
+                    frac * 100.0,
+                    lo * 100.0,
+                    hi * 100.0
+                );
+                if !pass {
+                    // Where the values sit, so a threshold is one edit away:
+                    // the node's own spread, and for a node thresholding an
+                    // `input` (levels, remap, ...) the input value that would
+                    // give the middle of the wanted coverage.
+                    let q = |f: &dyn Fn(usize) -> f32, at: f32| {
+                        let mut v: Vec<f32> = (0..n).step_by((n / 4096).max(1)).map(f).collect();
+                        v.sort_by(f32::total_cmp);
+                        v[((v.len() - 1) as f32 * at.clamp(0.0, 1.0)) as usize]
+                    };
+                    let own = |i| f.f(i);
+                    detail += &format!(
+                        "; `{}` values 5/50/95%: {:.3} / {:.3} / {:.3}",
+                        c.node,
+                        q(&own, 0.05),
+                        q(&own, 0.5),
+                        q(&own, 0.95)
+                    );
+                    let input = self
+                        .nodes
+                        .iter()
+                        .find(|v| v.get("name").and_then(|x| x.as_str()) == Some(c.node.as_str()))
+                        .and_then(|v| v.get("input"))
+                        .and_then(|x| x.as_str());
+                    if let Some(inp) = input
+                        && let Ok(g) = ev.field(&node::In::Name(inp.to_string()))
+                    {
+                        let want = (lo + hi) / 2.0;
+                        let src = |i| g.f(i);
+                        detail += &format!(
+                            "; input `{inp}` is above {:.3} on {:.0}% of the area (5/50/95%: {:.3} / {:.3} / {:.3})",
+                            q(&src, 1.0 - want),
+                            want * 100.0,
+                            q(&src, 0.05),
+                            q(&src, 0.5),
+                            q(&src, 0.95)
+                        );
+                    }
+                }
+                out.push((format!("coverage {}", c.node), pass, detail));
             }
         }
         Ok(out)

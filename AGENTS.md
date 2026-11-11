@@ -117,6 +117,9 @@ type, so there is no need to memorise field names.
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
 | `repeat` | var, count or values, items (a loop, expanded before anything else) |
 
+A `material` item's `name` may be a pattern (`"wall_*"`): it colours every
+matching part in place (parts already in the model plus every name the
+batch makes); a pattern that matches nothing is an error.
 A `material` item may also carry `pbr` (a procedural material by name, see
 **Procedural materials** below), with `params` overrides and `scale`.
 A visible part with only a flat colour (no `pbr`) is a warning in
@@ -283,6 +286,9 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   parts made later in the same batch.
 - **`expect`** runs checks after the batch in the same call (fields as for
   `verify`); any failure makes the call an error, but the batch stays applied.
+- **Structured results stay small**: `apply_ops`' structuredContent is the
+  result text plus counts and bounds; `summary: "full"` (or
+  `scene_summary`) gives every part and op.
 - Part lists fold array runs: `+book, +book_1..13`.
 - The result lists only notable items (routine `ok` lines become
   "applied N item(s)") and ends with a **brief summary**: part/op counts, bounds, the
@@ -687,7 +693,10 @@ work, and every material has its own history tree.
   compares: a non-periodic node fails, naming the channel), `ranges` (finite,
   0..1), `albedo` (non-metal luminance in 0.02..0.9 at the 1st / 99th
   percentile, or your range), `normals` (unit, facing out), `coverage`
-  ([{node, min, max}]: share of the area where that node is above 0.5).
+  ([{node, min, max}]: share of the area where that node is above 0.5;
+  a failure gives the node's 5/50/95% values and, for a node with an
+  `input` (levels, remap), the input value that would hit the wanted
+  coverage, so the threshold is one edit away).
 - `material_view(material?, node?, channels?, size?, diameter?)`: one
   image, rendered on the CPU from the bake that gets exported (works
   headless): a lit sphere plus channel thumbnails, or one node's output
@@ -699,8 +708,9 @@ work, and every material has its own history tree.
   model (`materials/session.json`).
 - **On parts:** `{"type": "material", "name": "wall", "pbr": "bricks",
   "params": {"mortar": 0.012}, "scale": 1.5}`. The graph is embedded in
-  the op, so models and prefabs bake identically without the library (re-issue
-  the item after changing the material). Materials follow lineage like
+  the op, so models and prefabs bake identically without the library; a
+  `material_ops` edit re-embeds the new graph in every item of the active
+  model that uses it (one history step), so parts follow without re-issuing. Materials follow lineage like
   colours; the uv mapping runs after the whole graph, so cut faces and copies
   are mapped too (it replaces any `uvs` projection on those parts). Factors
   become 1 (white) unless given, then multiply the textures.

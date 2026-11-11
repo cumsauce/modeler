@@ -1075,6 +1075,80 @@ impl Session {
         Ok(())
     }
 
+    /// After `material_ops` edits `material`, re-embed its graph in every
+    /// material item of the active model that uses it, so parts follow the
+    /// edit without re-issuing those items. One history step; returns how
+    /// many items were refreshed.
+    pub fn refresh_pbr_users(&mut self, material: &str) -> Result<usize, String> {
+        let Some(doc) = self.materials.docs.get(material) else {
+            return Ok(0);
+        };
+        let graph = std::sync::Arc::new(doc.graph());
+        let before = self.model.clone();
+        let mut n = 0;
+        for op in &mut self.model.ops {
+            if let Op::Material { pbr: Some(r), .. } = op
+                && r.material == material
+            {
+                r.graph = Some(graph.clone());
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        if let Err(e) = self.model.refresh() {
+            self.model = before;
+            return Err(format!("re-applying `{material}` to the model failed: {e}"));
+        }
+        self.commit(&format!("material {material} edited"));
+        self.mark_autosave(true, false, false);
+        Ok(n)
+    }
+
+    /// `material` items whose `name` has a `*` (and no `input`) become one
+    /// in-place item per matching part: the model's parts plus every name
+    /// this batch makes. Copies of a matched source inherit it anyway.
+    fn expand_material_globs(
+        &self,
+        items: Vec<(serde_json::Value, Option<String>)>,
+    ) -> Result<Vec<(serde_json::Value, Option<String>)>, String> {
+        let mut names: Vec<String> = self.model.parts.iter().map(|p| p.name.clone()).collect();
+        for (raw, _) in &items {
+            if let Some(n) = raw.get("name").and_then(|v| v.as_str())
+                && !n.contains('*')
+            {
+                names.push(n.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut out = Vec::with_capacity(items.len());
+        for (raw, from) in items {
+            let pat = raw.get("name").and_then(|v| v.as_str()).map(str::to_string);
+            let is_glob = raw.get("type").and_then(|v| v.as_str()) == Some("material")
+                && raw.get("input").is_none()
+                && pat.as_deref().is_some_and(|p| p.contains('*'));
+            let (true, Some(pat)) = (is_glob, pat) else {
+                out.push((raw, from));
+                continue;
+            };
+            let hits: Vec<&String> = names
+                .iter()
+                .filter(|n| crate::name_matches(&pat, n))
+                .collect();
+            if hits.is_empty() {
+                return Err(format!("material `{pat}`: the pattern matches no part"));
+            }
+            for n in hits {
+                let mut v = raw.clone();
+                v["name"] = serde_json::Value::String(n.clone());
+                out.push((v, from.clone()));
+            }
+        }
+        Ok(out)
+    }
+
     fn apply_values_inner(
         &mut self,
         params: Option<crate::params::Params>,
@@ -1098,6 +1172,9 @@ impl Session {
         let style = self.model.style.clone();
         let full = style.params_under(&merged);
         let items = crate::spec::expand_repeats(&items, &full)
+            .map_err(|e| format!("{e}\n(nothing was applied)"))?;
+        let items = self
+            .expand_material_globs(items)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
         for (i, (raw, from)) in items.iter().enumerate() {
@@ -2142,6 +2219,21 @@ impl Session {
                 "id": a.id, "part": a.part, "text": a.text, "face": a.face, "vertex": a.vertex,
                 "group": a.group, "material": a.material, "node": a.node,
             })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The compact structured result of an edit: the prose (which already
+    /// lists what changed and every warning) plus the model's headline
+    /// numbers, not every part and op (`summary: "full"` for those).
+    pub fn brief_json(&self, text: &str) -> serde_json::Value {
+        let b = |v: bevy::math::Vec3| [v.x, v.y, v.z];
+        serde_json::json!({
+            "model": self.model.name,
+            "version": self.model.version,
+            "parts": self.model.parts.len(),
+            "ops": self.model.ops.len(),
+            "bounds": self.model.bounds().map(|(lo, hi)| serde_json::json!({"min": b(lo), "max": b(hi)})),
+            "text": text,
         })
     }
 
@@ -4648,6 +4740,87 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(!s.lints().iter().any(|l| l.contains("only a flat colour")));
         assert!(material_gaps(&s.model).1.is_empty());
+    }
+
+    #[test]
+    fn a_material_item_takes_a_name_pattern() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "wall_a", "kind": "box", "size": 0.1, "translation": [0, 0.05, 0]},
+                {"type": "primitive", "name": "wall_b", "kind": "box", "size": 0.1, "translation": [0.2, 0.05, 0]},
+                {"type": "primitive", "name": "floor", "kind": "box", "size": 0.1, "translation": [0.4, 0.05, 0]},
+                {"type": "material", "name": "wall_*", "color": "#c33"}
+            ]),
+        );
+        let col = |n: &str| {
+            s.model
+                .parts
+                .iter()
+                .find(|p| p.name == n)
+                .map(|p| p.material.base_color)
+        };
+        assert_ne!(col("wall_a"), col("floor"));
+        assert_eq!(col("wall_a"), col("wall_b"));
+        let err = s
+            .apply_values(
+                None,
+                vec![serde_json::json!({"type": "material", "name": "nope_*", "color": "#c33"})],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("matches no part"), "{err}");
+    }
+
+    #[test]
+    fn editing_a_material_reapplies_it_to_parts() {
+        let mut s = Session::default();
+        let mat =
+            |c: &str| vec![serde_json::json!({"type": "output", "name": "out", "base_color": c})];
+        s.materials
+            .ops("m", mat("#ff0000"), None, None, None, Some(16), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "b", "kind": "box", "size": 0.1, "translation": [0, 0.05, 0]},
+                {"type": "material", "name": "b", "pbr": "m"}
+            ]),
+        );
+        let key = |s: &Session| {
+            s.model.ops.iter().find_map(|o| match o {
+                Op::Material { pbr: Some(r), .. } => r.graph.as_ref().map(|g| format!("{g:?}")),
+                _ => None,
+            })
+        };
+        let before = key(&s);
+        s.materials
+            .ops("m", mat("#0000ff"), None, None, None, Some(16), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.refresh_pbr_users("m"), Ok(1));
+        assert_ne!(before, key(&s));
+    }
+
+    #[test]
+    fn a_failed_coverage_says_where_the_values_sit() {
+        let mut s = Session::default();
+        let ops = vec![
+            serde_json::json!({"type": "noise", "name": "n", "size": 0.1}),
+            serde_json::json!({"type": "levels", "name": "m", "input": "n", "in": [0.95, 0.99]}),
+            serde_json::json!({"type": "output", "name": "out", "base_color": "m"}),
+        ];
+        let expect: crate::material::MatExpect = serde_json::from_value(
+            serde_json::json!({"coverage": [{"node": "m", "min": 0.3, "max": 0.5}]}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (text, ok) = s
+            .materials
+            .ops("cov", ops, None, None, None, Some(32), Some(&expect))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!ok);
+        assert!(text.contains("input `n` is above"), "{text}");
     }
 
     #[test]

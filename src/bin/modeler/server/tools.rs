@@ -237,6 +237,15 @@ impl Tools {
                 resolution,
                 expect.as_ref(),
             )?;
+            // Parts wearing this material follow the edit.
+            let text = match s.refresh_pbr_users(&material) {
+                Ok(0) => text,
+                Ok(n) => format!(
+                    "{text}\nre-applied to {n} material item(s) in model `{}`",
+                    s.model.name
+                ),
+                Err(e) => format!("{text}\nwarning: {e}"),
+            };
             if ok {
                 Ok(text)
             } else {
@@ -862,15 +871,24 @@ Style::default()
             }
         };
         self.run_json(move |s| {
+            // Structured content is what many clients show instead of the
+            // text: keep it brief unless asked for the full scene.
+            let summary = |s: &Session, text: &str| {
+                if full {
+                    s.summary_json()
+                } else {
+                    s.brief_json(text)
+                }
+            };
             let text = match s.apply_values_as(params, ops, full) {
                 Ok(t) => t,
                 Err(e) => {
-                    let json = serde_json::json!({"ok": false, "error": e.to_string(), "summary": s.summary_json()});
+                    let json = serde_json::json!({"ok": false, "error": e.to_string()});
                     return Err((e, Some(json)));
                 }
             };
             let Some(spec) = expect else {
-                let json = serde_json::json!({"ok": true, "summary": s.summary_json()});
+                let json = serde_json::json!({"ok": true, "summary": summary(s, &text)});
                 return Ok((text, Some(json)));
             };
             let checks = s.verify_checks(&spec);
@@ -878,7 +896,7 @@ Style::default()
             let json = serde_json::json!({
                 "ok": ok,
                 "checks": Session::checks_json(&checks),
-                "summary": s.summary_json(),
+                "summary": summary(s, &text),
             });
             let (_, report) = s.verify(&spec);
             if ok {
@@ -1338,7 +1356,7 @@ impl rmcp::ServerHandler for Tools {
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
-- scene_summary, apply_ops and verify also return structuredContent JSON.
+- scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"); a material_ops edit re-applies itself to the parts using it.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
 - scene(open/switch/list/close) keeps several documents open; a prefab item naming an open doc instances it live (re-synced on switch); prefab style: \"scene\" re-themes a piece with the scene's tokens.
