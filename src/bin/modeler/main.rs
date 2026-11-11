@@ -72,6 +72,14 @@ fn main() -> AppExit {
             "--offscreen" => offscreen = true,
             "--model" => model_path = args.next().map(PathBuf::from),
             "--print-catalog-dir" => print_catalog_dir = true,
+            "--feedback-report" => {
+                // The friction log agents left (failures, slow calls, notes).
+                println!(
+                    "{}",
+                    modeler::feedback::report(&modeler::feedback::read(), None)
+                );
+                return AppExit::Success;
+            }
             "--project" => {
                 let Some(dir) = args.next() else {
                     eprintln!("--project needs a directory");
@@ -82,7 +90,7 @@ fn main() -> AppExit {
                 unsafe { std::env::set_var("MODELER_PROJECT", dir) };
             }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json> | --restore] [--project <game dir>] [--print-catalog-dir])"
+                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json> | --restore] [--project <game dir>] [--print-catalog-dir] [--feedback-report])"
             ),
         }
     }

@@ -118,7 +118,7 @@ fn ensure_project_gitignore() {
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
+         */session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/feedback.jsonl\n*/daemon.log\n*/daemon.log.1\n\
          *.tmp\n*/*.tmp\n",
     );
 }

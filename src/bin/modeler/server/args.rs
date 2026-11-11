@@ -340,6 +340,15 @@ pub(crate) struct AgentViewsArgs {
 pub(crate) struct SessionLogArgs {
     /// How many recent calls to show. Default 30, max 500.
     pub(crate) limit: Option<u32>,
+    /// Tell the maintainers what got in your way: a call that surprised
+    /// you, a workaround you needed, an error that didn't say what to do.
+    /// Stored on this machine with your last few calls attached.
+    #[serde(default)]
+    pub(crate) feedback: Option<String>,
+    /// true: instead of the call log, the friction report (failures grouped
+    /// by cause, slow calls, agents' notes) from every session.
+    #[serde(default)]
+    pub(crate) report: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

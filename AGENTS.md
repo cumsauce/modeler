@@ -570,6 +570,17 @@ comments on a procedural material or one of its nodes; humans also comment on
 outliner groups, listed with their parts), `list_annotations`,
 `delete_annotation(id)`.
 
+**Feedback:** when a call surprises you (an error that didn't say what to
+do, a field that didn't work as described, a workaround you needed), send
+one or two sentences with `session_log(feedback: "...")`: what you tried,
+what happened, what you expected. The server also logs every failed call
+(error, a clip of its arguments, failures in a row) and every call over 8 s
+on its own. All of it goes to `<catalog dir>/feedback.jsonl` on this machine
+(git-ignored in a project's `.modeler/`); `session_log(report: true)` or
+`modeler --feedback-report` folds it into failures grouped by cause (numbers
+and quoted names blanked, so one problem on many parts is one line), slow
+calls and notes.
+
 **Session:** `session_log(limit?)` is the per-call record (tool, ok/error,
 ms). Every mutation marks the session for autosave (ops, params, history,
 annotations; op-derived parts are left out and re-derive on restore), and the

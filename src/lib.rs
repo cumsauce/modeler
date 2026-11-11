@@ -66,6 +66,7 @@ pub mod contact;
 pub mod csg;
 pub mod error;
 pub mod export_opt;
+pub mod feedback;
 pub mod game;
 pub mod gltf;
 pub mod graph;

@@ -192,6 +192,37 @@ impl Tools {
 /// tool surfaces it so an agent can self-audit a build (failures, latency).
 pub(crate) static CALL_LOG: Mutex<Vec<(String, bool, u128)>> = Mutex::new(Vec::new());
 
+/// Records a finished call: the session log, and the friction log
+/// (`modeler::feedback`) for failures and slow calls.
+pub(crate) fn log_call_full(tool: &str, ok: bool, ms: u128, args: &str, error: &str) {
+    let streak = {
+        let log = CALL_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        log.iter()
+            .rev()
+            .take_while(|(t, o, _)| t == tool && !o)
+            .count() as u32
+    };
+    log_call(tool, ok, ms);
+    if !ok {
+        modeler::feedback::record(modeler::feedback::Entry {
+            kind: "error".into(),
+            tool: tool.into(),
+            detail: error.into(),
+            args: args.into(),
+            streak: streak + 1,
+            ..Default::default()
+        });
+    } else if ms > modeler::feedback::SLOW_MS {
+        modeler::feedback::record(modeler::feedback::Entry {
+            kind: "slow".into(),
+            tool: tool.into(),
+            detail: format!("{ms} ms"),
+            args: args.into(),
+            ..Default::default()
+        });
+    }
+}
+
 pub(crate) fn log_call(tool: &str, ok: bool, ms: u128) {
     if let Ok(mut log) = CALL_LOG.lock() {
         log.push((tool.to_string(), ok, ms));
@@ -1292,11 +1323,49 @@ Style::default()
     /// The recent call log: tool name, ok/error, duration in ms — so you can
     /// self-audit a build (what failed, what was slow) without leaving the
     /// server. Covers the last ~500 calls in this server process.
+    /// `feedback: "..."` tells the maintainers what got in your way (kept on
+    /// this machine with your recent calls); `report: true` shows the
+    /// friction report from every session.
     #[tool]
     async fn session_log(
         &self,
-        Parameters(SessionLogArgs { limit }): Parameters<SessionLogArgs>,
+        Parameters(SessionLogArgs {
+            limit,
+            feedback,
+            report,
+        }): Parameters<SessionLogArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if report {
+            let text = modeler::feedback::report(&modeler::feedback::read(), None);
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
+        if let Some(note) = feedback.filter(|n| !n.trim().is_empty()) {
+            let recent: Vec<String> = {
+                let log = CALL_LOG.lock().unwrap_or_else(|e| e.into_inner());
+                log.iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .map(|(t, ok, ms)| format!("{t} {} ({ms}ms)", if *ok { "ok" } else { "ERROR" }))
+                    .collect()
+            };
+            modeler::feedback::record(modeler::feedback::Entry {
+                kind: "note".into(),
+                tool: recent
+                    .last()
+                    .map(|r| r.split(' ').next().unwrap_or("").to_string())
+                    .unwrap_or_default(),
+                detail: note,
+                recent,
+                ..Default::default()
+            });
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "thanks: noted in {} with your last calls (stays on this machine)",
+                modeler::feedback::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ))]));
+        }
         let limit = limit.unwrap_or(30).min(500) as usize;
         let log = CALL_LOG.lock().unwrap_or_else(|e| e.into_inner());
         let start = log.len().saturating_sub(limit);
@@ -1338,11 +1407,26 @@ impl rmcp::ServerHandler for Tools {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let name = request.name.to_string();
+        let args = request
+            .arguments
+            .as_ref()
+            .map(|a| modeler::feedback::clip(&serde_json::Value::Object(a.clone()).to_string()))
+            .unwrap_or_default();
         let started = std::time::Instant::now();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = Self::tool_router().call(tcc).await;
         let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
-        log_call(&name, ok, started.elapsed().as_millis());
+        let error = match &result {
+            Err(e) => e.message.to_string(),
+            Ok(r) if !ok => r
+                .content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Ok(_) => String::new(),
+        };
+        log_call_full(&name, ok, started.elapsed().as_millis(), &args, &error);
         result
     }
 
@@ -1368,6 +1452,7 @@ impl rmcp::ServerHandler for Tools {
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views. Look at an image after building.
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
+- When a call surprises you (an error that didn't say what to do, a field that didn't work as described, a workaround you needed), tell the maintainers in one or two sentences with session_log(feedback: \"...\"): what you tried, what happened, what you expected. Failed and slow calls are logged on their own; notes say why.
 - scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"); a material_ops edit re-applies itself to the parts using it. catalog_describe(name, delete: true) removes a prefab.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
