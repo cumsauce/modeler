@@ -122,13 +122,42 @@ pub fn contact(a: &Body, b: &Body) -> Option<Contact> {
         if ov > small * 1e-6 {
             return Some(Contact::Overlap);
         }
+        // Manifold's min_gap is exact for the solids.
         if ma.min_gap(mb, f64::from(tol) * 2.0) > f64::from(tol) {
             return None;
         }
     }
     let mut pts = near_points(a.part, &b.tris, tol);
     pts.extend(near_points(b.part, &a.tris, tol));
-    (!pts.is_empty()).then_some(Contact::Surface(pts))
+    if pts.is_empty() {
+        // Surfaces meet between vertices (two curved faces, a face on an
+        // edge): the solids say they touch, so take the closest vertex pair
+        // region as the contact point.
+        let closest = |p: &Part, tris: &[[Vec3; 3]]| {
+            (0..p.verts.len())
+                .map(|i| p.world_vert(i))
+                .map(|v| {
+                    let d = tris
+                        .iter()
+                        .map(|t| (closest_on_tri(v, t) - v).length_squared())
+                        .fold(f32::MAX, f32::min);
+                    (d, v)
+                })
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+        };
+        let (Some((da, va)), Some((db, vb))) = (closest(a.part, &b.tris), closest(b.part, &a.tris))
+        else {
+            return None;
+        };
+        let near = if da <= db { va } else { vb };
+        // The solids already proved contact within `tol`; only sheets
+        // (no solid) need the vertices themselves to be close.
+        if a.solid.is_none() || b.solid.is_none() {
+            return None;
+        }
+        pts.push(near);
+    }
+    Some(Contact::Surface(pts))
 }
 
 /// The world points of `p` touching the ground plane y = 0.
@@ -201,7 +230,11 @@ fn support_of(a: &Body, bodies: &[Body], ground: f32) -> Option<String> {
         match contact(a, b) {
             Some(Contact::Overlap) => return Some(format!("attached to `{}`", b.part.name)),
             Some(Contact::Surface(pts)) => {
-                if pts.iter().any(|p| p.y < cy - margin) {
+                // A flat part (a sheet lying down) is held by contact in its
+                // own plane; anything else needs contact below its centre.
+                let (plo, phi) = a.part.bounds();
+                let flat = phi.y - plo.y <= margin * 2.0;
+                if flat || pts.iter().any(|p| p.y < cy - margin) {
                     return Some(format!("rests on `{}`", b.part.name));
                 }
                 above.push(b.part.name.clone());
