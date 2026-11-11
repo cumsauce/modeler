@@ -273,10 +273,14 @@ pub(crate) fn setup_scene(mut commands: Commands) {
                 TextColor(Color::srgba(0.8, 0.83, 0.88, 0.8)),
                 Node {
                     position_type: PositionType::Absolute,
-                    bottom: Val::Px(8.0),
-                    left: Val::Px(10.0),
+                    bottom: Val::Px(0.0),
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                     ..default()
                 },
+                BackgroundColor(Color::srgba(0.03, 0.035, 0.05, 0.97)),
+                GlobalZIndex(1),
             ));
         });
 }

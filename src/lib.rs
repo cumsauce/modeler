@@ -256,7 +256,12 @@ impl Model {
     pub fn bounds_of(&self, names: &[String]) -> Option<(Vec3, Vec3)> {
         let mut acc: Option<(Vec3, Vec3)> = None;
         for p in &self.parts {
-            if p.verts.is_empty() || !names.contains(&p.name) {
+            // Exact names, or a trailing `*` for a prefix (`"bike.*"`).
+            let hit = names.iter().any(|n| match n.strip_suffix('*') {
+                Some(pre) => p.name.starts_with(pre),
+                None => *n == p.name,
+            });
+            if p.verts.is_empty() || !hit {
                 continue;
             }
             let (min, max) = p.bounds();

@@ -199,15 +199,23 @@ pub(crate) fn update_graph_hud(
         }
     }
     let avail = size - Vec2::new(40.0, 90.0);
+    let origin = Vec2::new(size.x * 0.5, (size.y - 50.0) * 0.5);
     if !panel.user_view && lo.x <= hi.x {
         let ext = (hi - lo).max(Vec2::ONE);
-        panel.zoom = (avail.x / ext.x).min(avail.y / ext.y).clamp(0.2, 1.3);
+        // Fit, but never below a readable size: a tall graph starts at its
+        // top and the rest is a wheel/right-drag away.
+        panel.zoom = (avail.x / ext.x).min(avail.y / ext.y).clamp(0.6, 1.3);
         panel.pan = -(lo + hi) * 0.5;
+        if ext.y * panel.zoom > avail.y {
+            panel.pan.y = (20.0 - origin.y) / panel.zoom - lo.y;
+        }
+        if ext.x * panel.zoom > avail.x {
+            panel.pan.x = (20.0 - origin.x) / panel.zoom - lo.x;
+        }
     }
     if panel.zoom <= 0.0 {
         panel.zoom = 1.0;
     }
-    let origin = Vec2::new(size.x * 0.5, (size.y - 50.0) * 0.5);
     let zoom = panel.zoom;
     let pan = panel.pan;
     let to_screen = |p: Vec2| origin + (p + pan) * zoom;

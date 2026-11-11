@@ -125,6 +125,63 @@ impl Default for Session {
     }
 }
 
+/// Stable reorder so an op that reads a part produced by a LATER op in the
+/// same batch runs after it (item order inside a batch doesn't matter).
+/// In-place edits (output == input) never count as producers; non-op items
+/// keep their place relative to each other.
+fn producers_first<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
+    let n = items.len();
+    let produces = |it: &BatchItem| -> Vec<String> {
+        match it {
+            BatchItem::Op(op) if !graph::inputs(op).contains(&graph::output(op)) => {
+                graph::outputs(op)
+            }
+            _ => Vec::new(),
+        }
+    };
+    let deps: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let BatchItem::Op(op) = &items[i].0 else {
+                return Vec::new();
+            };
+            let ins = graph::inputs(op);
+            ((i + 1)..n)
+                .filter(|&j| {
+                    produces(&items[j].0)
+                        .iter()
+                        .any(|o| ins.contains(&o.as_str()))
+                })
+                .collect()
+        })
+        .collect();
+    if deps.iter().all(Vec::is_empty) {
+        return items;
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    fn visit(
+        i: usize,
+        deps: &[Vec<usize>],
+        done: &mut [bool],
+        order: &mut Vec<usize>,
+        depth: usize,
+    ) {
+        if done[i] || depth > deps.len() {
+            return;
+        }
+        done[i] = true;
+        for &j in &deps[i] {
+            visit(j, deps, done, order, depth + 1);
+        }
+        order.push(i);
+    }
+    for i in 0..n {
+        visit(i, &deps, &mut done, &mut order, 0);
+    }
+    let mut slots: Vec<Option<(BatchItem, T)>> = items.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
 impl Session {
     /// Cheap summary of everything the autosave persists; if it is unchanged
     /// across a call, nothing needs writing.
@@ -502,7 +559,7 @@ impl Session {
             l.starts_with('#')
                 && (l.ends_with(" ok") || l.ends_with(" hidden") || l.ends_with(" shown"))
         };
-        let n = text.lines().filter(|l| routine(l)).count();
+        let n = text.lines().filter(|l| l.starts_with('#')).count();
         let mut kept: Vec<&str> = text.lines().filter(|l| !routine(l)).collect();
         let applied = format!("applied {n} item(s)");
         kept.insert(0, &applied);
@@ -700,6 +757,7 @@ impl Session {
         items: Vec<(BatchItem, Option<serde_json::Value>)>,
         with_summary: bool,
     ) -> CmdResult {
+        let items = producers_first(items);
         let mut lines = Vec::with_capacity(items.len());
         for (i, (item, template)) in items.into_iter().enumerate() {
             if let BatchItem::Op(op) = &item {
@@ -2962,6 +3020,23 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         let r = s.apply_values(None, ops);
         assert!(r.is_err(), "the array still reads `cut`");
+    }
+
+    #[test]
+    fn batch_items_may_read_parts_produced_later_in_the_batch() {
+        let mut s = Session::default();
+        s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "hull", "name": "pill", "inputs": ["a", "b"]}),
+                serde_json::json!({"type": "primitive", "name": "a", "kind": "sphere", "size": 0.1}),
+                serde_json::json!({"type": "primitive", "name": "b", "kind": "sphere", "size": 0.1, "translation": [0, 0.5, 0]}),
+                serde_json::json!({"type": "material", "name": "pill", "color": "#f00"}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("pill").is_some());
     }
 
     #[test]

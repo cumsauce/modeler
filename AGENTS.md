@@ -88,7 +88,8 @@ type, so there is no need to memorise field names.
 
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is
-  dependency-ordered, so item order inside the graph doesn't matter.
+  dependency-ordered, and a batch runs an item that reads a part made later
+  in the same batch after its producer, so item order doesn't matter.
 - **Parsing is strict but forgiving.** All items are parsed before anything
   is applied; errors name the item and field
   (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and
@@ -219,7 +220,7 @@ name: the producer first, then in-place material/visibility/transform edits).
   - Several views come back tiled into ONE labelled image (`grid: false` for
     separate images), so `["front", "right", "top", "iso"]` is one read.
   - The top view is a plan: +x right, -z up.
-  - `focus: [parts]` frames just those, and framing works at any scale.
+  - `focus: [parts]` frames just those (`*` globs work: `"bike.*"`), and framing works at any scale.
   - A shadowed key light makes openings read even in orthographic views.
   - Images are sized to stay under ~1.15 MP (long edge 1568), the size a
     model reads at full detail; bigger grids shrink their cells (the
