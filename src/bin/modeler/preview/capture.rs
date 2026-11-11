@@ -10,7 +10,19 @@ pub(crate) fn take_screenshot(
     mut commands: Commands,
     mut pending: ResMut<PendingShots>,
     cameras: Query<&Camera, With<MainCamera>>,
+    env_ready: Query<(), (With<MainCamera>, With<bevy::light::EnvironmentMapLight>)>,
+    mut warm: Local<(u32, u32)>,
 ) {
+    // Same hold as agent shots: the environment light must be filtered.
+    warm.1 = warm.1.saturating_add(1);
+    if env_ready.is_empty() {
+        warm.0 = 0;
+    } else {
+        warm.0 = warm.0.saturating_add(1);
+    }
+    if warm.0 < 4 && warm.1 < 120 {
+        return;
+    }
     let Some(reply) = pending.0.pop() else {
         return;
     };

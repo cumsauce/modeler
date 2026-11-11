@@ -128,8 +128,10 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
             AgentCamera,
             Camera3d::default(),
             Projection::from(PerspectiveProjection::default()),
+            studio_env(&mut images, STUDIO_INTENSITY * 0.6),
+            contact_shading(),
             AmbientLight {
-                brightness: 300.0,
+                brightness: 40.0,
                 ..default()
             },
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
@@ -300,6 +302,9 @@ pub(crate) fn agent_view_projection(
 /// Takes one pending agent shot per frame: repositions the offscreen camera,
 /// resizes the target image, then requests the capture. One per frame so each
 /// capture is guaranteed to show its own view.
+/// Frames to wait after the environment light appears before shooting.
+const ENV_WARM_FRAMES: u32 = 4;
+
 pub(crate) fn process_agent_shot(
     mut agent_shots: ResMut<PendingAgentShots>,
     mut rig: ResMut<AgentRig>,
@@ -309,8 +314,23 @@ pub(crate) fn process_agent_shot(
     mut pbr_cache: ResMut<PbrCache>,
     mut cameras: Query<(&mut Projection, &mut RenderTarget, &mut Transform), With<AgentCamera>>,
     modeler: Res<Modeler>,
+    env_ready: Query<(), (With<AgentCamera>, With<bevy::light::EnvironmentMapLight>)>,
+    mut warm: Local<(u32, u32)>,
     mut commands: Commands,
 ) {
+    // A camera with a generated environment light draws nothing until its
+    // maps are filtered (the component appears, then the GPU filters over
+    // the next frames), so hold shots until then. If filtering never comes
+    // (no compute support) shoot anyway after ~2 s rather than time out.
+    warm.1 = warm.1.saturating_add(1);
+    if env_ready.is_empty() {
+        warm.0 = 0;
+    } else {
+        warm.0 = warm.0.saturating_add(1);
+    }
+    if warm.0 < ENV_WARM_FRAMES && warm.1 < 120 {
+        return;
+    }
     let Some((view, width, height, focus, style, reply)) = agent_shots.0.pop() else {
         return;
     };

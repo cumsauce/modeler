@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::bake::{self, CHANNELS, Channels};
+use super::env;
 use super::eval::{self, Samples};
 use super::node::{self, Buf};
 use crate::catalog::{self, Kind};
@@ -653,8 +654,12 @@ pub fn sphere_preview(doc: &MatDoc, ch: &Channels, cell: usize, diameter: f32) -
                     let x = (px as f32 + 0.5) / cell as f32 * 2.0 - 1.0;
                     let y = 1.0 - (py as f32 + 0.5) / cell as f32 * 2.0;
                     let d2 = x * x + y * y;
+                    let u8c = |v: f32| (bake::to_srgb(tone(v)) * 255.0 + 0.5) as u8;
                     if d2 > 1.0 {
-                        return [24, 24, 28, 255];
+                        // The studio behind the sphere, softened, so what
+                        // the sphere reflects is visible around it.
+                        let b = env::radiance([x * 0.7, y * 0.7, -1.0], 0.12);
+                        return [u8c(b[0] * 0.8), u8c(b[1] * 0.8), u8c(b[2] * 0.8), 255];
                     }
                     let nz = (1.0 - d2).sqrt();
                     let n = [x, y, nz];
@@ -690,7 +695,6 @@ pub fn sphere_preview(doc: &MatDoc, ch: &Channels, cell: usize, diameter: f32) -
                         nw,
                         light,
                     );
-                    let u8c = |v: f32| (bake::to_srgb(v) * 255.0 + 0.5) as u8;
                     [u8c(col[0]), u8c(col[1]), u8c(col[2]), 255]
                 })
                 .collect()
@@ -743,13 +747,38 @@ fn shade(
     let vh = dot(v, h).max(0.0);
     let f = f0.map(|x| x + (1.0 - x) * (1.0 - vh).powi(5));
     let spec = f.map(|x| x * d * g / (4.0 * nl.max(1e-3) * nv));
-    let sky = 0.25 + 0.15 * n[1];
+    // Image-based light from the studio: irradiance for diffuse, the
+    // reflection blurred by roughness for specular, weighted by the split-sum
+    // environment BRDF (Karis' analytic fit).
+    let refl = [0, 1, 2].map(|c| 2.0 * nv * n[c] - v[c]);
+    let irr = env::irradiance(n);
+    let pre = env::radiance(refl, env::roughness_blur(rough));
+    let (ea, eb) = env_brdf(rough, nv);
     [0, 1, 2].map(|c| {
         let diff = base[c] * (1.0 - metal) / std::f32::consts::PI;
-        let direct = (diff * (1.0 - f[c]) + spec[c]) * nl * 3.0;
-        let amb = (base[c] * (1.0 - metal) + f0[c] * 0.5) * sky * ao;
-        direct * (0.4 + 0.6 * ao) + amb + emis[c]
+        let direct = (diff * (1.0 - f[c]) + spec[c]) * nl * 1.5;
+        let ibl = (base[c] * (1.0 - metal) * irr[c] + pre[c] * (f0[c] * ea + eb)) * ao;
+        direct * (0.4 + 0.6 * ao) + ibl + emis[c]
     })
+}
+
+/// Karis' analytic fit of the split-sum environment BRDF: (scale, bias) on F0.
+fn env_brdf(rough: f32, nv: f32) -> (f32, f32) {
+    let c0 = [-1.0, -0.0275, -0.572, 0.022];
+    let c1 = [1.0, 0.0425, 1.04, -0.04];
+    let r: [f32; 4] = [0, 1, 2, 3].map(|i| rough * c0[i] + c1[i]);
+    let a004 = (r[0] * r[0]).min((-9.28 * nv).exp2()) * r[0] + r[1];
+    (-1.04 * a004 + r[2], 1.04 * a004 + r[3])
+}
+
+/// Identity up to 0.8, then a soft shoulder to 1: base colours stay exact
+/// while the studio's HDR highlights roll off instead of clipping flat.
+fn tone(x: f32) -> f32 {
+    if x <= 0.8 {
+        x.max(0.0)
+    } else {
+        0.8 + 0.2 * (1.0 - (-(x - 0.8) / 0.2).exp())
+    }
 }
 
 /// The session's working materials: edited in place, each with its own

@@ -5,6 +5,7 @@
 pub mod atlas;
 pub mod bake;
 pub mod doc;
+pub mod env;
 pub mod eval;
 pub mod node;
 pub mod noise;

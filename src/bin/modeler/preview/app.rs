@@ -293,8 +293,61 @@ pub(crate) fn part_bundle(
     )
 }
 
+/// Environment light strength (cd/m² per unit of studio radiance).
+pub(crate) const STUDIO_INTENSITY: f32 = 900.0;
+
+/// The procedural photo studio (`modeler::material::env`) as an environment
+/// light, filtered on the GPU: glossy parts reflect soft boxes and a
+/// cyclorama horizon instead of a flat ambient, so roughness and normal maps
+/// read. The same function lights the CPU material sphere.
+pub(crate) fn studio_env(
+    images: &mut Assets<Image>,
+    intensity: f32,
+) -> GeneratedEnvironmentMapLight {
+    use bevy::render::render_resource::{
+        Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+    };
+    const SIZE: u32 = 256;
+    let mut img = Image::new(
+        Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 6,
+        },
+        TextureDimension::D2,
+        modeler::material::env::cubemap_rgba16f(SIZE as usize),
+        TextureFormat::Rgba16Float,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    img.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::Cube),
+        ..default()
+    });
+    GeneratedEnvironmentMapLight {
+        environment_map: images.add(img),
+        intensity,
+        ..default()
+    }
+}
+
+/// Contact shading: screen-space ambient occlusion darkens creases and
+/// contacts (a counter against its wall, chair legs on the floor), the main
+/// cue that separates touching parts. SSAO needs MSAA off, so edges are
+/// anti-aliased by SMAA instead (single-frame, so agent shots stay
+/// deterministic, unlike TAA).
+pub(crate) fn contact_shading() -> impl Bundle {
+    (
+        Msaa::Off,
+        bevy::pbr::ScreenSpaceAmbientOcclusion {
+            radius: 0.5,
+            ..default()
+        },
+        bevy::anti_alias::smaa::Smaa::default(),
+    )
+}
+
 /// Camera and lights (no floor: the camera may orbit below the model).
-pub(crate) fn setup_scene(mut commands: Commands) {
+pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
     // entity does nothing), so faces turned from the sun went black. A dim
     // camera-aligned fill keeps every side readable as the human orbits.
@@ -314,8 +367,10 @@ pub(crate) fn setup_scene(mut commands: Commands) {
             Name::new("camera"),
             MainCamera,
             Camera3d::default(),
+            studio_env(&mut images, STUDIO_INTENSITY),
+            contact_shading(),
             AmbientLight {
-                brightness: 900.0,
+                brightness: 60.0,
                 ..default()
             },
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
@@ -324,7 +379,7 @@ pub(crate) fn setup_scene(mut commands: Commands) {
             c.spawn((
                 Name::new("view fill"),
                 DirectionalLight {
-                    illuminance: 1500.0,
+                    illuminance: 500.0,
                     ..default()
                 },
                 Transform::default(),

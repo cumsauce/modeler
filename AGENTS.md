@@ -294,6 +294,13 @@ name: the producer first, then in-place material/visibility/transform edits).
   - The top view is a plan: +x right, -z up.
   - `focus: [parts]` frames just those (`*` globs work: `"bike.*"`), and framing works at any scale.
   - A shadowed key light makes openings read even in orthographic views.
+  - Both the window and agent cameras are lit by a procedural photo
+    studio (`src/material/env.rs`: soft boxes over a grey cyclorama, filtered
+    on the GPU as an environment light), so glossy and metal parts show real
+    reflections, plus SSAO for contact shading (MSAA off, SMAA instead).
+    `material_view` shades its sphere with the same studio. Renders wait for
+    the environment light to finish filtering, so a shot right after startup
+    is never blank.
   - Images are sized to stay under ~1.15 MP (long edge 1568), the size a
     model reads at full detail; bigger grids shrink their cells (the
     result says so). A 2x2 grid of 640x480 is ~1.6k tokens.

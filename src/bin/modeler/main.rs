@@ -144,13 +144,24 @@ fn main() -> AppExit {
     if headless {
         app.add_plugins(MinimalPlugins); // MinimalPlugins already runs the schedule loop
     } else {
-        app.add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "modeler".into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        // Synchronous pipeline compilation: a frame that needs a new shader
+        // variant waits for it instead of skipping those meshes, so a render
+        // right after startup (or after a new material kind appears) never
+        // comes back empty or missing parts. Costs a short stall, once.
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "modeler".into(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(bevy::render::RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                }),
+        )
         .add_systems(Startup, (setup_scene, setup_material_pane))
         .add_systems(Startup, setup_agent_camera)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
