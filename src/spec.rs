@@ -1018,6 +1018,73 @@ pub struct RoundSpec {
     segments: u32,
 }
 
+/// A number (both cross axes) or [a, b] (the two cross axes in x, y, z order).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ScaleEndArg {
+    Both(f32),
+    Each([f32; 2]),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeformSpec {
+    name: String,
+    /// The part to deform (a closed solid stays closed; sheets work too).
+    /// Hide it once the deformed copy is made.
+    input: String,
+    /// "displace" (noise along the normals: rocks, cliffs, bark, dents),
+    /// "bend" (curl the part along `axis` by `degrees` toward `toward`:
+    /// horns, tusks, curved blades), "twist" (`degrees` about `axis`
+    /// over the part's length) or "taper" (cross-section from 1 to
+    /// `scale_end` along `axis`). Chain deforms for a horn: taper, then bend.
+    mode: String,
+    /// bend/twist/taper: the axis the effect runs along, "x", "y" or "z"
+    /// (default "y"); it spans the part's whole extent on that axis.
+    #[serde(default)]
+    axis: Option<String>,
+    /// bend/twist: total angle in degrees from the low end to the high end.
+    #[serde(default)]
+    degrees: Option<f32>,
+    /// bend: where the high end curls toward: "x", "-x", "z", "-z", "y",
+    /// "-y" (or right/left/front/back/up/down); not along `axis`. Default
+    /// +x (+y when axis is x).
+    #[serde(default)]
+    toward: Option<String>,
+    /// taper: the scale at the high end of `axis` (0.1 = a point-ish tip,
+    /// 1.5 = flares out); a number, or [a, b] for the two cross axes.
+    #[serde(default)]
+    scale_end: Option<ScaleEndArg>,
+    /// taper: profile exponent (default 1 = linear; 2 keeps it thick longer
+    /// then thins, 0.5 thins early).
+    #[serde(default)]
+    power: Option<f32>,
+    /// displace: largest offset along the normal in meters (default 12% of
+    /// the part's smallest size); negative pushes the bumps in.
+    #[serde(default)]
+    amount: Option<f32>,
+    /// displace: noise feature size in meters (default 45% of the part's
+    /// largest size: a few big lumps); smaller = more, finer bumps.
+    #[serde(default)]
+    scale: Option<f32>,
+    /// displace: noise octaves, 1..8 (default 4): finer detail on the lumps.
+    #[serde(default)]
+    octaves: Option<u32>,
+    /// displace: noise seed (default 0); same seed = same rock.
+    #[serde(default)]
+    seed: Option<u32>,
+    /// displace: "fbm" (default, rounded lumps), "ridged" (sharp creases:
+    /// cliffs, crags, bark) or "turbulence" (billowy dents).
+    #[serde(default)]
+    noise: Option<String>,
+    /// Target edge length in meters: the input is refined to it first so
+    /// the deform has vertices to move (a 12-triangle box can't bend).
+    /// Default: scale / 8 for displace, 1/32 of the axis length otherwise;
+    /// capped at about 250k triangles.
+    #[serde(default)]
+    detail: Option<f32>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShellSpec {
@@ -1395,6 +1462,7 @@ pub enum OpSpec {
     Terrain(TerrainSpec),
     Hull(HullSpec),
     Round(RoundSpec),
+    Deform(DeformSpec),
     Shell(ShellSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
@@ -1431,6 +1499,7 @@ pub const OP_TYPES: &[&str] = &[
     "terrain",
     "hull",
     "round",
+    "deform",
     "shell",
     "transform",
     "move",
@@ -1870,6 +1939,32 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 segments: s.segments,
             })
         }
+        "deform" => {
+            let s: DeformSpec = de(&ctx, &body)?;
+            let def = crate::deform::Deform {
+                mode: s.mode,
+                axis: s.axis,
+                degrees: s.degrees,
+                toward: s.toward,
+                scale_end: s.scale_end.map(|v| match v {
+                    ScaleEndArg::Both(x) => [x, x],
+                    ScaleEndArg::Each(a) => a,
+                }),
+                power: s.power,
+                amount: s.amount,
+                scale: s.scale,
+                octaves: s.octaves,
+                seed: s.seed,
+                noise: s.noise,
+                detail: s.detail,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Deform {
+                name: s.name,
+                input: s.input,
+                def: Box::new(def),
+            })
+        }
         "shell" => {
             let s: ShellSpec = de(&ctx, &body)?;
             if s.thickness.is_nan() || s.thickness <= 0.0 {
@@ -2254,6 +2349,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "round" => {
             json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})
         }
+        "deform" => {
+            json!({"type": "deform", "name": "rock", "input": "rock_raw", "mode": "displace", "amount": 0.08, "scale": 0.4, "seed": 7})
+        }
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
         }
@@ -2344,6 +2442,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "terrain" => schemars::schema_for!(TerrainSpec),
         "hull" => schemars::schema_for!(HullSpec),
         "round" => schemars::schema_for!(RoundSpec),
+        "deform" => schemars::schema_for!(DeformSpec),
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),

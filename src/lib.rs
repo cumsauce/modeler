@@ -64,6 +64,7 @@ pub mod catalog;
 pub mod commands;
 pub mod contact;
 pub mod csg;
+pub mod deform;
 pub mod error;
 pub mod export_opt;
 pub mod feedback;
@@ -883,6 +884,14 @@ pub enum Op {
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },
+    /// Bends, twists, tapers or noise-displaces a part's (refined) mesh:
+    /// rocks, horns, tusks, curved blades. Output in model space.
+    Deform {
+        name: String,
+        input: String,
+        #[serde(flatten)]
+        def: Box<crate::deform::Deform>,
+    },
     /// Rounds a solid's edges: `fillet` / `chamfer` by `radius`, or
     /// subdivision `smooth`.
     Round {

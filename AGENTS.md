@@ -99,6 +99,7 @@ type, so there is no need to memorise field names.
 | `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
 | `hull` | name, inputs |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
+| `deform` | name, input, mode (displace / bend / twist / taper), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
@@ -295,6 +296,32 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   Then `place` buildings onto it (`{"type": "place", "parts": ["hut"],
   "on": "ground", "at": [x, z]}`) and colour it with a tile material that
   mixes grass and rock by `facing` up.
+- **`deform`** reshapes a part's mesh for organic forms. The input is baked
+  to model space and refined to edges no longer than `detail` first (default
+  `scale / 8` for displace, 1/32 of the axis length otherwise, capped near
+  250k triangles), so a low-poly sphere becomes a lumpy rock, not a spiky one
+  and a 12-triangle box can bend. A closed solid stays a closed,
+  outward-wound solid (booleans still work), UVs ride through, and open
+  sheets are subdivided and deformed too. Hide the input.
+  - `displace`: moves every vertex along its normal by 3D noise: `amount`
+    (meters, the largest offset; default 12% of the smallest size; negative
+    dents), `scale` (feature size, default 45% of the largest size),
+    `octaves` (4), `seed`, `noise` `fbm` (lumps) / `ridged` (crags, cliffs,
+    bark) / `turbulence`. A rock: a sphere scaled flat, then
+    `{"type": "deform", "name": "rock", "input": "rock_raw", "mode":
+    "displace", "amount": 0.08, "seed": 7}`.
+  - `twist`: `degrees` about `axis` (default y) from its low end to its high
+    end (a twisted bar, a drill bit, a rope strand).
+  - `taper`: the cross-section scales from 1 to `scale_end` (a number, or
+    `[a, b]` for the two cross axes in x/y/z order) along `axis`; `power`
+    bends the profile (2 = stays thick, thins late).
+  - `bend`: the part's `axis` extent curls into an arc of `degrees` toward
+    `toward` (`x`, `-z`, ... or right/back/...; not the axis itself), the
+    low end staying put. A horn is a cylinder tapered, then bent:
+    `{"mode": "taper", "scale_end": 0.08}` into `{"mode": "bend", "degrees":
+    120, "toward": "-z"}`; a curved blade bends a thin box.
+  Every number takes params (`"degrees": "$curl"`), and chains of deforms
+  re-derive like any op.
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`shell`** hollows a closed solid: every face moves in by exactly
