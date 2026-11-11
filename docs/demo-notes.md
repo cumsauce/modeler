@@ -2,7 +2,7 @@
 
 Built through the MCP driver on the `review-pass-fixes` build: ground disc,
 cylinder tower with a door and window cut by booleans, cone roof, hub, 4 blades
-(source + `radial_array` count 3 about z), a 9-post fence (`linear_array`),
+(`radial_array` count 4 about z with `include_source`), a 9-post fence (`linear_array`),
 a mirrored back rail, and a two-sphere tree. Hide/rename went in as graph ops.
 Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
 
@@ -29,12 +29,13 @@ Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
    every image numbered; `--save-shot` saves extras as `_2`, `_3`.
 5. **`probe_ray` first hit only -> FIXED.** `all_hits: true`.
 6. **Framing -> FIXED (partly).** `focus: [parts]` on `agent_shot` /
-   `agent_views`. The large flat grey backdrop in the iso shot is still
-   unexplained.
+   `agent_views`. The grey backdrop is still open (see below).
 7. **Radial array bookkeeping -> FIXED.** `include_source: true`.
 8. **`expect_bounds` -> FIXED.** Failures name the part that sets the extreme.
 
 ## Still open (found while verifying)
+- The large flat grey backdrop in the iso shot is unexplained (not yet checked
+  whether it is the ground disc, the ground plane or the camera's clear colour).
 - Smooth per-vertex normals across boolean cut edges give dark streaks on the
   tower; recompute normals per face (or by angle threshold) on boolean outputs.
 - The boolean lint cannot tell harmless curved-cut seams from real holes
