@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use bevy::camera::visibility::RenderLayers;
 
 #[derive(Resource)]
 pub(crate) struct Modeler {
@@ -181,18 +180,12 @@ pub(crate) fn part_bundle(
     )
 }
 
-/// Camera, lights and the grey ground slab the model sits on.
-pub(crate) fn setup_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+/// Camera and lights (no floor: the camera may orbit below the model).
+pub(crate) fn setup_scene(mut commands: Commands) {
     commands.spawn((
         Name::new("camera"),
         MainCamera,
         Camera3d::default(),
-        // Layer 1 holds the grey floor: only the human window renders it.
-        RenderLayers::from_layers(&[0, 1]),
         Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
@@ -209,7 +202,6 @@ pub(crate) fn setup_scene(
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.5, 0.0)),
-        RenderLayers::from_layers(&[0, 1]),
     ));
     commands.spawn((
         Name::new("typing hud"),
@@ -243,16 +235,5 @@ pub(crate) fn setup_scene(
             left: Val::Px(8.0),
             ..default()
         },
-    ));
-    let ground = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.35, 0.35, 0.38),
-        ..default()
-    });
-    commands.spawn((
-        Name::new("ground"),
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(100.0, 100.0))),
-        MeshMaterial3d(ground),
-        Transform::from_translation(Vec3::new(0.0, -0.01, 0.0)),
-        RenderLayers::layer(1),
     ));
 }

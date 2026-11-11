@@ -80,7 +80,7 @@ pub(crate) fn orbit_camera(
                     // Left-drag orbits around the target; click-without-drag pins.
                     MouseButton::Left => {
                         orbit.yaw -= d.x * 0.01;
-                        orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-0.2, 1.4);
+                        orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-1.4, 1.4);
                         orbit.user = true;
                     }
                     // Middle/right-drag pans the target in the camera's screen plane.
@@ -121,7 +121,7 @@ pub(crate) fn orbit_camera(
         orbit.user = true;
     }
     if keys.pressed(KeyCode::ArrowDown) {
-        orbit.pitch = (orbit.pitch - spin).max(-0.2);
+        orbit.pitch = (orbit.pitch - spin).max(-1.4);
         orbit.user = true;
     }
     let (sin_y, cos_y) = orbit.yaw.sin_cos();

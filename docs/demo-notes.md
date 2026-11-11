@@ -43,8 +43,9 @@ Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
   seams (108 open edges on `tower_final`) enclose ~0, so the warning is gone.
   `validate` still reports raw open edges.
 - **Grey iso backdrop -> FIXED.** It was the preview's 100x100 grey floor slab,
-  which the agent camera also rendered. The floor now lives on render layer 1,
-  which only the human window's camera draws.
+  which the agent camera also rendered. The floor has since been removed from
+  the preview entirely, and the orbit camera's pitch now spans -80 to +80 degrees
+  (-1.4 to 1.4 rad) so you can look from below.
 
 ## Still open
 - The nudge is a workaround for csgrs; a robust boolean backend would remove it.
