@@ -1002,6 +1002,55 @@ pub struct HullSpec {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BlobSpec {
+    name: String,
+    /// Closed solids to melt together (spheres, capsules, boxes, any mesh).
+    /// First input's material; hide the inputs.
+    inputs: Vec<String>,
+    /// "union" (default: everything melted into one), "subtract" (the rest
+    /// carved out of the first with a rounded rim) or "intersect".
+    #[serde(default)]
+    op: Option<String>,
+    /// Fillet radius of the blend in meters (0 = a sharp seam). Default: a
+    /// fifth of the smallest input's thinnest size.
+    #[serde(default)]
+    blend: Option<f32>,
+    /// Voxel size in meters. Default: 1/120 of the result's size. Finer is
+    /// smoother but slower; refused past ~27M samples.
+    #[serde(default)]
+    resolution: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlaneSpec {
+    /// The side it points to is "above". Default [0, 1, 0] (up).
+    #[serde(default)]
+    normal: Option<[f32; 3]>,
+    /// Any world point on the plane. Default the origin.
+    #[serde(default)]
+    point: Option<[f32; 3]>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SplitSpec {
+    /// Outputs `name_above` and `name_below`.
+    name: String,
+    /// A closed solid to cut; hide it.
+    input: String,
+    /// The cutting plane: {"normal": [0, 1, 0], "point": [0, 0.3, 0]}.
+    plane: PlaneSpec,
+    /// "both" (default), "above" or "below".
+    #[serde(default)]
+    keep: Option<String>,
+    /// Meters between the halves (each moves half of it along the normal).
+    #[serde(default)]
+    gap: f32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RoundSpec {
     name: String,
     /// A closed solid to round.
@@ -1461,6 +1510,8 @@ pub enum OpSpec {
     Text(TextSpec),
     Terrain(TerrainSpec),
     Hull(HullSpec),
+    Blob(BlobSpec),
+    Split(SplitSpec),
     Round(RoundSpec),
     Deform(DeformSpec),
     Shell(ShellSpec),
@@ -1498,6 +1549,8 @@ pub const OP_TYPES: &[&str] = &[
     "text",
     "terrain",
     "hull",
+    "blob",
+    "split",
     "round",
     "deform",
     "shell",
@@ -1923,6 +1976,56 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 inputs: s.inputs,
             })
         }
+        "blob" => {
+            let s: BlobSpec = de(&ctx, &body)?;
+            if s.inputs.is_empty() {
+                return Err(format!("{ctx}: inputs: a blob needs at least one part"));
+            }
+            let op = s.op.unwrap_or_else(|| "union".into());
+            if !["union", "subtract", "intersect"].contains(&op.as_str()) {
+                return Err(format!(
+                    "{ctx}: op: must be union, subtract or intersect, got `{op}`"
+                ));
+            }
+            if s.blend.is_some_and(|b| b.is_nan() || b < 0.0) {
+                return Err(format!("{ctx}: blend: must be >= 0 meters"));
+            }
+            let resolution = s.resolution.unwrap_or(0.0);
+            if resolution.is_nan() || resolution < 0.0 {
+                return Err(format!("{ctx}: resolution: must be > 0 meters"));
+            }
+            BatchItem::Op(Op::Blob {
+                name: s.name,
+                inputs: s.inputs,
+                op,
+                blend: s.blend,
+                resolution,
+            })
+        }
+        "split" => {
+            let s: SplitSpec = de(&ctx, &body)?;
+            let keep = s.keep.unwrap_or_else(|| "both".into());
+            if !["both", "above", "below"].contains(&keep.as_str()) {
+                return Err(format!(
+                    "{ctx}: keep: must be both, above or below, got `{keep}`"
+                ));
+            }
+            let normal = s.plane.normal.unwrap_or([0.0, 1.0, 0.0]);
+            if normal.iter().all(|c| *c == 0.0) || normal.iter().any(|c| !c.is_finite()) {
+                return Err(format!("{ctx}: plane.normal: must be a non-zero direction"));
+            }
+            if s.gap.is_nan() || s.gap < 0.0 {
+                return Err(format!("{ctx}: gap: must be >= 0 meters"));
+            }
+            BatchItem::Op(Op::Split {
+                name: s.name,
+                input: s.input,
+                normal,
+                point: s.plane.point.unwrap_or([0.0; 3]),
+                keep,
+                gap: s.gap,
+            })
+        }
         "round" => {
             let s: RoundSpec = de(&ctx, &body)?;
             if !["fillet", "chamfer", "smooth"].contains(&s.mode.as_str()) {
@@ -2346,6 +2449,12 @@ pub fn example(ty: &str) -> Option<Value> {
         "hull" => {
             json!({"type": "hull", "name": "pill", "inputs": ["ball_a", "ball_b"]})
         }
+        "blob" => {
+            json!({"type": "blob", "name": "creature", "inputs": ["body", "head", "arm_l", "arm_r"], "blend": 0.04})
+        }
+        "split" => {
+            json!({"type": "split", "name": "vase", "input": "vase_raw", "plane": {"normal": [0, 1, 0], "point": [0, 0.15, 0]}, "gap": 0.02})
+        }
         "round" => {
             json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})
         }
@@ -2441,6 +2550,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "text" => schemars::schema_for!(TextSpec),
         "terrain" => schemars::schema_for!(TerrainSpec),
         "hull" => schemars::schema_for!(HullSpec),
+        "blob" => schemars::schema_for!(BlobSpec),
+        "split" => schemars::schema_for!(SplitSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "deform" => schemars::schema_for!(DeformSpec),
         "shell" => schemars::schema_for!(ShellSpec),
