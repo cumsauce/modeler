@@ -126,6 +126,25 @@ pub struct VerifySpec {
     /// Pairs `[a, b]`: `a` rests on (or is attached to) `b`.
     #[serde(default)]
     pub rests: Option<Vec<[String; 2]>>,
+    /// No part passes through another: `true`, or `{allow: [[a, b]], max}`.
+    /// Fails any pair where more than `max` (default 0.2) of the smaller
+    /// part's volume is inside the other, unless `allow` lists the pair
+    /// (`*` patterns, either order). Shallow overlaps are joints.
+    #[serde(default)]
+    pub collisions: Option<CollisionSpec>,
+}
+
+/// `collisions: true` or `{allow, max}`.
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CollisionSpec {
+    On(bool),
+    With {
+        #[serde(default)]
+        allow: Vec<[String; 2]>,
+        #[serde(default)]
+        max: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -176,17 +195,125 @@ impl Default for Session {
     }
 }
 
+/// What a move did, in words: where the moved parts' centre went, parts it
+/// left behind (they touched a moved part and now touch nothing), and new
+/// overlaps between moved and unmoved parts.
+fn move_report(before: &[Arc<Part>], after: &[Arc<Part>], patterns: &[String]) -> String {
+    use crate::contact::{Body, contact};
+    let moved = |p: &Part| patterns.iter().any(|q| crate::name_matches(q, &p.name));
+    let live = |ps: &[Arc<Part>]| -> Vec<Arc<Part>> {
+        ps.iter()
+            .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
+            .cloned()
+            .collect()
+    };
+    let (before, after) = (live(before), live(after));
+    let centre = |ps: &[Arc<Part>]| {
+        ps.iter()
+            .filter(|p| moved(p))
+            .map(|p| p.bounds())
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+            .map(|(lo, hi)| (lo + hi) * 0.5)
+    };
+    let mut out = String::new();
+    if let (Some(c0), Some(c1)) = (centre(&before), centre(&after)) {
+        let d = c1 - c0;
+        let words: Vec<String> = [
+            (d.x, "right (+x)", "left (-x)"),
+            (d.y, "up (+y)", "down (-y)"),
+            (d.z, "front (+z)", "back (-z)"),
+        ]
+        .iter()
+        .filter(|(v, _, _)| v.abs() >= 1e-3)
+        .map(|(v, pos, neg)| format!("{:.3} m {}", v.abs(), if *v > 0.0 { pos } else { neg }))
+        .collect();
+        out += &if words.is_empty() {
+            "\n  centre stays put".to_string()
+        } else {
+            format!("\n  centre moved {}", words.join(", "))
+        };
+    }
+    // Only parts near the moved set, before or after, can change contact.
+    let near = |p: &Part, set: &[Arc<Part>]| {
+        let (lo, hi) = p.bounds();
+        set.iter().filter(|m| moved(m)).any(|m| {
+            let (a, b) = m.bounds();
+            (0..3).all(|k| lo[k] <= b[k] + 1e-3 && a[k] <= hi[k] + 1e-3)
+        })
+    };
+    let by_name = |ps: &[Arc<Part>], n: &str| ps.iter().find(|p| p.name == n).cloned();
+    let mut left = Vec::new();
+    let mut new_ov = Vec::new();
+    for u in after.iter().filter(|p| !moved(p)) {
+        if !near(u, &before) && !near(u, &after) {
+            continue;
+        }
+        let Some(u0) = by_name(&before, &u.name) else {
+            continue;
+        };
+        let (ub0, ub1) = (Body::new(&u0), Body::new(u));
+        let touched_moved = before
+            .iter()
+            .filter(|m| moved(m))
+            .any(|m| contact(&ub0, &Body::new(m)).is_some());
+        if touched_moved
+            && after
+                .iter()
+                .filter(|p| p.name != u.name)
+                .all(|o| contact(&ub1, &Body::new(o)).is_none())
+        {
+            left.push(u.name.clone());
+        }
+        for m in after.iter().filter(|m| moved(m)) {
+            let Some(m0) = by_name(&before, &m.name) else {
+                continue;
+            };
+            let was = crate::contact::overlap_between(&ub0, &Body::new(&m0)).is_some();
+            if !was && let Some(o) = crate::contact::overlap_between(&ub1, &Body::new(m)) {
+                new_ov.push(o);
+            }
+        }
+    }
+    if !left.is_empty() {
+        out += &format!(
+            "\n  WARNING left behind: {} touched a moved part and now touches nothing (add it to `parts` to carry it along)",
+            left.iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !new_ov.is_empty() {
+        new_ov.sort_by(|x, y| y.fraction.total_cmp(&x.fraction));
+        out += &format!(
+            "\n  WARNING new overlap(s): {}",
+            new_ov
+                .iter()
+                .map(|o| o.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    out
+}
+
 /// Stable reorder so an op that reads a part produced by a LATER op in the
 /// same batch runs after it (item order inside a batch doesn't matter).
 /// In-place edits (output == input) never count as producers; non-op items
-/// keep their place relative to each other. Pattern hides/shows and
-/// moves/places resolve their part names when applied, so they run last
-/// (in their own order) and see every part the batch creates.
+/// keep their place relative to each other. Edits that name existing parts
+/// (hide/show, rename, uvs, move/place) run after every op, in the order
+/// written, so they see every part the batch creates and a later
+/// `show_part x` still overrides an earlier `hide_part "*_raw"`.
 fn producers_first<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
-    let late = |it: &BatchItem| match it {
-        BatchItem::Hide { part } | BatchItem::Show { part } => part.contains('*'),
-        BatchItem::Move { .. } => true,
-        _ => false,
+    let late = |it: &BatchItem| {
+        matches!(
+            it,
+            BatchItem::Hide { .. }
+                | BatchItem::Show { .. }
+                | BatchItem::Rename { .. }
+                | BatchItem::Uvs { .. }
+                | BatchItem::Move { .. }
+        )
     };
     let (tail, head): (Vec<_>, Vec<_>) = items.into_iter().partition(|(it, _)| late(it));
     let mut out = order_producers(head);
@@ -1058,12 +1185,13 @@ impl Session {
             },
             &label,
         )?;
+        let report = move_report(&parts_now, &self.model.parts, patterns);
         Ok(match on {
             Some(on) => format!(
-                "place `{name}`: {count} part(s) dropped onto `{on}` (re-issue name `{name}` to adjust)"
+                "place `{name}`: {count} part(s) dropped onto `{on}` (re-issue name `{name}` to adjust){report}"
             ),
             None => format!(
-                "move `{name}`: {count} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust)",
+                "move `{name}`: {count} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust){report}",
                 pivot[0], pivot[1], pivot[2]
             ),
         })
@@ -1179,7 +1307,8 @@ impl Session {
             && spec.rebuild.is_none()
             && spec.stable.is_none()
             && spec.supported.is_none()
-            && spec.rests.is_none();
+            && spec.rests.is_none()
+            && spec.collisions.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
             Ok(t) => out.push((name.to_string(), true, t)),
@@ -1250,6 +1379,48 @@ impl Session {
                 record(
                     &format!("rests {a} on {b}"),
                     crate::contact::rests_on(&self.model, a, b),
+                );
+            }
+        }
+        let coll = match &spec.collisions {
+            Some(CollisionSpec::On(true)) => Some((Vec::new(), 0.2)),
+            Some(CollisionSpec::With { allow, max }) => Some((allow.clone(), max.unwrap_or(0.2))),
+            _ => None,
+        };
+        if let Some((allow, max)) = coll {
+            let (bad, joints) = crate::contact::collisions(&self.model, &allow, max);
+            let joints_txt = if joints.is_empty() {
+                String::new()
+            } else {
+                let list: Vec<String> = joints
+                    .iter()
+                    .take(8)
+                    .map(|o| format!("{}/{} {:.0}%", o.a, o.b, o.fraction * 100.0))
+                    .collect();
+                format!(
+                    "; {} joint(s): {}{}",
+                    joints.len(),
+                    list.join(", "),
+                    if joints.len() > 8 { ", ..." } else { "" }
+                )
+            };
+            if bad.is_empty() {
+                record(
+                    "collisions",
+                    Ok(format!(
+                        "no part is more than {:.0}% inside another{joints_txt}",
+                        max * 100.0
+                    )),
+                );
+            } else {
+                let list: Vec<String> = bad.iter().map(|o| o.describe()).collect();
+                record(
+                    "collisions",
+                    Err(format!(
+                        "{} pair(s) pass through each other: {} (intended joints go in `allow: [[a, b]]`){joints_txt}",
+                        bad.len(),
+                        list.join("; ")
+                    )),
                 );
             }
         }
@@ -1786,6 +1957,74 @@ impl Session {
         } else {
             Ok(format!("deleted annotation #{id}"))
         }
+    }
+
+    /// A short overview for a freshly loaded model: counts, bounds, visible
+    /// parts (folded), params, named moves/places and warnings.
+    /// `scene_summary` / `ops` give the full listing.
+    pub fn load_brief(&self) -> String {
+        let bounds = self
+            .model
+            .bounds()
+            .map(|(min, max)| format!("bounds {min:?}..{max:?}"))
+            .unwrap_or_else(|| "empty".into());
+        let visible: Vec<String> = self
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| p.name.clone())
+            .collect();
+        let hidden = self.model.parts.len() - visible.len();
+        let mut s = format!(
+            "model `{}` v{}: {} parts ({hidden} hidden), {} ops, {bounds}\n",
+            self.model.name,
+            self.model.version,
+            self.model.parts.len(),
+            self.model.ops.len()
+        );
+        let names = crate::compact_names(&visible);
+        let shown = names.len().min(40);
+        s += &format!(
+            "visible: {}{}\n",
+            names[..shown].join(", "),
+            if names.len() > shown { ", ..." } else { "" }
+        );
+        if !self.model.params.is_empty() {
+            let ps: Vec<String> = self
+                .model
+                .params
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            s += &format!("params: {}\n", ps.join(", "));
+        }
+        let moves: Vec<String> = self
+            .model
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::Move { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if !moves.is_empty() {
+            s += &format!("named moves/places: {}\n", moves.join(", "));
+        }
+        if !self.model.annotations.is_empty() {
+            s += &format!("annotations: {}\n", self.model.annotations.len());
+        }
+        let lints = self.lints();
+        if lints.is_empty() {
+            s += "warnings: none\n";
+        } else {
+            s += &format!("warnings ({}):\n", lints.len());
+            for l in &lints {
+                s += &format!("- {l}\n");
+            }
+        }
+        s += "(scene_summary lists every part, ops the full graph)\n";
+        s
     }
 
     pub fn summary(&self) -> String {
@@ -3344,8 +3583,103 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(s.model.part("top_raw").is_some_and(|p| !p.visible));
+        // A later explicit show still wins over an earlier pattern hide.
+        s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "hide_part", "part": "*_raw"}),
+                serde_json::json!({"type": "show_part", "part": "top_raw"}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.part("top_raw").is_some_and(|p| p.visible));
         let lo = s.model.part("b").map(|p| p.bounds().0).unwrap_or_default();
         assert!((lo.y - 1.0).abs() < 1e-4, "b at {lo:?}");
+    }
+
+    fn batch(items: serde_json::Value) -> (Session, String) {
+        let mut s = Session::default();
+        let serde_json::Value::Array(items) = items else {
+            panic!("array");
+        };
+        let t = s
+            .apply_values_as(None, items, true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        (s, t)
+    }
+
+    #[test]
+    fn collisions_fail_deep_overlaps_and_list_shallow_joints() {
+        let (s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "cab", "kind": "box", "size": [0.6, 0.8, 0.6], "translation": [0, 0.4, 0]},
+            // Half buried in the cabinet: a collision.
+            {"type": "primitive", "name": "door", "kind": "box", "size": [0.5, 0.6, 0.04], "translation": [0, 0.4, 0.3]},
+            // A tap sunk 1 cm into the top: a joint.
+            {"type": "primitive", "name": "tap", "kind": "box", "size": [0.02, 0.3, 0.02], "translation": [0.2, 0.94, 0]}
+        ]));
+        let spec = |j: serde_json::Value| -> VerifySpec {
+            serde_json::from_value(j).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let checks = s.verify_checks(&spec(serde_json::json!({"collisions": true})));
+        let (_, ok, detail) = &checks[0];
+        assert!(!ok, "{detail}");
+        assert!(
+            detail.contains("`cab` / `door`") && detail.contains("50%"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("joint") && detail.contains("tap"),
+            "{detail}"
+        );
+        let checks = s.verify_checks(&spec(
+            serde_json::json!({"collisions": {"allow": [["door", "cab*"]]}}),
+        ));
+        assert!(checks[0].1, "{}", checks[0].2);
+    }
+
+    #[test]
+    fn move_reports_direction_left_behind_parts_and_new_overlaps() {
+        let (mut s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "cab", "kind": "box", "size": [0.6, 0.8, 0.6], "translation": [0, 0.4, 0]},
+            {"type": "primitive", "name": "door", "kind": "box", "size": [0.56, 0.7, 0.02], "translation": [0, 0.4, 0.31]},
+            {"type": "primitive", "name": "handle", "kind": "box", "size": [0.02, 0.1, 0.02], "translation": [0.2, 0.5, 0.33]}
+        ]));
+        // Hinged on the wrong side and without its handle: swings into the box.
+        let t = s
+            .apply_values_as(
+                None,
+                vec![serde_json::json!({"type": "move", "name": "open", "parts": ["door"], "axis": [0, 1, 0], "degrees": -70, "pivot": "door:right-front"})],
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("back (-z)"), "{t}");
+        assert!(t.contains("left behind: `handle`"), "{t}");
+        assert!(t.contains("new overlap") && t.contains("`cab`"), "{t}");
+        // The right way: outward, handle along. No warnings.
+        let t = s
+            .apply_values_as(
+                None,
+                vec![serde_json::json!({"type": "move", "name": "open", "parts": ["door", "handle"], "axis": [0, 1, 0], "degrees": 70, "pivot": "door:right-back"})],
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("front (+z)") && !t.contains("WARNING"), "{t}");
+    }
+
+    #[test]
+    fn z_fight_warning_names_the_visible_boolean_input() {
+        let (s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "top_raw", "kind": "box", "size": [1, 0.04, 0.6], "translation": [0, 0.9, 0]},
+            {"type": "primitive", "name": "hole", "kind": "box", "size": [0.4, 0.2, 0.3], "translation": [0, 0.9, 0]},
+            {"type": "boolean", "name": "top", "op": "difference", "a": "top_raw", "b": "hole"},
+            {"type": "hide_part", "part": "hole"}
+        ]));
+        let l = s.lints().join("\n");
+        assert!(
+            l.contains("`top_raw` is an input of the boolean that makes `top`"),
+            "{l}"
+        );
     }
 
     #[test]

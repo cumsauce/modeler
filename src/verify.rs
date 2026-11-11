@@ -545,10 +545,28 @@ pub fn lints(model: &Model) -> Vec<String> {
                 && near(amax.y, bmax.y)
                 && near(amax.z, bmax.z)
             {
-                out.push(format!(
-                    "parts `{}` and `{}` occupy identical bounds — their faces will z-fight",
-                    a.name, b.name
-                ));
+                // Usually a source left visible next to what was made from it.
+                let source_of = |src: &str, out_name: &str| {
+                    model.ops.iter().find(|op| {
+                        crate::graph::output(op) == out_name
+                            && crate::graph::output(op) != src
+                            && crate::graph::inputs(op).contains(&src)
+                    })
+                };
+                let hint = match (source_of(&a.name, &b.name), source_of(&b.name, &a.name)) {
+                    (Some(op), _) => Some((&a.name, &b.name, crate::graph::kind(op))),
+                    (_, Some(op)) => Some((&b.name, &a.name, crate::graph::kind(op))),
+                    _ => None,
+                };
+                out.push(match hint {
+                    Some((src, made, kind)) => format!(
+                        "`{src}` is an input of the {kind} that makes `{made}` and is still visible: their faces will z-fight (hide it: {{\"type\": \"hide_part\", \"part\": \"{src}\"}})"
+                    ),
+                    None => format!(
+                        "parts `{}` and `{}` occupy identical bounds — their faces will z-fight",
+                        a.name, b.name
+                    ),
+                });
             }
         }
     }

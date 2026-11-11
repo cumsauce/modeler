@@ -168,9 +168,19 @@ def daemon_mode(socket_path, windowed):
                                 {"ok": True, "text": ["daemon stopping"],
                                  "n_images": 0}) + "\n").encode())
                             return
+                        note = None
+                        if session.proc.poll() is not None:
+                            # The modeler exited (killed, crashed, rebuilt):
+                            # respawn it; autosave restores the session.
+                            code = session.proc.returncode
+                            session = ModelerSession(windowed=windowed)
+                            note = (f"daemon: the modeler server had exited (code {code}); "
+                                    "restarted it, session restored from autosave")
                         out = session.call(c["name"], c.get("args", {}),
                                            c.get("save_shot"), c.get("save_dir"),
                                            c.get("b64", False))
+                        if note:
+                            out["text"] = [note] + list(out.get("text", []))
                     except Exception as e:  # bad line or dead server
                         out = {"ok": False, "text": [f"daemon error: {e}"],
                                "n_images": 0}
@@ -185,7 +195,13 @@ def daemon_mode(socket_path, windowed):
 def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, json_only=False):
     calls = json.load(open(calls_path)) if calls_path != "/dev/stdin" else json.load(sys.stdin)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(socket_path)
+    try:
+        s.connect(socket_path)
+    except OSError as e:
+        print(json.dumps({"ok": False, "text": [
+            f"no modeler daemon on {socket_path} ({e.strerror}). Start one with: "
+            "python3 mcp_driver.py --daemon --windowed &"], "n_images": 0}), flush=True)
+        sys.exit(1)
     with s:
         f = s.makefile("r")
         for c in calls:

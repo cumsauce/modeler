@@ -160,6 +160,96 @@ pub fn contact(a: &Body, b: &Body) -> Option<Contact> {
     Some(Contact::Surface(pts))
 }
 
+/// Two visible parts sharing volume.
+#[derive(Debug, Clone)]
+pub struct Overlap {
+    pub a: String,
+    pub b: String,
+    /// Shared volume, m³.
+    pub volume: f64,
+    /// Share of the smaller part's volume inside the other (0..1).
+    pub fraction: f64,
+    /// Centre of the shared region's box.
+    pub at: [f64; 3],
+}
+
+/// Every pair of visible closed parts that share volume, deepest first.
+pub fn overlaps(model: &Model) -> Vec<Overlap> {
+    let bodies: Vec<Body> = visible(model).map(Body::new).collect();
+    let mut out = Vec::new();
+    for (i, a) in bodies.iter().enumerate() {
+        for b in &bodies[i + 1..] {
+            if let Some(o) = overlap_between(a, b) {
+                out.push(o);
+            }
+        }
+    }
+    out.sort_by(|x, y| y.fraction.total_cmp(&x.fraction));
+    out
+}
+
+/// The volume `a` and `b` share, if any.
+pub fn overlap_between(a: &Body, b: &Body) -> Option<Overlap> {
+    if !boxes_near(a.part, b.part, 0.0) {
+        return None;
+    }
+    let (Some(ma), Some(mb)) = (&a.solid, &b.solid) else {
+        return None;
+    };
+    let inter = ma.intersection(mb);
+    let ov = inter.volume().abs();
+    let small = ma.volume().abs().min(mb.volume().abs()).max(1e-30);
+    if ov <= small * 1e-6 {
+        return None;
+    }
+    let at = inter.bounding_box().map_or([0.0; 3], |bb| {
+        let (lo, hi) = (bb.min(), bb.max());
+        [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ]
+    });
+    Some(Overlap {
+        a: a.part.name.clone(),
+        b: b.part.name.clone(),
+        volume: ov,
+        fraction: (ov / small).min(1.0),
+        at,
+    })
+}
+
+impl Overlap {
+    pub fn describe(&self) -> String {
+        format!(
+            "`{}` / `{}`: {:.0}% of the smaller inside the other ({:.3e} m³ shared, centred at [{:.3}, {:.3}, {:.3}])",
+            self.a,
+            self.b,
+            self.fraction * 100.0,
+            self.volume,
+            self.at[0],
+            self.at[1],
+            self.at[2]
+        )
+    }
+
+    /// Whether an `[x, y]` allow pair (`*` patterns, either order) covers it.
+    pub fn allowed_by(&self, allow: &[[String; 2]]) -> bool {
+        let m = crate::name_matches;
+        allow
+            .iter()
+            .any(|[x, y]| (m(x, &self.a) && m(y, &self.b)) || (m(x, &self.b) && m(y, &self.a)))
+    }
+}
+
+/// Overlaps split into collisions (more than `max` of the smaller part
+/// buried, and not allowed) and joints (shallow or allowed).
+pub fn collisions(model: &Model, allow: &[[String; 2]], max: f64) -> (Vec<Overlap>, Vec<Overlap>) {
+    overlaps(model)
+        .into_iter()
+        .partition(|o| o.fraction > max && !o.allowed_by(allow))
+}
+
 /// The world points of `p` touching the ground plane y = 0.
 pub fn ground_points(p: &Part) -> Vec<Vec3> {
     let tol = ground_tolerance(p);

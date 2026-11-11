@@ -26,7 +26,9 @@ python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
 
 Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
 array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when
-done. Typical first calls: `scene_summary` (also shows the autosaved session,
+done. If the daemon's server has died (killed, crashed), the next call
+restarts it from the autosave and says so; with no daemon at all the
+client prints the start command. Typical first calls: `scene_summary` (also shows the autosaved session,
 if any), `catalog_list`, then `new_model` + `apply_ops` to build. If your
 session's MCP tool list has no `mcp__modeler__*` tools, this driver is the
 documented fallback — it speaks the same tool surface over stdio. Each
@@ -90,9 +92,10 @@ type, so there is no need to memorise field names.
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is
   dependency-ordered, and a batch runs an item that reads a part made later
-  in the same batch after its producer, and pattern hides/shows (`"*_raw"`)
-  and moves/places run last, so they see every part the batch makes: item
-  order doesn't matter.
+  in the same batch after its producer, and edits naming parts (hide/show,
+  rename, uvs, move/place) run after every op in the order written, so
+  `"*_raw"` sees every part the batch makes and a later `show_part` still
+  wins: item order doesn't matter.
 - **Parsing is strict but forgiving.** All items are parsed before anything
   is applied; errors name the item and field
   (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and
@@ -118,6 +121,11 @@ type, so there is no need to memorise field names.
   in list order (later = outer parent). Give it a `name` and re-issue that
   name to adjust, e.g. lean a bike onto its kickstand with
   `{"type": "move", "name": "lean", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]}`.
+  Every move/place result says where the moved parts' centre went
+  ("0.25 m front (+z)": a door swinging the wrong way shows here) and
+  warns about parts **left behind** (they touched a moved part and now
+  touch nothing: a handle not listed with its door) and **new overlaps**
+  with unmoved parts (the door swinging into its cabinet).
 - **`place`** drops parts onto a surface so nothing is placed by hand
   arithmetic: `{"type": "place", "name": "mug_on", "parts": ["mug"], "on":
   "desk_top", "at": [-0.4, 0.1]}` slides the mug's footprint centre to
@@ -215,7 +223,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, bounds?, validate?, rebuild?, stable?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `parts`: exact part names, order-insensitive; reports missing and
     unexpected names. `*` matches any run of characters (`"gz.*"` covers a
@@ -239,6 +247,13 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `validate`: every part closed and outward-wound.
   - `rebuild`: an uncached re-derivation matches the cache.
   - `stable`: the centre of mass (uniform density) sits over the footprint.
+  - `collisions`: no part passes through another. `true`, or `{allow:
+    [["c_leg*", "c_seat"]], max: 0.2}`. Fails any pair where more than
+    `max` (default 20%) of the smaller part's volume is inside the other,
+    unless `allow` lists it (`*` patterns, either order). Shallow overlaps
+    (a tap sunk 1 cm into a counter) pass and are listed as joints.
+    `grounded`/`supported` count any overlap as a joint, so only this
+    catches a part swung or placed into another.
 
   Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
@@ -305,7 +320,8 @@ name: the producer first, then in-place material/visibility/transform edits).
 **Model, catalog, output:** `new_model(name)` (the old model stays one undo
 away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
 tags, prompt)` (all required; reports when it overwrote an entry),
-`load_prefab(name)`, `catalog_list` and `catalog_describe` (each entry also
+`load_prefab(name)` (answers with a brief: counts, visible parts, params,
+named moves, warnings), `catalog_list` and `catalog_describe` (each entry also
 lists its knobs: params with values and named moves/places, read from the
 file),
 `export_model(path, "glb" | "gltf")` (skips hidden parts).
@@ -348,7 +364,9 @@ items of a batch that failed partway. `save_prefab` only names and indexes it.
 
 `scene_summary` warnings: full-ring radial arrays whose copy 0 overlaps the
 source (only with `include_source: false`), visible parts still wearing the
-default material, parts with identical world bounds (z-fighting), boolean
+default material, parts with identical world bounds (z-fighting; when one
+is an input of the op making the other, the warning names it and says to
+hide it), boolean
 volume sanity (a difference that didn't shrink its input = the cutter
 misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
