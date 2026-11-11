@@ -125,7 +125,7 @@ pub fn resolve_size(kind: PrimitiveKind, v: &Value) -> Result<[f32; 3], String> 
 }
 
 /// A colour: RGBA [r, g, b, a], RGB [r, g, b] (alpha 1), components 0..1 or
-/// 0..255, or a hex string "#rrggbb" / "#rrggbbaa".
+/// 0..255, or a hex string "#rgb", "#rrggbb" or "#rrggbbaa".
 #[derive(Clone, Copy, Debug)]
 pub struct ColorArg(pub [f32; 4]);
 
@@ -144,7 +144,7 @@ impl schemars::JsonSchema for ColorArg {
     }
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "description": "Colour: [r, g, b] or [r, g, b, a] (0..1, or 0..255), or \"#rrggbb\" / \"#rrggbbaa\".",
+            "description": "Colour: [r, g, b] or [r, g, b, a] (0..1, or 0..255), or \"#rgb\", \"#rrggbb\" or \"#rrggbbaa\".",
             "anyOf": [
                 {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 4},
                 {"type": "string"}
@@ -176,9 +176,17 @@ fn parse_color(v: &Value) -> Result<[f32; 4], String> {
         )),
         Value::String(s) => {
             let h = s.trim_start_matches('#');
+            // CSS short forms #rgb / #rgba expand each digit (#222 = #222222).
+            let long: String;
+            let h = if h.len() == 3 || h.len() == 4 {
+                long = h.chars().flat_map(|c| [c, c]).collect();
+                long.as_str()
+            } else {
+                h
+            };
             if !(h.len() == 6 || h.len() == 8) || !h.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(format!(
-                    "colour string must be #rrggbb or #rrggbbaa, got {s:?}"
+                    "colour string must be #rgb, #rrggbb or #rrggbbaa, got {s:?}"
                 ));
             }
             let byte =
@@ -766,6 +774,7 @@ mod tests {
         assert_eq!(parse_color(&json!([1, 0, 0])), Ok([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(parse_color(&json!([255, 0, 0])), Ok([1.0, 0.0, 0.0, 1.0]));
         assert_eq!(parse_color(&json!("#ff0000")), Ok([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(parse_color(&json!("#f00")), Ok([1.0, 0.0, 0.0, 1.0]));
         assert!(parse_color(&json!([1, 0])).is_err());
     }
 

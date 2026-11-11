@@ -84,7 +84,7 @@ type, so there is no need to memorise field names.
     (`[radius]`, `[radius, height]`, `[ring, tube]`, `[inner, outer]`, box
     `[x, y, z]`), or an object (`{radius, height}`, `{width, height, depth}`).
     A sphere is round: flatten it with a transform's scale.
-  - colours: `[r, g, b]`, `[r, g, b, a]`, 0..1 or 0..255, or `"#rrggbb(aa)"`.
+  - colours: `[r, g, b]`, `[r, g, b, a]`, 0..1 or 0..255, or `"#rgb"` or `"#rrggbb(aa)"`.
 - **Materials follow lineage.** An in-place material on X runs before every
   op that copies or cuts X, wherever it sits in the batch, so arrays, mirrors
   and transforms of X inherit the colour.

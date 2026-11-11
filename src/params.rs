@@ -19,9 +19,14 @@ pub fn resolve(v: &Value, params: &Params) -> Result<Value, String> {
     Ok(match v {
         Value::String(s) if is_expr(s) => {
             let x = eval(s.trim_start_matches('='), params)?;
-            serde_json::Number::from_f64(x)
-                .map(Value::Number)
-                .ok_or_else(|| format!("`{s}` is not a finite number ({x})"))?
+            // Whole numbers come out as integers so counts (u32 fields) accept them.
+            if x.fract() == 0.0 && x.abs() < 9.0e15 {
+                Value::Number((x as i64).into())
+            } else {
+                serde_json::Number::from_f64(x)
+                    .map(Value::Number)
+                    .ok_or_else(|| format!("`{s}` is not a finite number ({x})"))?
+            }
         }
         Value::Array(items) => Value::Array(
             items
@@ -188,12 +193,14 @@ mod tests {
         let v = json!({"size": [0.8, "$h", 0], "translation": [0, "=$h/2", 0], "name": "t"});
         assert_eq!(
             resolve(&v, &p),
-            Ok(json!({"size": [0.8, 2.0, 0], "translation": [0, 1.0, 0], "name": "t"}))
+            Ok(json!({"size": [0.8, 2, 0], "translation": [0, 1, 0], "name": "t"}))
         );
         assert_eq!(
             refs(&v),
             ["h".to_string()].into_iter().collect::<BTreeSet<_>>()
         );
         assert!(eval("$nope", &p).is_err_and(|e| e.contains("unknown parameter")));
+        // Integral results stay integers (for counts).
+        assert_eq!(resolve(&json!("=$h * 6"), &p), Ok(json!(12)));
     }
 }
