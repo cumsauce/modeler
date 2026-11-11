@@ -137,7 +137,14 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
             Projection::from(PerspectiveProjection::default()),
             studio_env(&mut images, STUDIO_INTENSITY * 0.6),
             contact_shading(),
-            screen_reflections(),
+            // No screen-space reflections, unlike the window: SSR's ray march
+            // is noisy per frame, and a single-frame shot (no TAA history to
+            // average it) kept that noise as speckle on glossy and metal
+            // parts, plus smeared reflections that read as geometry (dark
+            // columns under typewriter keys). The studio environment still
+            // gives glossy parts their reflections. Deferred like the window
+            // camera (SSR used to imply this), so materials shade the same.
+            bevy::core_pipeline::prepass::DeferredPrepass,
             AmbientLight {
                 brightness: 40.0,
                 ..default()
@@ -309,12 +316,16 @@ pub(crate) fn agent_view_projection(
     }
 }
 
-/// Takes one pending agent shot per frame: repositions the offscreen camera,
-/// resizes the target image, then requests the capture. One per frame so each
-/// capture is guaranteed to show its own view.
 /// Frames to wait after the environment light appears before shooting.
 const ENV_WARM_FRAMES: u32 = 4;
 
+/// Takes pending agent shots one at a time: repositions the offscreen
+/// camera, resizes the target image, then requests the capture. The next
+/// shot waits until that capture has landed and its observer has restored
+/// the rig (studio lights, environment, layers), so a view is never aimed
+/// while the previous one's `lighting: "scene"` or `ids` setup is live, and
+/// a scene-lit shot never records already-dimmed lights as the ones to
+/// restore.
 pub(crate) fn process_agent_shot(
     mut agent_shots: ResMut<PendingAgentShots>,
     mut rig: ResMut<AgentRig>,
@@ -326,6 +337,7 @@ pub(crate) fn process_agent_shot(
     modeler: Res<Modeler>,
     env_ready: Query<(), (With<AgentCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
+    capturing: Local<Arc<AtomicBool>>,
     mut studio: Query<(Entity, &mut DirectionalLight), With<StudioLight>>,
     mut env: Query<(&mut bevy::light::EnvironmentMapLight, &mut AmbientLight), With<AgentCamera>>,
     mut commands: Commands,
@@ -341,6 +353,9 @@ pub(crate) fn process_agent_shot(
         warm.0 = warm.0.saturating_add(1);
     }
     if warm.0 < ENV_WARM_FRAMES && warm.1 < 120 {
+        return;
+    }
+    if capturing.load(Ordering::Acquire) {
         return;
     }
     let Some((view, width, height, focus, style, reply)) = agent_shots.0.pop() else {
@@ -468,6 +483,9 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
+    let ids = style.ids;
+    let capturing = Arc::clone(&capturing);
+    capturing.store(true, Ordering::Release);
     commands
         .spawn(Screenshot::image(image_handle))
         .observe(
@@ -492,11 +510,12 @@ pub(crate) fn process_agent_shot(
                 for e in &stand_ins {
                     commands.entity(*e).despawn();
                 }
-                if !stand_ins.is_empty() {
+                if ids {
                     commands
                         .entity(camera_entity)
                         .insert(RenderLayers::layer(0));
                 }
+                capturing.store(false, Ordering::Release);
                 if let Ok(mut s) = slot.lock()
                     && let Some(reply) = s.take()
                 {

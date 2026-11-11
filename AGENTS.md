@@ -314,8 +314,12 @@ name: the producer first, then in-place material/visibility/transform edits).
   - Both the window and agent cameras are lit by a procedural photo
     studio (`src/material/env.rs`: soft boxes over a grey cyclorama, filtered
     on the GPU as an environment light), so glossy and metal parts show real
-    reflections, and screen-space reflections (deferred rendering, MSAA
-    off; TAA on the window camera, SMAA on agent views) so glossy parts also mirror the parts around them.
+    reflections. The window camera adds screen-space reflections (deferred
+    rendering, MSAA off, TAA averaging SSR's per-frame noise) so glossy
+    parts also mirror the parts around them. Agent views have no SSR: a
+    single-frame shot kept its noise as speckle on glossy/metal parts and
+    its smears read as geometry. They are deferred too, single-frame with
+    SMAA, so shots are deterministic (an unchanged view `diff`s to 0%).
     Agent views add SSAO contact shading; the window does not (SSAO froze
     its presentation on Metal, and so does a forward window camera over the
     deferred materials: keep the window camera deferred).
