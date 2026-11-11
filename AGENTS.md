@@ -79,9 +79,9 @@ type, so there is no need to memorise field names.
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
 | `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
-| `hide_part` / `show_part` | part |
+| `hide_part` / `show_part` | part (a trailing `*` matches a prefix: `"cut*"` hides every cutter) |
 | `rename` | part, to |
-| `delete` | name (an op output, or a baked part) |
+| `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `uvs` | part, projection (box / planar / cylindrical / spherical) |
 
@@ -161,7 +161,8 @@ type, so there is no need to memorise field names.
   captured when the item is applied; re-issue it after re-saving the prefab.
 - **`expect`** runs checks after the batch in the same call (fields as for
   `verify`); any failure makes the call an error, but the batch stays applied.
-- The result ends with a **brief summary**: part/op counts, bounds, the
+- The result lists only notable items (routine `ok` lines become
+  "applied N item(s)") and ends with a **brief summary**: part/op counts, bounds, the
   parts this call added (`+`), changed (`~`) and removed (`-`), and every
   warning. Pass `summary: "full"` (or call `scene_summary`) for the whole
   part list; structured clients always get the full summary as JSON
@@ -227,7 +228,8 @@ name: the producer first, then in-place material/visibility/transform edits).
     reports per part the area, outlines, holes and thinnest wall, plus an
     image of the cut (y = plan, z = front, x = side). Shows hidden
     interiors no outside view can: wall thickness, handles poking inside.
-  - `mass: {density?: {part: kg/m3}, default_density?}`: per-part and total
+  - `mass: {parts?, density?: {part: kg/m3}, default_density?}` (`parts`
+    weighs one object of a scene, `*` globs, on its own footprint): per-part and total
     mass, centre of mass, the footprint, and whether it tips over (with the
     tilt it tolerates). Default density 1000.
 - `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,

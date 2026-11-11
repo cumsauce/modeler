@@ -432,6 +432,11 @@ pub fn lints(model: &Model) -> Vec<String> {
             world_signed_volume(po),
         );
         let tol = (va.abs().max(vb.abs()).max(vo.abs()) * 1e-3).max(1e-15);
+        // "No overlap" must see a small part sunk a few mm into a big one
+        // (a handle into a pot): scale with the smaller input, above f32 noise.
+        let sum_tol = (va.abs().min(vb.abs()) * 1e-4)
+            .max(va.abs().max(vb.abs()) * 1e-6)
+            .max(1e-15);
         match kind.as_str() {
             "difference" => {
                 if vo > va - tol {
@@ -448,7 +453,7 @@ pub fn lints(model: &Model) -> Vec<String> {
                         "union `{name}` is smaller than its larger input ({}) — inverted or torn result",
                         fmt_vol(vo)
                     ));
-                } else if (vo - (va + vb)).abs() <= tol && !is_cutter(&model.ops, out_name) {
+                } else if (vo - (va + vb)).abs() <= sum_tol && !is_cutter(&model.ops, out_name) {
                     out.push(format!(
                         "union `{name}` volume is exactly `{a}` + `{b}` ({}) — the inputs have no overlap",
                         fmt_vol(vo)

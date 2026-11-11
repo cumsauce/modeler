@@ -470,11 +470,30 @@ pub fn mass(
     density: &BTreeMap<String, f64>,
     default_density: f64,
 ) -> (String, serde_json::Value) {
+    mass_of(model, None, density, default_density)
+}
+
+/// [`mass`] over just `only` (names, trailing `*` = prefix) when given:
+/// weigh one object of a scene, and judge its own footprint.
+pub fn mass_of(
+    model: &Model,
+    only: Option<&[String]>,
+    density: &BTreeMap<String, f64>,
+    default_density: f64,
+) -> (String, serde_json::Value) {
+    let picked = |p: &Part| {
+        only.is_none_or(|o| {
+            o.iter().any(|n| match n.strip_suffix('*') {
+                Some(pre) => p.name.starts_with(pre),
+                None => &p.name == n,
+            })
+        })
+    };
     let mut text = String::new();
     let (mut total_m, mut total_v, mut com) = (0.0, 0.0, [0.0f64; 3]);
     let mut rows = Vec::new();
     let mut not_solid = Vec::new();
-    for p in visible(model) {
+    for p in visible(model).filter(|p| picked(p)) {
         let (v, c) = volume_centroid(p);
         if v <= 0.0 || crate::verify::open_edge_count(p) > 0 {
             not_solid.push(p.name.clone());
@@ -508,11 +527,16 @@ pub fn mass(
         com[2]
     );
     // Footprint: verts within a hair of the lowest point, convex hull in xz.
-    let (mlo, mhi) = model.bounds().unwrap_or((Vec3::ZERO, Vec3::ZERO));
+    let (mlo, mhi) = visible(model)
+        .filter(|p| picked(p))
+        .map(|p| p.bounds())
+        .fold((Vec3::MAX, Vec3::MIN), |(a, b), (lo, hi)| {
+            (a.min(lo), b.max(hi))
+        });
     let tol = ((mhi - mlo).length() as f64 * 2e-4).max(1e-5);
     let floor = mlo.y as f64;
     let mut pts: Vec<[f64; 2]> = Vec::new();
-    for p in visible(model) {
+    for p in visible(model).filter(|p| picked(p)) {
         for i in 0..p.verts.len() {
             let v = p.world_vert(i);
             if (v.y as f64) <= floor + tol {
@@ -684,5 +708,17 @@ mod tests {
         let (t, j) = mass(&model_of(vec![base, arm]), &dens, 1000.0);
         assert!(!j["stability"]["stable"].as_bool().unwrap_or(true), "{t}");
         assert!(t.contains("TIPS"), "{t}");
+    }
+
+    #[test]
+    fn mass_of_one_object_uses_its_own_footprint() {
+        let base = cube("lamp_base", 0.2, [5.0, 0.1, 0.0]);
+        let mut arm = cube("lamp_arm", 0.2, [5.5, 0.3, 0.0]);
+        arm.scale = [1.0, 1.0, 1.0];
+        let big = cube("table", 2.0, [0.0, 1.0, 0.0]);
+        let m = model_of(vec![base, arm, big]);
+        let (t, j) = mass_of(&m, Some(&["lamp_*".to_string()]), &BTreeMap::new(), 1000.0);
+        assert!(!j["stability"]["stable"].as_bool().unwrap_or(true), "{t}");
+        assert!(!t.contains("`table`"), "{t}");
     }
 }

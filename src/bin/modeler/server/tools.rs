@@ -792,8 +792,9 @@ impl Tools {
                     let _ = png_tx.send(png);
                 }
                 if let Some(m) = mass {
-                    let (t, j) = modeler::inspect::mass(
+                    let (t, j) = modeler::inspect::mass_of(
                         model,
+                        m.parts.as_deref(),
                         &m.density,
                         m.default_density.unwrap_or(1000.0),
                     );

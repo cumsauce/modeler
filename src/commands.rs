@@ -390,7 +390,12 @@ impl Session {
             .iter()
             .enumerate()
             .filter(|&(i, o)| {
+                // In-place edits of the deleted part (hide, material,
+                // transform on itself) go with it.
+                let own_edit = graph::inputs(o) == [graph::output(o).to_string()]
+                    && produced.iter().any(|p| p == graph::output(o));
                 i != idx
+                    && !own_edit
                     && graph::inputs(o)
                         .iter()
                         .any(|inp| produced.iter().any(|p| p == inp))
@@ -404,7 +409,11 @@ impl Session {
             )
             .into());
         }
-        self.model.ops.retain(|o| graph::output(o) != name);
+        self.model.ops.retain(|o| {
+            let own_edit = graph::inputs(o) == [graph::output(o).to_string()]
+                && produced.iter().any(|p| p == graph::output(o));
+            graph::output(o) != name && !own_edit
+        });
         let live: Vec<String> = self.model.ops.iter().map(Self::template_key).collect();
         self.model.templates.retain(|k, _| live.contains(k));
         self.model.refresh()?;
@@ -475,12 +484,24 @@ impl Session {
     ) -> CmdResult {
         let before = self.part_fingerprints();
         let text = self.batch(|s| s.apply_values_inner(params, items))?;
-        let tail = if full {
-            self.summary()
-        } else {
-            self.brief_summary(&before)
+        if full {
+            return Ok(format!("{text}\n{}", self.summary()));
+        }
+        // Brief: routine per-item echoes collapse to a count; anything else
+        // (param lines, notes) stays.
+        let routine = |l: &str| {
+            l.starts_with('#')
+                && (l.ends_with(" ok") || l.ends_with(" hidden") || l.ends_with(" shown"))
         };
-        Ok(format!("{text}\n{tail}"))
+        let n = text.lines().filter(|l| routine(l)).count();
+        let mut kept: Vec<&str> = text.lines().filter(|l| !routine(l)).collect();
+        let applied = format!("applied {n} item(s)");
+        kept.insert(0, &applied);
+        Ok(format!(
+            "{}\n{}",
+            kept.join("\n"),
+            self.brief_summary(&before)
+        ))
     }
 
     /// A content hash per part (geometry, transform, material, visibility),
@@ -731,10 +752,10 @@ impl Session {
                     self.set_uvs(&part, &projection).map_err(fail)?
                 }
                 BatchItem::Hide { part } => self
-                    .set_visible(&part, false)
+                    .set_visible_glob(&part, false)
                     .map_err(|e| format!("batch item #{i} failed: {e}"))?,
                 BatchItem::Show { part } => self
-                    .set_visible(&part, true)
+                    .set_visible_glob(&part, true)
                     .map_err(|e| format!("batch item #{i} failed: {e}"))?,
                 BatchItem::Rename { part, to } => self
                     .rename_part(&part, &to)
@@ -758,6 +779,32 @@ impl Session {
                 .ops
                 .iter()
                 .any(|o| graph::outputs(o).iter().any(|n| n == name))
+    }
+
+    /// [`Self::set_visible`] on one part, or on every part matching a
+    /// trailing-`*` prefix (`"book*"`, `"cut_*"`).
+    pub fn set_visible_glob(&mut self, pattern: &str, visible: bool) -> CmdResult {
+        let Some(prefix) = pattern.strip_suffix('*') else {
+            return self.set_visible(pattern, visible);
+        };
+        let names: Vec<String> = self
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.name.starts_with(prefix) && p.visible != visible)
+            .map(|p| p.name.clone())
+            .collect();
+        if names.is_empty() && !self.model.parts.iter().any(|p| p.name.starts_with(prefix)) {
+            return Err(format!("no part matches `{pattern}`").into());
+        }
+        for n in &names {
+            self.set_visible(n, visible)?;
+        }
+        Ok(format!(
+            "{} part(s) {} by `{pattern}`",
+            names.len(),
+            if visible { "shown" } else { "hidden" }
+        ))
     }
 
     /// Shows or hides a part. Hidden parts stay in the model and keep
@@ -2794,5 +2841,35 @@ mod tests {
             ..Default::default()
         };
         assert!(s.verify(&spec).0);
+    }
+
+    #[test]
+    fn delete_takes_own_edits_and_hide_takes_globs() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let ops: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"type": "primitive", "name": "cut", "kind": "box", "size": 1},
+            {"type": "linear_array", "name": "cut", "input": "cut", "count": 3, "offset": [2, 0, 0]},
+            {"type": "hide_part", "part": "cut*"},
+            {"type": "material", "name": "cut", "color": "#f00"}
+        ]))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let t = s
+            .apply_values_as(None, ops, false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("3 part(s) hidden by `cut*`"), "{t}");
+        assert!(s.model.parts.iter().all(|p| !p.visible));
+        let ops: Vec<serde_json::Value> =
+            serde_json::from_value(serde_json::json!([{"type": "delete", "name": "cut_2"}]))
+                .unwrap_or_else(|e| panic!("{e}"));
+        // cut_2 is an array output, not an op; deleting the source op
+        // with its own hide/material edits must work.
+        let _ = s.apply_values(None, ops);
+        let ops: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"type": "delete", "name": "cut"}
+        ]))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let r = s.apply_values(None, ops);
+        assert!(r.is_err(), "the array still reads `cut`");
     }
 }
