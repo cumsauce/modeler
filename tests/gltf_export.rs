@@ -115,6 +115,22 @@ fn check_gltf(doc: &gltf::Document, bin: &[u8]) {
         }
         let idx_view = indices.view().expect("index buffer view");
         assert!(idx_view.offset() + idx_view.length() <= bin.len());
+
+        // The data itself reads back: positions inside the declared bounds
+        // and indices in range (byteOffsets point at the right bytes).
+        let reader = prim.reader(|_| Some(bin));
+        let read: Vec<[f32; 3]> = reader.read_positions().expect("positions").collect();
+        assert_eq!(read.len(), 8);
+        let (lo, hi) = (y_min - 1e-6, y_max + 1e-6);
+        for p in &read {
+            assert!(
+                (0.0..=1.0).contains(&p[0]) && (0.0..=1.0).contains(&p[2]),
+                "{p:?}"
+            );
+            assert!(p[1] >= lo && p[1] <= hi, "{p:?} outside y {y_min}..{y_max}");
+        }
+        let ix: Vec<u32> = reader.read_indices().expect("indices").into_u32().collect();
+        assert_eq!(ix, vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6]);
     }
 
     // Total buffer byteLength matches what the accessors asked for, summed.
@@ -211,4 +227,73 @@ fn hidden_parts_are_not_exported() {
         std::sync::Arc::make_mut(p).visible = false;
     }
     assert!(modeler::gltf::export_glb(&model, &dir.join("none.glb")).is_err());
+}
+
+#[test]
+fn procedural_materials_export_textures_and_tangents() {
+    let mut s = modeler::commands::Session::default();
+    let nodes = serde_json::json!([
+        {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
+        {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": 0.005},
+        {"type": "math", "name": "h", "op": "mul", "a": "m", "b": 0.004},
+        {"type": "ao_from_height", "name": "ao", "height": "h", "radius": 0.01},
+        {"type": "output", "name": "out", "base_color": "m", "height": "h", "ao": "ao"}
+    ]);
+    s.materials
+        .ops(
+            "bricks",
+            nodes.as_array().unwrap().clone(),
+            None,
+            None,
+            None,
+            Some(64),
+            None,
+        )
+        .unwrap();
+    let items = serde_json::json!([
+        {"type": "primitive", "name": "a", "kind": "box", "size": [1, 1, 1], "translation": [0, 0.5, 0]},
+        {"type": "primitive", "name": "b", "kind": "box", "size": [1, 1, 1], "translation": [2, 0.5, 0]},
+        {"type": "material", "name": "a", "pbr": "bricks"},
+        {"type": "material", "name": "b", "pbr": "bricks"}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    let dir = temp_dir("pbr");
+    let path = dir.join("bricks.glb");
+    modeler::gltf::export_glb(&s.model, &path).unwrap();
+    let (doc, buffers, images) = gltf::import(&path).expect("glb imports with its images");
+    // One shared texture set (base, metal-rough, normal, occlusion) for both parts.
+    assert_eq!(images.len(), 4);
+    assert!(images.iter().all(|i| i.width == 64 && i.height == 64));
+    for mesh in doc.meshes() {
+        let prim = mesh.primitives().next().unwrap();
+        let m = prim.material();
+        assert!(m.pbr_metallic_roughness().base_color_texture().is_some());
+        assert!(
+            m.pbr_metallic_roughness()
+                .metallic_roughness_texture()
+                .is_some()
+        );
+        assert!(m.normal_texture().is_some());
+        assert!(m.occlusion_texture().is_some());
+        let reader = prim.reader(|b| Some(&buffers[b.index()]));
+        let tangents: Vec<[f32; 4]> = reader.read_tangents().expect("TANGENT").collect();
+        let normals: Vec<[f32; 3]> = reader.read_normals().unwrap().collect();
+        assert_eq!(tangents.len(), normals.len());
+        for (t, n) in tangents.iter().zip(&normals) {
+            let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-3, "unit tangent {t:?}");
+            assert!(
+                (t[0] * n[0] + t[1] * n[1] + t[2] * n[2]).abs() < 1e-3,
+                "tangent ⟂ normal"
+            );
+            assert!(t[3] == 1.0 || t[3] == -1.0);
+        }
+        // Metric uvs over the default 1 m tile: a 1 m face spans one repeat.
+        let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0).unwrap().into_f32().collect();
+        let span = uvs
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), u| (a.min(u[0]), b.max(u[0])));
+        assert!((span.1 - span.0 - 1.0).abs() < 1e-4, "{span:?}");
+    }
 }
