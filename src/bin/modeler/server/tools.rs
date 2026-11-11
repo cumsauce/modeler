@@ -23,10 +23,37 @@ impl Tools {
         &self,
         f: impl FnOnce(&mut Session) -> CmdResult + Send + 'static,
     ) -> Result<CallToolResult, ErrorData> {
+        self.run_json(move |s| f(s).map(|t| (t, None)).map_err(|e| (e, None)))
+            .await
+    }
+
+    /// Like [`Self::run`], but the closure may also return structured JSON,
+    /// sent as the result's `structuredContent` next to the text (on success
+    /// and on failure), so clients need not parse the prose.
+    async fn run_json(
+        &self,
+        f: impl FnOnce(
+            &mut Session,
+        ) -> Result<
+            (String, Option<serde_json::Value>),
+            (modeler::ModelerError, Option<serde_json::Value>),
+        > + Send
+        + 'static,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (json_tx, json_rx) = std::sync::mpsc::channel();
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = Cmd::Exec(Box::new(move |session: &mut Session| {
             let before = session.persist_fingerprint();
-            let reply = f(session);
+            let reply = match f(session) {
+                Ok((text, json)) => {
+                    let _ = json_tx.send(json);
+                    Ok(text)
+                }
+                Err((e, json)) => {
+                    let _ = json_tx.send(json);
+                    Err(e)
+                }
+            };
             // Autosave after every mutation so unnamed WIP survives a restart
             // (also when a batch fails midway: its earlier items stay applied);
             // read-only calls leave the fingerprint alone and skip the write.
@@ -42,9 +69,15 @@ impl Tools {
             .send(cmd)
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        match reply_rx.await {
-            Ok(Ok(text)) => Ok(ok_result(text)),
-            Ok(Err(message)) => Ok(err_result(message.to_string())),
+        let reply = reply_rx.await;
+        let json = json_rx.try_recv().ok().flatten();
+        let with_json = |mut r: CallToolResult| {
+            r.structured_content = json.clone();
+            r
+        };
+        match reply {
+            Ok(Ok(text)) => Ok(with_json(ok_result(text))),
+            Ok(Err(message)) => Ok(with_json(err_result(message.to_string()))),
             Err(_) => Err(ErrorData::internal_error(
                 "preview app dropped the reply",
                 None,
@@ -128,7 +161,8 @@ impl Tools {
     /// Call this first (and after any confusing result) to ground yourself in the model.
     #[tool]
     async fn scene_summary(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| Ok(s.summary())).await
+        self.run_json(|s| Ok((s.summary(), Some(s.summary_json()))))
+            .await
     }
 
     /// Export the current model as glTF. Pass format "gltf" for a JSON .gltf or "glb"
@@ -296,6 +330,41 @@ impl Tools {
         self.run(move |s| s.describe_op(&name)).await
     }
 
+    /// What changed between two history nodes (default `to`: the live model):
+    /// ops added (+), removed (-) and changed (~, with the old parameters),
+    /// plus parameter changes. Use after `jump` to see what the other branch had.
+    #[tool]
+    async fn diff(
+        &self,
+        Parameters(DiffArgs { from, to }): Parameters<DiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.diff(from, to)).await
+    }
+
+    /// Re-apply ops from another history node onto the live model: all ops
+    /// there that are new or different, or just `ops` by name. The way back
+    /// after a jump: no need to re-issue the abandoned branch's ops by hand.
+    #[tool]
+    async fn cherry_pick(
+        &self,
+        Parameters(CherryPickArgs { from, ops }): Parameters<CherryPickArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| s.cherry_pick(from, ops)).await
+    }
+
+    /// An example payload and the JSON schema for one apply_ops item type, or
+    /// (no kind) every type with an example. Cheaper than guessing field names.
+    #[tool]
+    async fn describe_op(
+        &self,
+        Parameters(DescribeOpArgs { kind }): Parameters<DescribeOpArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(match modeler::spec::describe_type(kind.as_deref()) {
+            Ok(t) => ok_result(t),
+            Err(e) => err_result(e),
+        })
+    }
+
     /// Replace the session with a fresh empty model. The old model stays one
     /// undo away (recorded in the history tree), so this is the clean way to
     /// start the next model without restarting the server.
@@ -324,16 +393,33 @@ impl Tools {
             expect,
         }): Parameters<ApplyOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| {
-            let text = s.apply_values(params, ops)?;
-            let Some(spec) = expect else {
-                return Ok(text);
+        self.run_json(move |s| {
+            let text = match s.apply_values(params, ops) {
+                Ok(t) => t,
+                Err(e) => {
+                    let json = serde_json::json!({"ok": false, "error": e.to_string(), "summary": s.summary_json()});
+                    return Err((e, Some(json)));
+                }
             };
-            let (ok, report) = s.verify(&spec);
+            let Some(spec) = expect else {
+                let json = serde_json::json!({"ok": true, "summary": s.summary_json()});
+                return Ok((text, Some(json)));
+            };
+            let checks = s.verify_checks(&spec);
+            let ok = checks.iter().all(|c| c.1);
+            let json = serde_json::json!({
+                "ok": ok,
+                "checks": Session::checks_json(&checks),
+                "summary": s.summary_json(),
+            });
+            let (_, report) = s.verify(&spec);
             if ok {
-                Ok(format!("{text}\nexpect: all passed\n{report}"))
+                Ok((format!("{text}\nexpect: all passed\n{report}"), Some(json)))
             } else {
-                Err(format!("expect FAILED (the batch was applied)\n{report}\n\n{text}").into())
+                Err((
+                    format!("expect FAILED (the batch was applied)\n{report}\n\n{text}").into(),
+                    Some(json),
+                ))
             }
         })
         .await
@@ -349,9 +435,16 @@ impl Tools {
         &self,
         Parameters(spec): Parameters<modeler::commands::VerifySpec>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| {
-            let (ok, report) = s.verify(&spec);
-            if ok { Ok(report) } else { Err(report.into()) }
+        self.run_json(move |s| {
+            let checks = s.verify_checks(&spec);
+            let ok = checks.iter().all(|c| c.1);
+            let json = serde_json::json!({"ok": ok, "checks": Session::checks_json(&checks)});
+            let (_, report) = s.verify(&spec);
+            if ok {
+                Ok((report, Some(json)))
+            } else {
+                Err((report.into(), Some(json)))
+            }
         })
         .await
     }

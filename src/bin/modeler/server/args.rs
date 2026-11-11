@@ -141,6 +141,33 @@ pub(crate) struct ProbeRayArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct DiffArgs {
+    /// History node id to compare from.
+    pub(crate) from: usize,
+    /// History node id to compare to; default the live model.
+    #[serde(default)]
+    pub(crate) to: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct CherryPickArgs {
+    /// History node to take ops from (e.g. the tip of a branch you jumped away from).
+    pub(crate) from: usize,
+    /// Only these op output names; default every op there that is new or
+    /// different from the live graph.
+    #[serde(default)]
+    pub(crate) ops: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct DescribeOpArgs {
+    /// An apply_ops item type (primitive, transform, ...); omit to list all
+    /// types with an example each.
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct HistoryPruneArgs {
     /// How many of the newest snapshots to keep (cursor, root and branch
     /// points are always kept as well).

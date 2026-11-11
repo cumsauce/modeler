@@ -16,12 +16,15 @@ Client (connects to the daemon, or spawns a throwaway server):
     mcp_driver.py --calls calls.json ...          # throwaway mode, as before
 Image options: --save-shot PATH (first image to PATH, extras PATH_2...),
 --save-dir DIR (every image, numbered), --b64 (also print base64; off by default).
+--json: when a tool returns structured content (scene_summary, apply_ops,
+verify), print it as "json" and drop the prose "text" (structured content is
+always included as "json"; --json only removes the duplicate prose).
 Calls JSON: [{"name": "...", "args": {...}}, ...]
 Without --calls in client/throwaway mode, reads calls line-by-line on stdin;
 "quit" in daemon mode stops the daemon.
 
-Results print as JSON lines: {"ok":..., "text": [...], "n_images": ...,
-"saved_shot": path}.
+Results print as JSON lines: {"ok":..., "text": [...], "json": {...}?,
+"n_images": ..., "saved_shot": path}.
 """
 import json, subprocess, sys, base64, os, socket, threading
 
@@ -88,6 +91,8 @@ class ModelerSession:
                     images.append(c)
             out = {"ok": not result.get("isError", False), "text": texts,
                    "n_images": len(images)}
+            if result.get("structuredContent") is not None:
+                out["json"] = result["structuredContent"]
             if images:
                 if b64:  # opt-in: the base64 blobs drown the useful output
                     out["images_b64"] = [i.get("data", "") for i in images]
@@ -121,13 +126,21 @@ class ModelerSession:
         self.proc.terminate()
 
 
-def run_calls(session, calls, save_shot=None, save_dir=None, b64=False):
+def trim(out, json_only):
+    """--json: drop the prose when structured content is present."""
+    if json_only and "json" in out:
+        out = dict(out)
+        out.pop("text", None)
+    return out
+
+
+def run_calls(session, calls, save_shot=None, save_dir=None, b64=False, json_only=False):
     for c in calls:
         if isinstance(c, str):
             print(json.dumps({"ok": True, "text": [c], "n_images": 0}), flush=True)
             continue
-        print(json.dumps(session.call(c["name"], c.get("args", {}), save_shot, save_dir, b64)),
-              flush=True)
+        out = session.call(c["name"], c.get("args", {}), save_shot, save_dir, b64)
+        print(json.dumps(trim(out, json_only)), flush=True)
 
 
 def daemon_mode(socket_path, windowed):
@@ -169,7 +182,7 @@ def daemon_mode(socket_path, windowed):
             os.unlink(socket_path)
 
 
-def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False):
+def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, json_only=False):
     calls = json.load(open(calls_path)) if calls_path != "/dev/stdin" else json.load(sys.stdin)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(socket_path)
@@ -184,7 +197,11 @@ def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False):
             if b64:
                 payload["b64"] = True
             s.sendall((json.dumps(payload) + "\n").encode())
-            print(f.readline().strip(), flush=True)
+            line = f.readline().strip()
+            try:
+                print(json.dumps(trim(json.loads(line), json_only)), flush=True)
+            except ValueError:
+                print(line, flush=True)
 
 
 def main():
@@ -202,6 +219,7 @@ def main():
     if "--save-dir" in argv:
         save_dir = argv[argv.index("--save-dir") + 1]
     b64 = "--b64" in argv
+    json_only = "--json" in argv
     calls_path = None
     if "--calls" in argv:
         calls_path = argv[argv.index("--calls") + 1]
@@ -209,22 +227,23 @@ def main():
     if daemon:
         daemon_mode(socket_path, windowed)
     elif connect:
-        client_mode(socket_path, calls_path, save_shot, save_dir, b64)
+        client_mode(socket_path, calls_path, save_shot, save_dir, b64, json_only)
     else:
         # Throwaway mode: own server, dies with this invocation.
         session = ModelerSession(windowed=windowed)
         print(json.dumps({"tools": session.tool_names()}), flush=True)
         try:
             if calls_path:
-                run_calls(session, json.load(open(calls_path)), save_shot, save_dir, b64)
+                run_calls(session, json.load(open(calls_path)), save_shot, save_dir, b64,
+                          json_only)
             else:
                 for line in sys.stdin:
                     line = line.strip()
                     if not line or line == "quit":
                         break
                     c = json.loads(line)
-                    print(json.dumps(session.call(c["name"], c.get("args", {}),
-                                                  save_shot, save_dir, b64)), flush=True)
+                    out = session.call(c["name"], c.get("args", {}), save_shot, save_dir, b64)
+                    print(json.dumps(trim(out, json_only)), flush=True)
         finally:
             session.close()
 

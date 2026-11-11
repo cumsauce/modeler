@@ -624,6 +624,89 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
     })
 }
 
+/// A ready-to-send example item for each type, for `describe_op`.
+pub fn example(ty: &str) -> Option<Value> {
+    use serde_json::json;
+    Some(match ty {
+        "primitive" => {
+            json!({"type": "primitive", "name": "leg", "kind": "cylinder", "size": {"radius": 0.05, "height": 0.8}, "translation": [0.4, 0.4, 0.3]})
+        }
+        "transform" => {
+            json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
+        }
+        "boolean" => {
+            json!({"type": "boolean", "name": "wall_cut", "op": "difference", "a": "wall", "b": "door_cutter"})
+        }
+        "radial_array" => {
+            json!({"type": "radial_array", "name": "spokes", "input": "spoke", "count": 6, "axis": "z", "center": [0, 1, 0]})
+        }
+        "linear_array" => {
+            json!({"type": "linear_array", "name": "posts", "input": "post", "count": 9, "offset": [1, 0, 0]})
+        }
+        "mirror" => {
+            json!({"type": "mirror", "name": "arm_r", "input": "arm", "axis": "x", "offset": [0, 0, 0]})
+        }
+        "material" => {
+            json!({"type": "material", "name": "leg", "color": "#8b5a2b", "roughness": 0.8})
+        }
+        "hide_part" => json!({"type": "hide_part", "part": "door_cutter"}),
+        "show_part" => json!({"type": "show_part", "part": "door_cutter"}),
+        "rename" => json!({"type": "rename", "part": "wall_cut", "to": "wall"}),
+        "delete" => json!({"type": "delete", "name": "leg_raised"}),
+        "tri_mesh" => {
+            json!({"type": "tri_mesh", "name": "tri", "verts": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "indices": [0, 1, 2]})
+        }
+        "uvs" => json!({"type": "uvs", "part": "wall", "projection": "box"}),
+        "prefab" => {
+            json!({"type": "prefab", "name": "lamp1", "prefab": "lamp", "translation": [2, 0, 0]})
+        }
+        _ => return None,
+    })
+}
+
+/// `describe_op`: with a type, its example and JSON schema; without, one
+/// example line per type.
+pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
+    let Some(ty) = ty else {
+        let mut out = vec![
+            "apply_ops item types (describe_op with a kind for its full schema). Values may be \"$param\" or \"=expr\".".to_string(),
+        ];
+        for t in OP_TYPES {
+            if let Some(e) = example(t) {
+                out.push(format!("- {t}: {e}"));
+            }
+        }
+        return Ok(out.join("\n"));
+    };
+    let schema = match ty {
+        "primitive" => schemars::schema_for!(PrimitiveSpec),
+        "transform" => schemars::schema_for!(TransformSpec),
+        "boolean" => schemars::schema_for!(BooleanSpec),
+        "radial_array" => schemars::schema_for!(RadialArraySpec),
+        "linear_array" => schemars::schema_for!(LinearArraySpec),
+        "mirror" => schemars::schema_for!(MirrorSpec),
+        "material" => schemars::schema_for!(MaterialSpec),
+        "hide_part" | "show_part" => schemars::schema_for!(PartSpec),
+        "rename" => schemars::schema_for!(RenameSpec),
+        "delete" => schemars::schema_for!(DeleteSpec),
+        "tri_mesh" => schemars::schema_for!(TriMeshSpec),
+        "uvs" => schemars::schema_for!(UvsSpec),
+        "prefab" => schemars::schema_for!(PrefabSpec),
+        other => {
+            return Err(format!(
+                "unknown item type `{other}` (one of: {})",
+                OP_TYPES.join(", ")
+            ));
+        }
+    };
+    let example = example(ty).unwrap_or(Value::Null);
+    Ok(format!(
+        "example:\n{}\n\nschema (plus \"type\": \"{ty}\"):\n{}",
+        serde_json::to_string_pretty(&example).unwrap_or_default(),
+        serde_json::to_string_pretty(&schema).unwrap_or_default()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +783,18 @@ mod tests {
             panic!("radial should parse");
         };
         assert!(include_source);
+    }
+
+    #[test]
+    fn every_type_has_a_parseable_example() {
+        for t in OP_TYPES {
+            let e = example(t).unwrap_or_else(|| panic!("no example for {t}"));
+            if *t == "prefab" {
+                continue; // needs a catalog entry
+            }
+            parse_item(0, &e).unwrap_or_else(|err| panic!("{t}: {err}"));
+            describe_type(Some(t)).unwrap_or_else(|err| panic!("{t}: {err}"));
+        }
+        assert!(describe_type(None).is_ok_and(|s| s.contains("radial_array")));
     }
 }
