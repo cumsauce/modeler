@@ -4300,6 +4300,48 @@ mod tests {
     }
 
     #[test]
+    fn deform_reads_params_and_rederives() {
+        use serde_json::json;
+        let mut s = Session::default();
+        s.apply_values(
+            Some([("bend".to_string(), 30.0)].into()),
+            vec![
+                json!({"type": "primitive", "name": "horn_raw", "kind": "cylinder",
+                       "size": [0.05, 0.6], "translation": [0, 0.3, 0]}),
+                json!({"type": "deform", "name": "horn_t", "input": "horn_raw",
+                       "mode": "taper", "scale_end": 0.1}),
+                json!({"type": "deform", "name": "horn", "input": "horn_t",
+                       "mode": "bend", "degrees": "$bend", "toward": "-z"}),
+                json!({"type": "hide_part", "part": "horn_*"}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let depth = |s: &Session| {
+            let (lo, _) = s
+                .model
+                .part("horn")
+                .unwrap_or_else(|| panic!("horn"))
+                .bounds();
+            -lo.z
+        };
+        let before = depth(&s);
+        let out = s
+            .apply_values(Some([("bend".to_string(), 120.0)].into()), vec![])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(out.contains("re-derived 1 op(s)"), "{out}");
+        assert!(depth(&s) > before + 0.1, "{before} -> {}", depth(&s));
+        let horn = s.model.part("horn").unwrap_or_else(|| panic!("horn"));
+        assert_eq!(crate::verify::open_edge_count(horn), 0);
+        let Err(e) = s.apply_values(
+            None,
+            vec![json!({"type": "deform", "name": "x", "input": "horn", "mode": "melt"})],
+        ) else {
+            panic!("bad mode should fail");
+        };
+        assert!(e.to_string().contains("mode"), "{e}");
+    }
+
+    #[test]
     fn diff_and_cherry_pick_recover_a_branch() {
         use serde_json::json;
         let mut s = Session::default();

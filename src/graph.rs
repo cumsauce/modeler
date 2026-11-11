@@ -639,6 +639,11 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::csg::round(name, &src, mode, *radius, *segments)?;
             upsert(named, name, part);
         }
+        Op::Deform { name, input, def } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::deform::deform(name, &src, def)?;
+            upsert(named, name, part);
+        }
         Op::Shell {
             name,
             input,
@@ -1037,6 +1042,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Hull { name, .. }
         | Op::LSystem { name, .. }
         | Op::Round { name, .. }
+        | Op::Deform { name, .. }
         | Op::Shell { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
@@ -1095,6 +1101,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Hull { .. } => "hull",
         Op::LSystem { .. } => "lsystem",
         Op::Round { .. } => "round",
+        Op::Deform { .. } => "deform",
         Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
@@ -1135,6 +1142,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
             inputs.iter().map(String::as_str).collect()
         }
         Op::Round { input, .. } => vec![input],
+        Op::Deform { input, .. } => vec![input],
         Op::Shell { input, .. } => vec![input],
         Op::Primitive {
             frame: Some(frame), ..
@@ -1349,6 +1357,9 @@ pub fn describe(ops: &[Op]) -> String {
             } => format!(
                 "#{i} round `{name}` <- `{input}` {mode} radius={radius} segments={segments}"
             ),
+            Op::Deform { name, input, def } => {
+                format!("#{i} deform `{name}` <- `{input}` {}", def.summary())
+            }
             Op::Shell {
                 name,
                 input,
