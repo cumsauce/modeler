@@ -9,6 +9,18 @@ pub(crate) struct Orbit {
     pub(crate) dist: f32,
     pub(crate) target: Vec3,
     pub(crate) user: bool,
+    /// Half the model's bounding diagonal: a floor for pan speed, so panning
+    /// stays useful after zooming in close on a large scene.
+    pub(crate) scene_radius: f32,
+}
+
+/// Wheel / trackpad scroll in "lines": macOS trackpads report pixels (dozens
+/// per gesture frame), mouse wheels report lines.
+pub(crate) fn scroll_lines(scroll: &AccumulatedMouseScroll) -> f32 {
+    match scroll.unit {
+        bevy::input::mouse::MouseScrollUnit::Line => scroll.delta.y,
+        bevy::input::mouse::MouseScrollUnit::Pixel => scroll.delta.y / 40.0,
+    }
 }
 
 impl Default for Orbit {
@@ -19,6 +31,7 @@ impl Default for Orbit {
             dist: 6.0,
             target: Vec3::ZERO,
             user: false,
+            scene_radius: 1.0,
         }
     }
 }
@@ -48,9 +61,13 @@ pub(crate) fn orbit_camera(
     mut camera: Query<&mut Transform, With<MainCamera>>,
     panel: Res<GraphPanel>,
 ) {
-    let scroll_y = if panel.hover { 0.0 } else { scroll.delta.y };
+    let scroll_y = if panel.hover {
+        0.0
+    } else {
+        scroll_lines(&scroll)
+    };
     if scroll_y != 0.0 {
-        orbit.dist = (orbit.dist * (1.0 - 0.12 * scroll_y)).clamp(0.2, 200.0);
+        orbit.dist = (orbit.dist * (-0.15 * scroll_y).exp()).clamp(0.2, 200.0);
         orbit.user = true;
     }
     if keys.pressed(KeyCode::PageUp) {
@@ -83,7 +100,7 @@ pub(crate) fn orbit_camera(
                 match button {
                     // Left-drag orbits around the target; click-without-drag pins.
                     MouseButton::Left => {
-                        orbit.yaw -= d.x * 0.01;
+                        orbit.yaw += d.x * 0.01;
                         orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-1.4, 1.4);
                         orbit.user = true;
                     }
@@ -95,7 +112,10 @@ pub(crate) fn orbit_camera(
                         let up = right
                             .cross(-Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p))
                             .normalize();
-                        let s = orbit.dist * 0.0016;
+                        // Grab-style: the target moves with the cursor at the target's
+                        // depth (45° fov), never slower than a fraction of the scene.
+                        let depth = orbit.dist.max(orbit.scene_radius * 0.4);
+                        let s = depth * 0.828 / window.height().max(1.0);
                         orbit.target -= right * (d.x * s);
                         orbit.target += up * (d.y * s);
                         orbit.user = true;

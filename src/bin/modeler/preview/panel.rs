@@ -224,9 +224,10 @@ pub(crate) fn update_graph_hud(
     let cursor = windows.single().ok().and_then(|w| w.cursor_position());
     panel.hover = cursor.is_some_and(|c| c.x < size.x && c.y < size.y);
     if let Some(c) = cursor.filter(|_| panel.hover) {
-        if scroll.delta.y != 0.0 {
+        let lines = scroll_lines(&scroll);
+        if lines != 0.0 {
             let before = (c - origin) / zoom - pan;
-            panel.zoom = (zoom * (1.0 + 0.12 * scroll.delta.y)).clamp(0.1, 4.0);
+            panel.zoom = (zoom * (0.15 * lines).exp()).clamp(0.1, 4.0);
             panel.pan = (c - origin) / panel.zoom - before;
             panel.user_view = true;
         }
@@ -290,6 +291,36 @@ pub(crate) fn update_graph_hud(
         node.left = Val::Px(mid.x - len * 0.5);
         node.top = Val::Px(mid.y - 1.0);
         tf.rotation = Rot2::radians(d.y.atan2(d.x));
+    }
+}
+
+/// With the panel open the 3D view is a separate pane on the right half (not
+/// drawn under the panel), so screenshots of it never include the graph.
+pub(crate) fn graph_pane_viewport(
+    visible: Res<GraphHudVisible>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<&mut Camera, With<MainCamera>>,
+) {
+    let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
+        return;
+    };
+    let want = visible.0.then(|| {
+        let (w, h) = (window.physical_width(), window.physical_height());
+        bevy::camera::Viewport {
+            physical_position: UVec2::new(w / 2, 0),
+            physical_size: UVec2::new((w - w / 2).max(1), h.max(1)),
+            ..default()
+        }
+    });
+    let same = match (&camera.viewport, &want) {
+        (Some(a), Some(b)) => {
+            a.physical_position == b.physical_position && a.physical_size == b.physical_size
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        camera.viewport = want;
     }
 }
 

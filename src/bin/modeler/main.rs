@@ -128,6 +128,7 @@ fn main() -> AppExit {
             update_typing_hud.run_if(windowed),
             update_graph_hud.run_if(windowed),
             highlight_selected.run_if(windowed),
+            graph_pane_viewport.run_if(windowed),
         ),
     );
     if headless {

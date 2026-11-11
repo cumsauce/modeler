@@ -142,6 +142,7 @@ pub(crate) fn rebuild_scene(
     if let Some((min, max)) = modeler.session.model.bounds() {
         orbit.target = (min + max) * 0.5;
         let radius = (max - min).length() * 0.5;
+        orbit.scene_radius = radius.max(0.01);
         orbit.dist = (radius * 2.4).max(1.0);
         // A new model re-frames the view and hands control back to the drift.
         orbit.user = false;
@@ -189,6 +190,17 @@ pub(crate) fn setup_scene(mut commands: Commands) {
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
     // entity does nothing), so faces turned from the sun went black. A dim
     // camera-aligned fill keeps every side readable as the human orbits.
+    // UI gets its own full-window camera, so the 3D camera can be a pane.
+    commands.spawn((
+        Name::new("ui camera"),
+        Camera2d,
+        Camera {
+            order: 1,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        IsDefaultUiCamera,
+    ));
     commands
         .spawn((
             Name::new("camera"),
@@ -249,7 +261,7 @@ pub(crate) fn setup_scene(mut commands: Commands) {
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.05, 0.06, 0.08, 0.88)),
+            BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
         ))
         .with_children(|p| {
             p.spawn((

@@ -324,10 +324,13 @@ fired.
 
 ## Preview window (human side)
 
-Left/middle/right-drag = orbit/pan, scroll = zoom, arrows + PageUp/Down too.
+Left/middle/right-drag = orbit/pan (pan follows the cursor, with a floor so
+large scenes stay quick to pan when zoomed in), scroll = zoom (trackpad pixel
+scroll is scaled to wheel lines), arrows + PageUp/Down too.
 Auto-drift stops once the human steers; a model change re-frames the camera
 around true world bounds (bounds include part transforms). **G** toggles the
-node-graph panel (left half; `MODELER_GRAPH=1` opens it at start). It has one box per
+node-graph pane (left half; the 3D view shrinks to the right half, and `screenshot`
+captures only the 3D pane, never the graph; `MODELER_GRAPH=1` opens it at start). It has one box per
 geometry op, coloured by kind, with edges from each input to its reader. In-place
 edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, and
 a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A

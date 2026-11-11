@@ -61,6 +61,8 @@ pub(crate) fn pin_on_click(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
+    // The cursor is window-relative; the 3D view may be a pane (graph open).
+    let cursor = cursor - camera.logical_viewport_rect().map_or(Vec2::ZERO, |r| r.min);
     let Ok(ray) = camera.viewport_to_world(cam_transform, cursor) else {
         return;
     };
