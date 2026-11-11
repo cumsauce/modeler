@@ -27,10 +27,10 @@ impl Tools {
         let cmd = Cmd::Exec(Box::new(move |session: &mut Session| {
             let before = session.persist_fingerprint();
             let reply = f(session);
-            // Autosave after every mutation so unnamed WIP survives a restart;
+            // Autosave after every mutation so unnamed WIP survives a restart
+            // (also when a batch fails midway: its earlier items stay applied);
             // read-only calls leave the fingerprint alone and skip the write.
-            if reply.is_ok()
-                && session.persist_fingerprint() != before
+            if session.persist_fingerprint() != before
                 && let Err(e) = catalog::save_session_state(&session.model)
             {
                 eprintln!("session autosave failed: {e}");
@@ -129,113 +129,6 @@ impl Tools {
     #[tool]
     async fn scene_summary(&self) -> Result<CallToolResult, ErrorData> {
         self.run(|s| Ok(s.summary())).await
-    }
-
-    /// Add a named primitive part (box, sphere, cylinder, ...) with a size and a
-    /// translation. The fastest way to block out a shape: add a few primitives, then
-    /// refine with boolean ops.
-    #[tool]
-    async fn add_primitive(
-        &self,
-        Parameters(AddPrimitiveArgs {
-            kind,
-            size,
-            translation,
-            name,
-        }): Parameters<AddPrimitiveArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.add_primitive(kind, size, translation, &name))
-            .await
-    }
-
-    /// Add a part from raw triangle data: vertex positions and triangle indices, with
-    /// optional normals and UVs (both are computed for you when omitted: auto normals
-    /// and box projection). Use for shapes primitives and booleans cannot make.
-    #[tool]
-    async fn add_tri_mesh(
-        &self,
-        Parameters(AddTriMeshArgs {
-            name,
-            verts,
-            indices,
-            normals,
-            uvs,
-        }): Parameters<AddTriMeshArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.add_tri_mesh(&name, verts, indices, normals, uvs))
-            .await
-    }
-
-    /// Boolean-combine two parts: "union" glues a and b, "difference" subtracts b from a
-    /// (holes, cutouts), "intersection" keeps only the overlap. Both input parts are
-    /// consumed and replaced by the result, optionally named.
-    #[tool]
-    async fn boolean(
-        &self,
-        Parameters(BooleanArgs { op, a, b, name }): Parameters<BooleanArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.boolean(op, &a, &b, name.as_deref()))
-            .await
-    }
-
-    /// Move, rotate (quaternion [x, y, z, w]) or scale one part. Fields left out stay
-    /// as they are, so you can nudge just the translation.
-    #[tool]
-    async fn transform_part(
-        &self,
-        Parameters(TransformPartArgs {
-            part,
-            translation,
-            rotation,
-            scale,
-        }): Parameters<TransformPartArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.transform_part(&part, translation, rotation, scale))
-            .await
-    }
-
-    /// Delete a part by name.
-    #[tool]
-    async fn delete_part(
-        &self,
-        Parameters(PartArgs { part }): Parameters<PartArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.delete_part(&part)).await
-    }
-
-    /// Rename a part. Pick descriptive names; parts are addressed by name everywhere.
-    #[tool]
-    async fn rename_part(
-        &self,
-        Parameters(RenamePartArgs { part, to }): Parameters<RenamePartArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.rename_part(&part, &to)).await
-    }
-
-    /// Set a part's material: base colour [r, g, b, a], roughness and metalness. Any
-    /// field left out keeps its current value.
-    #[tool]
-    async fn set_material(
-        &self,
-        Parameters(SetMaterialArgs {
-            part,
-            base_color,
-            roughness,
-            metalness,
-        }): Parameters<SetMaterialArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.set_material(&part, base_color, roughness, metalness))
-            .await
-    }
-
-    /// Re-project a part's UVs with a named projection (e.g. "box", "planar").
-    /// Use after reshaping a part when textures or exports need clean UVs.
-    #[tool]
-    async fn set_uvs(
-        &self,
-        Parameters(SetUvsArgs { part, projection }): Parameters<SetUvsArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.set_uvs(&part, &projection)).await
     }
 
     /// Export the current model as glTF. Pass format "gltf" for a JSON .gltf or "glb"
@@ -386,137 +279,6 @@ impl Tools {
         self.run(move |s| s.jump(id)).await
     }
 
-    /// Add a primitive as a procedural graph step (upsert by output name —
-    /// re-issuing an op with the same `name` replaces it, which is how you
-    /// tweak a parameter). Prefer ops over baked parts: the graph re-derives.
-    #[tool]
-    async fn op_primitive(
-        &self,
-        Parameters(OpPrimitiveArgs {
-            name,
-            kind,
-            size,
-            translation,
-            rotation,
-        }): Parameters<OpPrimitiveArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_primitive(&name, kind, size, translation, rotation))
-            .await
-    }
-
-    /// Place/rotate/scale an earlier part into a new output as a graph step.
-    #[tool]
-    async fn op_transform(
-        &self,
-        Parameters(OpTransformArgs {
-            name,
-            input,
-            translation,
-            rotation,
-            scale,
-        }): Parameters<OpTransformArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_transform(&name, &input, translation, rotation, scale))
-            .await
-    }
-
-    /// Boolean-combine two earlier parts as a graph step.
-    #[tool]
-    async fn op_boolean(
-        &self,
-        Parameters(OpBooleanArgs { name, op, a, b }): Parameters<OpBooleanArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_boolean(&name, op, &a, &b)).await
-    }
-
-    /// Copy an earlier part around a circle: `count` copies over `degrees`.
-    /// Outputs are named name_0 .. name_{count-1}.
-    #[tool]
-    async fn op_radial_array(
-        &self,
-        Parameters(OpRadialArrayArgs {
-            name,
-            input,
-            count,
-            center,
-            degrees,
-            start_degrees,
-            axis,
-            include_source,
-        }): Parameters<OpRadialArrayArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| {
-            s.op_radial_array(
-                &name,
-                &input,
-                count,
-                center,
-                degrees,
-                start_degrees,
-                axis,
-                include_source,
-            )
-        })
-        .await
-    }
-
-    /// Re-material an earlier part as a graph step.
-    #[tool]
-    async fn op_material(
-        &self,
-        Parameters(OpMaterialArgs {
-            name,
-            input,
-            base_color,
-            roughness,
-            metalness,
-        }): Parameters<OpMaterialArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_material(&name, &input, base_color, roughness, metalness))
-            .await
-    }
-
-    /// Copy an earlier part in a straight line as a graph step. The source
-    /// counts as copy 0; outputs are name_1 .. name_{count-1}.
-    #[tool]
-    async fn op_linear_array(
-        &self,
-        Parameters(OpLinearArrayArgs {
-            name,
-            input,
-            count,
-            offset,
-        }): Parameters<OpLinearArrayArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_linear_array(&name, &input, count, offset))
-            .await
-    }
-
-    /// Mirror an earlier part across a plane as a graph step. The mesh is
-    /// baked (verts reflected, winding flipped), so it renders correctly.
-    #[tool]
-    async fn op_mirror(
-        &self,
-        Parameters(OpMirrorArgs {
-            name,
-            input,
-            axis,
-            offset,
-        }): Parameters<OpMirrorArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_mirror(&name, &input, axis, offset))
-            .await
-    }
-
-    /// Remove one graph step by its output name and re-derive the model.
-    #[tool]
-    async fn op_delete(
-        &self,
-        Parameters(OpNameArgs { name }): Parameters<OpNameArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.op_delete(&name)).await
-    }
-
     /// List the procedural graph: one line per op with its inputs.
     #[tool]
     async fn ops(&self) -> Result<CallToolResult, ErrorData> {
@@ -545,21 +307,53 @@ impl Tools {
         self.run(move |s| s.new_model(&name)).await
     }
 
-    /// Apply a whole batch in one call: an array of objects, each tagged
-    /// with a "type" field — the graph ops ("primitive", "transform",
-    /// "boolean", "radial_array", "linear_array", "mirror", "material")
-    /// carrying the same parameters as the individual tools, plus the baked
-    /// edits "hide_part" {"part"}, "show_part" {"part"} and "rename"
-    /// {"part", "to"}. Applied in order with the usual upsert/rollback
-    /// semantics; stops at the first error with per-item context. The result
-    /// ends with the full scene summary.
+    /// Build or edit the model: an array of items, each tagged with a "type" —
+    /// graph ops ("primitive", "transform", "boolean", "radial_array",
+    /// "linear_array", "mirror", "material") plus "hide_part", "show_part",
+    /// "rename", "delete", "tri_mesh" (raw triangles) and "uvs". Ops are
+    /// upserts by output name (re-issue to tweak). Items are applied in order;
+    /// the batch stops at the first error, naming the item and field. Pass
+    /// `expect` to verify in the same call. The result ends with the scene
+    /// summary. Use describe_op(kind) for an example payload.
     #[tool]
     async fn apply_ops(
         &self,
-        Parameters(ApplyOpsArgs { ops }): Parameters<ApplyOpsArgs>,
+        Parameters(ApplyOpsArgs { ops, expect }): Parameters<ApplyOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let items: Vec<BatchItem> = ops.into_iter().map(BatchItem::from).collect();
-        self.run(move |s| s.apply_batch(items)).await
+        let items = match parse_ops(&ops) {
+            Ok(items) => items,
+            Err(e) => return Ok(err_result(format!("{e}\n(nothing was applied)"))),
+        };
+        self.run(move |s| {
+            let text = s.apply_batch(items)?;
+            let Some(spec) = expect else {
+                return Ok(text);
+            };
+            let (ok, report) = s.verify(&spec);
+            if ok {
+                Ok(format!("{text}\nexpect: all passed\n{report}"))
+            } else {
+                Err(format!("expect FAILED (the batch was applied)\n{report}\n\n{text}").into())
+            }
+        })
+        .await
+    }
+
+    /// Deterministic checks in one call: `parts` (exact visible part names),
+    /// `bounds` ({min, max, tol}; null skips an axis), `validate` (every part
+    /// closed and outward-wound) and `rebuild` (uncached re-derivation matches
+    /// the cache). With no arguments runs validate + rebuild. Each check
+    /// reports PASS/FAIL; any FAIL makes the call an error.
+    #[tool]
+    async fn verify(
+        &self,
+        Parameters(spec): Parameters<modeler::commands::VerifySpec>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| {
+            let (ok, report) = s.verify(&spec);
+            if ok { Ok(report) } else { Err(report.into()) }
+        })
+        .await
     }
 
     /// Move the orbit camera: yaw/pitch in degrees and the distance from the
@@ -587,65 +381,6 @@ impl Tools {
         Ok(CallToolResult::success(vec![Content::text(format!(
             "camera set to yaw {yaw}°, pitch {pitch}°, dist {dist}"
         ))]))
-    }
-
-    /// Hide a part: it stays in the model and keeps deriving from ops, but the
-    /// preview and the glTF export skip it. The clean way to get boolean
-    /// intermediates out of an export without breaking the graph.
-    #[tool]
-    async fn hide_part(
-        &self,
-        Parameters(PartArgs { part }): Parameters<PartArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.set_visible(&part, false)).await
-    }
-
-    /// Un-hide a previously hidden part.
-    #[tool]
-    async fn show_part(
-        &self,
-        Parameters(PartArgs { part }): Parameters<PartArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.set_visible(&part, true)).await
-    }
-
-    /// Mesh-level validation, no renderer needed: per-part edge manifoldness
-    /// and winding (signed volume must be positive). Catches inverted normals
-    /// and torn geometry that a screenshot only hints at.
-    #[tool]
-    async fn validate(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| Ok(s.validate())).await
-    }
-
-    /// Re-derives the op graph into a scratch copy and compares the geometry
-    /// against the cached parts. Catches a stale parts cache or a
-    /// non-deterministic op. Baked edits (set_material, visibility) are not
-    /// compared — a refresh legitimately resets those.
-    #[tool]
-    async fn check_rebuild(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|s| s.check_rebuild()).await
-    }
-
-    /// Assert the model's part names exactly (order-insensitive). Fails with
-    /// the missing and unexpected names, so you can deterministically verify
-    /// "my gate is 14 parts named X..." instead of eyeballing a render.
-    #[tool]
-    async fn expect_parts(
-        &self,
-        Parameters(ExpectPartsArgs { parts }): Parameters<ExpectPartsArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.expect_parts(&parts)).await
-    }
-
-    /// Assert the model's world bounds numerically — the deterministic form of
-    /// "it sits on the ground", "it is centered", "the roof peaks at ~2.2".
-    /// Per-axis expectations; `null` skips an axis. Over visible parts only.
-    #[tool]
-    async fn expect_bounds(
-        &self,
-        Parameters(ExpectBoundsArgs { min, max, tol }): Parameters<ExpectBoundsArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(move |s| s.expect_bounds(min, max, tol)).await
     }
 
     /// Cast a ray through the scene and report the first part it hits (name,
@@ -688,28 +423,6 @@ impl Tools {
             }
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
-    /// Render the model from the agent's own offscreen camera — independent of
-    /// the human's window view, orthographic for the six cardinal views (true
-    /// proportions, auto-framed to the bounds), perspective for "iso". Returns
-    /// a PNG. Windowed preview only.
-    #[tool]
-    async fn agent_shot(
-        &self,
-        Parameters(AgentShotArgs {
-            view,
-            width,
-            height,
-            focus,
-        }): Parameters<AgentShotArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let view = parse_agent_view(&view).map_err(|e| ErrorData::internal_error(e, None))?;
-        let png = self.agent_render(view, width, height, focus).await?;
-        Ok(CallToolResult::success(vec![
-            Content::image(B64.encode(png.0), "image/png"),
-            Content::text(png.1),
-        ]))
     }
 
     /// Render several agent views in one call — e.g. ["front", "right", "top"]

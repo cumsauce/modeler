@@ -150,21 +150,43 @@ pub fn expect_bounds(
     }
 }
 
-/// Edges of a part that are not shared by exactly two triangles, welding
-/// vertices by (1e-5) position first: primitives emit per-face vertices that
-/// share a point.
+/// Edges of a part that are not shared by exactly two triangles, after
+/// welding coincident vertices. Two welds are tried and the smaller count
+/// wins: a 1e-5 grid (primitives emit per-face vertices whose positions differ
+/// in the last bits) and exact positions (Manifold outputs keep distinct
+/// vertices closer than any grid). A genuinely open mesh is open under both.
 pub fn open_edge_count(p: &Part) -> usize {
-    let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
-    let mut welded = Vec::with_capacity(p.verts.len());
-    for v in &p.verts {
-        let key = [
-            (v[0] * 1e5).round() as i64,
-            (v[1] * 1e5).round() as i64,
-            (v[2] * 1e5).round() as i64,
-        ];
-        let next = ids.len() as u32;
-        welded.push(*ids.entry(key).or_insert(next));
+    let grid = open_edges_with(p, |v| {
+        [
+            (v[0] as f64 * 1e5).round() as i64,
+            (v[1] as f64 * 1e5).round() as i64,
+            (v[2] as f64 * 1e5).round() as i64,
+        ]
+    });
+    if grid == 0 {
+        return 0;
     }
+    // +0.0 so -0.0 and 0.0 weld together.
+    let exact = open_edges_with(p, |v| {
+        [
+            (v[0] + 0.0).to_bits() as i64,
+            (v[1] + 0.0).to_bits() as i64,
+            (v[2] + 0.0).to_bits() as i64,
+        ]
+    });
+    grid.min(exact)
+}
+
+fn open_edges_with(p: &Part, key: impl Fn(&[f32; 3]) -> [i64; 3]) -> usize {
+    let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
+    let welded: Vec<u32> = p
+        .verts
+        .iter()
+        .map(|v| {
+            let next = ids.len() as u32;
+            *ids.entry(key(v)).or_insert(next)
+        })
+        .collect();
     let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
     for t in p.indices.as_chunks::<3>().0 {
         for e in 0..3 {
@@ -381,30 +403,6 @@ pub fn lints(model: &Model) -> Vec<String> {
                     p.name,
                     100.0 * gap / surface.max(1e-9)
                 ));
-            }
-        }
-    }
-    // Material-after-copy: array/mirror/transform ops earlier in the list
-    // cloned the (still uncolored) source, so the copies stay default-gray.
-    for (i, op) in model.ops.iter().enumerate() {
-        if let Op::Material { input, .. } = op {
-            for earlier in &model.ops[..i] {
-                let copies = matches!(
-                    earlier,
-                    Op::Transform { .. }
-                        | Op::RadialArray { .. }
-                        | Op::LinearArray { .. }
-                        | Op::Mirror { .. }
-                );
-                if copies
-                    && graph::inputs(earlier).contains(&input.as_str())
-                    && graph::output(earlier) != input.as_str()
-                {
-                    out.push(format!(
-                        "`{}` (made before the material op) copies `{input}`, so it kept the default material. Re-order: op_material first, then the copying op.",
-                        graph::output(earlier)
-                    ));
-                }
             }
         }
     }

@@ -10,9 +10,68 @@ pub type CmdResult = Result<String, ModelerError>;
 #[derive(Debug)]
 pub enum BatchItem {
     Op(Op),
-    Hide { part: String },
-    Show { part: String },
-    Rename { part: String, to: String },
+    Hide {
+        part: String,
+    },
+    Show {
+        part: String,
+    },
+    Rename {
+        part: String,
+        to: String,
+    },
+    /// Remove the op producing `name` (or a baked part of that name).
+    Delete {
+        name: String,
+    },
+    /// A baked raw-triangle part.
+    TriMesh {
+        name: String,
+        verts: Vec<[f32; 3]>,
+        indices: Vec<u32>,
+        normals: Option<Vec<[f32; 3]>>,
+        uvs: Option<Vec<[f32; 2]>>,
+    },
+    /// Re-project a part's UVs (baked).
+    Uvs {
+        part: String,
+        projection: String,
+    },
+}
+
+/// Deterministic checks for `verify` and an `apply_ops` expect block. Each
+/// field is optional; only the given checks run.
+#[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerifySpec {
+    /// Exact visible part names (order-insensitive).
+    #[serde(default)]
+    pub parts: Option<Vec<String>>,
+    /// World bounds of visible parts; `null` entries skip an axis.
+    #[serde(default)]
+    pub bounds: Option<BoundsSpec>,
+    /// Mesh checks: every visible part closed and outward-wound.
+    #[serde(default)]
+    pub validate: Option<bool>,
+    /// Re-derive the graph uncached and diff against the cached parts.
+    #[serde(default)]
+    pub rebuild: Option<bool>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundsSpec {
+    #[serde(default)]
+    pub min: [Option<f32>; 3],
+    #[serde(default)]
+    pub max: [Option<f32>; 3],
+    /// Allowed deviation per checked axis. Default 0.01.
+    #[serde(default = "default_bounds_tol")]
+    pub tol: f32,
+}
+
+fn default_bounds_tol() -> f32 {
+    0.01
 }
 
 /// A spot in the live view a human clicked on, waiting for its comment text. Set by
@@ -161,6 +220,7 @@ impl Session {
                 translation,
                 rotation,
                 scale,
+                relative: false,
             },
             &format!("op transform `{name}` <- `{input}`"),
         )
@@ -340,12 +400,52 @@ impl Session {
     pub fn apply_batch(&mut self, items: Vec<BatchItem>) -> CmdResult {
         let mut lines = Vec::with_capacity(items.len());
         for (i, item) in items.into_iter().enumerate() {
+            let fail = |e: ModelerError| format!("batch item #{i} failed: {e}");
             let msg = match item {
+                // In-place material/transform on a baked part: a baked edit.
+                BatchItem::Op(Op::Material {
+                    name,
+                    input,
+                    base_color,
+                    roughness,
+                    metalness,
+                }) if name == input && !self.derived_by_ops(&name) => self
+                    .set_material(&name, base_color, roughness, metalness)
+                    .map_err(fail)?,
+                BatchItem::Op(Op::Transform {
+                    name,
+                    input,
+                    translation,
+                    rotation,
+                    scale,
+                    relative: false,
+                }) if name == input && !self.derived_by_ops(&name) => self
+                    .transform_part(&name, translation, rotation, scale)
+                    .map_err(fail)?,
                 BatchItem::Op(op) => {
                     let label = Self::op_label(&op);
                     self.apply_op(op, &label)
                         .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
                     format!("{label} ok")
+                }
+                BatchItem::Delete { name } => {
+                    if self.model.ops.iter().any(|o| graph::output(o) == name) {
+                        self.op_delete(&name).map_err(fail)?
+                    } else {
+                        self.delete_part(&name).map_err(fail)?
+                    }
+                }
+                BatchItem::TriMesh {
+                    name,
+                    verts,
+                    indices,
+                    normals,
+                    uvs,
+                } => self
+                    .add_tri_mesh(&name, verts, indices, normals, uvs)
+                    .map_err(fail)?,
+                BatchItem::Uvs { part, projection } => {
+                    self.set_uvs(&part, &projection).map_err(fail)?
                 }
                 BatchItem::Hide { part } => self
                     .set_visible(&part, false)
@@ -429,6 +529,46 @@ impl Session {
     }
 
     /// Per-part mesh validation (see []).
+    /// Runs the checks in `spec` (all of validate + rebuild when `spec` is
+    /// empty). Returns (all passed, one line per check).
+    pub fn verify(&self, spec: &VerifySpec) -> (bool, String) {
+        let empty = spec.parts.is_none()
+            && spec.bounds.is_none()
+            && spec.validate.is_none()
+            && spec.rebuild.is_none();
+        let mut ok = true;
+        let mut lines = Vec::new();
+        let mut record = |name: &str, r: Result<String, String>| match r {
+            Ok(t) => lines.push(format!("PASS {name}: {t}")),
+            Err(e) => {
+                ok = false;
+                lines.push(format!("FAIL {name}: {e}"));
+            }
+        };
+        if let Some(parts) = &spec.parts {
+            record("parts", self.expect_parts(parts).map_err(|e| e.to_string()));
+        }
+        if let Some(b) = &spec.bounds {
+            record(
+                "bounds",
+                self.expect_bounds(b.min, b.max, b.tol)
+                    .map_err(|e| e.to_string()),
+            );
+        }
+        if spec.validate.unwrap_or(empty) {
+            let v = self.validate();
+            if v.starts_with("all parts") || v.starts_with("no parts") {
+                record("validate", Ok(v));
+            } else {
+                record("validate", Err(v.replace('\n', "; ")));
+            }
+        }
+        if spec.rebuild.unwrap_or(empty) {
+            record("rebuild", self.check_rebuild().map_err(|e| e.to_string()));
+        }
+        (ok, lines.join("\n"))
+    }
+
     pub fn validate(&self) -> String {
         crate::verify::validate(&self.model)
     }
@@ -1152,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_material_after_copy() {
+    fn copies_inherit_a_material_placed_after_them() {
         let mut s = Session::default();
         s.op_primitive(
             "arm",
@@ -1164,20 +1304,16 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         s.op_mirror("arm_r", "arm", crate::Axis::X, [0.0, 0.0, 0.0])
             .unwrap_or_else(|e| panic!("{e}"));
+        s.op_linear_array("arms", "arm", 3, [0.0, 0.0, 1.0])
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Material op written after the copies: lineage still colors them.
         s.op_material("arm", "arm", Some([1.0, 0.0, 0.0, 1.0]), None, None)
             .unwrap_or_else(|e| panic!("{e}"));
-        let lints = s.lints();
-        assert!(
-            lints
-                .iter()
-                .any(|l| l.contains("kept the default material")),
-            "lints: {lints:?}"
-        );
-        // And the part list really does show the copy uncolored.
-        assert!(
-            s.summary()
-                .contains("part `arm_r` still has the default material")
-        );
+        for n in ["arm", "arm_r", "arms_1", "arms_2"] {
+            let p = s.model.part(n).unwrap_or_else(|| panic!("{n}"));
+            assert_eq!(p.material.base_color, [1.0, 0.0, 0.0, 1.0], "{n}");
+        }
+        assert!(!s.summary().contains("default material"));
     }
 
     #[test]
@@ -1701,14 +1837,16 @@ mod tests {
                     input: "b".into(),
                     translation: None,
                     rotation: None,
-                    scale: None
+                    scale: None,
+                    relative: false,
                 },
                 Op::Transform {
                     name: "b".into(),
                     input: "a".into(),
                     translation: None,
                     rotation: None,
-                    scale: None
+                    scale: None,
+                    relative: false,
                 },
             ]),
             Err(ModelerError::Cycle(_))

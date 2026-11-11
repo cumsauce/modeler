@@ -612,6 +612,10 @@ pub enum Op {
         rotation: Option<[f32; 4]>,
         #[serde(default)]
         scale: Option<[f32; 3]>,
+        /// When true the values are offsets from the input instead of
+        /// absolute: translation adds, rotation composes, scale multiplies.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relative: bool,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {

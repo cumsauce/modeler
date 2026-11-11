@@ -343,4 +343,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn solid_primitives_count_as_closed() {
+        for &kind in PrimitiveKind::ALL {
+            if kind.is_open_sheet() {
+                continue;
+            }
+            let size = match kind {
+                PrimitiveKind::Torus => [1.0, 0.3, 0.0],
+                _ => [0.5, 1.0, 0.7],
+            };
+            let p = primitive(kind, size, "p").unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                crate::verify::open_edge_count(&p),
+                0,
+                "{kind} reads as open"
+            );
+        }
+    }
 }

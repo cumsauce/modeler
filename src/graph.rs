@@ -170,6 +170,24 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
             }
         }
     }
+    // Material lineage: an in-place material op on X runs before every other
+    // op that reads X (arrays, mirrors, transforms, booleans), so copies inherit
+    // the color wherever the material op sits in the list. Readers that also
+    // write X (other in-place edits) keep list order to avoid cycles.
+    for (m, op) in ops.iter().enumerate() {
+        if let Op::Material { name, input, .. } = op
+            && name == input
+        {
+            for &j in readers.get(input.as_str()).into_iter().flatten() {
+                if j != m
+                    && !outputs(&ops[j]).iter().any(|o| o == input)
+                    && !matches!(ops[j], Op::Rename { .. })
+                {
+                    deps[j].push(m);
+                }
+            }
+        }
+    }
     // A rename removes the old name, so it must run after every other op
     // that reads that name.
     for (i, op) in ops.iter().enumerate() {
@@ -229,20 +247,35 @@ fn run_op(op: &Op, named: &mut Vec<(String, Part)>) -> Result<(), ModelerError> 
             translation,
             rotation,
             scale,
+            relative,
         } => {
             let mut part = lookup(named, input)?;
             part.name = name.clone();
             if name != input {
                 part.visible = true;
             }
-            if let Some(t) = translation {
-                part.translation = *t;
-            }
-            if let Some(r) = rotation {
-                part.rotation = *r;
-            }
-            if let Some(s) = scale {
-                part.scale = *s;
+            if *relative {
+                // Offsets from the input: translation adds, rotation composes
+                // on top, scale multiplies.
+                if let Some(t) = translation {
+                    part.translation = (Vec3::from(part.translation) + Vec3::from(*t)).to_array();
+                }
+                if let Some(r) = rotation {
+                    part.rotation = (quat_of(*r) * quat_of(part.rotation)).to_array();
+                }
+                if let Some(s) = scale {
+                    part.scale = (Vec3::from(part.scale) * Vec3::from(*s)).to_array();
+                }
+            } else {
+                if let Some(t) = translation {
+                    part.translation = *t;
+                }
+                if let Some(r) = rotation {
+                    part.rotation = *r;
+                }
+                if let Some(s) = scale {
+                    part.scale = *s;
+                }
             }
             upsert(named, name, part);
         }
@@ -522,6 +555,7 @@ pub fn describe(ops: &[Op]) -> String {
                 translation,
                 rotation,
                 scale,
+                relative,
             } => {
                 let mut s = format!("#{i} transform `{name}` <- `{input}`");
                 if let Some(t) = translation {
@@ -532,6 +566,9 @@ pub fn describe(ops: &[Op]) -> String {
                 }
                 if let Some(sc) = scale {
                     s += &format!(" scale={sc:?}");
+                }
+                if *relative {
+                    s += " (relative)";
                 }
                 s
             }
@@ -632,6 +669,7 @@ mod tests {
                 translation: Some([0.0, 2.0, 0.0]),
                 rotation: None,
                 scale: None,
+                relative: false,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -663,6 +701,7 @@ mod tests {
                 translation: Some([0.4, 0.375, 0.0]),
                 rotation: None,
                 scale: None,
+                relative: false,
             },
             Op::Primitive {
                 name: "leg_template".into(),
@@ -690,6 +729,7 @@ mod tests {
                 translation: None,
                 rotation: None,
                 scale: None,
+                relative: false,
             },
             Op::Transform {
                 name: "b".into(),
@@ -697,6 +737,7 @@ mod tests {
                 translation: None,
                 rotation: None,
                 scale: None,
+                relative: false,
             },
         ]) else {
             panic!("a true cycle must fail")
@@ -847,6 +888,7 @@ mod tests {
             translation: None,
             rotation: None,
             scale: None,
+            relative: false,
         }]) {
             Err(e) => e,
             Ok(_) => panic!("missing input must fail"),
@@ -910,6 +952,7 @@ mod tests {
                 translation: Some([0.0, 5.0, 0.0]),
                 rotation: None,
                 scale: None,
+                relative: false,
             },
             prim("p"),
             Op::LinearArray {
@@ -934,6 +977,7 @@ mod tests {
                     translation: Some([0.0, size, 0.0]),
                     rotation: None,
                     scale: None,
+                    relative: false,
                 },
                 Op::Material {
                     name: "cache_c".into(),
@@ -960,5 +1004,33 @@ mod tests {
         let fresh = evaluate_uncached(&make(8.5)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ops_run_on_thread() - before, 8, "uncached re-runs every op");
         assert_eq!(fresh[1].translation, tweaked[1].translation);
+    }
+
+    #[test]
+    fn relative_transform_offsets_from_the_input() {
+        let ops = vec![
+            Op::Primitive {
+                name: "a".into(),
+                kind: crate::PrimitiveKind::Box,
+                size: [1.0; 3],
+                translation: [1.0, 2.0, 3.0],
+                rotation: None,
+            },
+            Op::Transform {
+                name: "b".into(),
+                input: "a".into(),
+                translation: Some([0.5, 0.0, 0.0]),
+                rotation: None,
+                scale: Some([2.0, 2.0, 2.0]),
+                relative: true,
+            },
+        ];
+        let parts = evaluate_uncached(&ops).unwrap_or_else(|e| panic!("{e}"));
+        let b = parts
+            .iter()
+            .find(|p| p.name == "b")
+            .unwrap_or_else(|| panic!("b"));
+        assert_eq!(b.translation, [1.5, 2.0, 3.0]);
+        assert_eq!(b.scale, [2.0, 2.0, 2.0]);
     }
 }

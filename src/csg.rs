@@ -359,12 +359,12 @@ mod tests {
             for op in [BoolOp::Difference, BoolOp::Union, BoolOp::Intersect] {
                 let out = boolean(&model, op, a, b, None)
                     .unwrap_or_else(|e| panic!("{op}({a},{b}): {e}"));
-                // No see-through holes, and the output is a valid solid for
-                // the next boolean (chained cuts). Raw open-edge counts can be
-                // nonzero here: Manifold places intersection verts closer than
-                // the counter's 1e-5 weld grid, which it then merges.
-                let (gap, _) = crate::verify::boundary_gap_area(&out);
-                assert!(gap < 1e-9, "{op}({a},{b}) has a hole: {gap}");
+                // Closed, and a valid solid for the next boolean (chained cuts).
+                assert_eq!(
+                    crate::verify::open_edge_count(&out),
+                    0,
+                    "{op}({a},{b}) has open edges"
+                );
                 part_to_manifold(&out).unwrap_or_else(|e| panic!("{op}({a},{b}) re-import: {e}"));
                 validate(&out, op.as_str());
             }
