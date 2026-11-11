@@ -58,7 +58,7 @@ Three layers, read top to bottom:
    `~/Library/Application Support/friendslop/modeler/prefabs` + a
    `catalog.json` index. Saves are non-destructive and atomic.
 
-## MCP tool surface (33 tools)
+## MCP tool surface (34 tools)
 
 **Build: one tool, `apply_ops`.** Everything that changes geometry is an
 item in `apply_ops(ops, params?, expect?)`, each tagged with a `"type"`.
@@ -379,6 +379,24 @@ batches, bytes):
 - `weld`, `small_indices` (u16), `orm` (AO packed into metal-roughness R),
   `emissive_strength` (KHR_materials_emissive_strength) are on in `game`.
 - Nodes carry `extras {part, material, comments}` for game-side lookup.
+
+**Scenes (open documents):** `scene(action, name?)` keeps several models
+open at once, each with its own ops, history and style; every other tool
+acts on the active one. `list` (active marked `*`, which prefabs each
+instances), `open` (an open doc, else the catalog entry, else a new empty
+doc), `switch` (open docs only), `close`. Build a map from pieces: model
+`console` in its own doc, `open` `bridge_map`, and place
+`{"type": "prefab", "name": "c1", "prefab": "console"}` items. A prefab
+item resolves to the **open doc of that name first** (else the catalog
+file), and switching back to a scene re-syncs every instance from its
+source (new parts, edits, style), so pieces stay live while you iterate.
+A prefab item's `style`: omitted keeps the piece's own style; `"scene"`
+re-derives it with the scene's tokens layered over its own (scene wins;
+re-themes with `style set` on the scene); an object patches tokens for that
+instance (`{"colors": {"primary": "#c33"}}`, a red-alert variant). Only
+items that read tokens (`@color`, presets) follow. The inactive docs
+autosave to `open_docs.json` and restore on startup; the preview window
+shows tabs for open docs (click to switch).
 
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
 (omit the optionals to consume a spot the human clicked; `material` + optional `node`

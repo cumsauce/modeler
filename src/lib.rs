@@ -951,6 +951,14 @@ pub enum Op {
         parts: Vec<String>,
         #[serde(default)]
         digest: u64,
+        /// Style mode as issued: `"scene"` (the scene's tokens layered over
+        /// the prefab's own) or a token patch object. None = its own style.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<serde_json::Value>,
+        /// The resolved style the prefab is re-derived with (filled from
+        /// `style` by the session, so evaluation needs no scene context).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restyle: Option<crate::style::Style>,
     },
 }
 

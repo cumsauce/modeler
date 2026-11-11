@@ -746,9 +746,17 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             rotation,
             scale,
             parts,
+            restyle,
             ..
         } => {
-            let model = load_prefab_guarded(prefab)?;
+            let mut model = load_prefab_guarded(prefab)?;
+            if let Some(st) = restyle {
+                let mut s = crate::commands::Session::default();
+                s.model = model;
+                s.set_style(st.clone())
+                    .map_err(|e| format!("{name}: restyling prefab `{prefab}`: {e}"))?;
+                model = s.model;
+            }
             let (it, ir) = (
                 Vec3::from(*translation),
                 quat_of(rotation.unwrap_or([0.0, 0.0, 0.0, 1.0])),

@@ -202,6 +202,16 @@ pub(crate) struct MaterialCatalogArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct SceneArgs {
+    /// list, open (an open doc, a catalog entry, or a new empty one), switch
+    /// (open docs only) or close.
+    pub(crate) action: String,
+    /// The document (= model / prefab name).
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct StyleArgs {
     /// show, set, replace, clear, list, describe, save, load or delete.
     pub(crate) action: String,

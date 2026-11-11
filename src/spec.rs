@@ -686,6 +686,12 @@ pub struct PrefabSpec {
     rotation: Option<[f32; 4]>,
     #[serde(default)]
     scale: Option<[f32; 3]>,
+    /// "scene": re-derive the prefab with the scene's style layered over its
+    /// own (scene tokens win); an object: a token patch for this instance
+    /// ({"colors": {"primary": "#c33"}}). Omitted: the prefab's own style.
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    style: Option<serde_json::Value>,
 }
 
 /// One `apply_ops` item, tagged by "type". Only used for the published JSON
@@ -1114,6 +1120,19 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 scale: s.scale,
                 parts,
                 digest,
+                style: match s.style {
+                    None => None,
+                    Some(v @ serde_json::Value::Object(_)) => Some(v),
+                    Some(serde_json::Value::String(m)) if m == "scene" => {
+                        Some(serde_json::Value::String(m))
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "{ctx}: style: \"scene\" or a token object, got {other}"
+                        ));
+                    }
+                },
+                restyle: None,
             })
         }
         other => {

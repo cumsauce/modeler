@@ -789,6 +789,28 @@ Style::default()
         self.run(move |s| s.new_model(&name)).await
     }
 
+    /// Open documents (scenes): several models open at once, each with its own
+    /// history and style; one is active and every other tool acts on it.
+    /// A prefab item naming an open document instances the live doc, and
+    /// switching back re-syncs instances. Actions: list, open, switch, close.
+    #[tool]
+    async fn scene(
+        &self,
+        Parameters(SceneArgs { action, name }): Parameters<SceneArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(move |s| {
+            let r = s.scene(&action, name.as_deref());
+            if action != "list"
+                && r.is_ok()
+                && let Err(e) = catalog::save_open_docs(&s.others)
+            {
+                eprintln!("open docs autosave failed: {e}");
+            }
+            r
+        })
+        .await
+    }
+
     /// Build or edit the model: an array of items, each tagged with a "type"
     /// (primitive, extrude, revolve, sweep, hull, round, shell, group, transform,
     /// boolean, radial_array, linear_array, mirror, material, prefab,
@@ -1279,6 +1301,7 @@ impl rmcp::ServerHandler for Tools {
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - scene_summary, apply_ops and verify also return structuredContent JSON.
+- scene(open/switch/list/close) keeps several documents open; a prefab item naming an open doc instances it live (re-synced on switch); prefab style: \"scene\" re-themes a piece with the scene's tokens.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
 - Style tokens (a cohesive look): set them first with style(action \"set\" or \"load\"), then build with \"@primary\" colours (.darken(x) .lighten(x) .mix(@b, x) .alpha(x)), \"$bevel\" numbers, \"style\": \"<preset>\" on material items; style defaults fill omitted fields. Prefer tokens over literal colours; follow the style's brief. Changing a token re-derives every item reading it.

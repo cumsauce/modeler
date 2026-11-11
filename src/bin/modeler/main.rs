@@ -56,6 +56,15 @@ fn main() -> AppExit {
             );
             session.model = model;
         }
+        let active = session.model.name.clone();
+        session.others = catalog::load_open_docs()
+            .into_iter()
+            .filter(|m| m.name != active)
+            .collect();
+        session.register_docs();
+        if !session.others.is_empty() {
+            eprintln!("restored {} other open document(s)", session.others.len());
+        }
         session.materials = modeler::material::Library::restore();
         if !session.materials.docs.is_empty() {
             eprintln!(
@@ -182,7 +191,7 @@ fn main() -> AppExit {
             Startup,
             (setup_toolbar, setup_outline_pane, setup_style_pane),
         )
-        .add_systems(Update, sync_toolbar)
+        .add_systems(Update, (sync_toolbar, sync_doc_tabs))
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }
     app.run()

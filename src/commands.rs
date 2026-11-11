@@ -185,6 +185,8 @@ pub struct Session {
     /// into one history step recorded when the outermost batch ends.
     batch_depth: usize,
     batch_labels: Vec<String>,
+    /// Open documents other than the active `model` (see [`Session::scene`]).
+    pub others: Vec<Model>,
 }
 
 impl Default for Session {
@@ -195,6 +197,7 @@ impl Default for Session {
             pending_pin: None,
             batch_depth: 0,
             batch_labels: Vec::new(),
+            others: Vec::new(),
         }
     }
 }
@@ -993,6 +996,10 @@ impl Session {
                 .map_err(|e| format!("{e}\n(nothing was applied)"))?;
             self.resolve_pbr(&mut item)
                 .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+            if let BatchItem::Op(op) = &mut item {
+                self.resolve_prefab(op)
+                    .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+            }
             let template = (!crate::params::refs(raw).is_empty()
                 || crate::style::reads_style(raw, &style))
             .then(|| raw.clone());
@@ -1063,6 +1070,215 @@ impl Session {
 
     /// Replaces the model's style (or patches it with `patch`) and re-derives
     /// every templated op whose resolved form changed, as one history step.
+    /// Refreshes a prefab op from its source (an open document first, else
+    /// the catalog file): the visible part list, the digest, and the style it
+    /// is re-derived with. Returns whether anything changed.
+    pub fn resolve_prefab(&self, op: &mut Op) -> Result<bool, ModelerError> {
+        let Op::Prefab {
+            prefab,
+            parts,
+            digest,
+            style,
+            restyle,
+            ..
+        } = op
+        else {
+            return Ok(false);
+        };
+        let src = crate::catalog::load_prefab(prefab)?;
+        let new_restyle = match style {
+            None => None,
+            Some(mode) => {
+                let mut st = src.style.clone();
+                let patch = if mode.as_str() == Some("scene") {
+                    serde_json::to_value(&self.model.style).map_err(|e| e.to_string())?
+                } else {
+                    mode.clone()
+                };
+                st.merge(&patch)
+                    .map_err(|e| format!("prefab `{prefab}` style: {e}"))?;
+                Some(st)
+            }
+        };
+        let new_parts: Vec<String> = src
+            .parts
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| p.name.clone())
+            .collect();
+        if new_parts.is_empty() {
+            return Err(format!("prefab `{prefab}` has no visible parts").into());
+        }
+        let new_digest = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_string(&src.ops)
+                .unwrap_or_default()
+                .hash(&mut h);
+            serde_json::to_string(&src.style)
+                .unwrap_or_default()
+                .hash(&mut h);
+            new_parts.hash(&mut h);
+            h.finish()
+        };
+        let changed = *parts != new_parts || *digest != new_digest || *restyle != new_restyle;
+        *parts = new_parts;
+        *digest = new_digest;
+        *restyle = new_restyle;
+        Ok(changed)
+    }
+
+    /// Re-resolves every prefab instance in the active model (after its
+    /// source document changed or the scene style moved) and re-derives.
+    /// Returns the instances that changed; records one history step if any.
+    pub fn sync_prefabs(&mut self) -> Result<Vec<String>, ModelerError> {
+        let mut ops = self.model.ops.clone();
+        let mut changed = Vec::new();
+        for op in &mut ops {
+            if self.resolve_prefab(op)? {
+                changed.push(graph::output(op).to_string());
+            }
+        }
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        let before = self.model.clone();
+        self.model.ops = ops;
+        if let Err(e) = self.model.refresh() {
+            self.model = before;
+            return Err(format!("re-deriving prefab instances failed: {e}").into());
+        }
+        self.commit("sync prefabs");
+        Ok(changed)
+    }
+
+    /// Open documents: `list`, `open` (an open doc, the catalog entry, or a
+    /// new empty model), `switch` (same as open for an open doc), `close`.
+    /// The active document is `self.model`; the rest wait in `others`, each
+    /// with its own history, and are visible to prefab instances by name.
+    pub fn scene(&mut self, action: &str, name: Option<&str>) -> CmdResult {
+        let need = || name.ok_or_else(|| format!("scene {action}: needs a name"));
+        match action {
+            "list" => {
+                let mut s = String::from("open documents:\n");
+                let line = |m: &Model, active: bool| {
+                    let uses: Vec<&str> = m
+                        .ops
+                        .iter()
+                        .filter_map(|o| match o {
+                            Op::Prefab { prefab, .. } => Some(prefab.as_str()),
+                            _ => None,
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    format!(
+                        "{} {} ({} parts, {} ops{}{})\n",
+                        if active { "*" } else { " " },
+                        m.name,
+                        m.parts.iter().filter(|p| p.visible).count(),
+                        m.ops.len(),
+                        if m.style.brief.is_empty() {
+                            ""
+                        } else {
+                            ", styled"
+                        },
+                        if uses.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", instances {}", uses.join(", "))
+                        }
+                    )
+                };
+                s += &line(&self.model, true);
+                for m in &self.others {
+                    s += &line(m, false);
+                }
+                Ok(s)
+            }
+            "open" | "switch" => {
+                let name = need()?;
+                if name == self.model.name {
+                    return Ok(format!("`{name}` is already the active document"));
+                }
+                let (incoming, how) =
+                    if let Some(i) = self.others.iter().position(|m| m.name == name) {
+                        (self.others.remove(i), "switched to")
+                    } else if action == "switch" {
+                        return Err(format!(
+                            "no open document `{name}` (open: {}); use action open",
+                            self.doc_names().join(", ")
+                        )
+                        .into());
+                    } else {
+                        match crate::catalog::load_prefab_file(name) {
+                            Ok(mut m) => {
+                                m.name = name.to_string();
+                                (m, "opened catalog entry")
+                            }
+                            Err(_) => (Model::named(name), "opened new empty document"),
+                        }
+                    };
+                let bump = self.model.version.max(incoming.version) + 1;
+                let outgoing = std::mem::replace(&mut self.model, incoming);
+                crate::catalog::set_open_doc(&outgoing.name, Some(outgoing.clone()));
+                crate::catalog::set_open_doc(name, None);
+                self.others.push(outgoing);
+                self.model.version = bump;
+                self.pending_pin = None;
+                let synced = self.sync_prefabs()?;
+                let mut s = format!("{how} `{name}` (open: {})", self.doc_names().join(", "));
+                if !synced.is_empty() {
+                    s += &format!(
+                        "\nupdated prefab instances from their sources: {}",
+                        synced.join(", ")
+                    );
+                }
+                Ok(s)
+            }
+            "close" => {
+                let name = need()?;
+                if name == self.model.name {
+                    let Some(next) = self.others.pop() else {
+                        return Err("can't close the only open document".into());
+                    };
+                    crate::catalog::set_open_doc(&next.name, None);
+                    let bump = self.model.version.max(next.version) + 1;
+                    self.model = next;
+                    self.model.version = bump;
+                } else {
+                    let Some(i) = self.others.iter().position(|m| m.name == name) else {
+                        return Err(format!("no open document `{name}`").into());
+                    };
+                    self.others.remove(i);
+                }
+                crate::catalog::set_open_doc(name, None);
+                Ok(format!(
+                    "closed `{name}` (its autosave is dropped; save_prefab first to keep it). open: {}",
+                    self.doc_names().join(", ")
+                ))
+            }
+            other => {
+                Err(format!("scene: unknown action `{other}` (list, open, switch, close)").into())
+            }
+        }
+    }
+
+    /// Names of every open document, the active one first.
+    pub fn doc_names(&self) -> Vec<String> {
+        std::iter::once(&self.model)
+            .chain(&self.others)
+            .map(|m| m.name.clone())
+            .collect()
+    }
+
+    /// Registers every inactive document for prefab lookup (after a restore).
+    pub fn register_docs(&self) {
+        for m in &self.others {
+            crate::catalog::set_open_doc(&m.name, Some(m.clone()));
+        }
+    }
+
     pub fn set_style(&mut self, new: crate::style::Style) -> CmdResult {
         new.check()?;
         let before = self.model.clone();
@@ -1084,12 +1300,16 @@ impl Session {
         }
         let mut n = 0;
         for op in changed {
-            if let Some(slot) = self.model.ops.iter_mut().find(|o| {
+            // Every op sharing the template (repeated in-place edits stack,
+            // and the last one wins), not just the first.
+            let want = serde_json::to_value(&op).ok();
+            for slot in self.model.ops.iter_mut().filter(|o| {
                 graph::output(o) == graph::output(&op) && graph::kind(o) == graph::kind(&op)
-            }) && serde_json::to_value(&*slot).ok() != serde_json::to_value(&op).ok()
-            {
-                *slot = op;
-                n += 1;
+            }) {
+                if serde_json::to_value(&*slot).ok() != want {
+                    *slot = op.clone();
+                    n += 1;
+                }
             }
         }
         self.model.style = new;
@@ -1098,6 +1318,7 @@ impl Session {
             return Err(format!("re-deriving restyled ops failed: {e}\n(style unchanged)").into());
         }
         self.commit("style");
+        let _ = self.sync_prefabs();
         let reading = self.model.templates.len();
         Ok(format!(
             "style set; re-derived {n} op(s) ({reading} op(s) read params or style tokens)"
@@ -2297,6 +2518,12 @@ impl Session {
             self.model.version,
             self.model.parts.len()
         );
+        if !self.others.is_empty() {
+            s += &format!(
+                "other open documents (scene switch): {}\n",
+                self.doc_names()[1..].join(", ")
+            );
+        }
         if !self.model.style.is_empty() {
             let st = &self.model.style;
             s += &format!(
@@ -2640,6 +2867,99 @@ mod tests {
             translation,
             rotation: None,
         }
+    }
+
+    use serde_json::json;
+
+    fn ok<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
+        r.unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn sty(v: serde_json::Value) -> crate::style::Style {
+        let mut st = crate::style::Style::default();
+        ok(st.merge(&v));
+        st
+    }
+
+    fn base_color(s: &Session, part: &str) -> [f32; 4] {
+        let Some(p) = s.model.part(part) else {
+            panic!("no part {part}");
+        };
+        p.material.base_color
+    }
+
+    #[test]
+    fn scenes_switch_and_prefab_instances_follow_their_doc() {
+        let mut s = Session::default();
+        ok(s.new_model("scn_crate"));
+        ok(s.set_style(sty(json!({
+            "colors": {"primary": "#ff0000"}
+        }))));
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "box", "kind": "box", "size": 0.5}),
+                json!({"type": "material", "name": "box", "color": "@primary"}),
+            ],
+        ));
+        ok(s.scene("open", Some("scn_map")));
+        assert_eq!(s.model.name, "scn_map");
+        ok(s.set_style(sty(json!({
+            "colors": {"primary": "#0000ff"}
+        }))));
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "prefab", "name": "a", "prefab": "scn_crate"}),
+                json!({"type": "prefab", "name": "b", "prefab": "scn_crate",
+                       "translation": [1, 0, 0], "style": "scene"}),
+                json!({"type": "prefab", "name": "c", "prefab": "scn_crate",
+                       "translation": [2, 0, 0], "style": {"colors": {"primary": "#00ff00"}}}),
+            ],
+        ));
+        let red = base_color(&s, "a.box");
+        assert!(red[0] > 0.9 && red[2] < 0.1, "own style: {red:?}");
+        let blue = base_color(&s, "b.box");
+        assert!(blue[2] > 0.9 && blue[0] < 0.1, "scene style: {blue:?}");
+        let green = base_color(&s, "c.box");
+        assert!(green[1] > 0.9 && green[0] < 0.1, "patched: {green:?}");
+        // Scene style change re-themes only the "scene" instance.
+        ok(s.set_style(sty(json!({
+            "colors": {"primary": "#ffffff"}
+        }))));
+        assert!(base_color(&s, "b.box")[1] > 0.9);
+        assert!(base_color(&s, "a.box")[1] < 0.1);
+        // Edit the crate in its own doc: a new part shows up in the map.
+        ok(s.scene("switch", Some("scn_crate")));
+        let crate_history = s.model.history.nodes.len();
+        ok(s.apply_values(
+            None,
+            vec![json!({"type": "primitive", "name": "lid", "kind": "box",
+                        "size": [0.5, 0.05, 0.5], "translation": [0, 0.27, 0]})],
+        ));
+        ok(s.scene("switch", Some("scn_map")));
+        assert!(s.model.part("a.lid").is_some(), "instance synced");
+        ok(s.scene("switch", Some("scn_crate")));
+        assert_eq!(s.model.history.nodes.len(), crate_history + 1);
+        assert!(ok(s.scene("list", None)).contains("instances scn_crate"));
+        ok(s.scene("close", Some("scn_map")));
+        assert_eq!(s.doc_names(), vec!["scn_crate".to_string()]);
+        assert!(crate::catalog::open_doc("scn_map").is_none());
+    }
+
+    #[test]
+    fn restyle_reaches_repeated_in_place_materials() {
+        let mut s = Session::default();
+        ok(s.set_style(sty(json!({"colors": {"primary": "#ff0000"}}))));
+        let items = vec![
+            json!({"type": "primitive", "name": "box", "kind": "box", "size": 0.5}),
+            json!({"type": "material", "name": "box", "color": "@primary"}),
+        ];
+        ok(s.apply_values(None, items.clone()));
+        ok(s.apply_values(None, items));
+        ok(s.set_style(sty(json!({"colors": {"primary": "#0000ff"}}))));
+        let c = base_color(&s, "box");
+        assert!(c[2] > 0.9 && c[0] < 0.1, "{c:?}");
     }
 
     #[test]

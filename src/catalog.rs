@@ -251,6 +251,34 @@ pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> 
     serde_json::from_str(&text).ok()
 }
 
+/// Autosaves the inactive open documents (`open_docs.json`), so a restart
+/// restores every open scene, not just the active one.
+pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
+    let dir = catalog_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
+    let text = serde_json::to_string(docs).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&dir.join("open_docs.json"), text.as_bytes())
+}
+
+/// The autosaved inactive documents (empty when missing or unreadable).
+pub fn load_open_docs() -> Vec<Model> {
+    let Ok(dir) = catalog_dir() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(dir.join("open_docs.json")) else {
+        return Vec::new();
+    };
+    let docs: Vec<Model> = serde_json::from_str(&text).unwrap_or_default();
+    docs.into_iter()
+        .filter(|m| m.check_format().is_ok())
+        .map(|mut m| {
+            let _ = m.restore_parts();
+            m
+        })
+        .collect()
+}
+
 /// The last autosaved session model, if one exists and parses. Missing or
 /// corrupt state just means a fresh session.
 pub fn load_session_state() -> Option<Model> {
@@ -400,6 +428,41 @@ pub fn delete_doc(kind: Kind, name: &str) -> Result<(), ModelerError> {
 /// re-derived from the ops here, so a graph prefab is small on disk and still
 /// opens fully evaluated.
 pub fn load_prefab(name: &str) -> Result<Model, ModelerError> {
+    if let Some(m) = open_doc(name) {
+        return Ok(m);
+    }
+    load_prefab_file(name)
+}
+
+static OPEN_DOCS: std::sync::Mutex<Option<std::collections::HashMap<String, Model>>> =
+    std::sync::Mutex::new(None);
+
+/// Registers (or with `None` removes) a document open in the session, so
+/// prefab instances of that name resolve to the live doc before the file.
+pub fn set_open_doc(name: &str, model: Option<Model>) {
+    if let Ok(mut g) = OPEN_DOCS.lock() {
+        let map = g.get_or_insert_with(Default::default);
+        match model {
+            Some(m) => {
+                map.insert(name.to_string(), m);
+            }
+            None => {
+                map.remove(name);
+            }
+        }
+    }
+}
+
+/// The open document named `name`, if any.
+pub fn open_doc(name: &str) -> Option<Model> {
+    OPEN_DOCS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
+}
+
+/// [`load_prefab`] from the catalog file only, ignoring open documents.
+pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
     let text = fs::read_to_string(&path)
         .map_err(|e| ModelerError::Io(format!("reading {}: {e}", path.display())))?;

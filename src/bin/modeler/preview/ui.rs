@@ -279,6 +279,91 @@ pub(crate) fn sync_toolbar(
     }
 }
 
+/// The open-document tabs over the 3D view's top-left corner (shown only
+/// when more than one document is open). Rebuilt when the open set changes.
+#[derive(Component)]
+pub(crate) struct DocTabs;
+
+/// One document tab: switches the session to that document on click.
+#[derive(Component)]
+pub(crate) struct DocTab(pub(crate) String);
+
+pub(crate) fn sync_doc_tabs(
+    mut commands: Commands,
+    modeler: Res<Modeler>,
+    view: Option<Res<View3d>>,
+    mut bars: Query<(Entity, &mut Node), With<DocTabs>>,
+    mut shown: Local<Vec<String>>,
+) {
+    let left = view.map(|v| v.rect.min.x + 8.0).unwrap_or(8.0);
+    for (_, mut node) in &mut bars {
+        if node.left != Val::Px(left) {
+            node.left = Val::Px(left);
+        }
+    }
+    let names = modeler.session.doc_names();
+    let mut key = names.clone();
+    key.sort();
+    key.push(names[0].clone());
+    if *shown == key {
+        return;
+    }
+    *shown = key;
+    for (b, _) in &bars {
+        commands.entity(b).despawn();
+    }
+    if names.len() < 2 {
+        return;
+    }
+    let bar = commands
+        .spawn((
+            Name::new("doc tabs"),
+            DocTabs,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(8.0),
+                left: Val::Px(left),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(4.0),
+                padding: UiRect::all(Val::Px(4.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            ThemeBackgroundColor(tokens::PANE_HEADER_BG),
+            GlobalZIndex(3),
+        ))
+        .id();
+    let mut sorted = names.clone();
+    sorted.sort();
+    for name in sorted {
+        let active = name == names[0];
+        let label = name.clone();
+        commands
+            .spawn_scene(bsn! {
+                @FeathersToolButton {
+                    @variant: ButtonVariant::selected(active),
+                    @caption: bsn! { @caption(label) }
+                }
+            })
+            .insert((DocTab(name), ChildOf(bar)))
+            .observe(on_doc_tab);
+    }
+}
+
+fn on_doc_tab(activate: On<Activate>, tabs: Query<&DocTab>, mut modeler: ResMut<Modeler>) {
+    let Ok(tab) = tabs.get(activate.event_target()) else {
+        return;
+    };
+    let s = &mut modeler.session;
+    match s.scene("switch", Some(&tab.0)) {
+        Ok(_) => {
+            let _ = modeler::catalog::save_session_state(&s.model);
+            let _ = modeler::catalog::save_open_docs(&s.others);
+        }
+        Err(e) => eprintln!("switching document: {e}"),
+    }
+}
+
 /// The theme's row height in pixels (for laying out under the header).
 #[allow(dead_code)]
 pub(crate) fn row_height() -> Val {

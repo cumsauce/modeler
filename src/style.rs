@@ -469,6 +469,11 @@ pub fn expand(raw: &Value, style: &Style) -> Result<Value, String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // A prefab's `style` is its own mode ("scene" / a token patch for
+        // the prefab), resolved against the prefab, not this scene.
+        if ty == "prefab" {
+            return Ok(v);
+        }
         if let Some(name) = m.remove("style") {
             let name = name
                 .as_str()
