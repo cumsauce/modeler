@@ -453,7 +453,7 @@ named moves, warnings), `catalog_list` and `catalog_describe` (`delete: true` re
 its file moves to `prefabs/removed/`; each entry also
 lists its knobs: params with values and named moves/places, read from the
 file),
-`export_model(path, "glb" | "gltf")` (skips hidden parts).
+`export_model(path, "gltf" (default) | "glb")` (skips hidden parts).
 
 **Game export (`export_model(..., optimize)`):** `optimize: "game"` (or an
 object of flags over it; `"none"` / omitted = plain) prepares the model for
@@ -731,18 +731,24 @@ work, and every material has its own history tree.
   become 1 (white) unless given, then multiply the textures.
 - **Export:** `export_model` writes the baked textures (base colour,
   metallic-roughness, normal, occlusion / emissive when driven) and a
-  TANGENT attribute. **Textures are shared files by default for `.gltf`**:
-  each PNG goes to the `textures/` folder at the root of the `assets/`
-  folder the model is exported into (else `textures/` beside the .gltf),
-  named by material, channel and a hash of its content
-  (`stone-base_color-1a2b....png`), and the .gltf points at it by uri. Every
-  model using the same bake points at the same file, so Bevy's asset server
-  loads it once. `.glb` embeds them unless `optimize: {"textures":
-  "shared"}`; `{"textures": "embed"}` packs a .gltf's too. Only **tile**
-  materials (the default domain: metric, repeating) can be shared across
-  models; an **object** bake is fitted to one mesh, and the export report
-  counts those. Use tile materials for anything a kit reuses (stone, bark,
-  leaves, metal) and keep object materials for one-off hero parts.
+  TANGENT attribute. **Prefer `.gltf`** (the default when `format` is
+  omitted, unless the path ends in `.glb`). Its textures are **shared KTX2
+  files**: GPU block-compressed (BC7 colour, BC5 normals, BC4 occlusion)
+  with a full mip chain and zstd supercompression, which Bevy's default 3D
+  features (`ktx2`, `zstd_rust`) load as they are and keep compressed on the
+  GPU (about a quarter of a PNG's memory, no shimmer at a distance). Each
+  goes to the `textures/` folder at the root of the `assets/` folder the
+  model is exported into (else `textures/` beside the .gltf), named by
+  material, channel and a hash of its content
+  (`stone-base_color-1a2b....ktx2`), and the .gltf points at it by uri.
+  Every model using the same bake points at the same file, so Bevy's asset
+  server loads it once. `optimize: {"textures": "png"}` writes shared PNGs
+  instead, `"embed"` packs PNGs into the buffer; `.glb` (one self-contained
+  file) embeds PNGs unless told `"ktx2"` / `"png"`. Only **tile** materials
+  (the default domain: metric, repeating) can be shared across models; an
+  **object** bake is fitted to one mesh, and the export report counts
+  those. Use tile materials for anything a kit reuses (stone, bark, leaves,
+  metal) and keep object materials for one-off hero parts.
 - **History:** `undo` / `redo` / `jump` / `history` take `doc:
   "material:<name>"` (or `"material"` for the active one).
 - **Bake cache:** bakes are cached by key (material, params, and for

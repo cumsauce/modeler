@@ -566,8 +566,11 @@ Style::default()
             .await
     }
 
-    /// Export the current model as glTF. Pass format "gltf" for a JSON .gltf or "glb"
-    /// for a self-contained binary .glb, plus the output file path. For a game
+    /// Export the current model as glTF. Prefer .gltf (the default format): its
+    /// baked textures go to the shared assets/textures/ folder as GPU-compressed,
+    /// mipmapped KTX2 files named by content, so every model using a tile
+    /// material shares one copy in memory. "glb" makes one self-contained
+    /// file with PNG textures inside. For a game
     /// engine pass `optimize: "game"` (material dedup, contact culling,
     /// instancing of copies, weld, u16 indices, ORM textures) or an object of
     /// overrides, e.g. `{"visible_from": [{"min": [..], "max": [..]}]}` to drop
@@ -583,7 +586,20 @@ Style::default()
             optimize,
         }): Parameters<ExportModelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = catalog::resolve_export_path(&PathBuf::from(path));
+        let format = format.unwrap_or_else(|| {
+            match std::path::Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str())
+            {
+                Some("glb") => "glb".into(),
+                _ => "gltf".into(),
+            }
+        });
+        let mut path = PathBuf::from(path);
+        if path.extension().is_none() {
+            path.set_extension(&format);
+        }
+        let path = catalog::resolve_export_path(&path);
         self.run(move |s| {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -1460,7 +1476,7 @@ impl rmcp::ServerHandler for Tools {
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
 - Style tokens (a cohesive look): set them first with style(action \"set\" or \"load\"), then build with \"@primary\" colours (.darken(x) .lighten(x) .mix(@b, x) .alpha(x)), \"$bevel\" numbers, \"style\": \"<preset>\" on material items; style defaults fill omitted fields. Prefer tokens over literal colours; follow the style's brief. Changing a token re-derives every item reading it.
-- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size and are shared: a .gltf export writes each texture once into assets/textures/, named by content, so every model reusing the material points at one file; object materials wrap a per-part atlas no other model can share, so prefer tile for kit materials). undo/redo/jump/history take doc \"material:<name>\".
+- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size and are shared: a .gltf export (the default, preferred over glb) writes each texture once into assets/textures/ as GPU-compressed mipmapped KTX2, named by content, so every model reusing the material points at one file; object materials wrap a per-part atlas no other model can share, so prefer tile for kit materials). undo/redo/jump/history take doc \"material:<name>\".
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()

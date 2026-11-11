@@ -43,10 +43,20 @@ pub struct Options {
     pub orm: bool,
     /// `KHR_materials_emissive_strength` on emissive materials (bloom).
     pub emissive_strength: Option<f32>,
-    /// Baked textures as shared PNG files (`Some(true)`) or packed into the
-    /// buffer (`Some(false)`); `None` = the format's default (.gltf shares,
-    /// .glb embeds).
-    pub shared_textures: Option<bool>,
+    /// How baked textures are written; `None` = the format's default
+    /// (.gltf: shared KTX2 files, .glb: PNG in the buffer).
+    pub textures: Option<TextureMode>,
+}
+
+/// How an export writes baked textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureMode {
+    /// Shared `.ktx2` files (GPU-compressed, mipmapped), named by content.
+    Ktx2,
+    /// Shared `.png` files, named by content.
+    Png,
+    /// PNG packed into the glTF buffer.
+    Embed,
 }
 
 impl Options {
@@ -64,7 +74,7 @@ impl Options {
             small_indices: false,
             orm: false,
             emissive_strength: None,
-            shared_textures: None,
+            textures: None,
         }
     }
 
@@ -115,11 +125,17 @@ impl Options {
             match k.as_str() {
                 "preset" => {}
                 "textures" => {
-                    o.shared_textures = match x.as_str() {
-                        Some("shared") => Some(true),
-                        Some("embed") => Some(false),
-                        _ => return Err("optimize.textures: \"shared\" or \"embed\"".into()),
-                    }
+                    o.textures = Some(match x.as_str() {
+                        Some("ktx2") => TextureMode::Ktx2,
+                        Some("png") | Some("shared") => TextureMode::Png,
+                        Some("embed") => TextureMode::Embed,
+                        _ => {
+                            return Err(
+                                "optimize.textures: \"ktx2\" (default), \"png\" or \"embed\""
+                                    .into(),
+                            );
+                        }
+                    })
                 }
                 "dedup_materials" => o.dedup_materials = flag(x)?,
                 "cull_contacts" => o.cull_contacts = flag(x)?,

@@ -72,14 +72,18 @@ pub(crate) struct MassArg {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExportModelArgs {
-    /// File path to write, e.g. "chair.glb".
+    /// File path to write, e.g. "models/chair.gltf".
     pub(crate) path: String,
-    /// "gltf" for a JSON .gltf or "glb" for a binary .glb.
-    pub(crate) format: String,
-    /// "game", "none" (default), or overrides {preset?, dedup_materials?,
-    /// cull_contacts?, visible_from?: [{min, max}], view_samples?, instance?,
-    /// merge?: "by_material", merge_keep?: [patterns], weld?, small_indices?,
-    /// orm?, emissive_strength?}.
+    /// "gltf" (default, preferred: textures as shared KTX2 files) or "glb"
+    /// (one self-contained file, PNG textures inside). Omitted: from the
+    /// path's extension, else gltf.
+    #[serde(default)]
+    pub(crate) format: Option<String>,
+    /// "game", "none" (default), or overrides {preset?, textures?: "ktx2"
+    /// (gltf default) | "png" | "embed", dedup_materials?, cull_contacts?,
+    /// visible_from?: [{min, max}], view_samples?, instance?, merge?:
+    /// "by_material", merge_keep?: [patterns], weld?, small_indices?, orm?,
+    /// emissive_strength?}.
     #[serde(default)]
     pub(crate) optimize: Option<serde_json::Value>,
 }

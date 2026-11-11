@@ -71,6 +71,7 @@ pub mod game;
 pub mod gltf;
 pub mod graph;
 pub mod inspect;
+pub mod ktx2;
 pub mod light;
 pub mod material;
 pub mod outline;

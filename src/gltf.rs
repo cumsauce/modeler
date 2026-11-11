@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::export_opt::TextureMode;
 use crate::{Model, Part};
 
 fn align4(n: usize) -> usize {
@@ -173,6 +174,8 @@ fn check_part(i: usize, part: &Part) -> Result<(), String> {
 pub struct TextureOut {
     pub dir: PathBuf,
     pub uri_prefix: String,
+    /// `.ktx2` (GPU-compressed, mipmapped) instead of `.png`.
+    pub ktx2: bool,
 }
 
 impl TextureOut {
@@ -186,12 +189,14 @@ impl TextureOut {
                 return TextureOut {
                     dir: a.join("textures"),
                     uri_prefix: "../".repeat(up) + "textures/",
+                    ktx2: true,
                 };
             }
         }
         TextureOut {
             dir: dir.join("textures"),
             uri_prefix: "textures/".into(),
+            ktx2: true,
         }
     }
 }
@@ -270,18 +275,35 @@ pub(crate) fn build_with(
                 let t = crate::material::pbr::textures(&ch);
                 let per_part = r.graph().is_ok_and(|g| g.domain == "object");
                 let mut add = |px: &[u8], what: &str| -> Result<u32, String> {
-                    let png = crate::raster::encode_png(t.w as u32, t.h as u32, px)?;
-                    texture_bytes += png.len();
                     let name = format!("{}-{what}", r.material);
+                    let (png, ext, mime) = if tex_out.is_some_and(|o| o.ktx2) {
+                        use crate::ktx2::Kind;
+                        let kind = match what {
+                            "base_color" | "emissive" => Kind::Srgb,
+                            "normal" => Kind::Normal,
+                            "occlusion" => Kind::Gray,
+                            _ => Kind::Linear,
+                        };
+                        (
+                            crate::ktx2::encode(px, t.w, t.h, kind)?,
+                            "ktx2",
+                            "image/ktx2",
+                        )
+                    } else {
+                        let png = crate::raster::encode_png(t.w as u32, t.h as u32, px)?;
+                        (png, "png", "image/png")
+                    };
+                    texture_bytes += png.len();
                     if let Some(out) = tex_out {
-                        let file = format!("{}-{:016x}.png", file_safe(&name), content_hash(&png));
+                        let file =
+                            format!("{}-{:016x}.{ext}", file_safe(&name), content_hash(&png));
                         let fp = out.dir.join(&file);
                         if fp.exists() {
                             tex_reused += 1;
                         } else {
                             std::fs::create_dir_all(&out.dir)
                                 .map_err(|e| format!("creating {}: {e}", out.dir.display()))?;
-                            let tmp = fp.with_extension("png.tmp");
+                            let tmp = fp.with_extension("tmp");
                             std::fs::write(&tmp, &png)
                                 .and_then(|_| std::fs::rename(&tmp, &fp))
                                 .map_err(|e| format!("writing {}: {e}", fp.display()))?;
@@ -293,7 +315,7 @@ pub(crate) fn build_with(
                         images.push(json!({
                             "name": name,
                             "uri": format!("{}{file}", out.uri_prefix),
-                            "mimeType": "image/png",
+                            "mimeType": mime,
                         }));
                     } else {
                         let view = b.view(&png, None);
@@ -681,7 +703,7 @@ pub(crate) fn build_with(
         .sum();
     let drawn: usize = exported.iter().map(|p| p.indices.len() / 3).sum();
     let mut report = format!(
-        "exported {} node(s), {} mesh(es), {} material(s), {} texture(s) ({} KB of PNG)\n\
+        "exported {} node(s), {} mesh(es), {} material(s), {} texture(s) ({} KB)\n\
          triangles: {} -> {} drawn ({} stored, the rest instanced); vertices {} -> {}\n\
          draw calls: {} -> {} batches (nodes sharing a mesh and material instance)",
         nodes.len(),
@@ -743,8 +765,14 @@ pub(crate) fn build_with(
     }
     if let Some(out) = tex_out {
         report += &format!(
-            "\ntextures: shared PNGs in {} ({tex_written} written, {tex_reused} already there from other exports)",
-            out.dir.display()
+            "\ntextures: shared {} files in {} ({tex_written} written, {tex_reused} already there from other exports){}",
+            if out.ktx2 { "KTX2" } else { "PNG" },
+            out.dir.display(),
+            if out.ktx2 {
+                "; GPU-compressed (BC7 colour, BC5 normals, BC4 AO) with mipmaps, zstd: Bevy's default 3D features load them"
+            } else {
+                ""
+            }
         );
         if tex_unique > 0 {
             report += &format!(
@@ -754,6 +782,16 @@ pub(crate) fn build_with(
         }
     }
     Ok((doc, b.bin, report))
+}
+
+fn texture_out(path: &Path, mode: TextureMode) -> Option<TextureOut> {
+    match mode {
+        TextureMode::Embed => None,
+        m => Some(TextureOut {
+            ktx2: m == TextureMode::Ktx2,
+            ..TextureOut::for_export(path)
+        }),
+    }
 }
 
 /// Write `<path>.gltf` plus a sibling `<stem>.bin` (path with the extension replaced by `bin`).
@@ -778,7 +816,7 @@ pub fn export_gltf_with(
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("bad export path {}", path.display()))?
         .to_owned();
-    let tex = (opts.shared_textures != Some(false)).then(|| TextureOut::for_export(path));
+    let tex = texture_out(path, opts.textures.unwrap_or(TextureMode::Ktx2));
     let (json, bin, report) =
         build_with(model, Some(format!("{stem_name}.bin")), opts, tex.as_ref())?;
     let json_text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
@@ -799,7 +837,7 @@ pub fn export_glb_with(
     path: &Path,
     opts: &crate::export_opt::Options,
 ) -> Result<String, crate::ModelerError> {
-    let tex = (opts.shared_textures == Some(true)).then(|| TextureOut::for_export(path));
+    let tex = texture_out(path, opts.textures.unwrap_or(TextureMode::Embed));
     let (json, bin, report) = build_with(model, None, opts, tex.as_ref())?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
     json_chunk.resize(align4(json_chunk.len()), b' ');

@@ -380,14 +380,16 @@ fn game_export_dedups_instances_culls_and_packs_orm() {
 }
 
 /// Two .gltf models under one `assets/` folder share one set of texture
-/// files, named by content, in `assets/textures/`.
+/// files, named by content, in `assets/textures/`: KTX2 by default (BC7 /
+/// BC5 with mips, which Bevy's own loader reads), PNG on request.
 #[test]
 fn gltf_exports_share_texture_files() {
     let mut s = modeler::commands::Session::default();
     let nodes = serde_json::json!([
         {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
         {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": 0.005},
-        {"type": "output", "name": "out", "base_color": "m", "roughness": 0.8}
+        {"type": "math", "name": "h", "op": "mul", "a": "m", "b": 0.004},
+        {"type": "output", "name": "out", "base_color": "m", "roughness": 0.8, "height": "h"}
     ]);
     s.materials
         .ops(
@@ -400,33 +402,70 @@ fn gltf_exports_share_texture_files() {
             None,
         )
         .unwrap();
-    let dir = temp_dir("shared").join("assets");
-    let mut files = Vec::new();
-    for (name, size) in [("rock_a", 1.0), ("rock_b", 0.6)] {
-        let items = serde_json::json!([
-            {"type": "primitive", "name": "r", "kind": "box", "size": size, "translation": [0, 0.5, 0]},
-            {"type": "material", "name": "r", "pbr": "stone"}
-        ]);
-        s.apply_values_as(None, items.as_array().unwrap().clone(), false)
-            .unwrap();
-        let path = dir.join("models").join(format!("{name}.gltf"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let report =
-            modeler::gltf::export_gltf_with(&s.model, &path, &modeler::export_opt::Options::none())
+    for mode in ["ktx2", "png"] {
+        let dir = temp_dir(&format!("shared-{mode}")).join("assets");
+        let opts = modeler::export_opt::Options::parse(&serde_json::json!({
+            "preset": "none", "textures": mode}))
+        .unwrap();
+        let mut uris = Vec::new();
+        for (name, size) in [("rock_a", 1.0), ("rock_b", 0.6)] {
+            let items = serde_json::json!([
+                {"type": "primitive", "name": "r", "kind": "box", "size": size, "translation": [0, 0.5, 0]},
+                {"type": "material", "name": "r", "pbr": "stone"}
+            ]);
+            s.apply_values_as(None, items.as_array().unwrap().clone(), false)
                 .unwrap();
-        assert!(report.contains("textures: shared PNGs"), "{report}");
-        let (doc, _, images) = gltf::import(&path).expect("gltf imports with external images");
-        assert_eq!(images.len(), 3);
-        for img in doc.images() {
-            let gltf::image::Source::Uri { uri, .. } = img.source() else {
-                panic!("image packed into the buffer");
-            };
-            assert!(uri.starts_with("../textures/"), "{uri}");
-            files.push(uri.to_string());
+            let path = dir.join("models").join(format!("{name}.gltf"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let report = if mode == "ktx2" {
+                // the default
+                modeler::gltf::export_gltf_with(
+                    &s.model,
+                    &path,
+                    &modeler::export_opt::Options::none(),
+                )
+            } else {
+                modeler::gltf::export_gltf_with(&s.model, &path, &opts)
+            }
+            .unwrap();
+            assert!(report.contains("textures: shared"), "{report}");
+            let doc = gltf::Gltf::open(&path).expect("gltf parses");
+            assert_eq!(doc.images().count(), 3);
+            for img in doc.images() {
+                let gltf::image::Source::Uri { uri, mime_type } = img.source() else {
+                    panic!("image packed into the buffer");
+                };
+                assert!(
+                    uri.starts_with("../textures/") && uri.ends_with(mode),
+                    "{uri}"
+                );
+                assert_eq!(mime_type, Some(format!("image/{mode}").as_str()));
+                uris.push(uri.to_string());
+            }
+        }
+        uris.sort();
+        uris.dedup();
+        assert_eq!(uris.len(), 3, "both rocks point at the same 3 files");
+        assert_eq!(std::fs::read_dir(dir.join("textures")).unwrap().count(), 3);
+        if mode == "ktx2" {
+            use bevy::image::{CompressedImageFormats, ktx2_buffer_to_image};
+            use bevy::render::render_resource::TextureFormat;
+            for u in &uris {
+                let bytes = std::fs::read(dir.join("models").join(u)).unwrap();
+                let srgb = u.contains("base_color");
+                let img = ktx2_buffer_to_image(&bytes, CompressedImageFormats::BC, srgb)
+                    .unwrap_or_else(|e| panic!("bevy rejects {u}: {e:?}"));
+                let want = if srgb {
+                    TextureFormat::Bc7RgbaUnormSrgb
+                } else if u.contains("normal") {
+                    TextureFormat::Bc5RgUnorm
+                } else {
+                    TextureFormat::Bc7RgbaUnorm
+                };
+                assert_eq!(img.texture_descriptor.format, want, "{u}");
+                assert_eq!(img.texture_descriptor.mip_level_count, 6, "{u}"); // 32 .. 1
+                assert_eq!(img.texture_descriptor.size.width, 32);
+            }
         }
     }
-    files.sort();
-    files.dedup();
-    assert_eq!(files.len(), 3, "both rocks point at the same 3 files");
-    assert_eq!(std::fs::read_dir(dir.join("textures")).unwrap().count(), 3);
 }
