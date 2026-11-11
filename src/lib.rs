@@ -355,23 +355,52 @@ impl Model {
 /// Serialization is non-destructive and small: a snapshot of a procedural
 /// model stores its ops (parts are re-derived on load) and never nests a
 /// second history inside itself.
+/// A document a [`History`] can snapshot: a model, or a material graph.
+pub trait Doc: Clone + std::fmt::Debug + Default + Serialize + serde::de::DeserializeOwned {
+    /// Drops what a recorded snapshot need not keep in memory (data that is
+    /// re-derived on navigation).
+    fn trim(&mut self) {}
+    /// A counter that changes with every edit (shown in `history`).
+    fn version(&self) -> u64;
+    /// The copy written to a file: trimmed, and never nesting a history.
+    fn for_file(&self) -> Self {
+        let mut d = self.clone();
+        d.trim();
+        d
+    }
+}
+
+impl Doc for Model {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn trim(&mut self) {
+        if self.parts_derive_from_ops() {
+            // Parts are the cached evaluation of ops.
+            self.parts.clear();
+        }
+    }
+    fn for_file(&self) -> Self {
+        let mut m = self.clone();
+        m.trim();
+        m.history = History::default();
+        m
+    }
+}
+
 #[derive(Clone, Debug, Default)]
-pub struct Snapshot {
-    pub model: Model,
+pub struct Snapshot<T: Doc = Model> {
+    /// The document at this node (named `model` in files for compatibility).
+    pub model: T,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub label: String,
 }
 
-impl Serialize for Snapshot {
+impl<T: Doc> Serialize for Snapshot<T> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut m = self.model.clone();
-        if m.parts_derive_from_ops() {
-            // Parts are the cached evaluation of ops; drop them from the file.
-            m.parts.clear();
-        }
-        m.history = History::default();
+        let m = self.model.for_file();
         let mut st = s.serialize_struct("Snapshot", 4)?;
         st.serialize_field("model", &m)?;
         st.serialize_field("parent", &self.parent)?;
@@ -381,11 +410,12 @@ impl Serialize for Snapshot {
     }
 }
 
-impl<'de> Deserialize<'de> for Snapshot {
+impl<'de, T: Doc> Deserialize<'de> for Snapshot<T> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        struct Raw {
-            model: Model,
+        #[serde(bound = "T: Doc")]
+        struct Raw<T> {
+            model: T,
             #[serde(default)]
             parent: Option<usize>,
             #[serde(default)]
@@ -393,7 +423,7 @@ impl<'de> Deserialize<'de> for Snapshot {
             #[serde(default)]
             label: String,
         }
-        let raw = Raw::deserialize(d)?;
+        let raw = Raw::<T>::deserialize(d)?;
         Ok(Snapshot {
             model: raw.model,
             parent: raw.parent,
@@ -407,14 +437,24 @@ impl<'de> Deserialize<'de> for Snapshot {
 /// mutation records a child of the current node; undo walks to the parent,
 /// redo to the most recent child, and jump lands anywhere. Navigation is O(1)
 /// and exact: nodes hold full models, never inverse operations.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct History {
-    pub nodes: Vec<Snapshot>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "T: Doc")]
+pub struct History<T: Doc = Model> {
+    pub nodes: Vec<Snapshot<T>>,
     #[serde(default)]
     pub current: Option<usize>,
 }
 
-impl History {
+impl<T: Doc> Default for History<T> {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            current: None,
+        }
+    }
+}
+
+impl<T: Doc> History<T> {
     /// True when nothing has been recorded yet (skipped in serialization).
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
@@ -427,10 +467,8 @@ impl History {
     /// parts: they are re-derived on navigation (`Model::restore_parts`),
     /// which the eval cache makes cheap. Memory then grows with the ops, not
     /// with edits x mesh size.
-    pub fn record(&mut self, mut model: Model, label: impl Into<String>) -> usize {
-        if model.parts_derive_from_ops() {
-            model.parts.clear();
-        }
+    pub fn record(&mut self, mut model: T, label: impl Into<String>) -> usize {
+        model.trim();
         let id = self.nodes.len();
         self.nodes.push(Snapshot {
             model,
@@ -447,21 +485,21 @@ impl History {
 
     /// Moves the cursor to the parent and returns its id and model (owned, so
     /// the caller can hand it back into a model that owns this history).
-    pub fn undo(&mut self) -> Option<(usize, Model)> {
+    pub fn undo(&mut self) -> Option<(usize, T)> {
         let parent = self.nodes[self.current?].parent?;
         self.current = Some(parent);
         Some((parent, self.nodes[parent].model.clone()))
     }
 
     /// Moves the cursor to the most recent child and returns its id and model.
-    pub fn redo(&mut self) -> Option<(usize, Model)> {
+    pub fn redo(&mut self) -> Option<(usize, T)> {
         let id = *self.nodes[self.current?].children.last()?;
         self.current = Some(id);
         Some((id, self.nodes[id].model.clone()))
     }
 
     /// Moves the cursor to any node in the tree and returns its id and model.
-    pub fn jump(&mut self, id: usize) -> Result<(usize, Model), ModelerError> {
+    pub fn jump(&mut self, id: usize) -> Result<(usize, T), ModelerError> {
         let Some(node) = self.nodes.get(id) else {
             return Err(format!("no history node #{id} (0..{})", self.nodes.len()).into());
         };
@@ -499,7 +537,7 @@ impl History {
                 next += 1;
             }
         }
-        let nearest_kept = |mut i: usize, nodes: &[Snapshot]| -> Option<usize> {
+        let nearest_kept = |mut i: usize, nodes: &[Snapshot<T>]| -> Option<usize> {
             while let Some(p) = nodes[i].parent {
                 if kept[p] {
                     return Some(remap[p]);
@@ -518,7 +556,7 @@ impl History {
             })
             .collect();
         let old = std::mem::take(&mut self.nodes);
-        let mut nodes: Vec<Snapshot> = Vec::with_capacity(next);
+        let mut nodes: Vec<Snapshot<T>> = Vec::with_capacity(next);
         for (i, mut node) in old.into_iter().enumerate() {
             if kept[i] {
                 node.parent = parents[i];
@@ -555,7 +593,7 @@ impl History {
             };
             lines.push(format!(
                 "#{id} {parent}, {label}, v{}{cursor}",
-                node.model.version
+                node.model.version()
             ));
         }
         lines.join("\n")

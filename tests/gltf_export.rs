@@ -187,6 +187,22 @@ fn hidden_parts_are_not_exported() {
     let doc = gltf::Gltf::open(&path).unwrap();
     let roots: Vec<_> = doc.default_scene().expect("scene").nodes().collect();
     assert_eq!(roots.len(), 1, "only the visible part is exported");
+    // The exported node carries the visible part's own name and colour,
+    // not the hidden part's that came before it.
+    let visible = model.parts[1].clone();
+    let node = &roots[0];
+    assert_eq!(node.name(), Some(visible.name.as_str()));
+    let mat = node
+        .mesh()
+        .expect("mesh")
+        .primitives()
+        .next()
+        .expect("prim")
+        .material();
+    assert_eq!(
+        mat.pbr_metallic_roughness().base_color_factor(),
+        visible.material.base_color
+    );
 
     // All-hidden exports are rejected rather than writing an empty scene.
     let mut model = test_model();

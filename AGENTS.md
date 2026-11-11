@@ -88,7 +88,7 @@ type, so there is no need to memorise field names.
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
-| `uvs` | part, projection (box / planar / cylindrical / spherical) |
+| `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
 
 - **Ops are upserts**: re-issuing an item with the same name *and type*
   replaces it and re-derives (the tweak path). Evaluation is

@@ -653,7 +653,7 @@ pub struct TriMeshSpec {
 #[serde(deny_unknown_fields)]
 pub struct UvsSpec {
     part: String,
-    /// box, planar, cylindrical or spherical.
+    /// box, planar, cylindrical, spherical or metric (box at real scale: uv in meters).
     projection: String,
 }
 

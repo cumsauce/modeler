@@ -146,8 +146,15 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerEr
     if part.verts.is_empty() {
         return Err(format!("cannot project UVs of empty part `{}`", part.name).into());
     }
-    if !matches!(projection, "planar" | "box" | "cylindrical" | "spherical") {
+    if !matches!(
+        projection,
+        "planar" | "box" | "cylindrical" | "spherical" | "metric"
+    ) {
         return Err(format!("unknown UV projection `{projection}`").into());
+    }
+    if projection == "metric" {
+        metric_box(part);
+        return Ok(());
     }
     // Box projection reads the face normals; make sure they exist.
     if part.normals.len() != part.verts.len() {
@@ -212,6 +219,66 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerEr
         uv[1] = uv[1].clamp(0.0, 1.0);
     }
     Ok(())
+}
+
+/// Box projection at real scale: each triangle is projected onto the plane
+/// facing its own normal's dominant axis, with UVs in meters (the part's
+/// scale applied), so a texture tiling every `t` meters looks the same size
+/// on every face of every part. Corners shared by triangles that pick
+/// different axes are split. Negative-facing faces flip u so nothing reads
+/// mirrored from outside.
+fn metric_box(part: &mut Part) {
+    use std::collections::HashMap;
+    let sc = Vec3::from(part.scale);
+    let count = part.verts.len();
+    let tris = if part.indices.is_empty() {
+        count / 3
+    } else {
+        part.indices.len() / 3
+    };
+    let idx = |i: usize| -> usize { part.indices.get(i).copied().unwrap_or(i as u32) as usize };
+    let has_n = part.normals.len() == count;
+    let (mut verts, mut normals, mut uvs, mut indices) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut remap: HashMap<(usize, u8), u32> = HashMap::new();
+    for t in 0..tris {
+        let c = [idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2)];
+        if c.iter().any(|&k| k >= count) {
+            continue;
+        }
+        let p = c.map(|k| Vec3::from(part.verts[k]) * sc);
+        let n = (p[1] - p[0]).cross(p[2] - p[0]);
+        let a = n.abs();
+        let (axis, sign) = if a.x >= a.y && a.x >= a.z {
+            (0u8, n.x.signum())
+        } else if a.y >= a.z {
+            (1, n.y.signum())
+        } else {
+            (2, n.z.signum())
+        };
+        for (corner, &k) in c.iter().enumerate() {
+            let key = (k, axis * 2 + u8::from(sign < 0.0));
+            let id = *remap.entry(key).or_insert_with(|| {
+                let w = p[corner];
+                let uv = match axis {
+                    0 => [-sign * w.z, w.y],
+                    1 => [w.x, -sign * w.z],
+                    _ => [sign * w.x, w.y],
+                };
+                verts.push(part.verts[k]);
+                if has_n {
+                    normals.push(part.normals[k]);
+                }
+                uvs.push(uv);
+                (verts.len() - 1) as u32
+            });
+            indices.push(id);
+        }
+    }
+    part.verts = verts;
+    part.normals = normals;
+    part.uvs = uvs;
+    part.indices = indices;
 }
 
 /// Rewrite a part's triangles for cylinder mapping: where a triangle's u values wrap
@@ -328,6 +395,24 @@ pub fn validate_uvs(part: &crate::Part, what: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metric_uvs_are_meters_on_every_face() {
+        let mut p = crate::primitives::primitive(crate::PrimitiveKind::Box, [2.0, 1.0, 0.5], "b")
+            .unwrap_or_else(|e| panic!("{e}"));
+        p.scale = [1.0, 3.0, 1.0];
+        super::project(&mut p, "metric").unwrap_or_else(|e| panic!("{e}"));
+        let span = |k: usize| {
+            let (lo, hi) = p.uvs.iter().fold((f32::MAX, f32::MIN), |(a, b), uv| {
+                (a.min(uv[k]), b.max(uv[k]))
+            });
+            hi - lo
+        };
+        // The front face spans 2 m across and 3 m up (scale applied).
+        assert!((span(0) - 2.0).abs() < 1e-5, "{}", span(0));
+        assert!((span(1) - 3.0).abs() < 1e-5, "{}", span(1));
+        assert_eq!(p.uvs.len(), p.verts.len());
+    }
+
     #[test]
     fn crease_splits_hard_edges_and_keeps_flat_welded() {
         let mut p = Part::new("fold");

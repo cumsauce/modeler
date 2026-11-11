@@ -159,7 +159,9 @@ fn build_json(
     let mut accessors = Vec::new();
     let mut buffer_views = Vec::new();
 
-    for (part, c) in model.parts.iter().zip(&chunks) {
+    // `layout` only lays out visible parts, so pair chunks with those.
+    let exported = model.parts.iter().filter(|p| p.visible);
+    for (part, c) in exported.zip(&chunks) {
         let material_index = materials.len() as u32;
         materials.push(json!({
             "name": format!("{}-mat", part.name),

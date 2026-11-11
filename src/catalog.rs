@@ -10,8 +10,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Model, ModelerError};
 
+/// A library kind: each lives in its own folder with its own `catalog.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Prefabs,
+    Materials,
+}
+
+impl Kind {
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Kind::Prefabs => "prefabs",
+            Kind::Materials => "materials",
+        }
+    }
+    fn noun(self) -> &'static str {
+        match self {
+            Kind::Prefabs => "prefab",
+            Kind::Materials => "material",
+        }
+    }
+}
+
 /// Where prefabs live: `<data>/friendslop/modeler/prefabs (kept from the friendslop days so existing catalogs carry over)`.
 pub fn catalog_dir() -> Result<PathBuf, ModelerError> {
+    kind_dir(Kind::Prefabs)
+}
+
+/// The folder of one library kind: `<data>/friendslop/modeler/<kind>`.
+pub fn kind_dir(kind: Kind) -> Result<PathBuf, ModelerError> {
     let base = if let Ok(dir) = std::env::var("FRIENDSLOP_DATA_DIR") {
         if !dir.is_empty() {
             PathBuf::from(dir)
@@ -21,7 +48,10 @@ pub fn catalog_dir() -> Result<PathBuf, ModelerError> {
     } else {
         native_data_dir()?
     };
-    Ok(base.join("friendslop").join("modeler").join("prefabs"))
+    Ok(base
+        .join("friendslop")
+        .join("modeler")
+        .join(kind.dir_name()))
 }
 
 fn native_data_dir() -> Result<PathBuf, ModelerError> {
@@ -137,12 +167,16 @@ pub struct Catalog {
     pub entries: Vec<CatalogEntry>,
 }
 
-fn catalog_path() -> Result<PathBuf, ModelerError> {
-    Ok(catalog_dir()?.join("catalog.json"))
+fn catalog_path(kind: Kind) -> Result<PathBuf, ModelerError> {
+    Ok(kind_dir(kind)?.join("catalog.json"))
 }
 
 fn load_catalog() -> Result<Catalog, ModelerError> {
-    let path = catalog_path()?;
+    load_index(Kind::Prefabs)
+}
+
+fn load_index(kind: Kind) -> Result<Catalog, ModelerError> {
+    let path = catalog_path(kind)?;
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(Catalog::default());
     };
@@ -151,7 +185,11 @@ fn load_catalog() -> Result<Catalog, ModelerError> {
 }
 
 fn save_catalog(catalog: &Catalog) -> Result<(), ModelerError> {
-    let path = catalog_path()?;
+    save_index(Kind::Prefabs, catalog)
+}
+
+fn save_index(kind: Kind, catalog: &Catalog) -> Result<(), ModelerError> {
+    let path = catalog_path(kind)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
@@ -252,6 +290,91 @@ pub fn save_prefab(
     }
     save_catalog(&catalog)?;
     Ok((name, overwrote))
+}
+
+/// Saves any library document (a material graph, ...) under `name` in
+/// `kind`'s folder and upserts its index entry. The document is written as
+/// [`crate::Doc::for_file`] (trimmed, its history kept inside it).
+/// Returns the sanitized name and whether an entry was overwritten.
+pub fn save_doc<T: crate::Doc>(
+    kind: Kind,
+    name: &str,
+    doc: &T,
+    description: &str,
+    tags: &[&str],
+    prompt: &str,
+) -> Result<(String, bool), ModelerError> {
+    let name = sanitize(name);
+    let mut catalog = load_index(kind)?;
+    let overwrote = catalog.entries.iter().any(|e| e.name == name);
+    let dir = kind_dir(kind)?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
+    let file = format!("{name}.json");
+    let text = serde_json::to_string_pretty(doc).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&dir.join(&file), text.as_bytes())?;
+    let entry = CatalogEntry {
+        name: name.clone(),
+        description: description.to_string(),
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        prompt: prompt.to_string(),
+        file,
+        created_at: iso_now(),
+    };
+    match catalog.entries.iter_mut().find(|e| e.name == name) {
+        Some(existing) => *existing = entry,
+        None => catalog.entries.push(entry),
+    }
+    save_index(kind, &catalog)?;
+    Ok((name, overwrote))
+}
+
+/// Loads a library document saved with [`save_doc`].
+pub fn load_doc<T: crate::Doc>(kind: Kind, name: &str) -> Result<T, ModelerError> {
+    let path = kind_dir(kind)?.join(format!("{}.json", sanitize(name)));
+    let text = fs::read_to_string(&path).map_err(|_| {
+        ModelerError::Io(format!(
+            "no {} named '{}' in the library",
+            kind.noun(),
+            sanitize(name)
+        ))
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|e| ModelerError::Parse(format!("parsing {}: {e}", path.display())))
+}
+
+/// Entries of one library kind, most recent last.
+pub fn list_kind(kind: Kind) -> Result<Vec<CatalogEntry>, ModelerError> {
+    let mut entries = load_index(kind)?.entries;
+    entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(entries)
+}
+
+/// One entry of a library kind.
+pub fn entry(kind: Kind, name: &str) -> Result<CatalogEntry, ModelerError> {
+    let wanted = sanitize(name);
+    load_index(kind)?
+        .entries
+        .into_iter()
+        .find(|e| e.name == wanted)
+        .ok_or_else(|| format!("no {} named '{wanted}' in the library", kind.noun()).into())
+}
+
+/// Removes a document and its entry (the file goes to `<kind>/removed/`,
+/// so a delete can be undone by hand).
+pub fn delete_doc(kind: Kind, name: &str) -> Result<(), ModelerError> {
+    let wanted = sanitize(name);
+    let mut catalog = load_index(kind)?;
+    let Some(i) = catalog.entries.iter().position(|e| e.name == wanted) else {
+        return Err(format!("no {} named '{wanted}' in the library", kind.noun()).into());
+    };
+    let e = catalog.entries.remove(i);
+    let dir = kind_dir(kind)?;
+    let bin = dir.join("removed");
+    fs::create_dir_all(&bin)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", bin.display())))?;
+    let _ = fs::rename(dir.join(&e.file), bin.join(&e.file));
+    save_index(kind, &catalog)
 }
 
 /// Load a saved model by name. Procedural prefabs store no parts; they are
