@@ -346,6 +346,22 @@ pub(crate) fn contact_shading() -> impl Bundle {
     )
 }
 
+/// Screen-space reflections: glossy surfaces reflect the other parts on
+/// screen (a fridge in a polished floor), on top of the studio. Needs the
+/// deferred renderer (the app default; cameras without a deferred prepass
+/// still render forward) and MSAA off (set by `contact_shading`, which
+/// must sit on the same camera).
+pub(crate) fn screen_reflections() -> impl Bundle {
+    (bevy::pbr::ScreenSpaceReflections {
+        // Mirrors too (Bevy's default starts at 0.08).
+        min_perceptual_roughness: 0.0..0.0,
+        max_perceptual_roughness: 0.55..0.65,
+        linear_steps: 32,
+        thickness: 0.1,
+        ..default()
+    },)
+}
+
 /// Camera and lights (no floor: the camera may orbit below the model).
 pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
@@ -368,9 +384,13 @@ pub(crate) fn setup_scene(mut commands: Commands, mut images: ResMut<Assets<Imag
             MainCamera,
             Camera3d::default(),
             studio_env(&mut images, STUDIO_INTENSITY),
+            Msaa::Off,
+            bevy::anti_alias::smaa::Smaa::default(),
+            screen_reflections(),
+            // Deferred like every material (the app default), with SSR.
             // No SSAO here: on the window camera it froze presentation
-            // (the view updated only on resize) on this Metal device; the
-            // offscreen agent camera keeps it.
+            // (the view updated only on resize) on this Metal device, as
+            // does a forward window camera over deferred materials.
             AmbientLight {
                 brightness: 60.0,
                 ..default()

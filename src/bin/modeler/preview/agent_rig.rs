@@ -130,6 +130,7 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
             Projection::from(PerspectiveProjection::default()),
             studio_env(&mut images, STUDIO_INTENSITY * 0.6),
             contact_shading(),
+            screen_reflections(),
             AmbientLight {
                 brightness: 40.0,
                 ..default()

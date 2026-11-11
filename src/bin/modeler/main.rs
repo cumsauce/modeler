@@ -162,6 +162,9 @@ fn main() -> AppExit {
                     ..default()
                 }),
         )
+        // Deferred by default so screen-space reflections work; cameras
+        // without a deferred prepass (the window) still render forward.
+        .insert_resource(bevy::pbr::DefaultOpaqueRendererMethod::deferred())
         .add_systems(Startup, (setup_scene, setup_material_pane))
         .add_systems(Startup, setup_agent_camera)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
