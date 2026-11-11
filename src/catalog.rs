@@ -15,6 +15,7 @@ use crate::{Model, ModelerError};
 pub enum Kind {
     Prefabs,
     Materials,
+    Styles,
 }
 
 impl Kind {
@@ -22,12 +23,14 @@ impl Kind {
         match self {
             Kind::Prefabs => "prefabs",
             Kind::Materials => "materials",
+            Kind::Styles => "styles",
         }
     }
     fn noun(self) -> &'static str {
         match self {
             Kind::Prefabs => "prefab",
             Kind::Materials => "material",
+            Kind::Styles => "style",
         }
     }
 }

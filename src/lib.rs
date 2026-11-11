@@ -67,7 +67,6 @@ pub mod csg;
 pub mod error;
 pub mod gltf;
 pub mod graph;
-pub mod graph_view;
 pub mod inspect;
 pub mod material;
 pub mod outline;
@@ -75,6 +74,7 @@ pub mod params;
 pub mod primitives;
 pub mod raster;
 pub mod spec;
+pub mod style;
 pub mod uv;
 pub mod verify;
 
@@ -211,6 +211,10 @@ pub struct Model {
     /// parameter, keyed by op output name: re-resolved when a parameter changes.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub templates: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The design tokens items read (`@colour`, `$number`, material presets,
+    /// field defaults); changing it re-derives every item that reads it.
+    #[serde(default, skip_serializing_if = "crate::style::Style::is_empty")]
+    pub style: crate::style::Style,
     /// Set by a successful `refresh` on an op-driven model: the cached parts
     /// are exactly the graph's derivation, so saves can omit them. Baked-part
     /// edits clear it (the cache then carries information the ops don't).

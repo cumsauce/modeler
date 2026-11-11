@@ -58,7 +58,7 @@ Three layers, read top to bottom:
    `~/Library/Application Support/friendslop/modeler/prefabs` + a
    `catalog.json` index. Saves are non-destructive and atomic.
 
-## MCP tool surface (32 tools)
+## MCP tool surface (33 tools)
 
 **Build: one tool, `apply_ops`.** Everything that changes geometry is an
 item in `apply_ops(ops, params?, expect?)`, each tagged with a `"type"`.
@@ -372,6 +372,48 @@ ms). Every mutation autosaves the whole session (parts, ops, params, history,
 annotations) to `session.json`, restored on startup, including the earlier
 items of a batch that failed partway. `save_prefab` only names and indexes it.
 
+## Style tokens
+
+A model carries a **style**: design tokens items read instead of literal
+values, so a generated scene has one cohesive look and restyles in one call
+(`src/style.rs`). Set it first, then build with tokens.
+
+- `style(action, tokens?, name?, ...)`: `show` (tokens + a swatch image),
+  `set` (merge `tokens`; a null removes a token), `replace`, `clear`, and
+  the library (`<data>/styles`): `list`, `describe`, `save` (name,
+  description, tags, prompt), `load` (becomes the model's style), `delete`.
+- Tokens: `brief` (the feel in words, shown in `scene_summary`),
+  `colors` (`"@primary"` anywhere a colour goes, with `.darken(x)`,
+  `.lighten(x)`, `.mix(@b, x)`, `.alpha(x)`, `.saturate(x)`,
+  `.desaturate(x)`; colours may alias `@others`), `materials` (presets, used
+  as `{"type": "material", "name": "top", "style": "plastic"}`; the item's own
+  fields win), `numbers` (`"$bevel"`, like params; a model param of the same
+  name wins), `defaults` (per item type, fields filled in when omitted:
+  `{"round": {"radius": "$bevel"}, "revolve": {"segments": "$segments"}}`).
+- There are no built-in styles: each project defines its own. A worked
+  example (a pastel toy look), then an item that uses it:
+
+  ```json
+  {"name": "style", "args": {"action": "set", "tokens": {
+    "brief": "chunky toy: pastels, soft rounded edges, low-poly curves",
+    "colors": {"primary": "#e07a5f", "secondary": "#81b29a", "wall": "#f4e1d2",
+               "ink": "#3d405b", "trim": "@primary.darken(0.25)"},
+    "materials": {"plastic": {"color": "@primary", "roughness": 0.45},
+                  "metal": {"color": "@ink.lighten(0.3)", "roughness": 0.35, "metalness": 1}},
+    "numbers": {"bevel": 0.04, "segments": 10},
+    "defaults": {"round": {"radius": "$bevel"}, "revolve": {"segments": "$segments"}}}}}
+  ```
+
+  `{"type": "material", "name": "table_top", "style": "plastic"}`,
+  `{"type": "material", "name": "ball", "color": "@secondary"}`,
+  `{"type": "round", "name": "top", "input": "top_raw", "mode": "fillet"}`
+  (radius from `$bevel`). Then `style set` with new colours or `style load`
+  of another saved style restyles the whole scene with no op edits.
+- Items that read the style keep their unresolved form (a template, like
+  params): `style set` / `load` re-derives every one whose resolved form
+  changed, as one history step (undo restores the old style). Items applied
+  before a style existed have no template and don't follow later styles.
+
 ## Procedural materials
 
 Materials are node graphs (SDFs, noise, maths, colour) evaluated on the CPU
@@ -485,25 +527,37 @@ fired.
 Left/middle/right-drag = orbit/pan (pan follows the cursor, with a floor so
 large scenes stay quick to pan when zoomed in), scroll = zoom (trackpad pixel
 scroll is scaled to wheel lines), arrows + PageUp/Down too.
-Auto-drift stops once the human steers; a model change re-frames the camera
-around true world bounds (bounds include part transforms). **G** toggles the
-node-graph pane (left 40% of the window, `PANE_FRACTION`; the 3D view takes the rest, and `screenshot`
-captures only the 3D pane, never the graph; `MODELER_GRAPH=1` opens it at start). It has one box per
-geometry op, coloured by kind, with edges from each input to its reader. In-place
-edits show as `+color` / `+hidden` / `+placed` / `+renamed` / `+moved` badges, and
-a whole-model `move` shows in the footer. Boxes whose output never shows are dimmed. A
-spring layout lays it out: new or changed ops drop in and glow. Wheel zooms, any drag
-pans, clicking a box makes its parts pulse in 3D and double-clicking frames them (`src/graph_view.rs` holds
-the view and layout; the panel lives in `preview/panel.rs`). **M** toggles the material pane in the same left pane (G and M replace each other;
-`MODELER_MATERIALS=1` opens it at start): the active material's graph by dependency level with a live
-thumbnail per node, a lit sphere and the channels, and clicking a node shows its
-output large (click again for the material). Layout: the outliner (O) on the left, open by default (G swaps the op graph
-into that spot), the material strip (M, open by default; `MODELER_OUTLINE=0` /
-`MODELER_MATERIALS=0` close them) along the bottom under both, the 3D view in
-the rest (`ui::apply_layout`). Comments use a Feathers popup
-(`preview/comments.rs`) listing the target's existing comments (each deletable):
-click a part in 3D, right-click an outliner row (a group comments on all its
-parts) or a material node / the preview sphere; Enter commits, Esc cancels. **O** toggles the outliner in the same left pane (`MODELER_OUTLINE=1` opens it at start): the scene as a hierarchy (`src/outline.rs`): prefab instances and array runs fold into expandable groups, hidden parts (cutters, blanks, sources) sink into one dimmed group, each row shows its material. Click a row to select it (its parts pulse in 3D), click a selected group or its chevron to open it, double-click to frame it; the wheel scrolls. The UI uses Bevy Feathers (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close button, and a toolbar at the 3D view's top right whose Outliner / Graph / Material toggles match O, G and M.
+Auto-drift stops once the human steers; a new model re-frames the camera
+around true world bounds (bounds include part transforms), while edits to
+the same model keep a camera the human steered.
+
+Layout (`ui::apply_layout`; the 3D camera renders to an image the size of
+what is left (`View3d`), shown by a UI node, so `screenshot` never includes a
+pane and screen-space reflections line up: a camera viewport inside the
+window misplaced them), every pane open by default
+(`MODELER_OUTLINE=0` / `MODELER_STYLE=0` / `MODELER_MATERIALS=0` close one):
+
+- **O**, the outliner, top of the left column (40%, `PANE_FRACTION`): the
+  scene as a hierarchy (`src/outline.rs`): prefab instances and array runs
+  fold into expandable groups, hidden parts (cutters, blanks, sources) sink
+  into one dimmed group, each row shows its material. Click a row to select
+  it (its parts pulse in 3D), click a selected group or its chevron to open
+  it, double-click to frame it; the wheel scrolls.
+- **S**, the style pane, under the outliner (`preview/style_pane.rs`): the
+  model's tokens, read-only: the brief, colour chips with hex, material
+  presets, numbers and defaults. It follows every `style` call.
+- **M**, the material strip along the bottom under both: the active
+  material's graph by dependency level with a live thumbnail per node, a lit
+  sphere and the channels; clicking a node shows its output large (click
+  again for the material).
+
+Comments use a Feathers popup (`preview/comments.rs`) listing the target's
+existing comments (each deletable): click a part in 3D, right-click an
+outliner row (a group comments on all its parts) or a material node / the
+preview sphere; Enter commits, Esc cancels. The UI uses Bevy Feathers
+(`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close
+button, and a toolbar at the 3D view's top right whose Outliner / Style /
+Material toggles match O, S and M.
 
 ## Dev notes / gotchas
 

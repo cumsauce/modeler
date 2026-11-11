@@ -388,6 +388,140 @@ impl Tools {
         .await
     }
 
+    /// The model's design tokens, so a scene has one cohesive look instead of
+    /// per-item guesses. Items then read `"@primary"` (colours, with
+    /// `.darken(x)` / `.lighten(x)` / `.mix(@other, x)` / `.alpha(x)` /
+    /// `.saturate(x)`), `"$bevel"` (numbers), `"style": "trim"` on a material
+    /// item (a preset), and `defaults` fill fields items omit. Changing a token
+    /// or loading another style re-derives every item that reads it (one undo).
+    /// Actions: "show" (tokens + a swatch image), "set" (merge `tokens`),
+    /// "replace", "clear", and the library: "list", "describe", "save" (name,
+    /// description, tags, prompt), "load" (becomes the model's style), "delete".
+    #[tool]
+    async fn style(
+        &self,
+        Parameters(StyleArgs {
+            action,
+            tokens,
+            name,
+            description,
+            tags,
+            prompt,
+        }): Parameters<StyleArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (png_tx, png_rx) = std::sync::mpsc::channel();
+        let r = self
+            .run(move |s| {
+                use modeler::catalog::Kind;
+                use modeler::style::Style;
+                let need = |what: &str, v: &Option<String>| {
+                    v.clone().ok_or_else(|| format!("{action}: needs `{what}`"))
+                };
+                Ok(match action.as_str() {
+                    "show" => {
+                        if let Ok(png) = s.model.style.swatches() {
+                            let _ = png_tx.send(png);
+                        }
+                        s.model.style.describe()
+                    }
+                    "set" | "replace" => {
+                        let t = tokens.ok_or("set: needs `tokens`")?;
+                        let mut st = if action == "set" {
+                            s.model.style.clone()
+                        } else {
+Style::default()
+                        };
+                        st.merge(&t)?;
+                        let msg = s.set_style(st)?;
+                        if let Ok(png) = s.model.style.swatches() {
+                            let _ = png_tx.send(png);
+                        }
+                        format!("{msg}\n{}", s.model.style.describe())
+                    }
+                    "clear" => s.set_style(Style::default())?,
+                    "list" => {
+                        let e = catalog::list_kind(Kind::Styles)?;
+                        if e.is_empty() {
+                            "style library is empty".to_string()
+                        } else {
+                            format_catalog(&e).replace("catalog entries", "saved styles")
+                        }
+                    }
+                    "describe" => {
+                        let n = need("name", &name)?;
+                        let e = catalog::entry(Kind::Styles, &n)?;
+                        let st: Style = catalog::load_doc(Kind::Styles, &n)?;
+                        if let Ok(png) = st.swatches() {
+                            let _ = png_tx.send(png);
+                        }
+                        format!(
+                            "saved `{}`: {} [{}]\nprompt: {}\n{}",
+                            e.name,
+                            e.description,
+                            e.tags.join(", "),
+                            e.prompt,
+                            st.describe()
+                        )
+                    }
+                    "save" => {
+                        let n = name
+                            .clone()
+                            .or_else(|| {
+                                (!s.model.style.name.is_empty()).then(|| s.model.style.name.clone())
+                            })
+                            .ok_or("save: needs `name`")?;
+                        if s.model.style.is_empty() {
+                            return Err("save: the model has no style (style set first)".into());
+                        }
+                        let tags = tags.unwrap_or_default();
+                        let t: Vec<&str> = tags.iter().map(String::as_str).collect();
+                        let mut st = s.model.style.clone();
+                        st.name = n.clone();
+                        let (saved, overwrote) = catalog::save_doc(
+                            Kind::Styles,
+                            &n,
+                            &st,
+                            &need("description", &description)?,
+                            &t,
+                            &prompt.clone().unwrap_or_default(),
+                        )?;
+                        s.model.style.name = saved.clone();
+                        format!(
+                            "saved style `{saved}`{}",
+                            if overwrote { " (overwrote the previous entry)" } else { "" }
+                        )
+                    }
+                    "load" => {
+                        let n = need("name", &name)?;
+                        let mut st: Style = catalog::load_doc(Kind::Styles, &n)?;
+                        st.name = n.clone();
+                        let msg = s.set_style(st)?;
+                        if let Ok(png) = s.model.style.swatches() {
+                            let _ = png_tx.send(png);
+                        }
+                        format!("loaded style `{n}`: {msg}\n{}", s.model.style.describe())
+                    }
+                    "delete" => {
+                        let n = need("name", &name)?;
+                        catalog::delete_doc(Kind::Styles, &n)?;
+                        format!("deleted saved style `{n}` (moved to removed/)")
+                    }
+                    other => {
+                        return Err(format!(
+                            "action `{other}`: use show, set, replace, clear, list, describe, save, load or delete"
+                        )
+                        .into());
+                    }
+                })
+            })
+            .await?;
+        let mut r = r;
+        if let Ok(png) = png_rx.try_recv() {
+            r.content.push(Content::image(B64.encode(png), "image/png"));
+        }
+        Ok(r)
+    }
+
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
     /// Call this first (and after any confusing result) to ground yourself in the model.
     #[tool]
@@ -1125,6 +1259,7 @@ impl rmcp::ServerHandler for Tools {
 - scene_summary, apply_ops and verify also return structuredContent JSON.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
+- Style tokens (a cohesive look): set them first with style(action \"set\" or \"load\"), then build with \"@primary\" colours (.darken(x) .lighten(x) .mix(@b, x) .alpha(x)), \"$bevel\" numbers, \"style\": \"<preset>\" on material items; style defaults fill omitted fields. Prefer tokens over literal colours; follow the style's brief. Changing a token re-derives every item reading it.
 - Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size; object materials wrap a per-part atlas; export_model writes the textures). undo/redo/jump/history take doc \"material:<name>\".
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(

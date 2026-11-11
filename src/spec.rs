@@ -153,6 +153,11 @@ impl schemars::JsonSchema for ColorArg {
     }
 }
 
+/// A colour value as RGBA 0..1 (for style tokens).
+pub fn parse_color_value(v: &Value) -> Result<[f32; 4], String> {
+    parse_color(v)
+}
+
 fn parse_color(v: &Value) -> Result<[f32; 4], String> {
     match v {
         Value::Array(items) if items.len() == 3 || items.len() == 4 => {

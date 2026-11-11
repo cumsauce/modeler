@@ -59,7 +59,7 @@ pub(crate) fn orbit_camera(
     mut orbit: ResMut<Orbit>,
     mut drag: ResMut<CameraDrag>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
-    panel: Res<GraphPanel>,
+    panel: Res<StylePane>,
     mat_pane: Res<MatPane>,
     outline: Res<OutlinePane>,
 ) {

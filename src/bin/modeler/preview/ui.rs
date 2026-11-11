@@ -1,6 +1,6 @@
 //! Shared window chrome built on Bevy Feathers (the editor widget set): the
 //! dark theme, Fira fonts, pane headers with a close button, and the toolbar
-//! over the 3D view that toggles the graph (G) and material (M) panes.
+//! over the 3D view that toggles the outliner (O), style (S) and material (M) panes.
 
 use bevy::feathers::constants::{fonts, icons, size};
 use bevy::feathers::controls::{ButtonVariant, FeathersToolButton};
@@ -21,31 +21,50 @@ pub(crate) const PANE_FRACTION: f32 = 0.4;
 /// Share of the window height the material strip takes along the bottom.
 pub(crate) const STRIP_FRACTION: f32 = 0.3;
 
-/// Window layout: the outliner (or the graph, G) on the left, the material
-/// strip (M) along the bottom under both, the 3D view in what is left. The
+/// Window layout: the outliner on the left with the style pane (S) under it,
+/// the material strip (M) along the bottom under both, the 3D view in what
+/// is left. The
 /// 3D camera renders to that rectangle only, so screenshots never include a
 /// pane.
 pub(crate) fn apply_layout(
     windows: Query<&Window, With<PrimaryWindow>>,
-    graph: Res<GraphHudVisible>,
+    style: Res<StylePane>,
     mat: Res<MatPane>,
     outline: Res<OutlinePane>,
-    mut left: Query<&mut Node, Or<(With<GraphHud>, With<OutlineHud>)>>,
-    mut cameras: Query<&mut Camera, With<MainCamera>>,
+    mut outline_nodes: Query<&mut Node, (With<OutlineHud>, Without<StyleHud>)>,
+    mut style_nodes: Query<&mut Node, (With<StyleHud>, Without<OutlineHud>)>,
+    mut cameras: Query<&mut RenderTarget, With<MainCamera>>,
+    (mut view, mut images): (ResMut<View3d>, ResMut<Assets<Image>>),
+    mut node: Query<&mut Node, (With<View3dNode>, Without<OutlineHud>, Without<StyleHud>)>,
+    mut shown: Query<&mut ImageNode, With<View3dNode>>,
 ) {
-    let (Ok(window), Ok(mut camera)) = (windows.single(), cameras.single_mut()) else {
+    let (Ok(window), Ok(mut target)) = (windows.single(), cameras.single_mut()) else {
         return;
     };
-    let left_open = graph.0 || outline.visible;
+    let left_open = style.visible || outline.visible;
     let h_pct = if mat.visible {
         100.0 - STRIP_FRACTION * 100.0
     } else {
         100.0
     };
-    for mut n in &mut left {
-        if n.height != Val::Percent(h_pct) {
-            n.height = Val::Percent(h_pct);
+    // Both open: the outliner takes the top 55%, the style pane the rest.
+    let (o_h, s_top, s_h) = match (outline.visible, style.visible) {
+        (true, true) => (h_pct * 0.55, h_pct * 0.55, h_pct * 0.45),
+        _ => (h_pct, 0.0, h_pct),
+    };
+    let set = |n: &mut Node, top: f32, h: f32| {
+        if n.top != Val::Percent(top) {
+            n.top = Val::Percent(top);
         }
+        if n.height != Val::Percent(h) {
+            n.height = Val::Percent(h);
+        }
+    };
+    for mut n in &mut outline_nodes {
+        set(&mut n, 0.0, o_h);
+    }
+    for mut n in &mut style_nodes {
+        set(&mut n, s_top, s_h);
     }
     let (w, h) = (window.physical_width(), window.physical_height());
     let x = if left_open {
@@ -58,20 +77,34 @@ pub(crate) fn apply_layout(
     } else {
         0
     };
-    let want = (left_open || mat.visible).then(|| bevy::camera::Viewport {
-        physical_position: UVec2::new(x, 0),
-        physical_size: UVec2::new((w - x.min(w)).max(1), (h - bottom.min(h)).max(1)),
-        ..default()
-    });
-    let same = match (&camera.viewport, &want) {
-        (Some(a), Some(b)) => {
-            a.physical_position == b.physical_position && a.physical_size == b.physical_size
+    let size = UVec2::new((w - x.min(w)).max(1), (h - bottom.min(h)).max(1));
+    let sf = window.scale_factor();
+    let rect = Rect::from_corners(
+        Vec2::new(x as f32, 0.0) / sf,
+        Vec2::new(x as f32 + size.x as f32, size.y as f32) / sf,
+    );
+    view.rect = rect;
+    if let Ok(mut n) = node.single_mut() {
+        let want = (
+            Val::Px(rect.min.x),
+            Val::Px(rect.min.y),
+            Val::Px(rect.width()),
+            Val::Px(rect.height()),
+        );
+        if (n.left, n.top, n.width, n.height) != want {
+            (n.left, n.top, n.width, n.height) = want;
         }
-        (None, None) => true,
-        _ => false,
-    };
-    if !same {
-        camera.viewport = want;
+    }
+    if view.size != size {
+        // A fresh target at the new size (as the agent rig does): the
+        // camera and the UI node switch to it together.
+        view.size = size;
+        let fresh = images.add(view_target(size.x, size.y));
+        view.image = fresh.clone();
+        *target = RenderTarget::Image(fresh.clone().into());
+        if let Ok(mut img) = shown.single_mut() {
+            img.image = fresh;
+        }
     }
 }
 
@@ -106,49 +139,28 @@ pub(crate) fn pane_bg() -> ThemeBackgroundColor {
 /// Which pane a close button or toolbar toggle acts on.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PaneToggle {
-    Graph,
+    Style,
     Material,
     Outline,
 }
 
-fn toggle(
-    which: PaneToggle,
-    graph: &mut GraphHudVisible,
-    mat: &mut MatPane,
-    outline: &mut OutlinePane,
-    panel: &mut GraphPanel,
-) {
+fn toggle(which: PaneToggle, style: &mut StylePane, mat: &mut MatPane, outline: &mut OutlinePane) {
     match which {
-        PaneToggle::Outline => {
-            // The graph shares the left side: O over it brings the outliner back.
-            if graph.0 {
-                graph.0 = false;
-                outline.visible = true;
-            } else {
-                outline.visible = !outline.visible;
-            }
-        }
-        PaneToggle::Graph => {
-            graph.0 = !graph.0;
-            panel.user_view = false;
-            panel.version = None;
-        }
-        PaneToggle::Material => {
-            mat.visible = !mat.visible;
-        }
+        PaneToggle::Outline => outline.visible = !outline.visible,
+        PaneToggle::Style => style.visible = !style.visible,
+        PaneToggle::Material => mat.visible = !mat.visible,
     }
 }
 
 fn on_toggle(
     activate: On<Activate>,
     which: Query<&PaneToggle>,
-    mut graph: ResMut<GraphHudVisible>,
+    mut style: ResMut<StylePane>,
     mut mat: ResMut<MatPane>,
     mut outline: ResMut<OutlinePane>,
-    mut panel: ResMut<GraphPanel>,
 ) {
     if let Ok(w) = which.get(activate.event_target()) {
-        toggle(*w, &mut graph, &mut mat, &mut outline, &mut panel);
+        toggle(*w, &mut style, &mut mat, &mut outline);
     }
 }
 
@@ -228,7 +240,7 @@ pub(crate) fn setup_toolbar(mut commands: Commands) {
         .id();
     for (which, label) in [
         (PaneToggle::Outline, "Outliner  O"),
-        (PaneToggle::Graph, "Graph  G"),
+        (PaneToggle::Style, "Style  S"),
         (PaneToggle::Material, "Material  M"),
     ] {
         commands
@@ -249,16 +261,16 @@ pub(crate) struct ToolbarToggle;
 
 /// Highlights the toolbar toggle of the open pane.
 pub(crate) fn sync_toolbar(
-    graph: Res<GraphHudVisible>,
+    style: Res<StylePane>,
     mat: Res<MatPane>,
     outline: Res<OutlinePane>,
     mut buttons: Query<(&PaneToggle, &mut ButtonVariant), With<ToolbarToggle>>,
 ) {
     for (which, mut variant) in &mut buttons {
         let open = match which {
-            PaneToggle::Graph => graph.0,
+            PaneToggle::Style => style.visible,
             PaneToggle::Material => mat.visible,
-            PaneToggle::Outline => outline.visible && !graph.0,
+            PaneToggle::Outline => outline.visible,
         };
         let want = ButtonVariant::selected(open);
         if *variant != want {

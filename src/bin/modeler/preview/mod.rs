@@ -16,6 +16,8 @@ mod outline_pane;
 pub(crate) use outline_pane::*;
 mod panel;
 pub(crate) use panel::*;
+mod style_pane;
+pub(crate) use style_pane::*;
 mod picking;
 pub(crate) use picking::*;
 mod ui;

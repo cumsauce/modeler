@@ -196,6 +196,26 @@ pub(crate) struct MaterialCatalogArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct StyleArgs {
+    /// show, set, replace, clear, list, describe, save, load or delete.
+    pub(crate) action: String,
+    /// For set / replace: {brief?, colors?: {name: colour}, materials?: {name:
+    /// {color, roughness, metalness, pbr, params, scale}}, numbers?: {name: n},
+    /// defaults?: {item_type: {field: value}}}. In set, a null value removes a token.
+    #[serde(default)]
+    pub(crate) tokens: Option<serde_json::Value>,
+    /// The library entry (save defaults to the style's own name).
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) prompt: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct OpNameArgs {
     /// The op's output part name, as shown by the ops list.
     pub(crate) name: String,

@@ -9,7 +9,7 @@ pub(crate) struct PendingShots(pub(crate) Vec<Mutex<Option<ShotReply>>>);
 pub(crate) fn take_screenshot(
     mut commands: Commands,
     mut pending: ResMut<PendingShots>,
-    cameras: Query<&Camera, With<MainCamera>>,
+    view: Res<View3d>,
     env_ready: Query<(), (With<MainCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
 ) {
@@ -26,24 +26,14 @@ pub(crate) fn take_screenshot(
     let Some(reply) = pending.0.pop() else {
         return;
     };
-    // Only the 3D pane: with the graph panel open, crop to the camera's viewport.
-    let crop = cameras
-        .single()
-        .ok()
-        .and_then(|c| c.viewport.as_ref())
-        .map(|v| (v.physical_position, v.physical_size));
+    // The 3D view's own image: never a pane.
     commands
-        .spawn(Screenshot::primary_window())
+        .spawn(Screenshot::image(view.image.clone()))
         .observe(move |captured: On<ScreenshotCaptured>| {
             if let Ok(mut slot) = reply.lock()
                 && let Some(reply) = slot.take()
             {
-                let _ = reply.send(match crop {
-                    Some((pos, size)) => image_to_canvas(&captured.image)
-                        .map(|c| crop_canvas(&c, pos, size))
-                        .and_then(|c| c.to_png()),
-                    None => encode_png(&captured.image),
-                });
+                let _ = reply.send(encode_png(&captured.image));
             }
         })
         .insert(Name::new("mcp screenshot"));
@@ -52,20 +42,6 @@ pub(crate) fn take_screenshot(
 /// Encode a captured frame to PNG bytes (BGRA/RGBA in, RGBA PNG out).
 pub(crate) fn encode_png(image: &Image) -> Result<Vec<u8>, String> {
     image_to_canvas(image)?.to_png()
-}
-
-/// The `pos`/`size` rectangle of a canvas (clamped to it).
-fn crop_canvas(c: &Canvas, pos: UVec2, size: UVec2) -> Canvas {
-    let (x0, y0) = ((pos.x as usize).min(c.w), (pos.y as usize).min(c.h));
-    let w = (size.x as usize).min(c.w - x0).max(1);
-    let h = (size.y as usize).min(c.h - y0).max(1);
-    let mut px = Vec::with_capacity(w * h * 4);
-    for y in y0..(y0 + h).min(c.h) {
-        let row = (y * c.w + x0) * 4;
-        px.extend_from_slice(&c.px[row..row + w * 4]);
-    }
-    px.resize(w * h * 4, 0);
-    Canvas::from_rgba(w, h, px)
 }
 
 /// A captured frame as an RGBA canvas (BGRA swizzled).

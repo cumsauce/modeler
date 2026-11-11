@@ -980,16 +980,22 @@ impl Session {
             }
             merged.insert(k, v);
         }
-        // Parse everything first, against the merged parameters.
+        // Parse everything first, against the merged parameters (over the
+        // style's number tokens) with the style's tokens expanded.
+        let style = self.model.style.clone();
+        let full = style.params_under(&merged);
         let mut parsed = Vec::with_capacity(items.len());
         for (i, raw) in items.iter().enumerate() {
-            let resolved = crate::params::resolve(raw, &merged)
+            let resolved = crate::style::expand(raw, &style)
+                .and_then(|v| crate::params::resolve(&v, &full))
                 .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
             let mut item = crate::spec::parse_item(i, &resolved)
                 .map_err(|e| format!("{e}\n(nothing was applied)"))?;
             self.resolve_pbr(&mut item)
                 .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
-            let template = (!crate::params::refs(raw).is_empty()).then(|| raw.clone());
+            let template = (!crate::params::refs(raw).is_empty()
+                || crate::style::reads_style(raw, &style))
+            .then(|| raw.clone());
             parsed.push((item, template));
         }
         // Templated ops already in the graph that read a changed parameter
@@ -1007,7 +1013,8 @@ impl Session {
                 continue;
             }
             if crate::params::refs(raw).iter().any(|r| changed.contains(r)) {
-                let resolved = crate::params::resolve(raw, &merged)
+                let resolved = crate::style::expand(raw, &style)
+                    .and_then(|v| crate::params::resolve(&v, &full))
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
                 let mut item = crate::spec::parse_item(0, &resolved)
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
@@ -1052,6 +1059,49 @@ impl Session {
         }
         lines.push(self.apply_items(parsed, false)?);
         Ok(lines.join("\n"))
+    }
+
+    /// Replaces the model's style (or patches it with `patch`) and re-derives
+    /// every templated op whose resolved form changed, as one history step.
+    pub fn set_style(&mut self, new: crate::style::Style) -> CmdResult {
+        new.check()?;
+        let before = self.model.clone();
+        let live: Vec<String> = self.model.ops.iter().map(Self::template_key).collect();
+        self.model.templates.retain(|k, _| live.contains(k));
+        let full = new.params_under(&self.model.params);
+        let mut changed = Vec::new();
+        for (key, raw) in &self.model.templates {
+            let resolved = crate::style::expand(raw, &new)
+                .and_then(|v| crate::params::resolve(&v, &full))
+                .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
+            let mut item = crate::spec::parse_item(0, &resolved)
+                .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
+            self.resolve_pbr(&mut item)
+                .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
+            if let BatchItem::Op(op) = item {
+                changed.push(op);
+            }
+        }
+        let mut n = 0;
+        for op in changed {
+            if let Some(slot) = self.model.ops.iter_mut().find(|o| {
+                graph::output(o) == graph::output(&op) && graph::kind(o) == graph::kind(&op)
+            }) && serde_json::to_value(&*slot).ok() != serde_json::to_value(&op).ok()
+            {
+                *slot = op;
+                n += 1;
+            }
+        }
+        self.model.style = new;
+        if let Err(e) = self.model.refresh() {
+            self.model = before;
+            return Err(format!("re-deriving restyled ops failed: {e}\n(style unchanged)").into());
+        }
+        self.commit("style");
+        let reading = self.model.templates.len();
+        Ok(format!(
+            "style set; re-derived {n} op(s) ({reading} op(s) read params or style tokens)"
+        ))
     }
 
     /// Applies a mixed batch: graph ops and baked edits (hide/show/rename),
@@ -2247,6 +2297,25 @@ impl Session {
             self.model.version,
             self.model.parts.len()
         );
+        if !self.model.style.is_empty() {
+            let st = &self.model.style;
+            s += &format!(
+                "style{}: {}{} colours, {} presets, {} numbers (style show for tokens)\n",
+                if st.name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" `{}`", st.name)
+                },
+                if st.brief.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{}\"; ", st.brief)
+                },
+                st.colors.len(),
+                st.materials.len(),
+                st.numbers.len()
+            );
+        }
         if !self.model.ops.is_empty() {
             s += &(graph::describe(&self.model.ops) + "\n");
         }

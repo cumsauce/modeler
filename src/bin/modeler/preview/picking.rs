@@ -42,10 +42,11 @@ pub(crate) fn pin_on_click(
     mut commands: Commands,
     mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
-    panel: Res<GraphPanel>,
+    panel: Res<StylePane>,
     mat_pane: Res<MatPane>,
     outline: Res<OutlinePane>,
     mut comment: ResMut<CommentBox>,
+    view: Res<View3d>,
 ) {
     if panel.hover || mat_pane.hover || outline.hover {
         return;
@@ -64,8 +65,12 @@ pub(crate) fn pin_on_click(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    // The cursor is window-relative; the 3D view may be a pane (graph open).
-    let cursor = cursor - camera.logical_viewport_rect().map_or(Vec2::ZERO, |r| r.min);
+    // The cursor is window-relative; the 3D view is an image in the area the
+    // panes leave, rendered at physical resolution.
+    if !view.rect.contains(cursor) {
+        return;
+    }
+    let cursor = (cursor - view.rect.min) * window.scale_factor();
     let Ok(ray) = camera.viewport_to_world(cam_transform, cursor) else {
         return;
     };

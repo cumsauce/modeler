@@ -30,7 +30,7 @@ pub(crate) struct OutlinePane {
 }
 
 impl OutlinePane {
-    /// Open at start (MODELER_OUTLINE=1), like MODELER_GRAPH for G.
+    /// Open at start unless MODELER_OUTLINE=0.
     pub(crate) fn open(visible: bool) -> Self {
         OutlinePane {
             visible,
@@ -67,21 +67,15 @@ pub(crate) fn update_outline_pane(
     typing: Res<PinTyping>,
     modeler: Res<Modeler>,
     mut pane: ResMut<OutlinePane>,
-    mut graph: ResMut<GraphHudVisible>,
     mut hud: Query<(&mut Visibility, &ComputedNode), With<OutlineHud>>,
     mut list: Query<(Entity, &mut ScrollPosition), With<OutlineList>>,
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
     if keys.just_pressed(KeyCode::KeyO) && !typing.open {
-        if graph.0 {
-            graph.0 = false;
-            pane.visible = true;
-        } else {
-            pane.visible = !pane.visible;
-        }
+        pane.visible = !pane.visible;
     }
-    let shown = pane.visible && !graph.0;
+    let shown = pane.visible;
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
     };

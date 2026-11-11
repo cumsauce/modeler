@@ -22,7 +22,7 @@ pub(crate) struct MatPreview;
 pub(crate) struct MatBox(usize);
 
 impl MatPane {
-    /// Open at start (MODELER_MATERIALS=1), like MODELER_GRAPH for G.
+    /// Open at start unless MODELER_MATERIALS=0.
     pub(crate) fn open(visible: bool) -> Self {
         MatPane {
             visible,

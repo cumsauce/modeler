@@ -114,8 +114,9 @@ fn main() -> AppExit {
     .insert_resource(AgentRig::default())
     .insert_resource(Orbit::default())
     .init_resource::<CameraDrag>()
-    .insert_resource(GraphHudVisible(std::env::var_os("MODELER_GRAPH").is_some()))
-    .init_resource::<GraphPanel>()
+    .insert_resource(StylePane::open(
+        std::env::var("MODELER_STYLE").map_or(true, |v| v != "0"),
+    ))
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
     // The outliner and material strip are open unless set to 0.
@@ -140,7 +141,7 @@ fn main() -> AppExit {
             spawn_pin_markers.run_if(windowed),
             comment_box.run_if(windowed),
             update_typing_hud.run_if(windowed),
-            update_graph_hud.run_if(windowed),
+            update_style_pane.run_if(windowed),
             highlight_selected.run_if(windowed),
             apply_layout.run_if(windowed),
             update_material_pane.run_if(windowed),
@@ -177,7 +178,10 @@ fn main() -> AppExit {
         .insert_resource(bevy::feathers::theme::UiTheme(
             bevy::feathers::dark_theme::create_dark_theme(),
         ))
-        .add_systems(Startup, (setup_toolbar, setup_outline_pane))
+        .add_systems(
+            Startup,
+            (setup_toolbar, setup_outline_pane, setup_style_pane),
+        )
         .add_systems(Update, sync_toolbar)
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }

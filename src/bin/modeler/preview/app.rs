@@ -20,6 +20,8 @@ pub(crate) struct PreviewPart;
 #[derive(Resource, Default)]
 pub(crate) struct SceneBuilt {
     pub(crate) version: Option<u64>,
+    /// The model the camera was last framed for.
+    pub(crate) framed: Option<String>,
 }
 
 /// Exits headless mode once the MCP server has hung up; windowed mode stays open so
@@ -136,12 +138,17 @@ pub(crate) fn rebuild_scene(
         ));
     }
     if let Some((min, max)) = modeler.session.model.bounds() {
-        orbit.target = (min + max) * 0.5;
         let radius = (max - min).length() * 0.5;
         orbit.scene_radius = radius.max(0.01);
-        orbit.dist = (radius * 2.4).max(1.0);
-        // A new model re-frames the view and hands control back to the drift.
-        orbit.user = false;
+        // A new model (or the first build) re-frames the view and hands
+        // control back to the drift; edits keep a camera the human steered.
+        let name = modeler.session.model.name.clone();
+        if !orbit.user || built.framed.as_deref() != Some(name.as_str()) {
+            orbit.target = (min + max) * 0.5;
+            orbit.dist = (radius * 2.4).max(1.0);
+            orbit.user = false;
+        }
+        built.framed = Some(name);
     }
 }
 
@@ -360,6 +367,27 @@ pub(crate) fn screen_reflections() -> impl Bundle {
     },)
 }
 
+/// The 3D view's render target: the human's camera renders here, and a UI
+/// node shows it in the space the panes leave.
+#[derive(Resource, Default)]
+pub(crate) struct View3d {
+    pub(crate) image: Handle<Image>,
+    /// The 3D area in logical window pixels.
+    pub(crate) rect: Rect,
+    /// The image size in physical pixels.
+    pub(crate) size: UVec2,
+}
+
+#[derive(Component)]
+pub(crate) struct View3dNode;
+
+pub(crate) fn view_target(w: u32, h: u32) -> Image {
+    let mut img = Image::new_target_texture(w, h, TextureFormat::Rgba8UnormSrgb, None);
+    // Screenshots copy it back.
+    img.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+    img
+}
+
 /// Camera and lights (no floor: the camera may orbit below the model).
 pub(crate) fn setup_scene(
     mut commands: Commands,
@@ -369,17 +397,35 @@ pub(crate) fn setup_scene(
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
     // entity does nothing), so faces turned from the sun went black. A dim
     // camera-aligned fill keeps every side readable as the human orbits.
-    // UI gets its own full-window camera, so the 3D camera can be a pane.
+    // The UI camera owns the window; the 3D camera renders to an image the
+    // size of the 3D area, shown by a UI node (`View3d`). A camera viewport
+    // inside the window broke screen-space reflections: their ray march maps
+    // to UVs over the whole target, so hits landed in the wrong place.
     commands.spawn((
         Name::new("ui camera"),
         Camera2d,
         Camera {
             order: 1,
-            clear_color: ClearColorConfig::None,
             ..default()
         },
         IsDefaultUiCamera,
     ));
+    let view_image = images.add(view_target(16, 16));
+    commands.spawn((
+        Name::new("3d view"),
+        View3dNode,
+        ImageNode::new(view_image.clone()),
+        Node {
+            position_type: PositionType::Absolute,
+            ..default()
+        },
+        Pickable::IGNORE,
+        GlobalZIndex(-1),
+    ));
+    commands.insert_resource(View3d {
+        image: view_image.clone(),
+        ..default()
+    });
     commands
         .spawn((
             Name::new("camera"),
@@ -399,6 +445,7 @@ pub(crate) fn setup_scene(
             },
             Transform::from_translation(Vec3::new(4.0, 3.0, 6.0)).looking_at(Vec3::ZERO, Vec3::Y),
         ))
+        .insert(RenderTarget::Image(view_image.into()))
         .with_children(|c| {
             c.spawn((
                 Name::new("view fill"),
@@ -435,57 +482,4 @@ pub(crate) fn setup_scene(
         bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
         GlobalZIndex(3),
     ));
-    let graph = commands
-        .spawn((
-            Name::new("graph hud"),
-            GraphHud,
-            Visibility::Hidden,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(0.0),
-                left: Val::Px(0.0),
-                width: Val::Percent(PANE_FRACTION * 100.0),
-                height: Val::Percent(100.0),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            pane_bg(),
-        ))
-        .with_children(|p| {
-            p.spawn((
-                GraphCanvas,
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(HEADER_H),
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                    bottom: Val::Px(0.0),
-                    ..default()
-                },
-            ));
-            p.spawn((
-                GraphFooter,
-                Text::new(String::new()),
-                ui_text(&assets, 11.0, false),
-                ui_color(true),
-                Node {
-                    position_type: PositionType::Absolute,
-                    bottom: Val::Px(0.0),
-                    left: Val::Px(0.0),
-                    right: Val::Px(0.0),
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                    ..default()
-                },
-                bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
-                GlobalZIndex(1),
-            ));
-        })
-        .id();
-    spawn_pane_header(
-        &mut commands,
-        &assets,
-        graph,
-        PaneToggle::Graph,
-        Text::new("Op graph"),
-    );
 }
