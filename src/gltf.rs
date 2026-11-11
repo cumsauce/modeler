@@ -168,7 +168,7 @@ fn check_part(i: usize, part: &Part) -> Result<(), String> {
 
 /// Builds the glTF JSON and its binary buffer. `buffer_uri` is `Some` for
 /// .gltf + .bin, `None` for an embedded .glb buffer.
-fn build(
+pub(crate) fn build(
     model: &Model,
     buffer_uri: Option<String>,
     opts: &crate::export_opt::Options,
@@ -396,6 +396,115 @@ fn build(
         }
         nodes.push(node);
     }
+    // Lights (KHR_lights_punctual, which Bevy's glTF loader reads). glTF
+    // point/spot intensity is candela; Bevy multiplies by 4 pi back to lumens.
+    let lights = crate::light::collect(model)?;
+    let mut punctual = Vec::new();
+    for l in &lights {
+        let mut j = json!({
+            "name": l.name,
+            "type": l.kind,
+            "color": l.color,
+            "intensity": if l.kind == "directional" {
+                l.intensity
+            } else {
+                l.intensity / (4.0 * std::f32::consts::PI)
+            },
+        });
+        if let Some(r) = l.range
+            && l.kind != "directional"
+        {
+            j["range"] = json!(r);
+        }
+        if l.kind == "spot" {
+            j["spot"] = json!({"innerConeAngle": l.inner, "outerConeAngle": l.outer});
+        }
+        punctual.push(j);
+        let mut node = json!({
+            "name": l.name,
+            "translation": l.position.to_array(),
+            "rotation": l.rotation().to_array(),
+            "extensions": {"KHR_lights_punctual": {"light": punctual.len() - 1}},
+        });
+        if l.shadows {
+            node["extras"] = json!({"shadows": true});
+        }
+        nodes.push(node);
+    }
+    if !punctual.is_empty() {
+        extensions.push("KHR_lights_punctual");
+    }
+    // Game data as node extras: colliders (a box / hull node per part, the
+    // part's node as its child when the body moves; `mesh` marks the part's
+    // own node) and markers (empty nodes).
+    let colliders = crate::game::colliders(model)?;
+    let mut children = std::collections::HashSet::new();
+    let mut unplaced = Vec::new();
+    for c in &colliders {
+        let at = nodes
+            .iter()
+            .position(|n| n["name"] == json!(c.part) && n.get("mesh").is_some());
+        let mut info = json!({"body": c.body});
+        if c.sensor {
+            info["sensor"] = json!(true);
+        }
+        match c.shape.as_str() {
+            "mesh" => {
+                let Some(i) = at else {
+                    unplaced.push(c.part.clone());
+                    continue;
+                };
+                info["shape"] = json!("trimesh");
+                nodes[i]["extras"]["collider"] = info;
+                continue;
+            }
+            "hull" => {
+                info["shape"] = json!("convex_hull");
+                info["points"] = json!(c.points);
+            }
+            _ => {
+                info["shape"] = json!("cuboid");
+                info["half_extents"] = json!(c.half_extents.to_array());
+            }
+        }
+        let mut node = json!({
+            "name": format!("{}.collider", c.part),
+            "translation": c.center.to_array(),
+            "extras": {"collider": info},
+        });
+        if c.body != "static"
+            && let Some(i) = at
+        {
+            // The body moves: the render node rides it as a child.
+            let t = &nodes[i]["translation"];
+            let local: Vec<f32> = (0..3)
+                .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - c.center[k])
+                .collect();
+            nodes[i]["translation"] = json!(local);
+            node["children"] = json!([i]);
+            children.insert(i);
+        } else if c.body != "static" {
+            unplaced.push(c.part.clone());
+        }
+        nodes.push(node);
+    }
+    let markers = crate::game::markers(model)?;
+    for m in &markers {
+        let mut extras = json!({"marker": m.kind});
+        if let Some(z) = m.size {
+            extras["size"] = json!(z);
+        }
+        if let Some(d) = &m.data {
+            extras["data"] = d.clone();
+        }
+        nodes.push(json!({
+            "name": m.name,
+            "translation": m.position.to_array(),
+            "rotation": m.rotation.to_array(),
+            "extras": extras,
+        }));
+    }
+    let roots: Vec<usize> = (0..nodes.len()).filter(|i| !children.contains(i)).collect();
     let mut buffer = json!({ "byteLength": b.bin.len() });
     if let Some(uri) = buffer_uri {
         buffer["uri"] = json!(uri);
@@ -403,7 +512,7 @@ fn build(
     let mut doc = json!({
         "asset": { "version": "2.0", "generator": "modeler" },
         "scene": 0,
-        "scenes": [{ "nodes": (0..nodes.len()).collect::<Vec<_>>() }],
+        "scenes": [{ "nodes": roots }],
         "nodes": nodes,
         "meshes": meshes,
         "materials": materials,
@@ -413,6 +522,9 @@ fn build(
     });
     if !extensions.is_empty() {
         doc["extensionsUsed"] = json!(extensions);
+    }
+    if !punctual.is_empty() {
+        doc["extensions"] = json!({"KHR_lights_punctual": {"lights": punctual}});
     }
     if !images.is_empty() {
         doc["images"] = json!(images);
@@ -453,7 +565,10 @@ fn build(
         {
             let mut pairs = std::collections::BTreeSet::new();
             for n in doc["nodes"].as_array().into_iter().flatten() {
-                let m = n["mesh"].as_u64().unwrap_or(0) as usize;
+                let Some(m) = n["mesh"].as_u64() else {
+                    continue;
+                };
+                let m = m as usize;
                 pairs.insert((m, doc["meshes"][m]["primitives"][0]["material"].as_u64()));
             }
             pairs.len()
@@ -461,6 +576,32 @@ fn build(
     );
     for l in &r.lines {
         report += &format!("\n- {l}");
+    }
+    if !colliders.is_empty() {
+        let count = |s: &str| colliders.iter().filter(|c| c.shape == s).count();
+        report += &format!(
+            "\ncolliders: {} ({} box, {} hull, {} mesh) in node extras.collider",
+            colliders.len(),
+            count("box"),
+            count("hull"),
+            count("mesh")
+        );
+        if !unplaced.is_empty() {
+            report += &format!(
+                "\n  WARNING: merged away, so the collider has no render node of its own (mesh colliders, moving bodies; keep them with merge_keep): {}",
+                unplaced.join(", ")
+            );
+        }
+    }
+    if !markers.is_empty() {
+        report += &format!("\nmarkers: {} in node extras.marker", markers.len());
+    }
+    if !lights.is_empty() {
+        let shadows = lights.iter().filter(|l| l.shadows).count();
+        report += &format!(
+            "\nlights: {} (KHR_lights_punctual; {shadows} want shadows: turn them on in game code via extras.shadows)",
+            lights.len()
+        );
     }
     Ok((doc, b.bin, report))
 }

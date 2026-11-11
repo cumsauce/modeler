@@ -16,6 +16,71 @@ pub(crate) fn windowed(headless: Option<Res<Headless>>) -> bool {
 #[derive(Component)]
 pub(crate) struct PreviewPart;
 
+/// A light from the model's `light` items (respawned with the parts).
+#[derive(Component)]
+pub(crate) struct SceneLight;
+
+/// Spawns the model's lights in Bevy units (lumens / lux), as a game would.
+fn spawn_lights(commands: &mut Commands, model: &modeler::Model) {
+    let lights = match modeler::light::collect(model) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lights: {e}");
+            return;
+        }
+    };
+    for l in lights {
+        let color = Color::linear_rgb(l.color[0], l.color[1], l.color[2]);
+        let tf = Transform::from_translation(l.position).with_rotation(l.rotation());
+        let name = Name::new(format!("light {}", l.name));
+        match l.kind.as_str() {
+            "directional" => {
+                commands.spawn((
+                    name,
+                    SceneLight,
+                    DirectionalLight {
+                        color,
+                        illuminance: l.intensity,
+                        shadow_maps_enabled: l.shadows,
+                        ..default()
+                    },
+                    tf,
+                ));
+            }
+            "spot" => {
+                commands.spawn((
+                    name,
+                    SceneLight,
+                    SpotLight {
+                        color,
+                        intensity: l.intensity,
+                        range: l.range.unwrap_or(20.0),
+                        inner_angle: l.inner,
+                        outer_angle: l.outer,
+                        shadow_maps_enabled: l.shadows,
+                        ..default()
+                    },
+                    tf,
+                ));
+            }
+            _ => {
+                commands.spawn((
+                    name,
+                    SceneLight,
+                    PointLight {
+                        color,
+                        intensity: l.intensity,
+                        range: l.range.unwrap_or(20.0),
+                        shadow_maps_enabled: l.shadows,
+                        ..default()
+                    },
+                    tf,
+                ));
+            }
+        }
+    }
+}
+
 /// Which model version the scene was last built from.
 #[derive(Resource, Default)]
 pub(crate) struct SceneBuilt {
@@ -111,15 +176,17 @@ pub(crate) fn rebuild_scene(
     mut built: ResMut<SceneBuilt>,
     existing: Query<Entity, With<PreviewPart>>,
     pins: Query<Entity, With<AnnotationPin>>,
+    lights: Query<Entity, With<SceneLight>>,
 ) {
     let version = modeler.session.model.version;
     if built.version == Some(version) {
         return;
     }
     built.version = Some(version);
-    for e in existing.iter().chain(&pins) {
+    for e in existing.iter().chain(&pins).chain(&lights) {
         commands.entity(e).despawn();
     }
+    spawn_lights(&mut commands, &modeler.session.model);
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
     for part in &modeler.session.model.parts {
@@ -469,6 +536,7 @@ pub(crate) fn setup_scene(
         .with_children(|c| {
             c.spawn((
                 Name::new("view fill"),
+                crate::preview::agent_rig::StudioLight,
                 DirectionalLight {
                     illuminance: 500.0,
                     ..default()
@@ -478,6 +546,7 @@ pub(crate) fn setup_scene(
         });
     commands.spawn((
         Name::new("sun"),
+        crate::preview::agent_rig::StudioLight,
         DirectionalLight {
             illuminance: 8000.0,
             shadow_maps_enabled: true,
@@ -502,4 +571,59 @@ pub(crate) fn setup_scene(
         bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
         GlobalZIndex(3),
     ));
+}
+
+/// Markers and colliders of the current model, re-collected when it changes.
+#[derive(Default)]
+pub(crate) struct GameGizmoCache {
+    version: Option<u64>,
+    markers: Vec<modeler::game::Marker>,
+    colliders: Vec<modeler::game::Collider>,
+}
+
+/// Draws markers (a cross, a facing arrow, the volume box) and collider
+/// boxes (green static, orange moving, blue sensors) in the 3D view and
+/// agent views, so placement is checkable by eye.
+pub(crate) fn draw_game_gizmos(
+    modeler: Res<Modeler>,
+    mut cache: Local<GameGizmoCache>,
+    mut gizmos: Gizmos,
+) {
+    let model = &modeler.session.model;
+    if cache.version != Some(model.version) {
+        cache.version = Some(model.version);
+        cache.markers = modeler::game::markers(model).unwrap_or_default();
+        cache.colliders = modeler::game::colliders(model).unwrap_or_default();
+    }
+    let marker_color = Color::srgb(1.0, 0.25, 0.85);
+    for m in &cache.markers {
+        let p = m.position;
+        let r = 0.15;
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            gizmos.line(p - axis * r, p + axis * r, marker_color);
+        }
+        let facing = m.rotation * Vec3::Z;
+        gizmos.arrow(p, p + facing * 0.5, marker_color);
+        if let Some(z) = m.size {
+            gizmos.cube(
+                Transform::from_translation(p)
+                    .with_rotation(m.rotation)
+                    .with_scale(Vec3::from(z)),
+                marker_color.with_alpha(0.6),
+            );
+        }
+    }
+    for c in &cache.colliders {
+        let color = if c.sensor {
+            Color::srgba(0.3, 0.6, 1.0, 0.5)
+        } else if c.body == "static" {
+            Color::srgba(0.3, 1.0, 0.4, 0.35)
+        } else {
+            Color::srgba(1.0, 0.6, 0.2, 0.6)
+        };
+        gizmos.cube(
+            Transform::from_translation(c.center).with_scale(c.half_extents * 2.0),
+            color,
+        );
+    }
 }

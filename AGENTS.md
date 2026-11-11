@@ -54,9 +54,23 @@ Three layers, read top to bottom:
    undo/redo/jump move the cursor O(1). Editing after a jump **branches** (the
    old future stays reachable as a sibling subtree). Nothing is pruned
    automatically.
-3. **Prefab catalog** (`src/catalog.rs`) — how work *persists*. JSON files in
-   `~/Library/Application Support/friendslop/modeler/prefabs` + a
-   `catalog.json` index. Saves are non-destructive and atomic.
+3. **Prefab catalog** (`src/catalog.rs`) — how work *persists*. JSON files +
+   a `catalog.json` index per kind (prefabs, styles, materials). Saves are
+   non-destructive and atomic. **Where** (`catalog::kind_dir`):
+   - **In a game project** (the default for real use): `<project>/.modeler/`,
+     next to `assets/` and never inside it, so the editable sources (ops,
+     history, styles) live in the game's repo but don't ship. The project is
+     `--project <dir>` (or `MODELER_PROJECT`), else the nearest ancestor of
+     the server's working directory with a `.modeler/` folder or a
+     `Cargo.toml` beside an `assets/` folder. Relative `export_model` paths
+     land in `<project>/assets/` (`"models/crate.glb"` ->
+     `assets/models/crate.glb`). `.modeler/.gitignore` is written once to
+     keep the per-machine autosaves (`session.json`, `open_docs.json`) out
+     of git. `catalog_list`'s first line says which library is in use.
+   - **Otherwise** the shared library
+     `~/Library/Application Support/friendslop/modeler/` (this repo: no
+     `assets/`, so testing uses the shared one). `FRIENDSLOP_DATA_DIR`
+     overrides both (tests).
 
 ## MCP tool surface (34 tools)
 
@@ -88,6 +102,9 @@ type, so there is no need to memorise field names.
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
+| `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
+| `marker` | name, kind, [translation], [yaw], [size], [data], [attach] |
+| `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
 
 A `material` item may also carry `pbr` (a procedural material by name, see
@@ -283,7 +300,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
   every part, nearest first). Proves openings are open and fills are solid.
   Runs on the model itself, so it works headless too.
-- `agent_views(views, width?, height?, focus?, grid?)`: offscreen renders,
+- `agent_views(views, width?, height?, focus?, grid?, lighting?)`: offscreen renders,
   independent of the human's window.
   - Up to 9 views: `front`/`back`/`left`/`right`/`top`/`bottom`
     (orthographic, auto-framed), `iso` (perspective), or a camera you place,
@@ -379,6 +396,78 @@ batches, bytes):
 - `weld`, `small_indices` (u16), `orm` (AO packed into metal-roughness R),
   `emissive_strength` (KHR_materials_emissive_strength) are on in `game`.
 - Nodes carry `extras {part, material, comments}` for game-side lookup.
+
+**Lights:** `{"type": "light", "name": "bulb", "kind": "point",
+"translation": [0, 1.4, 0], "color": "#ffd8a8", "intensity": 800,
+"attach": "lamp_shade"}`. Units are Bevy's: lumens for point/spot, lux for
+directional (defaults 2000 / 3000); at Bevy's default camera exposure
+(EV100 9.7, daylight) indoor lights need tens of thousands of lumens to
+read, so a game lighting an interior lowers its exposure instead. `direction`
+aims spot/directional lights (default down); spot cones take
+`outer_degrees` (35) and `inner_degrees` (0.8 x outer). `attach` makes the
+light ride its part through moves and places; prefab instances bring their
+lights (`inst.bulb`). Colours take style tokens (`"@glow"`). Lights export
+as KHR_lights_punctual (Bevy's loader spawns them; `shadows` goes in node
+extras since glTF has no flag). The preview lights them on top of the
+studio; `agent_views(..., lighting: "scene")` renders with the model's
+lights only (studio off, faint environment) to judge how the level is lit.
+
+**Game data (colliders, markers):**
+
+- `collider` rules give parts collision shapes:
+  `{"type": "collider", "name": "level", "parts": ["*"], "shape": "box"}`
+  then narrower rules (later wins per part): `mesh` for static level
+  geometry that needs its real shape (ramps, arches), `hull` for props,
+  `body: "dynamic"` for things that fall and get pushed (hull or box only),
+  `sensor: true` for triggers, `none` to exempt (decals, foliage).
+- `marker` items are named points for game code: spawns, waypoints, item
+  spots, cameras, trigger zones (`size` = a box volume). `yaw` faces them
+  (degrees about +y, 0 = +z), `data` carries any JSON (`{"team": 1}`),
+  `attach` makes them ride a part's moves.
+- Both come along with prefab instances (`b1.grab`; the prefab's rules
+  apply first, so the scene can override: `{"parts": ["b2.*"], "shape":
+  "box"}`), follow moves, and draw as gizmos in the window and agent views
+  (markers magenta, colliders green static / orange moving / blue sensor).
+- Export (any `optimize`): a `box`/`hull` collider is a node
+  `<part>.collider` at the part's centre with `extras.collider`
+  `{shape: "cuboid", half_extents} | {shape: "convex_hull", points}` plus
+  `body` and `sensor`; a moving body's render node is its child so they
+  move together. `mesh` sets `extras.collider = {shape: "trimesh"}` on the
+  part's own node. Markers are empty nodes with `extras {marker: kind,
+  size?, data?}`. The report counts both. With `merge`, keep moving bodies
+  and mesh colliders out via `merge_keep` (the report warns).
+- In Bevy, enable the glTF extras (`GltfExtras` comes with the scene) and
+  map them, e.g. with Avian:
+
+  ```rust
+  fn colliders(q: Query<(Entity, &GltfExtras), Added<GltfExtras>>, mut c: Commands) {
+      for (e, x) in &q {
+          let Ok(v) = serde_json::from_str::<serde_json::Value>(&x.value) else { continue };
+          let Some(col) = v.get("collider") else { continue };
+          let shape = match col["shape"].as_str() {
+              Some("cuboid") => { let h = &col["half_extents"];
+                  Collider::cuboid(2.0 * h[0].as_f64().unwrap_or(0.5) as f32,
+                                   2.0 * h[1].as_f64().unwrap_or(0.5) as f32,
+                                   2.0 * h[2].as_f64().unwrap_or(0.5) as f32) }
+              Some("convex_hull") => Collider::convex_hull(
+                  serde_json::from_value::<Vec<Vec3>>(col["points"].clone()).unwrap_or_default())
+                  .unwrap_or_else(|| Collider::sphere(0.1)),
+              _ => { c.entity(e).insert(ColliderConstructorHierarchy::new(
+                  ColliderConstructor::TrimeshFromMesh)); continue }
+          };
+          let body = match col["body"].as_str() {
+              Some("dynamic") => RigidBody::Dynamic,
+              Some("kinematic") => RigidBody::Kinematic,
+              _ => RigidBody::Static,
+          };
+          c.entity(e).insert((shape, body));
+          if col["sensor"].as_bool() == Some(true) { c.entity(e).insert(Sensor); }
+      }
+  }
+  ```
+
+  Markers the same way: read `extras.marker` and spawn your own
+  components at the node's `Transform`.
 
 **Scenes (open documents):** `scene(action, name?)` keeps several models
 open at once, each with its own ops, history and style; every other tool

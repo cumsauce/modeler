@@ -694,6 +694,83 @@ pub struct PrefabSpec {
     style: Option<serde_json::Value>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LightSpec {
+    name: String,
+    /// point, spot or directional.
+    kind: String,
+    /// Colour (default white); style tokens work ("@glow").
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    color: Option<Value>,
+    /// Lumens for point/spot (a 60 W bulb ~800), lux for directional
+    /// (overcast ~1000, full sun ~100000). Defaults: point/spot 2000, directional 3000.
+    #[serde(default)]
+    intensity: Option<f32>,
+    /// Point/spot reach in meters.
+    #[serde(default)]
+    range: Option<f32>,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// Spot/directional aim (default [0, -1, 0], straight down).
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
+    /// Spot cone half-angles (default inner 0.8 * outer, outer 35).
+    #[serde(default)]
+    inner_degrees: Option<f32>,
+    #[serde(default)]
+    outer_degrees: Option<f32>,
+    /// Casts shadows (costly in games: use on a few key lights).
+    #[serde(default)]
+    shadows: bool,
+    /// A part the light rides with through moves and places.
+    #[serde(default)]
+    attach: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ColliderSpec {
+    /// The rule's name (re-issue to change it; later rules win per part).
+    name: String,
+    /// Part names or `*` globs ("wall*", "crate1.*", "*").
+    parts: Vec<String>,
+    /// box (axis-aligned, cheapest), hull (convex hull of the part), mesh
+    /// (the render triangles: static level geometry only) or none (no
+    /// collider, e.g. to exempt decals from a "*" rule).
+    shape: String,
+    /// static (default), dynamic or kinematic.
+    #[serde(default)]
+    body: Option<String>,
+    /// A trigger: reports overlaps, blocks nothing.
+    #[serde(default)]
+    sensor: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerSpec {
+    name: String,
+    /// What it is for game code: spawn, waypoint, trigger, camera, item, ...
+    kind: String,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// Facing in degrees about +y (0 faces +z / front, 90 faces +x).
+    #[serde(default)]
+    yaw: Option<f32>,
+    /// A box volume [x, y, z] centred on the marker (triggers, zones).
+    #[serde(default)]
+    size: Option<[f32; 3]>,
+    /// Free-form JSON passed through to game code.
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    data: Option<Value>,
+    /// A part the marker rides with through moves and places.
+    #[serde(default)]
+    attach: Option<String>,
+}
+
 /// One `apply_ops` item, tagged by "type". Only used for the published JSON
 /// schema; parsing goes item by item through [`parse_ops`] so errors name the
 /// item and the field.
@@ -711,6 +788,9 @@ pub enum OpSpec {
     Shell(ShellSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
+    Light(LightSpec),
+    Collider(ColliderSpec),
+    Marker(MarkerSpec),
     Place(PlaceSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
@@ -727,6 +807,9 @@ pub enum OpSpec {
 }
 
 pub const OP_TYPES: &[&str] = &[
+    "light",
+    "collider",
+    "marker",
     "primitive",
     "extrude",
     "revolve",
@@ -929,6 +1012,90 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 scale: s.scale,
                 relative: s.relative,
                 pivot: s.pivot,
+            })
+        }
+        "collider" => {
+            let s: ColliderSpec = de(&ctx, &body)?;
+            if !matches!(s.shape.as_str(), "box" | "hull" | "mesh" | "none") {
+                return Err(format!(
+                    "{ctx}: shape: `{}` (one of box, hull, mesh, none)",
+                    s.shape
+                ));
+            }
+            let body_kind = s.body.unwrap_or_else(|| "static".into());
+            if !matches!(body_kind.as_str(), "static" | "dynamic" | "kinematic") {
+                return Err(format!(
+                    "{ctx}: body: `{body_kind}` (one of static, dynamic, kinematic)"
+                ));
+            }
+            if s.shape == "mesh" && body_kind == "dynamic" {
+                return Err(format!(
+                    "{ctx}: a dynamic body can't use a mesh collider (physics engines need convex shapes): use hull or box"
+                ));
+            }
+            if s.parts.is_empty() {
+                return Err(format!("{ctx}: parts: list at least one part or glob"));
+            }
+            BatchItem::Op(Op::Collider {
+                name: s.name,
+                parts: s.parts,
+                shape: s.shape,
+                body: body_kind,
+                sensor: s.sensor,
+            })
+        }
+        "marker" => {
+            let s: MarkerSpec = de(&ctx, &body)?;
+            if s.kind.trim().is_empty() {
+                return Err(format!("{ctx}: kind must not be empty"));
+            }
+            if let Some(z) = s.size
+                && z.iter().any(|v| v.is_nan() || *v <= 0.0)
+            {
+                return Err(format!("{ctx}: size must be positive on every axis"));
+            }
+            BatchItem::Op(Op::Marker {
+                name: s.name,
+                kind: s.kind,
+                translation: s.translation,
+                yaw: s.yaw,
+                size: s.size,
+                data: s.data,
+                attach: s.attach,
+            })
+        }
+        "light" => {
+            let s: LightSpec = de(&ctx, &body)?;
+            if !matches!(s.kind.as_str(), "point" | "spot" | "directional") {
+                return Err(format!(
+                    "{ctx}: kind: `{}` is not a light (point, spot or directional)",
+                    s.kind
+                ));
+            }
+            if s.intensity.is_some_and(|v| !(v >= 0.0 && v.is_finite())) {
+                return Err(format!("{ctx}: intensity must be >= 0"));
+            }
+            if let Some(d) = s.direction
+                && d.iter().map(|v| v * v).sum::<f32>() < 1e-12
+            {
+                return Err(format!("{ctx}: direction must not be zero"));
+            }
+            let color = match &s.color {
+                Some(c) => parse_color(c).map_err(|e| format!("{ctx}: color: {e}"))?,
+                None => [1.0; 4],
+            };
+            BatchItem::Op(Op::Light {
+                name: s.name,
+                kind: s.kind,
+                color,
+                intensity: s.intensity,
+                range: s.range,
+                translation: s.translation,
+                direction: s.direction,
+                inner_degrees: s.inner_degrees,
+                outer_degrees: s.outer_degrees,
+                shadows: s.shadows,
+                attach: s.attach,
             })
         }
         "move" => {
@@ -1199,6 +1366,13 @@ pub fn example(ty: &str) -> Option<Value> {
         "hide_part" => json!({"type": "hide_part", "part": "door_cutter"}),
         "show_part" => json!({"type": "show_part", "part": "door_cutter"}),
         "rename" => json!({"type": "rename", "part": "wall_cut", "to": "wall"}),
+        "collider" => {
+            json!({"type": "collider", "name": "walls_solid", "parts": ["wall*", "floor"], "shape": "box"})
+        }
+        "marker" => json!({"type": "marker", "name": "spawn_1", "kind": "spawn",
+            "translation": [0, 0, 2], "yaw": 180, "data": {"team": 1}}),
+        "light" => json!({"type": "light", "name": "lamp_bulb", "kind": "point",
+            "translation": [0, 1.4, 0], "color": "#ffd8a8", "intensity": 800, "attach": "lamp_shade"}),
         "delete" => json!({"type": "delete", "name": "leg_raised"}),
         "tri_mesh" => {
             json!({"type": "tri_mesh", "name": "tri", "verts": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "indices": [0, 1, 2]})
@@ -1244,6 +1418,9 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
+        "light" => schemars::schema_for!(LightSpec),
+        "collider" => schemars::schema_for!(ColliderSpec),
+        "marker" => schemars::schema_for!(MarkerSpec),
         "place" => schemars::schema_for!(PlaceSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),

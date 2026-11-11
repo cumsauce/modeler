@@ -40,21 +40,86 @@ pub fn catalog_dir() -> Result<PathBuf, ModelerError> {
     kind_dir(Kind::Prefabs)
 }
 
-/// The folder of one library kind: `<data>/friendslop/modeler/<kind>`.
+/// The folder of one library kind. In a game project (see [`project_root`])
+/// that is `<project>/.modeler/<kind>`, outside `assets/` so the editable
+/// sources ship with the repo but not with the game; otherwise the shared
+/// `<data>/friendslop/modeler/<kind>`. `FRIENDSLOP_DATA_DIR` overrides both
+/// (tests).
 pub fn kind_dir(kind: Kind) -> Result<PathBuf, ModelerError> {
-    let base = if let Ok(dir) = std::env::var("FRIENDSLOP_DATA_DIR") {
-        if !dir.is_empty() {
-            PathBuf::from(dir)
-        } else {
-            native_data_dir()?
-        }
-    } else {
-        native_data_dir()?
-    };
-    Ok(base
+    if let Ok(dir) = std::env::var("FRIENDSLOP_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir)
+            .join("friendslop")
+            .join("modeler")
+            .join(kind.dir_name()));
+    }
+    if let Some(root) = project_root() {
+        return Ok(root.join(PROJECT_DIR).join(kind.dir_name()));
+    }
+    Ok(native_data_dir()?
         .join("friendslop")
         .join("modeler")
         .join(kind.dir_name()))
+}
+
+/// The per-project folder holding prefabs, styles, materials and the session.
+pub const PROJECT_DIR: &str = ".modeler";
+
+/// The game project this server works in, if any: `MODELER_PROJECT` (set by
+/// `--project <dir>`), else the nearest ancestor of the working directory
+/// that has a `.modeler/` folder, or a `Cargo.toml` next to an `assets/`
+/// folder (a Bevy game). None = the shared library.
+pub fn project_root() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("MODELER_PROJECT")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    find_project(&cwd)
+}
+
+/// [`project_root`]'s search from `start` upward.
+pub fn find_project(start: &std::path::Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|d| {
+            d.join(PROJECT_DIR).is_dir()
+                || (d.join("Cargo.toml").is_file() && d.join("assets").is_dir())
+        })
+        .map(PathBuf::from)
+}
+
+/// Where relative export paths land: the project's `assets/` (created on
+/// demand), or the working directory outside a project.
+pub fn resolve_export_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match project_root() {
+        Some(root) => root.join("assets").join(path),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Keeps per-machine autosaves out of the project's git history (written
+/// once, when `.modeler/` is first created; prefabs, styles and materials
+/// stay tracked).
+fn ensure_project_gitignore() {
+    let Some(root) = project_root() else {
+        return;
+    };
+    let ign = root.join(PROJECT_DIR).join(".gitignore");
+    if ign.exists() || std::env::var("FRIENDSLOP_DATA_DIR").is_ok_and(|d| !d.is_empty()) {
+        return;
+    }
+    let _ = fs::create_dir_all(root.join(PROJECT_DIR));
+    let _ = fs::write(
+        ign,
+        "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
+         */session.json\n*/open_docs.json\n*.tmp\n*/*.tmp\n",
+    );
 }
 
 fn native_data_dir() -> Result<PathBuf, ModelerError> {
@@ -192,6 +257,7 @@ fn save_catalog(catalog: &Catalog) -> Result<(), ModelerError> {
 }
 
 fn save_index(kind: Kind, catalog: &Catalog) -> Result<(), ModelerError> {
+    ensure_project_gitignore();
     let path = catalog_path(kind)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -224,6 +290,7 @@ fn session_state_path() -> Result<PathBuf, ModelerError> {
 /// Failures are reported but never fatal: losing an autosave must not break
 /// the tool call that triggered it.
 pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
+    ensure_project_gitignore();
     let path = session_state_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -641,5 +708,27 @@ mod tests {
             )
             .unwrap();
         assert!(scene.model.part("row_2").is_some());
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn finds_a_bevy_project_or_a_modeler_folder_upward() {
+        let tmp = std::env::temp_dir().join(format!("modeler_proj_{}", std::process::id()));
+        let game = tmp.join("game");
+        let deep = game.join("src").join("levels");
+        fs::create_dir_all(&deep).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(find_project(&deep), None, "no Cargo.toml + assets yet");
+        fs::write(game.join("Cargo.toml"), "[package]").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(find_project(&deep), None, "Cargo.toml alone is not a game");
+        fs::create_dir_all(game.join("assets")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(find_project(&deep), Some(game.clone()));
+        let other = tmp.join("other");
+        fs::create_dir_all(other.join(PROJECT_DIR)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(find_project(&other), Some(other.clone()));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

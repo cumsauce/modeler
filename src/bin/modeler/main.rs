@@ -24,8 +24,17 @@ fn main() -> AppExit {
         match arg.as_str() {
             "--headless" => headless = true,
             "--model" => model_path = args.next().map(PathBuf::from),
+            "--project" => {
+                let Some(dir) = args.next() else {
+                    eprintln!("--project needs a directory");
+                    std::process::exit(2);
+                };
+                let dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| PathBuf::from(&dir));
+                // SAFETY: set before any other thread starts.
+                unsafe { std::env::set_var("MODELER_PROJECT", dir) };
+            }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless] [--model <path.json>])"
+                "unknown argument `{other}` (usage: modeler [--headless] [--model <path.json>] [--project <game dir>])"
             ),
         }
     }
@@ -145,6 +154,7 @@ fn main() -> AppExit {
             quit_when_server_done(headless),
             take_screenshot.run_if(windowed),
             rebuild_scene.run_if(windowed),
+            draw_game_gizmos.run_if(windowed),
             orbit_camera.run_if(windowed),
             pin_on_click.run_if(windowed),
             spawn_pin_markers.run_if(windowed),

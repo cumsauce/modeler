@@ -77,7 +77,10 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     let mut hashes: HashMap<String, u64> = HashMap::new();
     for i in order {
         let op = &ops[i];
-        if matches!(op, Op::Move { .. }) {
+        if matches!(
+            op,
+            Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. }
+        ) {
             continue;
         }
         let input_hashes: Vec<u64> = inputs(op)
@@ -423,7 +426,7 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
 fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
     match op {
         // Applied after the graph, in `evaluate_with`.
-        Op::Move { .. } => {}
+        Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. } => {}
         Op::Primitive {
             name,
             kind,
@@ -878,7 +881,10 @@ fn upsert_shared(named: &mut Named, name: &str, part: Arc<Part>) {
 /// The output part name an op writes, used for upsert matching.
 pub fn output(op: &Op) -> &str {
     match op {
-        Op::Move { name, .. } => name,
+        Op::Move { name, .. }
+        | Op::Light { name, .. }
+        | Op::Collider { name, .. }
+        | Op::Marker { name, .. } => name,
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
         | Op::Revolve { name, .. }
@@ -905,7 +911,7 @@ pub fn output(op: &Op) -> &str {
 pub fn outputs(op: &Op) -> Vec<String> {
     match op {
         // Writes no part of its own: it re-places finished parts.
-        Op::Move { .. } => Vec::new(),
+        Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. } => Vec::new(),
         Op::RadialArray {
             name,
             count,
@@ -926,6 +932,9 @@ pub fn outputs(op: &Op) -> Vec<String> {
 pub fn kind(op: &Op) -> &'static str {
     match op {
         Op::Move { .. } => "move",
+        Op::Light { .. } => "light",
+        Op::Collider { .. } => "collider",
+        Op::Marker { .. } => "marker",
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
         Op::Revolve { .. } => "revolve",
@@ -950,6 +959,9 @@ pub fn kind(op: &Op) -> &'static str {
 pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
         Op::Move { .. }
+        | Op::Light { .. }
+        | Op::Collider { .. }
+        | Op::Marker { .. }
         | Op::Primitive { .. }
         | Op::Extrude { .. }
         | Op::Revolve { .. }
@@ -982,6 +994,59 @@ pub fn describe(ops: &[Op]) -> String {
     let mut lines = vec![format!("ops ({})", ops.len())];
     for (i, op) in ops.iter().enumerate() {
         lines.push(match op {
+            Op::Collider {
+                name,
+                parts,
+                shape,
+                body,
+                sensor,
+            } => format!(
+                "#{i} collider `{name}` parts={parts:?} {shape} {body}{}",
+                if *sensor { " sensor" } else { "" }
+            ),
+            Op::Marker {
+                name,
+                kind,
+                translation,
+                yaw,
+                size,
+                attach,
+                ..
+            } => {
+                let mut s = format!("#{i} marker `{name}` ({kind}) at={translation:?}");
+                if let Some(y) = yaw {
+                    s += &format!(" yaw={y}");
+                }
+                if let Some(z) = size {
+                    s += &format!(" size={z:?}");
+                }
+                if let Some(a) = attach {
+                    s += &format!(" attach=`{a}`");
+                }
+                s
+            }
+            Op::Light {
+                name,
+                kind,
+                color,
+                intensity,
+                translation,
+                direction,
+                attach,
+                ..
+            } => {
+                let mut s = format!("#{i} light `{name}` ({kind}) at={translation:?} color={color:?}");
+                if let Some(v) = intensity {
+                    s += &format!(" intensity={v}");
+                }
+                if let Some(d) = direction {
+                    s += &format!(" dir={d:?}");
+                }
+                if let Some(a) = attach {
+                    s += &format!(" attach=`{a}`");
+                }
+                s
+            }
             Op::Move {
                 name,
                 parts,

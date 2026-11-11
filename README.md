@@ -35,8 +35,10 @@ Point your agent's MCP config at the `modeler` binary
   instead of discarding.
 - **Prefab catalog**: non-destructive saves (op graph + history tree +
   annotations; procedural geometry re-derives on load; atomic writes).
-  Catalog lives in `~/Library/Application Support/friendslop/modeler/prefabs`
-  (carried over from the friendSLOP days).
+  In a game project (a `Cargo.toml` beside `assets/`, a `.modeler/` folder,
+  or `--project <dir>`) everything lives in `<project>/.modeler/`, outside
+  `assets/`, and relative exports land in `assets/`. Elsewhere it uses the
+  shared `~/Library/Application Support/friendslop/modeler/`.
 - **Senses for agents**: `verify` checks (closed meshes, bounds, grounded,
   stable), `inspect` (gaps/overlaps between parts, cross-sections, mass and
   tipping), and `agent_views` renders: several views tiled into one image,

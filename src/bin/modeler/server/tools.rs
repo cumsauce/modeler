@@ -547,8 +547,11 @@ Style::default()
             optimize,
         }): Parameters<ExportModelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let path = PathBuf::from(path);
+        let path = catalog::resolve_export_path(&PathBuf::from(path));
         self.run(move |s| {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
             let opts = modeler::export_opt::Options::parse(
                 &optimize.clone().unwrap_or(serde_json::Value::Null),
             )?;
@@ -634,8 +637,17 @@ Style::default()
     /// List every entry in the shared prefab catalog: names, tags and descriptions.
     #[tool]
     async fn catalog_list(&self) -> Result<CallToolResult, ErrorData> {
-        self.run(|_s| catalog::list().map(|e| format_catalog(&e)))
-            .await
+        self.run(|_s| {
+            let place = match catalog::project_root() {
+                Some(root) => format!(
+                    "library: project {} (.modeler/; relative exports go to assets/)\n",
+                    root.display()
+                ),
+                None => "library: shared (no game project; run in one or pass --project)\n".into(),
+            };
+            catalog::list().map(|e| place + &format_catalog(&e))
+        })
+        .await
     }
 
     /// Describe one catalog entry in full: description, tags and the prompt that made it.
@@ -965,6 +977,7 @@ Style::default()
             grid,
             style,
             dims,
+            lighting,
             diff,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -984,7 +997,21 @@ Style::default()
                 ));
             }
         };
-        let shot_style = ShotStyle { ids, dims };
+        let scene_lit = match lighting.as_deref() {
+            None | Some("studio") => false,
+            Some("scene") => true,
+            Some(other) => {
+                return Err(ErrorData::invalid_params(
+                    format!("lighting must be \"studio\" or \"scene\", got `{other}`"),
+                    None,
+                ));
+            }
+        };
+        let shot_style = ShotStyle {
+            ids,
+            dims,
+            scene_lit,
+        };
         let mut parsed = Vec::with_capacity(views.len());
         for v in views {
             parsed.push(match v {
@@ -1301,6 +1328,8 @@ impl rmcp::ServerHandler for Tools {
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - scene_summary, apply_ops and verify also return structuredContent JSON.
+- collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
+- light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
 - scene(open/switch/list/close) keeps several documents open; a prefab item naming an open doc instances it live (re-synced on switch); prefab style: \"scene\" re-themes a piece with the scene's tokens.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.

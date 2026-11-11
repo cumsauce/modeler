@@ -314,6 +314,11 @@ pub(crate) struct AgentViewsArgs {
     /// the orthographic views; overall size in perspective ones).
     #[serde(default)]
     pub(crate) dims: bool,
+    /// "studio" (default: soft boxes + sun, shows shape) or "scene": only
+    /// the model's own `light` items plus a faint ambient, to judge how the
+    /// level is lit (as the game would light it).
+    #[serde(default)]
+    pub(crate) lighting: Option<String>,
     /// Compare with the previous render of the same view/size/style: magenta
     /// where something now is, cyan where something was, the rest greyed,
     /// with the changed share.

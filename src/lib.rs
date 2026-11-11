@@ -66,9 +66,11 @@ pub mod contact;
 pub mod csg;
 pub mod error;
 pub mod export_opt;
+pub mod game;
 pub mod gltf;
 pub mod graph;
 pub mod inspect;
+pub mod light;
 pub mod material;
 pub mod outline;
 pub mod params;
@@ -857,6 +859,68 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         toward: Option<String>,
     },
+    /// A light: `point`, `spot` or `directional` (see `crate::light`). Writes
+    /// no part; collected after the graph, following `attach`'s moves.
+    Light {
+        name: String,
+        kind: String,
+        #[serde(default = "white")]
+        color: [f32; 4],
+        /// Lumens (point, spot) or lux (directional), Bevy's units.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intensity: Option<f32>,
+        /// Point/spot reach in meters (Bevy default 20).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<f32>,
+        #[serde(default)]
+        translation: [f32; 3],
+        /// Where spot and directional lights point (default straight down).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<[f32; 3]>,
+        /// Spot cone: the full-brightness and the edge half-angles.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inner_degrees: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outer_degrees: Option<f32>,
+        #[serde(default)]
+        shadows: bool,
+        /// A part the light rides with: moves and places of that part carry
+        /// the light along (a lamp's bulb, a door's sign).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<String>,
+    },
+    /// Collision shapes for the game: every part matching `parts` gets a
+    /// `shape` (box / hull / mesh / none) of `body` (static / dynamic /
+    /// kinematic), exported as node extras (see `crate::game`).
+    Collider {
+        name: String,
+        parts: Vec<String>,
+        shape: String,
+        #[serde(default = "static_body")]
+        body: String,
+        /// Detects overlaps without blocking (a trigger).
+        #[serde(default)]
+        sensor: bool,
+    },
+    /// A named point for game code: a spawn, waypoint, trigger volume,
+    /// camera spot. Exported as an empty node carrying `kind` and `data`.
+    Marker {
+        name: String,
+        kind: String,
+        #[serde(default)]
+        translation: [f32; 3],
+        /// Facing, degrees about +y (0 = toward +z / front).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yaw: Option<f32>,
+        /// A box volume [x, y, z] centred on the marker (triggers, zones).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<[f32; 3]>,
+        /// Free-form JSON for game code ({"team": 1}).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<String>,
+    },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {
         name: String,
@@ -960,6 +1024,14 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restyle: Option<crate::style::Style>,
     },
+}
+
+fn static_body() -> String {
+    "static".into()
+}
+
+fn white() -> [f32; 4] {
+    [1.0; 4]
 }
 
 fn default_axis() -> Axis {

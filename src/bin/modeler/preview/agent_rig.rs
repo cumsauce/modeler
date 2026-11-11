@@ -34,7 +34,14 @@ pub(crate) struct PendingAgentShots(
 pub(crate) struct ShotStyle {
     pub(crate) ids: bool,
     pub(crate) dims: bool,
+    /// Light with the model's own lights only (studio lights hidden).
+    pub(crate) scene_lit: bool,
 }
+
+/// The studio's own lights (sun, fills, agent key), hidden for a
+/// `lighting: "scene"` shot.
+#[derive(Component)]
+pub(crate) struct StudioLight;
 
 /// Flat-colour stand-ins for an `ids` shot; only the agent camera sees their
 /// render layer, so the human's window never flickers.
@@ -146,6 +153,7 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
             // opening shows the shadowed interior instead of a back wall lit
             // exactly like the facade.
             c.spawn((
+                StudioLight,
                 DirectionalLight {
                     illuminance: 350.0,
                     shadow_maps_enabled: true,
@@ -154,6 +162,7 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
                 Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.45, -0.55, 0.0)),
             ));
             c.spawn((
+                StudioLight,
                 DirectionalLight {
                     illuminance: 150.0,
                     ..default()
@@ -317,6 +326,8 @@ pub(crate) fn process_agent_shot(
     modeler: Res<Modeler>,
     env_ready: Query<(), (With<AgentCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
+    mut studio: Query<(Entity, &mut DirectionalLight), With<StudioLight>>,
+    mut env: Query<(&mut bevy::light::EnvironmentMapLight, &mut AmbientLight), With<AgentCamera>>,
     mut commands: Commands,
 ) {
     // A camera with a generated environment light draws nothing until its
@@ -428,6 +439,21 @@ pub(crate) fn process_agent_shot(
             .entity(camera_entity)
             .insert(RenderLayers::layer(ID_LAYER));
     }
+    // Scene lighting: hide the studio, keep a faint environment so unlit
+    // corners read as dark rather than void. Restored after the capture.
+    let mut studio_lights: Vec<(Entity, f32)> = Vec::new();
+    let mut restore_env = None;
+    if style.scene_lit {
+        for (e, mut l) in &mut studio {
+            studio_lights.push((e, l.illuminance));
+            l.illuminance = 0.0;
+        }
+        if let Ok((mut g, mut a)) = env.get_mut(camera_entity) {
+            restore_env = Some((g.intensity, a.brightness));
+            g.intensity *= 0.01;
+            a.brightness = 0.5;
+        }
+    }
     // World box of what is framed, projected to pixels (ortho only).
     let overlay = style.dims.then(|| {
         let (lo, hi) = bounds.unwrap_or((Vec3::ZERO, Vec3::ZERO));
@@ -445,7 +471,24 @@ pub(crate) fn process_agent_shot(
     commands
         .spawn(Screenshot::image(image_handle))
         .observe(
-            move |captured: On<ScreenshotCaptured>, mut commands: Commands| {
+            move |captured: On<ScreenshotCaptured>,
+                  mut commands: Commands,
+                  mut env: Query<
+                (&mut bevy::light::EnvironmentMapLight, &mut AmbientLight),
+                With<AgentCamera>,
+            >,
+                  mut lights: Query<&mut DirectionalLight, With<StudioLight>>| {
+                for (e, lux) in &studio_lights {
+                    if let Ok(mut l) = lights.get_mut(*e) {
+                        l.illuminance = *lux;
+                    }
+                }
+                if let Some((gi, ab)) = restore_env
+                    && let Ok((mut g, mut a)) = env.get_mut(camera_entity)
+                {
+                    g.intensity = gi;
+                    a.brightness = ab;
+                }
                 for e in &stand_ins {
                     commands.entity(*e).despawn();
                 }
