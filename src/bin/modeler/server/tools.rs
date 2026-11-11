@@ -646,6 +646,7 @@ impl rmcp::ServerHandler for Tools {
 
     fn get_info(&self) -> rmcp::model::ServerInfo {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
+- 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
 - Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, transform, boolean, radial_array, linear_array, mirror, material, prefab, hide_part, show_part, rename, delete, tri_mesh, uvs). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); graph order doesn't matter.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).

@@ -34,6 +34,12 @@ result line is `{"ok", "text", "json"?, ...}`; `--json` drops the prose when
 structured JSON is present. The daemon keeps the preview window open; check
 it with `agent_views` / `screenshot` and verify numerically with `verify`.
 
+## Units
+
+**1 unit = 1 meter, always.** Y is up and the ground is y = 0. Size things
+at real-world scale: a door is about 0.9 x 2.1, a table top sits at 0.75, a
+mug is about 0.1 tall. glTF uses meters too, so exports need no scaling.
+
 ## The mental model
 
 Three layers, read top to bottom:
