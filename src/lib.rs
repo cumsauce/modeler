@@ -82,8 +82,8 @@ pub mod raster;
 pub mod simplify;
 pub mod spec;
 pub mod style;
-pub mod text;
 pub mod terrain;
+pub mod text;
 pub mod uv;
 pub mod verify;
 

@@ -184,7 +184,7 @@ impl P<'_> {
         }
     }
     fn prod(&mut self) -> Result<Expr, String> {
-        let mut a = self.pow()?;
+        let mut a = self.unary()?;
         loop {
             let op = if self.eat("*") {
                 Bin::Mul
@@ -198,13 +198,8 @@ impl P<'_> {
             a = Expr::Bin(op, Box::new(a), Box::new(self.pow()?));
         }
     }
-    fn pow(&mut self) -> Result<Expr, String> {
-        let a = self.unary()?;
-        if self.eat("^") {
-            return Ok(Expr::Bin(Bin::Pow, Box::new(a), Box::new(self.pow()?)));
-        }
-        Ok(a)
-    }
+    // `-2^2` is -(2^2) and `2^-1` works: `^` binds tighter than a sign
+    // on its left and takes one on its right (right-associative).
     fn unary(&mut self) -> Result<Expr, String> {
         if self.eat("-") {
             return Ok(Expr::Neg(Box::new(self.unary()?)));
@@ -212,7 +207,14 @@ impl P<'_> {
         if self.eat("!") {
             return Ok(Expr::Not(Box::new(self.unary()?)));
         }
-        self.atom()
+        self.pow()
+    }
+    fn pow(&mut self) -> Result<Expr, String> {
+        let a = self.atom()?;
+        if self.eat("^") {
+            return Ok(Expr::Bin(Bin::Pow, Box::new(a), Box::new(self.unary()?)));
+        }
+        Ok(a)
     }
     fn atom(&mut self) -> Result<Expr, String> {
         self.ws();
@@ -226,11 +228,13 @@ impl P<'_> {
         let start = self.i;
         let c = self.s.get(self.i).copied().unwrap_or(0);
         if c.is_ascii_digit() || c == b'.' {
-            while self
-                .s
-                .get(self.i)
-                .is_some_and(|c| c.is_ascii_digit() || *c == b'.' || *c == b'e' || *c == b'E')
-            {
+            while let Some(&c) = self.s.get(self.i) {
+                let sign = (c == b'-' || c == b'+')
+                    && self.i > start
+                    && matches!(self.s[self.i - 1], b'e' | b'E');
+                if !(c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || sign) {
+                    break;
+                }
                 self.i += 1;
             }
             return self.src[start..self.i]
@@ -435,6 +439,15 @@ mod tests {
         let c = compile("l > 1 && !(w == 0)", &vars, &consts).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(c.eval(&[2.0, 1.0]), 1.0);
         assert_eq!(c.eval(&[2.0, 0.0]), 0.0);
+        for (src, want) in [
+            ("-2^2", -4.0),
+            ("2^-1", 0.5),
+            ("1e-3 * 1000", 1.0),
+            ("2.5E+1 - 5", 20.0),
+        ] {
+            let e = compile(src, &vars, &consts).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert!((e.eval(&[0.0, 0.0]) - want).abs() < 1e-9, "{src}");
+        }
         let w = parse_word("!(w)F(l)[+(45)A(l*r, w)]X", &vars, &consts)
             .unwrap_or_else(|e| panic!("{e}"));
         let syms: String = w.iter().map(|t| t.sym).collect();

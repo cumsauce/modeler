@@ -659,8 +659,27 @@ pub(crate) fn build_with(
                 .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - c.center[k])
                 .collect();
             nodes[i]["translation"] = json!(local);
-            node["children"] = json!([i]);
-            children.insert(i);
+            // Its LOD nodes (`part.lod1`, ...) ride the body too.
+            let mut kids = vec![i];
+            let prefix = format!("{}.lod", c.part);
+            for (j, n) in nodes.iter_mut().enumerate() {
+                let is_lod = n["name"].as_str().is_some_and(|s| {
+                    s.strip_prefix(&prefix)
+                        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                });
+                if j != i && is_lod && !children.contains(&j) {
+                    let t = &n["translation"];
+                    let local: Vec<f32> = (0..3)
+                        .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - c.center[k])
+                        .collect();
+                    n["translation"] = json!(local);
+                    kids.push(j);
+                }
+            }
+            for &k in &kids {
+                children.insert(k);
+            }
+            node["children"] = json!(kids);
         } else if c.body != "static" {
             unplaced.push(c.part.clone());
         }

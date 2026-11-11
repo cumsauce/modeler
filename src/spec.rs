@@ -497,7 +497,7 @@ pub struct LSystemSpec {
 }
 
 /// Axiom, rules and sizes per preset (meters).
-fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
+pub(crate) fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
     use crate::lsystem::{Choice, LSystem};
     let r = |pairs: &[(char, &[(f32, &str)])]| {
         pairs
@@ -1819,7 +1819,9 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let s: TextSpec = de(&ctx, &body)?;
             let align = s.align.unwrap_or_else(|| "center".into());
             if !["center", "left", "right"].contains(&align.as_str()) {
-                return Err(format!("{ctx}: align: center, left or right, got `{align}`"));
+                return Err(format!(
+                    "{ctx}: align: center, left or right, got `{align}`"
+                ));
             }
             BatchItem::Op(Op::Text {
                 name: s.name,

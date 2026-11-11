@@ -114,6 +114,11 @@ pub fn outline(
     let k = size / cap;
     let line_h = face.height() as f32 * line_spacing;
     let mut all = Vec::new();
+    // Windows line ends and tabs: `\r` is dropped, a tab is four spaces.
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ");
     for (li, line) in text.split('\n').enumerate() {
         let mut b = Rings {
             rings: Vec::new(),
@@ -175,7 +180,7 @@ pub fn build(
     }
     let rings = outline(text, font, size, align, line_spacing, letter_spacing)
         .map_err(|e| format!("text `{name}`: {e}"))?;
-    let mut part = crate::csg::extrude(name, &rings, depth, 0.0, [1.0, 1.0], 1, 0.0)?;
+    let mut part = crate::csg::extrude_glyphs(name, &rings, depth)?;
     // Footprint (x, z) up y -> stand it up: footprint z becomes height and
     // the thickness goes to -z, so the face reads from the front.
     for v in &mut part.verts {
@@ -198,12 +203,15 @@ mod tests {
         let p = build("sign", "EXIT 42\nob", "bold", 0.2, 0.03, "center", 1.2, 0.0)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&p), 0);
-        let (lo, hi) = p.verts.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| {
-            (
-                [lo[0].min(v[0]), lo[1].min(v[1]), lo[2].min(v[2])],
-                [hi[0].max(v[0]), hi[1].max(v[1]), hi[2].max(v[2])],
-            )
-        });
+        let (lo, hi) = p
+            .verts
+            .iter()
+            .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| {
+                (
+                    [lo[0].min(v[0]), lo[1].min(v[1]), lo[2].min(v[2])],
+                    [hi[0].max(v[0]), hi[1].max(v[1]), hi[2].max(v[2])],
+                )
+            });
         // Capitals are 0.2 tall above the baseline; centred; 3 cm deep.
         assert!((hi[1] - 0.2).abs() < 0.02, "{hi:?}");
         assert!(lo[1] < -0.2, "two lines: {lo:?}");

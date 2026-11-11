@@ -101,6 +101,23 @@ pub fn encode(rgba: &[u8], w: usize, h: usize, kind: Kind) -> Result<Vec<u8>, St
     if w == 0 || h == 0 || rgba.len() != w * h * 4 {
         return Err(format!("ktx2: bad image {w}x{h} ({} bytes)", rgba.len()));
     }
+    // GPUs (wgpu) refuse a block-compressed texture whose base size is not
+    // a whole number of 4x4 blocks: stretch such an image to the next
+    // multiple of 4 (uvs are normalised, so the mapping is unchanged).
+    let (rgba, w, h) = if w % 4 != 0 || h % 4 != 0 {
+        let (nw, nh) = (w.next_multiple_of(4), h.next_multiple_of(4));
+        let mut out = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            let sy = (y * h / nh).min(h - 1);
+            for x in 0..nw {
+                let sx = (x * w / nw).min(w - 1);
+                out[(y * nw + x) * 4..][..4].copy_from_slice(&rgba[(sy * w + sx) * 4..][..4]);
+            }
+        }
+        (std::borrow::Cow::Owned(out), nw, nh)
+    } else {
+        (std::borrow::Cow::Borrowed(rgba), w, h)
+    };
     let (format, vk, model, transfer, block_bytes) = kind.format();
     let settings = Settings::new(format, Effort::Balanced);
     // levels[i] = (zstd bytes, uncompressed length), level 0 = full size.
@@ -194,5 +211,14 @@ mod tests {
         assert_eq!(&a[..4], &[0xAB, 0x4B, 0x54, 0x58]);
         let levels = u32::from_le_bytes([a[40], a[41], a[42], a[43]]);
         assert_eq!(levels, 7); // 64x32 .. 1x1
+    }
+
+    #[test]
+    fn an_odd_sized_image_is_stretched_to_whole_blocks() {
+        let (w, h) = (37, 10);
+        let px = vec![200u8; w * h * 4];
+        let a = encode(&px, w, h, Kind::Linear).unwrap_or_else(|e| panic!("{e}"));
+        let dim = |i: usize| u32::from_le_bytes([a[i], a[i + 1], a[i + 2], a[i + 3]]);
+        assert_eq!((dim(20), dim(24)), (40, 12));
     }
 }

@@ -517,11 +517,23 @@ fn lods_add_simplified_nodes_with_ranges() {
     let report = modeler::gltf::export_glb_with(&s.model, &path, &opts).unwrap();
     assert!(report.contains("lods:"), "{report}");
     let (doc, _, _) = gltf::import(&path).expect("imports");
-    let names: Vec<String> = doc.nodes().filter_map(|n| n.name().map(String::from)).collect();
-    for n in ["ball", "ball.lod1", "ball.lod2", "ball_1.lod1", "ball_1.lod2"] {
+    let names: Vec<String> = doc
+        .nodes()
+        .filter_map(|n| n.name().map(String::from))
+        .collect();
+    for n in [
+        "ball",
+        "ball.lod1",
+        "ball.lod2",
+        "ball_1.lod1",
+        "ball_1.lod2",
+    ] {
         assert!(names.iter().any(|x| x == n), "{n} missing from {names:?}");
     }
-    assert!(!names.iter().any(|x| x == "crate.lod1"), "a 12-triangle box got LODs");
+    assert!(
+        !names.iter().any(|x| x == "crate.lod1"),
+        "a 12-triangle box got LODs"
+    );
     let tris = |name: &str| {
         let n = doc.nodes().find(|n| n.name() == Some(name)).unwrap();
         let p = n.mesh().unwrap().primitives().next().unwrap();
@@ -533,7 +545,10 @@ fn lods_add_simplified_nodes_with_ranges() {
         let n = doc.nodes().find(|n| n.name() == Some(name)).unwrap();
         serde_json::from_str(n.extras().as_ref().unwrap().get()).unwrap()
     };
-    let (l0, l1) = (extras("ball")["lod"].clone(), extras("ball.lod1")["lod"].clone());
+    let (l0, l1) = (
+        extras("ball")["lod"].clone(),
+        extras("ball.lod1")["lod"].clone(),
+    );
     assert_eq!(l0["level"], 0);
     assert_eq!(l1["level"], 1);
     assert_eq!(l0["far"], l1["near"]);

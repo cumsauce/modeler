@@ -262,9 +262,9 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   be `"$param"`). Expressions: `+ - * / % ^`, comparisons, `&& || !`,
   `min max abs sqrt sin cos floor`. The turtle reads a module's first
   number: `F(len)` / `f(len)` meters, `+(deg)` and every turn, `!(radius)`
-  sets the radius, `L(scale)` scales the leaf. Rules are tried in key
-  order (sorted), first match wins, so keep a symbol's conditions
-  exclusive; a rule only matches modules with the same number of
+  sets the radius, `L(scale)` scales the leaf. A symbol's rules with a
+  condition are tried first (in key order), then the one without, so a bare
+  `A(l)` works as the fallback; first match wins; a rule only matches modules with the same number of
   parameters. Set `radius_scale` / `length_scale` to 1 when the rules size
   branches themselves. Runaway growth
   (over 400k symbols or 40k segments) is refused with a hint. Params work

@@ -187,8 +187,12 @@ impl Options {
                 "lod_distances" => {
                     o.lod_distances = serde_json::from_value(x.clone())
                         .ok()
-                        .filter(|v: &Vec<f32>| v.windows(2).all(|w| w[0] < w[1]) && v.iter().all(|d| *d > 0.0))
-                        .ok_or("optimize.lod_distances: increasing meters, one per lod, e.g. [20, 60]")?;
+                        .filter(|v: &Vec<f32>| {
+                            v.windows(2).all(|w| w[0] < w[1]) && v.iter().all(|d| *d > 0.0)
+                        })
+                        .ok_or(
+                            "optimize.lod_distances: increasing meters, one per lod, e.g. [20, 60]",
+                        )?;
                 }
                 "lod_min_tris" => {
                     o.lod_min_tris = x.as_u64().ok_or("optimize.lod_min_tris: a count")? as usize
@@ -413,6 +417,11 @@ fn add_lods(
     let switch = |p: &Part, k: usize| -> f32 {
         if let Some(d) = o.lod_distances.get(k) {
             return *d;
+        }
+        // Past the given distances, keep tripling the last one so the
+        // ranges never run backwards.
+        if let Some(last) = o.lod_distances.last() {
+            return last * 3f32.powi((k + 1 - o.lod_distances.len()) as i32);
         }
         let (lo, hi) = p.verts.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
             (lo.min(Vec3::from(*v)), hi.max(Vec3::from(*v)))

@@ -269,6 +269,33 @@ fn cross_section(rings: Vec<Vec<[f64; 2]>>) -> manifold_csg::CrossSection {
     )
 }
 
+/// Extrudes font outlines straight up (as `extrude`, no twist or taper)
+/// with the non-zero fill rule fonts are drawn with, so glyphs that overlap
+/// (tight letter spacing, script joins, overlapping contours) merge instead
+/// of cutting holes in each other.
+pub fn extrude_glyphs(
+    name: &str,
+    profile: &[Vec<[f32; 2]>],
+    height: f32,
+) -> Result<Part, ModelerError> {
+    check_profile(profile)?;
+    if height.is_nan() || height <= 0.0 {
+        return Err(ModelerError::Csg(format!(
+            "text `{name}`: depth must be > 0, got {height}"
+        )));
+    }
+    let rings: Vec<Vec<[f64; 2]>> = profile
+        .iter()
+        .map(|r| r.iter().map(|p| [p[0] as f64, -p[1] as f64]).collect())
+        .collect();
+    let cs = manifold_csg::CrossSection::from_polygons_with_fill_rule(
+        &rings,
+        manifold_csg::FillRule::NonZero,
+    );
+    let m = Manifold::extrude_with_options(&cs, height as f64, 1, 0.0, 1.0, 1.0);
+    finish_sweep(&m, name, "text")
+}
+
 fn finish_sweep(m: &Manifold, name: &str, what: &str) -> Result<Part, ModelerError> {
     m.status()
         .map_err(|e| ModelerError::Csg(format!("{what} `{name}` failed: {e}")))?;

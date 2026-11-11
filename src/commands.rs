@@ -1124,12 +1124,24 @@ impl Session {
                 let ty = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if ty == "lsystem" {
                     let text = |k: &str| raw.get(k).map(|v| v.to_string()).unwrap_or_default();
-                    let custom = raw.get("axiom").is_some() || raw.get("rules").is_some();
-                    let preset = raw.get("preset").and_then(|v| v.as_str()).unwrap_or("");
-                    let leafy = if custom {
-                        text("axiom").contains('L') || text("rules").contains('L')
-                    } else {
-                        !preset.is_empty() && preset != "roots"
+                    // Whatever the item leaves out comes from its preset.
+                    let base = raw
+                        .get("preset")
+                        .and_then(|v| v.as_str())
+                        .and_then(|p| crate::spec::lsystem_preset(p).ok());
+                    let preset_axiom = base.as_ref().is_some_and(|b| b.axiom.contains('L'));
+                    let preset_rules = base.as_ref().is_some_and(|b| {
+                        b.rules
+                            .iter()
+                            .flat_map(|r| &r.1)
+                            .any(|c| c.to.contains('L'))
+                    });
+                    let leafy = match raw.get("axiom") {
+                        Some(_) => text("axiom").contains('L'),
+                        None => preset_axiom,
+                    } || match raw.get("rules") {
+                        Some(_) => text("rules").contains('L'),
+                        None => preset_rules,
                     };
                     if leafy {
                         names.push(format!("{n}_leaves"));

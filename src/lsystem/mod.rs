@@ -166,6 +166,11 @@ fn compile(ls: &LSystem) -> Result<Compiled, String> {
             choices: cs,
         });
     }
+    // Conditional rules are tried before a symbol's unconditional one, so
+    // `A(l)` as a fallback never shadows `A(l) : l > 1` (keys sort first).
+    for rs in rules.values_mut() {
+        rs.sort_by_key(|r| r.head.cond.is_none());
+    }
     Ok(Compiled { axiom, rules })
 }
 
@@ -270,7 +275,19 @@ fn expand(ls: &LSystem, c: &Compiled) -> Result<Vec<Module>, String> {
                 }
                 pick
             };
+            let at = out.len();
             out.extend(pick.iter().map(|t| t.eval(args)));
+            if let Some(bad) = out[at..]
+                .iter()
+                .find(|o| o.a[..o.n as usize].iter().any(|x| !x.is_finite()))
+            {
+                return Err(format!(
+                    "a rule for `{}` made `{}` with a non-finite number at iteration {} (a division by zero, or sqrt of a negative?)",
+                    m.sym,
+                    bad.sym,
+                    it + 1
+                ));
+            }
             if out.len() > MAX_SYMBOLS {
                 return Err(format!(
                     "the string passes {MAX_SYMBOLS} symbols at iteration {}: lower iterations (or make rules grow slower)",
@@ -451,6 +468,9 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
             );
         }
         place(&mut lp);
+        // No `L` was reached: keep the name (materials may point at it) but
+        // hide the empty part so nothing renders or exports it.
+        lp.visible = leaf_count > 0;
         lp
     });
     Ok(Drawn {
@@ -817,6 +837,46 @@ mod parametric_tests {
         s.apply_values(Some([("shrink".to_string(), 0.4)].into()), vec![])
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(span(&s) < before, "{before} -> {}", span(&s));
+    }
+
+    #[test]
+    fn a_bare_rule_is_the_fallback_after_conditional_ones() {
+        let one = |to: &str| {
+            vec![Choice {
+                p: 1.0,
+                to: to.into(),
+            }]
+        };
+        let ls = LSystem {
+            axiom: "A(2)".into(),
+            // "A(n)" sorts before "A(n) : n > 0", yet the condition wins.
+            rules: vec![
+                ("A(n)".into(), one("X")),
+                ("A(n) : n > 0".into(), one("F(1)A(n-1)")),
+            ],
+            iterations: 4,
+            ..super::tests::tree()
+        };
+        assert_eq!(
+            expand_text(&ls).unwrap_or_else(|e| panic!("{e}")),
+            "F(1)F(1)X"
+        );
+        let bad = LSystem {
+            axiom: "A(0)".into(),
+            rules: vec![("A(n)".into(), one("F(1/n)"))],
+            iterations: 1,
+            ..super::tests::tree()
+        };
+        assert!(expand_text(&bad).is_err_and(|e| e.contains("non-finite")));
+        // An L that is never reached leaves a hidden, empty leaves part.
+        let bare = LSystem {
+            axiom: "F".into(),
+            rules: vec![("X".into(), one("L"))],
+            iterations: 1,
+            ..super::tests::tree()
+        };
+        let d = build("b", &bare).unwrap_or_else(|e| panic!("{e}"));
+        assert!(d.leaves.is_some_and(|l| !l.visible && l.verts.is_empty()));
     }
 
     #[test]
