@@ -702,6 +702,22 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pivot: Option<[f32; 3]>,
     },
+    /// A parent transform (one level of hierarchy): after the whole graph
+    /// is evaluated, every part matching `parts` (names, trailing-`*`
+    /// prefixes) is moved as one rigid body: rotated about `pivot`, then
+    /// translated. No op ever reads the moved result, so copies (mirrors,
+    /// arrays) and cuts are built from the unmoved parts and then carried
+    /// along. Several moves compose in list order (a later one is the outer
+    /// parent). Re-issue by name to adjust.
+    Move {
+        name: String,
+        parts: Vec<String>,
+        #[serde(default)]
+        translation: Option<[f32; 3]>,
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        pivot: [f32; 3],
+    },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {
         name: String,

@@ -73,7 +73,7 @@ type, so there is no need to memorise field names.
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
-| `move` | parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot] |
+| `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot] |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset |
@@ -105,12 +105,15 @@ type, so there is no need to memorise field names.
   from the input (translation adds, rotation composes, scale multiplies).
   With `pivot`, a relative rotation/scale turns about that world point
   instead of the part's own origin.
-- **`move`** applies one rigid relative transform to many parts at once (a
-  whole model or a sub-assembly), about `pivot` (default: the centre of
-  their bottom face). Lean a bike onto its kickstand with
-  `{"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]}`.
-  Each part gets its own in-place relative transform op, so the move
-  survives re-derivation and copies (arrays, mirrors) still move once.
+- **`move`** is a parent transform (one level of hierarchy): every part
+  matching `parts` moves as one rigid body, rotated about `pivot` (default:
+  the centre of their bottom face, fixed when issued) and then translated.
+  It applies after the whole graph is evaluated, so no op ever reads the
+  moved result: mirrors, arrays and cuts are built from the unmoved parts and
+  carried along, and the model's recipe stays readable. Several moves compose
+  in list order (later = outer parent). Give it a `name` and re-issue that
+  name to adjust, e.g. lean a bike onto its kickstand with
+  `{"type": "move", "name": "lean", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]}`.
 - **Radial arrays** default to `include_source: true`: the source is item 0
   and `count` items spread evenly (copies `name_1..`). With `false`, `count`
   new copies `name_0..` start at `start_degrees` and the source stays put.

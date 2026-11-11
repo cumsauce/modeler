@@ -458,6 +458,9 @@ pub struct TransformSpec {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MoveSpec {
+    /// Optional id; re-issue the same name to adjust this move.
+    #[serde(default)]
+    name: Option<String>,
     parts: Vec<String>,
     #[serde(default, alias = "position")]
     translation: Option<[f32; 3]>,
@@ -846,6 +849,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 ));
             }
             BatchItem::Move {
+                name: s.name,
                 parts: s.parts,
                 translation: s.translation,
                 rotation,
@@ -1005,7 +1009,7 @@ pub fn example(ty: &str) -> Option<Value> {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
         }
         "move" => {
-            json!({"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]})
+            json!({"type": "move", "name": "lean", "parts": ["*"], "axis": [1, 0, 0], "degrees": 8, "pivot": [0, 0, 0]})
         }
         "boolean" => {
             json!({"type": "boolean", "name": "wall_cut", "op": "difference", "a": "wall", "b": "door_cutter"})

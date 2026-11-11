@@ -77,6 +77,9 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     let mut hashes: HashMap<String, u64> = HashMap::new();
     for i in order {
         let op = &ops[i];
+        if matches!(op, Op::Move { .. }) {
+            continue;
+        }
         let input_hashes: Vec<u64> = inputs(op)
             .iter()
             .map(|n| hashes.get(*n).copied().unwrap_or(0))
@@ -128,6 +131,34 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
         }
         for n in outs {
             hashes.insert(n.clone(), hash_of(n.as_bytes(), &[key]));
+        }
+    }
+    // Parent transforms, applied to the finished parts in list order.
+    for op in ops {
+        let Op::Move {
+            parts,
+            translation,
+            rotation,
+            pivot,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let r = rotation.map(quat_of).unwrap_or(bevy::math::Quat::IDENTITY);
+        let t = Vec3::from(translation.unwrap_or([0.0; 3]));
+        let p = Vec3::from(*pivot);
+        for (name, part) in named.iter_mut() {
+            let hit = parts.iter().any(|pat| match pat.strip_suffix('*') {
+                Some(pre) => name.starts_with(pre),
+                None => name == pat,
+            });
+            if !hit {
+                continue;
+            }
+            let part = Arc::make_mut(part);
+            part.translation = (p + r * (Vec3::from(part.translation) - p) + t).to_array();
+            part.rotation = (r * quat_of(part.rotation)).to_array();
         }
     }
     Ok(named.into_iter().map(|(_, part)| part).collect())
@@ -230,6 +261,8 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
 /// Runs one op against the named-part map, upserting its output.
 fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
     match op {
+        // Applied after the graph, in `evaluate_with`.
+        Op::Move { .. } => {}
         Op::Primitive {
             name,
             kind,
@@ -657,6 +690,7 @@ fn upsert_shared(named: &mut Named, name: &str, part: Arc<Part>) {
 /// The output part name an op writes, used for upsert matching.
 pub fn output(op: &Op) -> &str {
     match op {
+        Op::Move { name, .. } => name,
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
         | Op::Revolve { name, .. }
@@ -681,6 +715,8 @@ pub fn output(op: &Op) -> &str {
 /// just `name`. [`output`] stays the op's identity key for upsert matching.
 pub fn outputs(op: &Op) -> Vec<String> {
     match op {
+        // Writes no part of its own: it re-places finished parts.
+        Op::Move { .. } => Vec::new(),
         Op::RadialArray {
             name,
             count,
@@ -700,6 +736,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
 /// in-place op (output name == an input name) never eats its own source.
 pub fn kind(op: &Op) -> &'static str {
     match op {
+        Op::Move { .. } => "move",
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
         Op::Revolve { .. } => "revolve",
@@ -722,7 +759,8 @@ pub fn kind(op: &Op) -> &'static str {
 /// The part names an op reads.
 pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
-        Op::Primitive { .. }
+        Op::Move { .. }
+        | Op::Primitive { .. }
         | Op::Extrude { .. }
         | Op::Revolve { .. }
         | Op::Sweep { .. }
@@ -753,6 +791,22 @@ pub fn describe(ops: &[Op]) -> String {
     let mut lines = vec![format!("ops ({})", ops.len())];
     for (i, op) in ops.iter().enumerate() {
         lines.push(match op {
+            Op::Move {
+                name,
+                parts,
+                translation,
+                rotation,
+                pivot,
+            } => {
+                let mut s = format!("#{i} move `{name}` parts={parts:?} pivot={pivot:?}");
+                if let Some(r) = rotation {
+                    s += &format!(" rot={r:?}");
+                }
+                if let Some(t) = translation {
+                    s += &format!(" t={t:?}");
+                }
+                s
+            }
             Op::Primitive {
                 name,
                 kind,

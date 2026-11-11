@@ -40,6 +40,7 @@ pub enum BatchItem {
     },
     /// One rigid relative transform over many parts (names / `*` globs).
     Move {
+        name: Option<String>,
         parts: Vec<String>,
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
@@ -759,12 +760,13 @@ impl Session {
                     .add_tri_mesh(&name, verts, indices, normals, uvs)
                     .map_err(fail)?,
                 BatchItem::Move {
+                    name,
                     parts,
                     translation,
                     rotation,
                     pivot,
                 } => self
-                    .move_parts(&parts, translation, rotation, pivot)
+                    .move_parts(name, &parts, translation, rotation, pivot)
                     .map_err(fail)?,
                 BatchItem::Uvs { part, projection } => {
                     self.set_uvs(&part, &projection).map_err(fail)?
@@ -799,13 +801,14 @@ impl Session {
                 .any(|o| graph::outputs(o).iter().any(|n| n == name))
     }
 
-    /// Moves every visible part matching `patterns` (exact or trailing-`*`)
-    /// as one rigid body: rotation about `pivot` (default: centre of their
-    /// combined bottom face), then translation. Op-derived parts get a
-    /// relative in-place transform op each (so it survives re-derivation);
-    /// baked parts are edited directly.
+    /// Records a parent transform (`Op::Move`) over every part matching
+    /// `patterns` (exact or trailing-`*`): rotation about `pivot` (default:
+    /// centre of their combined bottom face, fixed now), then translation.
+    /// It applies after the graph, so nothing downstream sees it. Named
+    /// moves are upserts: re-issue `name` to adjust.
     pub fn move_parts(
         &mut self,
+        name: Option<String>,
         patterns: &[String],
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
@@ -821,41 +824,46 @@ impl Session {
             .model
             .parts
             .iter()
-            .filter(|p| p.visible && matches(&p.name))
+            .filter(|p| matches(&p.name))
             .map(|p| p.name.clone())
             .collect();
         if names.is_empty() {
-            return Err(format!("move: no visible part matches {patterns:?}").into());
+            return Err(format!("move: no part matches {patterns:?}").into());
         }
-        let pivot = pivot.unwrap_or_else(|| {
-            let (lo, hi) = self.model.bounds_of(&names).unwrap_or_default();
-            [(lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5]
+        if !self.model.derived_from_ops {
+            return Err("move needs an op-built model (this one has baked parts); use transform on each part".into());
+        }
+        let name = name.unwrap_or_else(|| {
+            let n = self
+                .model
+                .ops
+                .iter()
+                .filter(|o| matches!(o, Op::Move { .. }))
+                .count();
+            format!("move_{}", n + 1)
         });
-        let r = rotation.map(crate::quat_of).unwrap_or(Quat::IDENTITY);
-        let t = Vec3::from(translation.unwrap_or([0.0; 3]));
-        let p = Vec3::from(pivot);
-        for n in &names {
-            if self.derived_by_ops(n) {
-                self.model.ops.push(Op::Transform {
-                    name: n.clone(),
-                    input: n.clone(),
-                    translation,
-                    rotation,
-                    scale: None,
-                    relative: true,
-                    pivot: rotation.map(|_| pivot),
-                });
-            } else if let Some(part) = self.model.parts.iter_mut().find(|q| &q.name == n) {
-                let part = std::sync::Arc::make_mut(part);
-                let tr = p + r * (Vec3::from(part.translation) - p) + t;
-                part.translation = tr.to_array();
-                part.rotation = (r * crate::quat_of(part.rotation)).to_array();
+        // An existing move of this name is replaced, so the default pivot is
+        // measured on the parts without it.
+        let pivot = match pivot {
+            Some(p) => p,
+            None => {
+                let (lo, hi) = self.model.bounds_of(&names).unwrap_or_default();
+                [(lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5]
             }
-        }
-        self.model.refresh()?;
-        self.commit(&format!("move {} part(s)", names.len()));
+        };
+        let label = format!("move `{name}`");
+        self.apply_op(
+            Op::Move {
+                name: name.clone(),
+                parts: patterns.to_vec(),
+                translation,
+                rotation,
+                pivot,
+            },
+            &label,
+        )?;
         Ok(format!(
-            "moved {} part(s) as one body (pivot [{:.4}, {:.4}, {:.4}])",
+            "move `{name}`: {} part(s) as one body about [{:.4}, {:.4}, {:.4}] (re-issue name `{name}` to adjust)",
             names.len(),
             pivot[0],
             pivot[1],
@@ -3021,6 +3029,71 @@ mod tests {
         assert!(
             mlo.y > 0.04 && alo.y < -0.06,
             "a {alo:?}..{ahi:?} m {mlo:?}..{mhi:?}"
+        );
+    }
+
+    #[test]
+    fn move_in_a_later_batch_tilts_a_mirror_once() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let v = |j: serde_json::Value| -> Vec<serde_json::Value> {
+            serde_json::from_value(j).unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.apply_values(
+            None,
+            v(serde_json::json!([
+                {"type": "sweep", "name": "a", "profile": [[0.01, 0.01], [-0.01, 0.01], [-0.01, -0.01], [0.01, -0.01]], "path": [[0, 0, 0.0], [0, 1, 0.3]]},
+                {"type": "mirror", "name": "a_m", "input": "a", "axis": "z"},
+                {"type": "material", "name": "a", "color": "#f00"}
+            ])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let before = s.model.part("a_m").map(|p| p.bounds()).unwrap_or_default();
+        s.apply_values(
+            None,
+            v(serde_json::json!([{"type": "move", "parts": ["*"], "axis": [1, 0, 0], "degrees": 10, "pivot": [0, 0, 0]}])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (mlo, mhi) = s.model.part("a_m").map(|p| p.bounds()).unwrap_or_default();
+        // a_m rotated rigidly: its top end (0, 1, -0.3) goes to
+        // (0, cos10 + 0.3 sin10, sin10 - 0.3 cos10).
+        let (c, sn) = (10f32.to_radians().cos(), 10f32.to_radians().sin());
+        let top_z = sn - 0.3 * c;
+        assert!(
+            (mlo.z - top_z).abs() < 0.02,
+            "before {before:?} after {mlo:?}..{mhi:?}, want min z ~{top_z}"
+        );
+    }
+
+    #[test]
+    fn reissuing_a_named_move_adjusts_it() {
+        let mut s = Session::default();
+        s.new_model("t").unwrap_or_else(|e| panic!("{e}"));
+        let v = |j: serde_json::Value| -> Vec<serde_json::Value> {
+            serde_json::from_value(j).unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.apply_values(
+            None,
+            v(serde_json::json!([
+                {"type": "primitive", "name": "a", "kind": "box", "size": 1, "translation": [0, 0.5, 0]},
+                {"type": "move", "name": "lift", "parts": ["*"], "translation": [0, 1, 0]}
+            ])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.apply_values(
+            None,
+            v(serde_json::json!([{"type": "move", "name": "lift", "parts": ["*"], "translation": [0, 2, 0]}])),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (lo, _) = s.model.bounds().unwrap_or_default();
+        assert!((lo.y - 2.0).abs() < 1e-4, "{lo:?}");
+        assert_eq!(
+            s.model
+                .ops
+                .iter()
+                .filter(|o| matches!(o, Op::Move { .. }))
+                .count(),
+            1
         );
     }
 }
