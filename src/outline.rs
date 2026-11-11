@@ -20,7 +20,7 @@ pub struct Row {
     pub label: String,
     /// Material summary: the procedural material's name or the colour.
     pub detail: String,
-    /// Linear base colour for the swatch.
+    /// sRGB base colour for the swatch.
     pub swatch: [f32; 3],
     /// Every part this row stands for.
     pub parts: Vec<String>,
@@ -39,14 +39,8 @@ fn numbered(name: &str) -> Option<(&str, u32)> {
 }
 
 fn hex(c: [f32; 4]) -> String {
-    let s = |x: f32| {
-        let v = if x <= 0.003_130_8 {
-            x * 12.92
-        } else {
-            1.055 * x.powf(1.0 / 2.4) - 0.055
-        };
-        (v.clamp(0.0, 1.0) * 255.0).round() as u8
-    };
+    // Part colours are stored as given (sRGB 0..1).
+    let s = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", s(c[0]), s(c[1]), s(c[2]))
 }
 

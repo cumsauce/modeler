@@ -209,7 +209,18 @@ fn pbr_material(
     cache: &mut PbrCache,
 ) -> Option<Handle<StandardMaterial>> {
     let r = part.material.pbr.as_ref()?;
-    let key = modeler::material::pbr::bake_key(r, Some(part));
+    // The bake plus the factors that tint it: a colour token change must
+    // reach a part whose texture is already cached.
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        modeler::material::pbr::bake_key(r, Some(part)).hash(&mut h);
+        let m = &part.material;
+        for x in m.base_color.iter().chain([&m.roughness, &m.metalness]) {
+            x.to_bits().hash(&mut h);
+        }
+        h.finish()
+    };
     if let Some(h) = cache.0.get(&key) {
         return Some(h.clone());
     }
@@ -283,6 +294,13 @@ pub(crate) fn part_bundle(
             base_color: Color::srgba(r, g, b, a),
             perceptual_roughness: part.material.roughness,
             metallic: part.material.metalness,
+            // A colour with alpha (glass, holograms) blends; Bevy renders
+            // blended materials forward, over the deferred opaque pass.
+            alpha_mode: if a < 0.999 {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Opaque
+            },
             ..default()
         })
     });
@@ -433,7 +451,9 @@ pub(crate) fn setup_scene(
             Camera3d::default(),
             studio_env(&mut images, STUDIO_INTENSITY),
             Msaa::Off,
-            bevy::anti_alias::smaa::Smaa::default(),
+            // TAA, not SMAA: SSR's ray march is jittered per frame, and the
+            // temporal history averages that noise out (and the edges too).
+            bevy::anti_alias::taa::TemporalAntiAliasing::default(),
             screen_reflections(),
             // Deferred like every material (the app default), with SSR.
             // No SSAO here: on the window camera it froze presentation

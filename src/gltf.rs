@@ -171,52 +171,45 @@ fn check_part(i: usize, part: &Part) -> Result<(), String> {
 fn build(
     model: &Model,
     buffer_uri: Option<String>,
-) -> Result<(Value, Vec<u8>), crate::ModelerError> {
-    let exported: Vec<&Part> = model
+    opts: &crate::export_opt::Options,
+) -> Result<(Value, Vec<u8>, String), crate::ModelerError> {
+    use crate::export_opt::MeshRef;
+    let visible: Vec<Part> = model
         .parts
         .iter()
-        .map(|p| &**p)
         .filter(|p| p.visible)
+        .map(|p| (**p).clone())
         .collect();
-    if exported.is_empty() {
+    if visible.is_empty() {
         return Err(format!("model '{}' has no visible parts to export", model.name).into());
     }
+    for (i, part) in visible.iter().enumerate() {
+        check_part(i, part)?;
+    }
+    let prepared = crate::export_opt::prepare(visible, opts);
+    let exported = &prepared.parts;
     let mut b = Builder::default();
     let (mut nodes, mut meshes, mut materials) = (Vec::new(), Vec::new(), Vec::new());
     let (mut images, mut textures) = (Vec::new(), Vec::new());
+    let mut extensions: Vec<&str> = Vec::new();
     // Texture sets by bake key: tile materials are shared across parts.
     let mut sets: HashMap<u64, Value> = HashMap::new();
-    for (i, part) in exported.iter().enumerate() {
-        check_part(i, part)?;
-        let mut min = [f32::MAX; 3];
-        let mut max = [f32::MIN; 3];
-        for v in &part.verts {
-            for c in 0..3 {
-                min[c] = min[c].min(v[c]);
-                max[c] = max[c].max(v[c]);
-            }
-        }
-        let n = part.verts.len();
-        let pos = b.accessor(&le_f32s(&part.verts), n, "VEC3", 5126, false);
-        b.accessors[pos as usize]["min"] = json!(min);
-        b.accessors[pos as usize]["max"] = json!(max);
-        let nrm = b.accessor(&le_f32s(&part.normals), n, "VEC3", 5126, false);
-        let uv = b.accessor(&le_f32s(&part.uvs), n, "VEC2", 5126, false);
-        let idx_bytes: Vec<u8> = part
-            .indices
-            .iter()
-            .flat_map(|ix| ix.to_le_bytes())
-            .collect();
-        let idx = b.accessor(&idx_bytes, part.indices.len(), "SCALAR", 5125, true);
-        let mut attributes = json!({"POSITION": pos, "NORMAL": nrm, "TEXCOORD_0": uv});
-
+    // Material JSON -> index, when deduplicating.
+    let mut material_ids: HashMap<String, usize> = HashMap::new();
+    // Part index -> its mesh index (instanced copies point at the source's).
+    let mut mesh_of: Vec<usize> = Vec::with_capacity(exported.len());
+    let mut texture_bytes = 0usize;
+    for (pi, part) in exported.iter().enumerate() {
+        // ---- material
         let mut pbr = json!({
             "baseColorFactor": part.material.base_color,
             "metallicFactor": part.material.metalness,
             "roughnessFactor": part.material.roughness,
         });
-        let mut material = json!({"name": format!("{}-mat", part.name)});
+        let mut material = json!({});
+        let mut textured = false;
         if let Some(r) = &part.material.pbr {
+            textured = true;
             let key = crate::material::pbr::bake_key(r, Some(part));
             if let std::collections::hash_map::Entry::Vacant(slot) = sets.entry(key) {
                 let ch = crate::material::pbr::bake_part(part)?
@@ -224,6 +217,7 @@ fn build(
                 let t = crate::material::pbr::textures(&ch);
                 let mut add = |px: &[u8], what: &str| -> Result<u32, String> {
                     let png = crate::raster::encode_png(t.w as u32, t.h as u32, px)?;
+                    texture_bytes += png.len();
                     let view = b.view(&png, None);
                     images.push(json!({
                         "name": format!("{}-{what}", r.material),
@@ -233,13 +227,33 @@ fn build(
                     textures.push(json!({"sampler": 0, "source": images.len() - 1}));
                     Ok((textures.len() - 1) as u32)
                 };
+                // ORM: occlusion rides in metallic-roughness R (glTF reads AO
+                // from R, roughness from G, metal from B), one texture fewer.
+                let packed = match (&t.occlusion, opts.orm) {
+                    (Some(o), true) => {
+                        let mut mr = t.metal_rough.clone();
+                        for (d, s) in mr
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .zip(o.as_chunks::<4>().0)
+                        {
+                            d[0] = s[0];
+                        }
+                        Some(mr)
+                    }
+                    _ => None,
+                };
+                let mr = add(packed.as_deref().unwrap_or(&t.metal_rough), "metal_rough")?;
                 let mut set = json!({
                     "base": add(&t.base, "base_color")?,
-                    "mr": add(&t.metal_rough, "metal_rough")?,
+                    "mr": mr,
                     "normal": add(&t.normal, "normal")?,
                     "blend": t.blend,
                 });
-                if let Some(o) = &t.occlusion {
+                if packed.is_some() {
+                    set["ao"] = json!(mr);
+                } else if let Some(o) = &t.occlusion {
                     set["ao"] = json!(add(o, "occlusion")?);
                 }
                 if let Some(e) = &t.emissive {
@@ -250,7 +264,6 @@ fn build(
             let set = &sets[&key];
             pbr["baseColorTexture"] = json!({"index": set["base"]});
             pbr["metallicRoughnessTexture"] = json!({"index": set["mr"]});
-            material["name"] = json!(format!("{}-{}", part.name, r.material));
             material["normalTexture"] = json!({"index": set["normal"]});
             if let Some(a) = set.get("ao") {
                 material["occlusionTexture"] = json!({"index": a});
@@ -258,29 +271,130 @@ fn build(
             if let Some(e) = set.get("emissive") {
                 material["emissiveTexture"] = json!({"index": e});
                 material["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+                if let Some(k) = opts.emissive_strength {
+                    material["extensions"] =
+                        json!({"KHR_materials_emissive_strength": {"emissiveStrength": k}});
+                    if !extensions.contains(&"KHR_materials_emissive_strength") {
+                        extensions.push("KHR_materials_emissive_strength");
+                    }
+                }
             }
             if set["blend"] == json!(true) {
                 material["alphaMode"] = json!("BLEND");
             }
-            let tan: Vec<u8> = tangents(part)
-                .iter()
-                .flat_map(|t| t.iter().flat_map(|f| f.to_le_bytes()))
-                .collect();
-            attributes["TANGENT"] = json!(b.accessor(&tan, n, "VEC4", 5126, false));
+        }
+        if part.material.base_color[3] < 0.999 {
+            material["alphaMode"] = json!("BLEND");
         }
         material["pbrMetallicRoughness"] = pbr;
-        materials.push(material);
-        meshes.push(json!({
+        let mat_index = if opts.dedup_materials {
+            let key = material.to_string();
+            match material_ids.get(&key) {
+                Some(i) => *i,
+                None => {
+                    material["name"] = json!(match &part.material.pbr {
+                        Some(r) => format!("{}-{}", r.material, material_ids.len()),
+                        None => format!("mat-{}", material_ids.len()),
+                    });
+                    materials.push(material);
+                    material_ids.insert(key, materials.len() - 1);
+                    materials.len() - 1
+                }
+            }
+        } else {
+            material["name"] = json!(match &part.material.pbr {
+                Some(r) => format!("{}-{}", part.name, r.material),
+                None => format!("{}-mat", part.name),
+            });
+            materials.push(material);
+            materials.len() - 1
+        };
+
+        // ---- mesh (or the shared one of an instanced copy)
+        let mut translation = part.translation;
+        let mesh_index = match &prepared.meshes[pi] {
+            MeshRef::CopyOf { source, offset } => {
+                let src = &exported[*source];
+                translation = [0, 1, 2].map(|k| src.translation[k] + offset[k]);
+                mesh_of[*source]
+            }
+            MeshRef::Own => {
+                let mut min = [f32::MAX; 3];
+                let mut max = [f32::MIN; 3];
+                for v in &part.verts {
+                    for c in 0..3 {
+                        min[c] = min[c].min(v[c]);
+                        max[c] = max[c].max(v[c]);
+                    }
+                }
+                let n = part.verts.len();
+                let pos = b.accessor(&le_f32s(&part.verts), n, "VEC3", 5126, false);
+                b.accessors[pos as usize]["min"] = json!(min);
+                b.accessors[pos as usize]["max"] = json!(max);
+                let nrm = b.accessor(&le_f32s(&part.normals), n, "VEC3", 5126, false);
+                let mut attributes = json!({"POSITION": pos, "NORMAL": nrm});
+                // Untextured parts need no uvs in a game (dropped when optimising).
+                if textured || opts.is_none() {
+                    attributes["TEXCOORD_0"] =
+                        json!(b.accessor(&le_f32s(&part.uvs), n, "VEC2", 5126, false));
+                }
+                let idx = if opts.small_indices && n <= u16::MAX as usize {
+                    let bytes: Vec<u8> = part
+                        .indices
+                        .iter()
+                        .flat_map(|ix| (*ix as u16).to_le_bytes())
+                        .collect();
+                    b.accessor(&bytes, part.indices.len(), "SCALAR", 5123, true)
+                } else {
+                    let bytes: Vec<u8> = part
+                        .indices
+                        .iter()
+                        .flat_map(|ix| ix.to_le_bytes())
+                        .collect();
+                    b.accessor(&bytes, part.indices.len(), "SCALAR", 5125, true)
+                };
+                if textured {
+                    let tan: Vec<u8> = tangents(part)
+                        .iter()
+                        .flat_map(|t| t.iter().flat_map(|f| f.to_le_bytes()))
+                        .collect();
+                    attributes["TANGENT"] = json!(b.accessor(&tan, n, "VEC4", 5126, false));
+                }
+                meshes.push(json!({
+                    "name": part.name,
+                    "primitives": [{"attributes": attributes, "indices": idx, "material": mat_index}],
+                }));
+                meshes.len() - 1
+            }
+        };
+        mesh_of.push(mesh_index);
+        // An instanced copy whose material differs needs its own primitive
+        // material; copies are only matched with equal materials, so the
+        // shared mesh's material is right.
+        let mut node = json!({
             "name": part.name,
-            "primitives": [{"attributes": attributes, "indices": idx, "material": materials.len() - 1}],
-        }));
-        nodes.push(json!({
-            "name": part.name,
-            "translation": part.translation,
+            "translation": translation,
             "rotation": part.rotation,
             "scale": part.scale,
-            "mesh": meshes.len() - 1,
-        }));
+            "mesh": mesh_index,
+        });
+        if !opts.is_none() {
+            let mut extras = json!({"part": part.name});
+            if let Some(r) = &part.material.pbr {
+                extras["material"] = json!(r.material);
+            }
+            let notes: Vec<&str> = model
+                .annotations
+                .iter()
+                .filter(|a| a.part == part.name)
+                .map(|a| a.text.as_str())
+                .collect();
+            if !notes.is_empty() {
+                extras["comments"] = json!(notes);
+            }
+            node["extras"] = extras;
+        }
+        nodes.push(node);
     }
     let mut buffer = json!({ "byteLength": b.bin.len() });
     if let Some(uri) = buffer_uri {
@@ -297,6 +411,9 @@ fn build(
         "bufferViews": b.views,
         "buffers": [buffer],
     });
+    if !extensions.is_empty() {
+        doc["extensionsUsed"] = json!(extensions);
+    }
     if !images.is_empty() {
         doc["images"] = json!(images);
         doc["textures"] = json!(textures);
@@ -304,28 +421,92 @@ fn build(
         doc["samplers"] =
             json!([{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}]);
     }
-    Ok((doc, b.bin))
+    // The report: before -> after.
+    let r = &prepared.report;
+    let tris: usize = exported
+        .iter()
+        .zip(&prepared.meshes)
+        .filter(|(_, m)| **m == MeshRef::Own)
+        .map(|(p, _)| p.indices.len() / 3)
+        .sum();
+    let drawn: usize = exported.iter().map(|p| p.indices.len() / 3).sum();
+    let mut report = format!(
+        "exported {} node(s), {} mesh(es), {} material(s), {} texture(s) ({} KB of PNG)\n\
+         triangles: {} -> {} drawn ({} stored, the rest instanced); vertices {} -> {}\n\
+         draw calls: {} -> {} batches (nodes sharing a mesh and material instance)",
+        nodes.len(),
+        doc["meshes"].as_array().map_or(0, Vec::len),
+        doc["materials"].as_array().map_or(0, Vec::len),
+        images.len(),
+        texture_bytes / 1024,
+        r.before_tris,
+        drawn,
+        tris,
+        r.before_verts,
+        exported
+            .iter()
+            .zip(&prepared.meshes)
+            .filter(|(_, m)| **m == MeshRef::Own)
+            .map(|(p, _)| p.verts.len())
+            .sum::<usize>(),
+        r.before_parts,
+        {
+            let mut pairs = std::collections::BTreeSet::new();
+            for n in doc["nodes"].as_array().into_iter().flatten() {
+                let m = n["mesh"].as_u64().unwrap_or(0) as usize;
+                pairs.insert((m, doc["meshes"][m]["primitives"][0]["material"].as_u64()));
+            }
+            pairs.len()
+        },
+    );
+    for l in &r.lines {
+        report += &format!("\n- {l}");
+    }
+    Ok((doc, b.bin, report))
 }
 
 /// Write `<path>.gltf` plus a sibling `<stem>.bin` (path with the extension replaced by `bin`).
 pub fn export_gltf(model: &Model, path: &Path) -> Result<(), crate::ModelerError> {
+    export_gltf_with(model, path, &crate::export_opt::Options::none()).map(|_| ())
+}
+
+/// Write a single binary `.glb`.
+pub fn export_glb(model: &Model, path: &Path) -> Result<(), crate::ModelerError> {
+    export_glb_with(model, path, &crate::export_opt::Options::none()).map(|_| ())
+}
+
+/// [`export_gltf`] with optimisation passes; returns the report.
+pub fn export_gltf_with(
+    model: &Model,
+    path: &Path,
+    opts: &crate::export_opt::Options,
+) -> Result<String, crate::ModelerError> {
     let stem = path.with_extension("");
     let stem_name = stem
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("bad export path {}", path.display()))?
         .to_owned();
-    let (json, bin) = build(model, Some(format!("{stem_name}.bin")))?;
+    let (json, bin, report) = build(model, Some(format!("{stem_name}.bin")), opts)?;
     let json_text = serde_json::to_string(&json).map_err(|e| e.to_string())?;
     let bin_path = path.with_extension("bin");
     fs::write(&bin_path, &bin).map_err(|e| format!("writing {}: {e}", bin_path.display()))?;
-    fs::write(path, json_text).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(())
+    fs::write(path, &json_text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(format!(
+        "{report}\nfile: {} KB (+ {} KB .bin)",
+        json_text.len() / 1024,
+        bin.len() / 1024
+    ))
 }
 
-/// Write a single binary `.glb`: 12-byte header, JSON chunk (space padded), BIN chunk (zero padded).
-pub fn export_glb(model: &Model, path: &Path) -> Result<(), crate::ModelerError> {
-    let (json, bin) = build(model, None)?;
+/// [`export_glb`] with optimisation passes; returns the report. The file is
+/// a 12-byte header, a JSON chunk (space padded), a BIN chunk (zero padded).
+pub fn export_glb_with(
+    model: &Model,
+    path: &Path,
+    opts: &crate::export_opt::Options,
+) -> Result<String, crate::ModelerError> {
+    let (json, bin, report) = build(model, None, opts)?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
     json_chunk.resize(align4(json_chunk.len()), b' ');
     let mut bin_chunk = bin;
@@ -342,6 +523,7 @@ pub fn export_glb(model: &Model, path: &Path) -> Result<(), crate::ModelerError>
     out.extend_from_slice(&(bin_chunk.len() as u32).to_le_bytes());
     out.extend_from_slice(b"BIN\0");
     out.extend_from_slice(&bin_chunk);
-    fs::write(path, out)
-        .map_err(|e| crate::ModelerError::Io(format!("writing {}: {e}", path.display())))
+    fs::write(path, &out)
+        .map_err(|e| crate::ModelerError::Io(format!("writing {}: {e}", path.display())))?;
+    Ok(format!("{report}\nfile: {} KB", out.len() / 1024))
 }

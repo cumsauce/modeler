@@ -531,19 +531,41 @@ Style::default()
     }
 
     /// Export the current model as glTF. Pass format "gltf" for a JSON .gltf or "glb"
-    /// for a self-contained binary .glb, plus the output file path.
+    /// for a self-contained binary .glb, plus the output file path. For a game
+    /// engine pass `optimize: "game"` (material dedup, contact culling,
+    /// instancing of copies, weld, u16 indices, ORM textures) or an object of
+    /// overrides, e.g. `{"visible_from": [{"min": [..], "max": [..]}]}` to drop
+    /// faces no camera inside those boxes can see, `{"merge": "by_material",
+    /// "merge_keep": ["door*"]}` for one draw call per material,
+    /// `{"emissive_strength": 4}` for bloom. The result reports before -> after.
     #[tool]
     async fn export_model(
         &self,
-        Parameters(ExportModelArgs { path, format }): Parameters<ExportModelArgs>,
+        Parameters(ExportModelArgs {
+            path,
+            format,
+            optimize,
+        }): Parameters<ExportModelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = PathBuf::from(path);
-        self.run(move |s| match format.as_str() {
-            "glb" => gltf::export_glb(&s.model, &path)
-                .map(|_| format!("exported `{}` to {}", s.model.name, path.display())),
-            "gltf" => gltf::export_gltf(&s.model, &path)
-                .map(|_| format!("exported `{}` to {}", s.model.name, path.display())),
-            other => Err(format!("unknown format `{other}` (use \"gltf\" or \"glb\")").into()),
+        self.run(move |s| {
+            let opts = modeler::export_opt::Options::parse(
+                &optimize.clone().unwrap_or(serde_json::Value::Null),
+            )?;
+            let report = match format.as_str() {
+                "glb" => gltf::export_glb_with(&s.model, &path, &opts)?,
+                "gltf" => gltf::export_gltf_with(&s.model, &path, &opts)?,
+                other => {
+                    return Err(
+                        format!("unknown format `{other}` (use \"gltf\" or \"glb\")").into(),
+                    );
+                }
+            };
+            Ok(format!(
+                "exported `{}` to {}\n{report}",
+                s.model.name,
+                path.display()
+            ))
         })
         .await
     }

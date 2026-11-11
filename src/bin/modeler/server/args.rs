@@ -76,6 +76,12 @@ pub(crate) struct ExportModelArgs {
     pub(crate) path: String,
     /// "gltf" for a JSON .gltf or "glb" for a binary .glb.
     pub(crate) format: String,
+    /// "game", "none" (default), or overrides {preset?, dedup_materials?,
+    /// cull_contacts?, visible_from?: [{min, max}], view_samples?, instance?,
+    /// merge?: "by_material", merge_keep?: [patterns], weld?, small_indices?,
+    /// orm?, emissive_strength?}.
+    #[serde(default)]
+    pub(crate) optimize: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

@@ -191,11 +191,7 @@ pub(crate) fn update_outline_pane(
                 border_radius: BorderRadius::all(Val::Px(2.0)),
                 ..default()
             },
-            BackgroundColor(Color::linear_rgb(cr, cg, cb).with_alpha(if r.dim {
-                0.4
-            } else {
-                1.0
-            })),
+            BackgroundColor(Color::srgb(cr, cg, cb).with_alpha(if r.dim { 0.4 } else { 1.0 })),
             ChildOf(row),
         ));
         commands.spawn((

@@ -297,3 +297,83 @@ fn procedural_materials_export_textures_and_tangents() {
         assert!((span.1 - span.0 - 1.0).abs() < 1e-4, "{span:?}");
     }
 }
+
+#[test]
+fn game_export_dedups_instances_culls_and_packs_orm() {
+    let mut s = modeler::commands::Session::default();
+    let nodes = serde_json::json!([
+        {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
+        {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": 0.005},
+        {"type": "math", "name": "h", "op": "mul", "a": "m", "b": 0.004},
+        {"type": "ao_from_height", "name": "ao", "height": "h", "radius": 0.01},
+        {"type": "output", "name": "out", "base_color": "m", "height": "h", "ao": "ao"}
+    ]);
+    s.materials
+        .ops(
+            "bricks",
+            nodes.as_array().unwrap().clone(),
+            None,
+            None,
+            None,
+            Some(64),
+            None,
+        )
+        .unwrap();
+    let items = serde_json::json!([
+        {"type": "primitive", "name": "floor", "kind": "box", "size": [4, 0.1, 1], "translation": [0, 0.05, 0]},
+        {"type": "material", "name": "floor", "pbr": "bricks"},
+        {"type": "primitive", "name": "post", "kind": "box", "size": [0.1, 1, 0.1], "translation": [-1, 0.6, 0]},
+        {"type": "linear_array", "name": "post", "input": "post", "count": 4, "offset": [0.6, 0, 0]},
+        {"type": "material", "name": "post", "color": "#808890"}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    let dir = temp_dir("game");
+    let path = dir.join("game.glb");
+    let opts = modeler::export_opt::Options::game();
+    let report = modeler::gltf::export_glb_with(&s.model, &path, &opts).unwrap();
+    let (doc, buffers, images) = gltf::import(&path).expect("game glb imports");
+    // Five nodes, two meshes (floor + one post shared by its copies), two materials.
+    assert_eq!(doc.nodes().count(), 5, "{report}");
+    assert_eq!(doc.meshes().count(), 2, "{report}");
+    assert_eq!(doc.materials().count(), 2, "{report}");
+    // ORM: base, metal-rough(+AO), normal: no separate occlusion image.
+    assert_eq!(images.len(), 3, "{report}");
+    let post_nodes: Vec<_> = doc
+        .nodes()
+        .filter(|n| n.name().is_some_and(|x| x.starts_with("post")))
+        .collect();
+    let mesh_ids: std::collections::BTreeSet<usize> = post_nodes
+        .iter()
+        .filter_map(|n| n.mesh().map(|m| m.index()))
+        .collect();
+    assert_eq!(mesh_ids.len(), 1, "posts share one mesh");
+    for mesh in doc.meshes() {
+        let prim = mesh.primitives().next().unwrap();
+        // u16 indices.
+        assert_eq!(
+            prim.indices().unwrap().data_type(),
+            gltf::accessor::DataType::U16
+        );
+        let reader = prim.reader(|b| Some(&buffers[b.index()]));
+        let n = reader.read_indices().unwrap().into_u32().count() / 3;
+        if mesh.name() == Some("post") {
+            // The bottom (2 triangles, sunk on the floor) is culled.
+            assert_eq!(n, 10, "{report}");
+            assert!(reader.read_tex_coords(0).is_none(), "untextured: no uvs");
+        }
+    }
+    let m = doc
+        .materials()
+        .find(|m| m.normal_texture().is_some())
+        .unwrap();
+    assert_eq!(
+        m.occlusion_texture().unwrap().texture().index(),
+        m.pbr_metallic_roughness()
+            .metallic_roughness_texture()
+            .unwrap()
+            .texture()
+            .index()
+    );
+    assert!(report.contains("contact culling"), "{report}");
+}

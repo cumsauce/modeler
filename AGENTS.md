@@ -298,7 +298,7 @@ name: the producer first, then in-place material/visibility/transform edits).
     studio (`src/material/env.rs`: soft boxes over a grey cyclorama, filtered
     on the GPU as an environment light), so glossy and metal parts show real
     reflections, and screen-space reflections (deferred rendering, MSAA
-    off, SMAA instead) so glossy parts also mirror the parts around them.
+    off; TAA on the window camera, SMAA on agent views) so glossy parts also mirror the parts around them.
     Agent views add SSAO contact shading; the window does not (SSAO froze
     its presentation on Metal, and so does a forward window camera over the
     deferred materials: keep the window camera deferred).
@@ -360,6 +360,25 @@ named moves, warnings), `catalog_list` and `catalog_describe` (each entry also
 lists its knobs: params with values and named moves/places, read from the
 file),
 `export_model(path, "glb" | "gltf")` (skips hidden parts).
+
+**Game export (`export_model(..., optimize)`):** `optimize: "game"` (or an
+object of flags over it; `"none"` / omitted = plain) prepares the model for
+Bevy and returns a before -> after report (tris, verts, meshes, materials,
+batches, bytes):
+
+- `dedup_materials` (on): identical looks share one glTF material, so Bevy
+  shares the `StandardMaterial` handle and can batch.
+- `cull_contacts` (on): drops triangles whose samples, nudged outward, land
+  inside another visible solid (bottoms on the deck, insets in frames).
+- `visible_from: [{min, max}]` (opt-in): keeps only triangles a ray can see
+  from some point in those camera boxes (`view_samples`, default 256), e.g.
+  an interior drops its hull's outer skin. Blended parts don't block.
+- `instance` (on): translated copies share one mesh with their own node.
+- `merge: "by_material"` (opt-in): one mesh per material; `merge_keep:
+  ["door*"]` keeps parts the game needs by name.
+- `weld`, `small_indices` (u16), `orm` (AO packed into metal-roughness R),
+  `emissive_strength` (KHR_materials_emissive_strength) are on in `game`.
+- Nodes carry `extras {part, material, comments}` for game-side lookup.
 
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
 (omit the optionals to consume a spot the human clicked; `material` + optional `node`
