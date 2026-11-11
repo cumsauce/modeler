@@ -333,6 +333,29 @@ pub fn validate(model: &Model) -> String {
     }
 }
 
+/// True when `part` only gathers cutters: it (or a union it feeds) is the
+/// `b` of a difference. Disjoint cutters are unioned on purpose.
+fn is_cutter(ops: &[Op], part: &str) -> bool {
+    ops.iter().any(|op| match op {
+        Op::Boolean {
+            op: crate::BoolOp::Difference,
+            a,
+            b,
+            ..
+        } => b == part && a != part,
+        Op::Boolean {
+            op: crate::BoolOp::Union,
+            a,
+            b,
+            ..
+        } if a == part || b == part => {
+            let out = graph::output(op);
+            out != part && is_cutter(ops, out)
+        }
+        _ => false,
+    })
+}
+
 /// Cheap deterministic warnings about the current graph/parts, appended to
 /// `scene_summary`. These encode the ordering and overlap traps that are
 /// easy to hit and expensive to spot in a render.
@@ -375,7 +398,7 @@ pub fn lints(model: &Model) -> Vec<String> {
                     out.push(format!(
                         "union `{name}` is smaller than its larger input ({vo:.4}) — inverted or torn result"
                     ));
-                } else if (vo - (va + vb)).abs() <= tol {
+                } else if (vo - (va + vb)).abs() <= tol && !is_cutter(&model.ops, out_name) {
                     out.push(format!(
                         "union `{name}` volume is exactly `{a}` + `{b}` ({vo:.4}) — the inputs have no overlap"
                     ));

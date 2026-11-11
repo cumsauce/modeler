@@ -113,7 +113,10 @@ pub(crate) fn agent_view_projection(
     let margin = 1.2;
     match view {
         AgentView::Iso => {
-            let dist = (radius * 2.6).max(2.0);
+            // The bounding sphere fits the vertical half-fov (22.5°, the
+            // tighter axis) at radius / sin(22.5°) ≈ 2.61 r; 3.0 r adds margin
+            // so tall models' tips aren't cropped.
+            let dist = (radius * 3.0).max(2.0);
             let dir = Vec3::new(1.0, 0.75, 1.0).normalize();
             (
                 center + dir * dist,

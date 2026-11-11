@@ -203,7 +203,7 @@ items of a batch that failed partway. `save_prefab` only names and indexes it.
 source (only with `include_source: false`), visible parts still wearing the
 default material, parts with identical world bounds (z-fighting), boolean
 volume sanity (a difference that didn't shrink its input = the cutter
-misses; a union whose volume exactly sums its inputs = no overlap) and
+misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
 outputs are closed). Hidden parts are excluded. An empty list means none
 fired.

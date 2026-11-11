@@ -1812,6 +1812,18 @@ mod tests {
             "lints: {:?}",
             lints
         );
+        // Unioning disjoint cutters is intentional: once the union is cut
+        // out of something, the no-overlap warning stays quiet.
+        s2.model.ops.push(Op::Boolean {
+            name: "cut".into(),
+            op: crate::BoolOp::Difference,
+            a: "sa".into(),
+            b: "joined".into(),
+        });
+        assert!(
+            !s2.lints().iter().any(|l| l.contains("no overlap")),
+            "cutter union still warned"
+        );
     }
 
     #[test]
