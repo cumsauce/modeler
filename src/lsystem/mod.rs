@@ -12,6 +12,15 @@
 //! - `!` thins the current branch by `radius_scale`, `L` places a leaf;
 //! - any other symbol (`X`, `A`, ...) only drives rewriting.
 //!
+//! **Parametric** systems carry numbers on modules: `A(1, 0.1)`. A rule
+//! head names them and may test them, `A(l, w) : l > 0.05`, and its
+//! successor computes new ones, `!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)`.
+//! The turtle reads a module's first number as its own argument: `F(l)` /
+//! `f(l)` length, `+(a)` and the other turns degrees, `!(w)` sets the
+//! radius, `L(s)` scales the leaf. A symbol's rules are tried in order (the
+//! rule list's order); the first whose parameter count matches and whose
+//! condition holds rewrites it.
+//!
 //! Every unbroken run of segments becomes ONE tube with mitred rings, so
 //! bends are smooth and there are no gaps at joints; branches start inside
 //! their parent. The wood is one closed solid per branch, merged into the
@@ -24,12 +33,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::Part;
 
+pub mod expr;
+use expr::{Head, Module, Template};
+
 /// Most symbols an expansion may reach (the string, before drawing).
 pub const MAX_SYMBOLS: usize = 400_000;
 /// Most drawn segments (each is a ring of the tube).
 pub const MAX_SEGMENTS: usize = 40_000;
 
-/// One rewrite choice: `to` replaces the symbol with probability weight `p`.
+/// One rewrite choice: `to` replaces the module with probability weight `p`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Choice {
     pub p: f32,
@@ -41,8 +53,12 @@ pub struct Choice {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LSystem {
     pub axiom: String,
-    /// Symbol -> choices (one choice = a deterministic rule).
-    pub rules: BTreeMap<char, Vec<Choice>>,
+    /// Rules in the order they are tried: a head (`A`, `A(l, w)`,
+    /// `A(l, w) : l > 0.1`) and its choices (one = deterministic).
+    pub rules: Vec<(String, Vec<Choice>)>,
+    /// Named numbers usable in rule expressions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub constants: BTreeMap<String, f64>,
     pub iterations: u32,
     pub angle: f32,
     pub length: f32,
@@ -65,14 +81,99 @@ pub struct LSystem {
     pub sides: u32,
     /// Leaf blade [width, length]; a leaf is placed at every `L`.
     pub leaf_size: [f32; 2],
+    #[serde(default)]
+    pub leaf: LeafStyle,
     pub translation: [f32; 3],
     pub rotation: Option<[f32; 4]>,
+}
+
+/// How leaves look.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LeafStyle {
+    /// Outline: ellipse, lance, round, heart, diamond, needle, maple.
+    pub shape: String,
+    /// Pitch away from the branch, degrees (leaves stand out of the stem).
+    pub angle: f32,
+    /// Bend along the length, degrees from base to tip (tips droop).
+    pub curl: f32,
+    /// V-fold along the midrib, degrees (0 = flat).
+    pub fold: f32,
+    /// Leaf stalk length, meters.
+    pub stalk: f32,
+}
+
+impl Default for LeafStyle {
+    fn default() -> Self {
+        LeafStyle {
+            shape: "ellipse".into(),
+            angle: 0.0,
+            curl: 0.0,
+            fold: 0.0,
+            stalk: 0.0,
+        }
+    }
+}
+
+pub const LEAF_SHAPES: &[&str] = &[
+    "ellipse", "lance", "round", "heart", "diamond", "needle", "maple",
+];
+
+/// Half-width (as a share of the leaf width) at `t` (0 base .. 1 tip).
+fn leaf_profile(shape: &str, t: f32) -> f32 {
+    use std::f32::consts::PI;
+    let s = (PI * t).sin().max(0.0);
+    match shape {
+        "lance" => 0.5 * s * (1.0 - t).powf(0.4),
+        "round" => 0.5 * s.powf(0.5),
+        "heart" => 0.5 * s.powf(0.7) * (1.25 - t * 0.9),
+        "diamond" => 0.5 * if t < 0.4 { t / 0.4 } else { (1.0 - t) / 0.6 },
+        "needle" => 0.5 * (1.0 - t).powf(0.3) * (t * 20.0).min(1.0),
+        // Five lobes: a round blade whose edge dips between lobe tips.
+        "maple" => 0.5 * s.powf(0.4) * (0.75 + 0.25 * (t * 5.0 * PI).cos().abs()),
+        _ => 0.5 * s.powf(0.8),
+    }
+}
+
+struct Rule {
+    head: Head,
+    choices: Vec<(f32, Vec<Template>)>,
+}
+
+/// The axiom and rules, parsed and compiled.
+struct Compiled {
+    axiom: Vec<Module>,
+    rules: std::collections::HashMap<char, Vec<Rule>>,
+}
+
+fn compile(ls: &LSystem) -> Result<Compiled, String> {
+    let axiom = expr::parse_word(&ls.axiom, &[], &ls.constants)
+        .map_err(|e| format!("axiom: {e}"))?
+        .iter()
+        .map(|t| t.eval(&[]))
+        .collect();
+    let mut rules: std::collections::HashMap<char, Vec<Rule>> = Default::default();
+    for (head, choices) in &ls.rules {
+        let h = expr::parse_head(head, &ls.constants).map_err(|e| format!("rules: {e}"))?;
+        let mut cs = Vec::new();
+        for c in choices {
+            let w = expr::parse_word(&c.to, &h.vars, &ls.constants)
+                .map_err(|e| format!("rules.{head}: {e}"))?;
+            cs.push((c.p, w));
+        }
+        rules.entry(h.sym).or_default().push(Rule {
+            head: h,
+            choices: cs,
+        });
+    }
+    Ok(Compiled { axiom, rules })
 }
 
 impl LSystem {
     /// Whether any `L` can appear (so the op writes `name_leaves`).
     pub fn has_leaves(&self) -> bool {
-        self.axiom.contains('L') || self.rules.values().flatten().any(|c| c.to.contains('L'))
+        let leafy = |w: &str| w.split(['(', ')']).step_by(2).any(|p| p.contains('L'));
+        leafy(&self.axiom) || self.rules.iter().flat_map(|r| &r.1).any(|c| leafy(&c.to))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -104,7 +205,14 @@ impl LSystem {
                 return Err(format!("rules.{s}: needs choices with weights >= 0"));
             }
         }
-        Ok(())
+        if !LEAF_SHAPES.contains(&self.leaf.shape.as_str()) {
+            return Err(format!(
+                "leaf.shape: unknown `{}` ({})",
+                self.leaf.shape,
+                LEAF_SHAPES.join(", ")
+            ));
+        }
+        compile(self).map(|_| ())
     }
 }
 
@@ -130,29 +238,39 @@ impl Rng {
 }
 
 /// Rewrites the axiom `iterations` times.
-pub fn expand(ls: &LSystem) -> Result<String, String> {
+fn expand(ls: &LSystem, c: &Compiled) -> Result<Vec<Module>, String> {
     let mut rng = Rng(ls.seed ^ 0x5EED);
-    let mut s = ls.axiom.clone();
+    let mut s = c.axiom.clone();
     for it in 0..ls.iterations {
-        let mut out = String::with_capacity(s.len() * 2);
-        for c in s.chars() {
-            match ls.rules.get(&c) {
-                Some(cs) if cs.len() == 1 => out.push_str(&cs[0].to),
-                Some(cs) => {
-                    let total: f32 = cs.iter().map(|c| c.p).sum();
-                    let mut x = rng.f() * total;
-                    let mut pick = &cs[cs.len() - 1];
-                    for ch in cs {
-                        if x < ch.p {
-                            pick = ch;
-                            break;
-                        }
-                        x -= ch.p;
+        let mut out = Vec::with_capacity(s.len() * 2);
+        for m in &s {
+            let args = &m.a[..m.n as usize];
+            let rule = c.rules.get(&m.sym).and_then(|rs| {
+                rs.iter().find(|r| {
+                    r.head.vars.len() == args.len()
+                        && r.head.cond.as_ref().is_none_or(|e| e.eval(args) != 0.0)
+                })
+            });
+            let Some(rule) = rule else {
+                out.push(*m);
+                continue;
+            };
+            let pick = if rule.choices.len() == 1 {
+                &rule.choices[0].1
+            } else {
+                let total: f32 = rule.choices.iter().map(|c| c.0).sum();
+                let mut x = rng.f() * total;
+                let mut pick = &rule.choices[rule.choices.len() - 1].1;
+                for (p, w) in &rule.choices {
+                    if x < *p {
+                        pick = w;
+                        break;
                     }
-                    out.push_str(&pick.to);
+                    x -= p;
                 }
-                None => out.push(c),
-            }
+                pick
+            };
+            out.extend(pick.iter().map(|t| t.eval(args)));
             if out.len() > MAX_SYMBOLS {
                 return Err(format!(
                     "the string passes {MAX_SYMBOLS} symbols at iteration {}: lower iterations (or make rules grow slower)",
@@ -163,6 +281,20 @@ pub fn expand(ls: &LSystem) -> Result<String, String> {
         s = out;
     }
     Ok(s)
+}
+
+/// The expanded string, written back as text (for tests and debugging).
+pub fn expand_text(ls: &LSystem) -> Result<String, String> {
+    let c = compile(ls)?;
+    let mut out = String::new();
+    for m in expand(ls, &c)? {
+        out.push(m.sym);
+        if m.n > 0 {
+            let a: Vec<String> = m.a[..m.n as usize].iter().map(|x| format!("{x}")).collect();
+            out += &format!("({})", a.join(","));
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Copy)]
@@ -190,7 +322,8 @@ pub struct Drawn {
 /// leaves, `name_leaves`.
 pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     ls.validate()?;
-    let s = expand(ls)?;
+    let compiled = compile(ls)?;
+    let s = expand(ls, &compiled)?;
     let mut rng = Rng(ls.seed);
     let a = ls.angle.to_radians();
     let jit = ls.jitter.to_radians();
@@ -204,11 +337,15 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     };
     let mut stack: Vec<Turtle> = Vec::new();
     let mut chains: Vec<Chain> = Vec::new();
-    let mut leaves: Vec<(Vec3, Quat)> = Vec::new();
+    let mut leaves: Vec<(Vec3, Quat, f32)> = Vec::new();
     let mut segments = 0usize;
     // Turtle axes in its own frame: heading +y, left -x, up +z.
     let (h, l, u) = (Vec3::Y, Vec3::NEG_X, Vec3::Z);
-    for c in s.chars() {
+    for m in &s {
+        let c = m.sym;
+        let arg = m.arg();
+        // A turn's own angle (degrees) when the module carries one.
+        let a = arg.map_or(a, f32::to_radians);
         let turn = |t: &mut Turtle, axis: Vec3, ang: f32, rng: &mut Rng| {
             let ang = ang + jit * rng.s();
             t.rot = (t.rot * Quat::from_axis_angle(axis, ang)).normalize();
@@ -221,7 +358,7 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
                         "more than {MAX_SEGMENTS} segments: lower iterations"
                     ));
                 }
-                let len = t.length * (1.0 + ls.length_jitter * rng.s()).max(0.05);
+                let len = arg.unwrap_or(t.length) * (1.0 + ls.length_jitter * rng.s()).max(0.05);
                 let idx = match t.chain {
                     Some(i) => i,
                     None => {
@@ -246,7 +383,7 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
                 }
             }
             'f' => {
-                t.pos += t.rot * h * t.length;
+                t.pos += t.rot * h * arg.unwrap_or(t.length);
                 t.chain = None;
             }
             '+' => turn(&mut t, u, a, &mut rng),
@@ -256,7 +393,10 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
             '\\' => turn(&mut t, h, a, &mut rng),
             '/' => turn(&mut t, h, -a, &mut rng),
             '|' => t.rot = (t.rot * Quat::from_axis_angle(u, std::f32::consts::PI)).normalize(),
-            '!' => t.radius *= ls.radius_scale,
+            '!' => match arg {
+                Some(w) => t.radius = w.max(0.0),
+                None => t.radius *= ls.radius_scale,
+            },
             '[' => {
                 stack.push(t);
                 t.chain = None;
@@ -274,7 +414,7 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
             }
             'L' => {
                 let roll = Quat::from_axis_angle(h, rng.s() * std::f32::consts::PI);
-                leaves.push((t.pos, (t.rot * roll).normalize()));
+                leaves.push((t.pos, (t.rot * roll).normalize(), arg.unwrap_or(1.0)));
             }
             _ => {}
         }
@@ -287,8 +427,8 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     }
     if wood.indices.is_empty() {
         return Err(format!(
-            "the system draws nothing: {} symbols but no `F` segments (check the rules)",
-            s.chars().count()
+            "the system draws nothing: {} modules but no `F` segments (check the rules)",
+            s.len()
         ));
     }
     let place = |p: &mut Part| {
@@ -301,8 +441,14 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     let leaf_count = leaves.len();
     let leaves = ls.has_leaves().then(|| {
         let mut lp = Part::new(format!("{name}_leaves"));
-        for (pos, rot) in &leaves {
-            blade(&mut lp, *pos, *rot, ls.leaf_size);
+        for (pos, rot, k) in &leaves {
+            blade(
+                &mut lp,
+                *pos,
+                *rot,
+                [ls.leaf_size[0] * k, ls.leaf_size[1] * k],
+                &ls.leaf,
+            );
         }
         place(&mut lp);
         lp
@@ -386,43 +532,86 @@ fn tube(part: &mut Part, pts: &[(Vec3, f32)], sides: usize) {
     }
 }
 
-/// A leaf: a thin closed blade (a flat bipyramid) from `pos` along the
-/// turtle's heading, width across its left axis, flat faces.
-fn blade(part: &mut Part, pos: Vec3, rot: Quat, [w, len]: [f32; 2]) {
-    let h = rot * Vec3::Y;
-    let l = rot * Vec3::NEG_X;
-    let u = rot * Vec3::Z;
-    let th = (w * 0.04).max(0.0005);
-    let base = pos;
-    let tip = pos + h * len;
-    let left = pos + h * len * 0.4 + l * w * 0.5;
-    let right = pos + h * len * 0.4 - l * w * 0.5;
-    let top = pos + h * len * 0.4 + u * th;
-    let bot = pos + h * len * 0.4 - u * th;
-    let rim = [base, left, tip, right];
-    for (apex, up) in [(top, true), (bot, false)] {
-        for i in 0..4 {
-            let (a, b) = (rim[i], rim[(i + 1) % 4]);
-            // Outward winding: counter-clockwise seen from outside.
-            let tri = if up { [a, b, apex] } else { [b, a, apex] };
-            let mut nrm = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or(u);
-            if (nrm.dot(if up { u } else { -u })) < 0.0 {
-                nrm = -nrm;
-            }
-            let o = part.verts.len() as u32;
-            for v in tri {
-                part.verts.push(v.to_array());
-                part.normals.push(nrm.to_array());
-                let rel = v - pos;
-                part.uvs.push([rel.dot(l), rel.dot(h)]);
-            }
-            let fix = (tri[1] - tri[0]).cross(tri[2] - tri[0]).dot(nrm) < 0.0;
-            if fix {
-                part.indices.extend_from_slice(&[o, o + 2, o + 1]);
-            } else {
-                part.indices.extend_from_slice(&[o, o + 1, o + 2]);
-            }
+/// A leaf: a thin closed blade from `pos`, pitched `angle` off the
+/// heading, with its outline from `shape`, a V `fold` along the midrib, a
+/// `curl` toward its underside along the length and an optional stalk.
+/// Built as rows across the blade: each interior row has a left edge, a
+/// midrib on top, a right edge and a midrib underneath (edges shared, so
+/// the blade is closed); base and tip are single points. Flat-shaded.
+fn blade(part: &mut Part, pos: Vec3, rot: Quat, [w, len]: [f32; 2], st: &LeafStyle) {
+    if w <= 0.0 || len <= 0.0 {
+        return;
+    }
+    let rot = (rot * Quat::from_axis_angle(Vec3::NEG_X, st.angle.to_radians())).normalize();
+    let (h, l, u) = (rot * Vec3::Y, rot * Vec3::NEG_X, rot * Vec3::Z);
+    let base = pos + h * st.stalk;
+    let th = (w * 0.03).max(0.0004);
+    let fold = st.fold.to_radians() * 0.5;
+    let rows = if st.shape == "needle" { 3 } else { 8 };
+    let curl = st.curl.to_radians();
+    // The midrib's path: a circular arc bent toward -u by `curl`.
+    let rib = |t: f32| -> (Vec3, Vec3, Vec3) {
+        let ang = curl * t;
+        let (along, up) = if curl.abs() < 1e-4 {
+            (h * len * t, Vec3::ZERO)
+        } else {
+            let r = len / curl;
+            (h * r * ang.sin(), -u * r * (1.0 - ang.cos()))
+        };
+        let tangent = (h * ang.cos() - u * ang.sin()).normalize();
+        let normal = tangent.cross(l).normalize();
+        (base + along + up, tangent, normal)
+    };
+    let tip_t = 1.0;
+    let mut grid: Vec<[Vec3; 4]> = Vec::new();
+    for r in 1..rows {
+        let t = r as f32 / rows as f32;
+        let (c, _, n) = rib(t);
+        let half = leaf_profile(&st.shape, t) * w;
+        let lift = n * half * fold.sin();
+        let left = c + l * half * fold.cos() + lift;
+        let right = c - l * half * fold.cos() + lift;
+        let thick = th * (1.0 - (2.0 * t - 1.0).powi(2)).max(0.2);
+        grid.push([left, c + n * thick, right, c - n * thick]);
+    }
+    let (tip, ..) = rib(tip_t);
+    let mut tri = |a: Vec3, b: Vec3, c: Vec3, out: Vec3| {
+        let mut nrm = (b - a).cross(c - a);
+        let (b, c) = if nrm.dot(out) < 0.0 {
+            nrm = -nrm;
+            (c, b)
+        } else {
+            (b, c)
+        };
+        let nrm = nrm.normalize_or(out);
+        let o = part.verts.len() as u32;
+        for v in [a, b, c] {
+            part.verts.push(v.to_array());
+            part.normals.push(nrm.to_array());
+            let rel = v - pos;
+            part.uvs.push([rel.dot(l), rel.dot(h)]);
         }
+        part.indices.extend_from_slice(&[o, o + 1, o + 2]);
+    };
+    // Faces: top = (left, top rib) and (top rib, right); bottom likewise.
+    let faces: [(usize, usize, f32); 4] = [(0, 1, 1.0), (1, 2, 1.0), (0, 3, -1.0), (3, 2, -1.0)];
+    for (i, j, side) in faces {
+        let out = |k: usize| rib((k as f32 + 1.0) / rows as f32).2 * side;
+        tri(base, grid[0][i], grid[0][j], out(0));
+        for k in 0..grid.len() - 1 {
+            let (a, b) = (grid[k], grid[k + 1]);
+            tri(a[i], b[i], b[j], out(k));
+            tri(a[i], b[j], a[j], out(k));
+        }
+        let last = grid.len() - 1;
+        tri(grid[last][i], tip, grid[last][j], out(last));
+    }
+    if st.stalk > 0.0 {
+        // A thin square stalk from the branch to the blade.
+        let r = (w * 0.03).max(0.001);
+        let (a, b) = (pos, base);
+        let pts = [(a, r), (b, r)];
+        tube(part, &pts, 4);
     }
 }
 
@@ -431,30 +620,32 @@ mod tests {
     use super::*;
 
     pub(crate) fn tree() -> LSystem {
-        let mut rules = BTreeMap::new();
-        rules.insert(
-            'X',
-            vec![
-                Choice {
+        let rules = vec![
+            (
+                "X".to_string(),
+                vec![
+                    Choice {
+                        p: 1.0,
+                        to: "F[+XL]F[-XL]&[XL]".into(),
+                    },
+                    Choice {
+                        p: 1.0,
+                        to: "F[^XL][&XL]".into(),
+                    },
+                ],
+            ),
+            (
+                "F".to_string(),
+                vec![Choice {
                     p: 1.0,
-                    to: "F[+XL]F[-XL]&[XL]".into(),
-                },
-                Choice {
-                    p: 1.0,
-                    to: "F[^XL][&XL]".into(),
-                },
-            ],
-        );
-        rules.insert(
-            'F',
-            vec![Choice {
-                p: 1.0,
-                to: "FF".into(),
-            }],
-        );
+                    to: "FF".into(),
+                }],
+            ),
+        ];
         LSystem {
             axiom: "X".into(),
             rules,
+            constants: BTreeMap::new(),
             iterations: 4,
             angle: 25.0,
             length: 0.2,
@@ -470,6 +661,13 @@ mod tests {
             seed: 7,
             sides: 7,
             leaf_size: [0.06, 0.12],
+            leaf: LeafStyle {
+                curl: 40.0,
+                fold: 30.0,
+                angle: 30.0,
+                stalk: 0.02,
+                ..LeafStyle::default()
+            },
             translation: [0.0; 3],
             rotation: None,
         }
@@ -564,5 +762,121 @@ mod op_tests {
             panic!("no rules should fail")
         };
         assert!(e.to_string().contains("preset"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod parametric_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_parametric_system_carries_numbers_and_stops_on_a_condition() {
+        let mut s = crate::commands::Session::default();
+        s.apply_values(
+            Some([("shrink".to_string(), 0.6)].into()),
+            vec![json!({"type": "lsystem", "name": "t", "axiom": "A(1, 0.08)",
+                "constants": {"k": "$shrink"},
+                "rules": {
+                    "A(l, w) : l >= 0.2": "!(w)F(l)[&(40)A(l*k, w*0.6)L(0.5)]/(137.5)[&(40)A(l*k, w*0.6)]A(l*0.8, w*0.8)",
+                    "A(l, w) : l < 0.2": "L(1)"
+                },
+                "iterations": 9, "leaf_shape": "maple", "leaf_size": [0.1, 0.1],
+                "leaf_angle": 30, "leaf_curl": 30, "leaf_fold": 20, "leaf_stalk": 0.03})],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let wood = s
+            .model
+            .parts
+            .iter()
+            .find(|p| p.name == "t")
+            .unwrap_or_else(|| panic!("no t"));
+        let leaves = s
+            .model
+            .parts
+            .iter()
+            .find(|p| p.name == "t_leaves")
+            .unwrap_or_else(|| panic!("no leaves"));
+        for p in [wood, leaves] {
+            assert_eq!(crate::verify::open_edge_count(p), 0, "{} is open", p.name);
+        }
+        // The trunk is 1 m: the first segment's length came from A(1, ..).
+        let top = wood.verts.iter().map(|v| v[1]).fold(f32::MIN, f32::max);
+        assert!(top > 1.5 && top < 6.0, "{top}");
+        // A smaller param shrinks the side branches.
+        let span = |s: &crate::commands::Session| {
+            let p = s
+                .model
+                .parts
+                .iter()
+                .find(|p| p.name == "t")
+                .unwrap_or_else(|| panic!());
+            p.verts.iter().map(|v| v[0].abs()).fold(0.0f32, f32::max)
+        };
+        let before = span(&s);
+        s.apply_values(Some([("shrink".to_string(), 0.4)].into()), vec![])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(span(&s) < before, "{before} -> {}", span(&s));
+    }
+
+    #[test]
+    fn expansion_text_and_errors() {
+        let ls = LSystem {
+            axiom: "A(3)".into(),
+            rules: vec![(
+                "A(n) : n > 0".into(),
+                vec![Choice {
+                    p: 1.0,
+                    to: "F(n)A(n-1)".into(),
+                }],
+            )],
+            iterations: 5,
+            ..super::tests::tree()
+        };
+        assert_eq!(
+            expand_text(&ls).unwrap_or_else(|e| panic!("{e}")),
+            "F(3)F(2)F(1)A(0)"
+        );
+        let bad = LSystem {
+            rules: vec![(
+                "A(n)".into(),
+                vec![Choice {
+                    p: 1.0,
+                    to: "F(m)".into(),
+                }],
+            )],
+            ..ls
+        };
+        let Err(e) = bad.validate() else {
+            panic!("unknown name should fail")
+        };
+        assert!(e.contains("unknown name `m`"), "{e}");
+    }
+
+    #[test]
+    fn every_leaf_shape_is_closed() {
+        for shape in LEAF_SHAPES {
+            let mut p = Part::new("l");
+            let st = LeafStyle {
+                shape: shape.to_string(),
+                angle: 30.0,
+                curl: 50.0,
+                fold: 40.0,
+                stalk: 0.0,
+            };
+            blade(&mut p, Vec3::ZERO, Quat::IDENTITY, [0.08, 0.15], &st);
+            assert_eq!(crate::verify::open_edge_count(&p), 0, "{shape} is open");
+            let vol: f32 = p
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|t| {
+                    let v = |i: u32| Vec3::from(p.verts[i as usize]);
+                    v(t[0]).dot(v(t[1]).cross(v(t[2]))) / 6.0
+                })
+                .sum();
+            assert!(vol > 0.0, "{shape} wound inward ({vol})");
+        }
     }
 }

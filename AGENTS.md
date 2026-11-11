@@ -249,7 +249,22 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   branch. Each unbroken branch is ONE smooth closed tube (`sides`), so no
   gaps at bends; branches start inside their parent. Leaves (`leaf_size`
   [width, length]) are thin closed blades in `name_leaves`: give the two
-  parts separate materials (`"*_leaves"` patterns see them). Runaway growth
+  parts separate materials (`"*_leaves"` patterns see them). Leaf look:
+  `leaf_shape` (ellipse, lance, round, heart, diamond, needle, maple),
+  `leaf_angle` (pitch out from the stem), `leaf_curl` (tips droop),
+  `leaf_fold` (V along the midrib), `leaf_stalk` (petiole, meters).
+  **Parametric** rules carry numbers on modules, so each branch knows its
+  own length, width or age: axiom `"A(1, 0.08)"`, rules
+  `{"A(l, w) : l >= 0.2": "!(w)F(l)[&(40)A(l*k, w*0.6)]/(137.5)A(l*0.8, w*0.8)",
+  "A(l, w) : l < 0.2": "L(1)"}` with `constants: {"k": 0.6}` (values may
+  be `"$param"`). Expressions: `+ - * / % ^`, comparisons, `&& || !`,
+  `min max abs sqrt sin cos floor`. The turtle reads a module's first
+  number: `F(len)` / `f(len)` meters, `+(deg)` and every turn, `!(radius)`
+  sets the radius, `L(scale)` scales the leaf. Rules are tried in key
+  order (sorted), first match wins, so keep a symbol's conditions
+  exclusive; a rule only matches modules with the same number of
+  parameters. Set `radius_scale` / `length_scale` to 1 when the rules size
+  branches themselves. Runaway growth
   (over 400k symbols or 40k segments) is refused with a hint. Params work
   in every number (`"length": "$h"`).
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,

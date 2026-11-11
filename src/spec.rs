@@ -419,8 +419,15 @@ pub struct LSystemSpec {
     axiom: Option<String>,
     /// Symbol -> replacement: {"X": "F[+X][-X]FX", "F": "FF"}; a list of
     /// choices is stochastic: {"X": ["F[+X]FX", {"p": 2, "to": "F[-X]X"}]}.
+    /// Parametric: modules carry numbers, `A(1, 0.1)`; a head names them
+    /// and may test them, {"A(l, w) : l > 0.05": "!(w)F(l)[&(40)A(l*0.6, w*0.7)]/(137.5)A(l*0.9, w*0.8)"}
+    /// (+ - * / % ^, comparisons, && || !, min max abs sqrt sin cos floor;
+    /// the turtle reads F(len) f(len) +(deg) !(radius) L(scale)).
     #[serde(default)]
-    rules: Option<std::collections::BTreeMap<String, RuleSpec>>,
+    rules: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Named numbers for rule expressions: {"r1": 0.9, "a": 40} (may be "$param").
+    #[serde(default)]
+    constants: Option<std::collections::BTreeMap<String, f64>>,
     /// Rewrites (0..12; the string grows exponentially).
     #[serde(default)]
     iterations: Option<u32>,
@@ -467,6 +474,21 @@ pub struct LSystemSpec {
     /// Leaf blade [width, length], meters.
     #[serde(default)]
     leaf_size: Option<[f32; 2]>,
+    /// Leaf outline: ellipse (default), lance, round, heart, diamond, needle, maple.
+    #[serde(default)]
+    leaf_shape: Option<String>,
+    /// Leaves pitch this many degrees out from their branch.
+    #[serde(default)]
+    leaf_angle: Option<f32>,
+    /// Leaves bend this many degrees from base to tip (drooping tips).
+    #[serde(default)]
+    leaf_curl: Option<f32>,
+    /// V-fold along the midrib, degrees.
+    #[serde(default)]
+    leaf_fold: Option<f32>,
+    /// Leaf stalk (petiole) length, meters.
+    #[serde(default)]
+    leaf_stalk: Option<f32>,
     #[serde(default, alias = "position")]
     translation: Option<[f32; 3]>,
     /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
@@ -482,7 +504,7 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             .iter()
             .map(|(k, cs)| {
                 (
-                    *k,
+                    k.to_string(),
                     cs.iter()
                         .map(|(p, to)| Choice {
                             p: *p,
@@ -496,6 +518,7 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
     let base = LSystem {
         axiom: "X".into(),
         rules: Default::default(),
+        constants: Default::default(),
         iterations: 4,
         angle: 25.0,
         length: 0.3,
@@ -511,9 +534,24 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
         seed: 1,
         sides: 7,
         leaf_size: [0.08, 0.14],
+        leaf: crate::lsystem::LeafStyle {
+            shape: "ellipse".into(),
+            angle: 35.0,
+            curl: 25.0,
+            fold: 25.0,
+            stalk: 0.0,
+        },
         translation: [0.0; 3],
         rotation: None,
     };
+    let leaf =
+        |shape: &str, angle: f32, curl: f32, fold: f32, stalk: f32| crate::lsystem::LeafStyle {
+            shape: shape.into(),
+            angle,
+            curl,
+            fold,
+            stalk,
+        };
     Ok(match name {
         // A broadleaf: a trunk, then forks spreading around it (about 4-5 m).
         "tree" => LSystem {
@@ -538,6 +576,7 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             radius: 0.12,
             radius_scale: 0.72,
             leaf_size: [0.16, 0.26],
+            leaf: leaf("ellipse", 40.0, 30.0, 25.0, 0.03),
             ..base
         },
         // A conifer: a straight leader, whorls of drooping branches that
@@ -560,7 +599,8 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             taper: 0.86,
             branch_roll: 0.0,
             tropism_strength: 0.06,
-            leaf_size: [0.05, 0.3],
+            leaf_size: [0.012, 0.22],
+            leaf: leaf("needle", 25.0, 10.0, 0.0, 0.0),
             ..base
         },
         // A low shrub: forks from the ground, dense leaves (about 1 m).
@@ -582,7 +622,8 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             radius_scale: 0.75,
             tropism: [0.0, 1.0, 0.0],
             tropism_strength: 0.02,
-            leaf_size: [0.05, 0.08],
+            leaf_size: [0.06, 0.08],
+            leaf: leaf("round", 45.0, 20.0, 20.0, 0.01),
             ..base
         },
         // A fern: five arching fronds of paired leaflets.
@@ -601,6 +642,7 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             tropism: [0.0, -1.0, 0.0],
             tropism_strength: 0.04,
             leaf_size: [0.035, 0.13],
+            leaf: leaf("lance", 15.0, 25.0, 10.0, 0.0),
             ..base
         },
         // A weed tuft: thin stems that fork and bend over.
@@ -624,7 +666,8 @@ fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, String> {
             radius: 0.004,
             radius_scale: 0.8,
             tropism_strength: 0.05,
-            leaf_size: [0.01, 0.04],
+            leaf_size: [0.012, 0.05],
+            leaf: leaf("lance", 30.0, 30.0, 30.0, 0.0),
             ..base
         },
         // Roots: grow down and spread (turned upside down: rotation x 180).
@@ -670,10 +713,10 @@ impl LSystemSpec {
             d.rules = rules
                 .into_iter()
                 .map(|(k, v)| {
-                    let mut cs = k.chars();
-                    let (Some(c), None) = (cs.next(), cs.next()) else {
-                        return Err(format!("{ctx}: rules: `{k}` must be one symbol"));
-                    };
+                    let c = k;
+                    let v: RuleSpec = serde_json::from_value(v).map_err(|e| {
+                        format!("{ctx}: rules.{c}: a string or a list of choices ({e})")
+                    })?;
                     let choices = match v {
                         RuleSpec::One(to) => vec![crate::lsystem::Choice { p: 1.0, to }],
                         RuleSpec::Many(v) => v
@@ -684,13 +727,20 @@ impl LSystemSpec {
                             })
                             .collect(),
                     };
-                    Ok((c, choices))
+                    Ok::<_, String>((c, choices))
                 })
                 .collect::<Result<_, _>>()?;
         }
         macro_rules! over {
             ($($f:ident),*) => { $(if let Some(v) = self.$f { d.$f = v; })* };
         }
+        if let Some(c) = self.constants {
+            d.constants = c;
+        }
+        macro_rules! leaf {
+            ($($f:ident => $g:ident),*) => { $(if let Some(v) = self.$f { d.leaf.$g = v; })* };
+        }
+        leaf!(leaf_shape => shape, leaf_angle => angle, leaf_curl => curl, leaf_fold => fold, leaf_stalk => stalk);
         over!(
             iterations,
             angle,
