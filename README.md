@@ -3,6 +3,12 @@
 A mesh modeling tool driven by an MCP server, with a live Bevy preview
 window. Built standalone out of the friendSLOP workspace; no game code.
 
+## Units
+
+**1 unit = 1 meter**, everywhere: op sizes and positions, bounds, the
+preview, saved prefabs and glTF exports (also meters, so they import at
+true scale). Y is up and the ground is y = 0. Model at real-world size.
+
 ## Run
 
 ```sh
