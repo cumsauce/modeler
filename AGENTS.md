@@ -96,6 +96,8 @@ type, so there is no need to memorise field names.
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
 | `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
 | `hull` | name, inputs |
+| `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
+| `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
 | `group` | name, inputs |
@@ -269,6 +271,27 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   in every number (`"length": "$h"`).
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
+- **`blob`** melts closed solids together with a smooth fillet instead of
+  a boolean's sharp seam: creatures, mushrooms, melted or sculpted forms.
+  Each input becomes a signed distance field (sampled from its mesh, any
+  closed solid works), they combine with a polynomial smooth-min of radius
+  `blend` meters (default: a fifth of the smallest input's thinnest size; 0
+  = a sharp union), and the result is meshed (Manifold's level set) into
+  one closed solid with the first input's material. `op: "subtract"`
+  carves the other inputs out of the first with a rounded rim (a dimple, an
+  eye socket), `"intersect"` keeps the rounded common volume.
+  `resolution` is the voxel size (default 1/120 of the result's size);
+  over ~27M samples is refused with the size that fits. Hide the inputs.
+  A blob of one input with a blend just remeshes it: use `round` for that.
+  `{"type": "blob", "name": "shroom", "inputs": ["stem", "cap"], "blend": 0.03}`.
+- **`split`** cuts a closed solid by a plane into `name_above` (the side
+  `plane.normal` points to) and `name_below`, both closed with flat caps:
+  broken pots, cutaway views, parts that open or animate apart.
+  `{"type": "split", "name": "vase", "input": "vase_raw", "plane":
+  {"normal": [0, 1, 0], "point": [0, 0.15, 0]}, "gap": 0.02}`. `keep:
+  "above"` / `"below"` makes only that half; `gap` pushes the halves apart
+  along the normal (half each way). Hide the input. A plane that misses the
+  part errors with the part's extent along the normal.
 - **`shell`** hollows a closed solid: every face moves in by exactly
   `thickness` (erosion by a ball, so convex corners stay sharp), and each
   face named in `open` (top/bottom/left/right/front/back, world axes) is left

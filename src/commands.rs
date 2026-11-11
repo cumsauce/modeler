@@ -1135,6 +1135,14 @@ impl Session {
                         names.push(format!("{n}_leaves"));
                     }
                 }
+                if ty == "split" {
+                    let keep = raw.get("keep").and_then(|v| v.as_str()).unwrap_or("both");
+                    for side in ["above", "below"] {
+                        if keep == "both" || keep == side {
+                            names.push(format!("{n}_{side}"));
+                        }
+                    }
+                }
                 if let Some(c) = raw.get("count").and_then(|v| v.as_u64()) {
                     match ty {
                         "linear_array" => names.extend((1..c).map(|i| format!("{n}_{i}"))),

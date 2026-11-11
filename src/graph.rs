@@ -628,6 +628,39 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::csg::hull(name, &refs)?;
             upsert(named, name, part);
         }
+        Op::Blob {
+            name,
+            inputs,
+            op,
+            blend,
+            resolution,
+        } => {
+            let parts: Vec<Arc<Part>> = inputs
+                .iter()
+                .map(|i| lookup_shared(named, i))
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&Part> = parts.iter().map(|p| p.as_ref()).collect();
+            let k = blend.unwrap_or_else(|| crate::blob::default_blend(&refs));
+            let part = crate::blob::blob(name, &refs, op, k, *resolution)?;
+            upsert(named, name, part);
+        }
+        Op::Split {
+            name,
+            input,
+            normal,
+            point,
+            keep,
+            gap,
+        } => {
+            let src = lookup_shared(named, input)?;
+            let (above, below) = crate::blob::split(name, &src, *normal, *point, *gap)?;
+            if keep != "below" {
+                upsert(named, &above.name.clone(), above);
+            }
+            if keep != "above" {
+                upsert(named, &below.name.clone(), below);
+            }
+        }
         Op::Round {
             name,
             input,
@@ -1035,6 +1068,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Group { name, .. }
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
+        | Op::Blob { name, .. }
+        | Op::Split { name, .. }
         | Op::LSystem { name, .. }
         | Op::Round { name, .. }
         | Op::Shell { name, .. }
@@ -1068,6 +1103,11 @@ pub fn outputs(op: &Op) -> Vec<String> {
         }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
+        Op::Split { name, keep, .. } => ["above", "below"]
+            .iter()
+            .filter(|side| keep == "both" || keep == *side)
+            .map(|side| format!("{name}_{side}"))
+            .collect(),
         Op::LSystem { name, def } => {
             let mut v = vec![name.clone()];
             if def.has_leaves() {
@@ -1093,6 +1133,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Group { .. } => "group",
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
+        Op::Blob { .. } => "blob",
+        Op::Split { .. } => "split",
         Op::LSystem { .. } => "lsystem",
         Op::Round { .. } => "round",
         Op::Shell { .. } => "shell",
@@ -1131,11 +1173,11 @@ pub fn inputs(op: &Op) -> Vec<&str> {
             vec![input]
         }
         Op::Boolean { a, b, .. } => vec![a, b],
-        Op::Group { inputs, .. } | Op::Hull { inputs, .. } => {
+        Op::Group { inputs, .. } | Op::Hull { inputs, .. } | Op::Blob { inputs, .. } => {
             inputs.iter().map(String::as_str).collect()
         }
         Op::Round { input, .. } => vec![input],
-        Op::Shell { input, .. } => vec![input],
+        Op::Shell { input, .. } | Op::Split { input, .. } => vec![input],
         Op::Primitive {
             frame: Some(frame), ..
         } => vec![frame_part(frame)],
@@ -1322,6 +1364,27 @@ pub fn describe(ops: &[Op]) -> String {
                 "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::Blob {
+                name,
+                inputs,
+                op,
+                blend,
+                resolution,
+            } => format!(
+                "#{i} blob `{name}` {op} of {inputs:?} blend={} resolution={}",
+                blend.map_or("auto".to_string(), |b| b.to_string()),
+                if *resolution > 0.0 { resolution.to_string() } else { "auto".into() }
+            ),
+            Op::Split {
+                name,
+                input,
+                normal,
+                point,
+                keep,
+                gap,
+            } => format!(
+                "#{i} split `{name}` <- `{input}` normal={normal:?} point={point:?} keep={keep} gap={gap}"
+            ),
             Op::LSystem { name, def } => format!(
                 "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
                 def.axiom,

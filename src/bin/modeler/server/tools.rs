@@ -900,7 +900,7 @@ Style::default()
     }
 
     /// Build or edit the model: an array of items, each tagged with a "type"
-    /// (primitive, extrude, revolve, sweep, lsystem, hull, round, shell, group, transform,
+    /// (primitive, extrude, revolve, sweep, lsystem, hull, blob, split, round, shell, group, transform,
     /// boolean, radial_array, linear_array, mirror, material, prefab,
     /// hide_part, show_part, rename, delete, tri_mesh, uvs, move, place,
     /// repeat, light, collider, marker). Ops are upserts
@@ -1459,7 +1459,7 @@ impl rmcp::ServerHandler for Tools {
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
-- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_shape/angle/curl/fold/stalk, wood in name and leaves in name_leaves; hull = convex hull of parts; round fillets/chamfers/smooths a solid's edges; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
+- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_shape/angle/curl/fold/stalk, wood in name and leaves in name_leaves; hull = convex hull of parts; blob melts solids together with a smooth fillet (blend meters; op union/subtract/intersect; creatures, mushrooms); split cuts a solid by a plane {normal, point} into capped name_above / name_below (gap pushes them apart); round fillets/chamfers/smooths a solid's edges; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.

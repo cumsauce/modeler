@@ -60,6 +60,7 @@ pub fn compact_names(names: &[String]) -> Vec<String> {
     out
 }
 
+pub mod blob;
 pub mod catalog;
 pub mod commands;
 pub mod contact;
@@ -851,6 +852,30 @@ pub enum Op {
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },
+    /// Inputs melted together as signed distance fields with a smooth
+    /// minimum of radius `blend` (`op` subtract / intersect too), meshed at
+    /// `resolution` (0 = auto). Creatures, mushrooms, organic forms.
+    Blob {
+        name: String,
+        inputs: Vec<String>,
+        op: String,
+        #[serde(default)]
+        blend: Option<f32>,
+        #[serde(default)]
+        resolution: f32,
+    },
+    /// Cuts `input` by the plane through `point` with `normal` into
+    /// `name_above` / `name_below` (capped solids; `keep` one or both), pushed
+    /// `gap` apart.
+    Split {
+        name: String,
+        input: String,
+        normal: [f32; 3],
+        point: [f32; 3],
+        keep: String,
+        #[serde(default)]
+        gap: f32,
+    },
     /// Rounds a solid's edges: `fillet` / `chamfer` by `radius`, or
     /// subdivision `smooth`.
     Round {

@@ -131,7 +131,7 @@ pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
 
 /// A Manifold back into a triangle `Part`: positions and interpolated UVs from
 /// the properties, creased normals (40°, so cut edges stay hard), `material`.
-fn manifold_to_part(m: &Manifold, name: &str, material: crate::Material) -> Part {
+pub(crate) fn manifold_to_part(m: &Manifold, name: &str, material: crate::Material) -> Part {
     manifold_to_part_mapped(m, name, material, |v| v)
 }
 
