@@ -25,8 +25,9 @@ python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
 ```
 
 Without `--windowed` the daemon runs `--offscreen`: the full renderer with no
-window, so `agent_views` works but `screenshot` / `set_camera` (the human's
-view) don't. `--headless` drops rendering entirely.
+window. `agent_views` works, and `screenshot` renders the window camera's
+view offscreen (1280x800; `set_camera` and auto-framing steer it as usual).
+`--headless` drops rendering entirely.
 
 Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
 array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when

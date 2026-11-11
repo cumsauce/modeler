@@ -129,8 +129,22 @@ pub(crate) fn drain_commands(
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no screenshot".into()));
                 } else if offscreen.0 {
-                    let _ = reply.send(Err(
-                        "offscreen: no window, so no human view to capture; agent_views renders (start the daemon with --windowed for a window)".into(),
+                    // No window: render the window camera's view (the orbit
+                    // that set_camera and auto-framing steer) with the agent rig.
+                    agent_shots.0.push((
+                        AgentView::Custom(CustomCam {
+                            yaw: 90.0 - orbit.yaw.to_degrees(),
+                            pitch: orbit.pitch.to_degrees(),
+                            dist: Some(orbit.dist),
+                            target: Some(orbit.target.to_array()),
+                            ortho: false,
+                            fov: 45.0,
+                        }),
+                        1280,
+                        800,
+                        None,
+                        ShotStyle::default(),
+                        reply,
                     ));
                 } else {
                     pending.0.push(Mutex::new(Some(reply)));
@@ -142,9 +156,9 @@ pub(crate) fn drain_commands(
                 dist,
                 reply,
             } => {
-                if headless.0 || offscreen.0 {
+                if headless.0 {
                     let _ = reply.send(Err(
-                        "no window camera to move (headless/offscreen); agent_views takes its own camera".into(),
+                        "headless: no camera to move; agent_views takes its own camera".into(),
                     ));
                 } else {
                     // Same convention as agent custom cameras: yaw 0 = on +z looking -z.

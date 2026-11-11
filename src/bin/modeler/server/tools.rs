@@ -674,7 +674,8 @@ Style::default()
     }
 
     /// Grab the current preview render as a PNG image so you can see the model.
-    /// Needs the windowed preview app; fails in --headless and --offscreen mode.
+    /// With no window (--offscreen) it renders the same camera (set_camera
+    /// and auto-framing steer it) offscreen; fails in --headless mode.
     #[tool]
     async fn screenshot(&self) -> Result<CallToolResult, ErrorData> {
         self.grab_screenshot().await
