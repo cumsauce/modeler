@@ -4,7 +4,7 @@ Built through the MCP driver on the `review-pass-fixes` build: ground disc,
 cylinder tower with a door and window cut by booleans, cone roof, hub, 4 blades
 (`radial_array` count 4 about z with `include_source`), a 9-post fence (`linear_array`),
 a mirrored back rail, and a two-sphere tree. Hide/rename went in as graph ops.
-Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png`.
+Calls: `docs/windmill-demo-calls.json`. Shots: `shots/windmill-demo-*.png` (gitignored; rerun the calls to regenerate).
 
 ## What worked
 - One `apply_ops` call built 31 ops / 26 parts; a bad batch would have stopped

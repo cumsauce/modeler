@@ -2,8 +2,8 @@
 
 Six models built procedurally through the modeler op graph, one server session
 each (build → visual check → `save_prefab` → `.glb` export → this doc). Every
-model below was screenshot-verified during the build (images in `shots/`,
-binary exports in `models/`). The existing `pink-flower` and `graph-flower`
+model below was screenshot-verified during the build (images go to `shots/`,
+binary exports to `models/`; both are gitignored, so regenerate them locally). The existing `pink-flower` and `graph-flower`
 catalog entries were left untouched.
 
 Session note: this agent's MCP tool list was frozen without the
