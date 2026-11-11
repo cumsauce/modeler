@@ -171,6 +171,86 @@ pub struct Overlap {
     pub fraction: f64,
     /// Centre of the shared region's box.
     pub at: [f64; 3],
+    /// How far the smaller part is sunk in, m: the shared region's extent
+    /// along the axis where it covers the least of the smaller part (a rod
+    /// pushed 2 cm into a wall is 2 cm deep, not its 2 mm thickness).
+    pub depth: f64,
+}
+
+/// One `collisions.allow` entry: a pair of name patterns (`*` globs, either
+/// order), optionally only while the overlap stays shallow.
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AllowRule {
+    Pair([String; 2]),
+    Limited {
+        pair: [String; 2],
+        /// Allowed only while the penetration depth is at most this (m).
+        #[serde(default)]
+        depth: Option<f64>,
+        /// Allowed only while at most this share of the smaller part is inside.
+        #[serde(default)]
+        max: Option<f64>,
+    },
+}
+
+impl AllowRule {
+    pub fn pair(&self) -> &[String; 2] {
+        match self {
+            AllowRule::Pair(p) | AllowRule::Limited { pair: p, .. } => p,
+        }
+    }
+
+    /// Whether the names match (either order), ignoring the limits.
+    pub fn names_match(&self, o: &Overlap) -> bool {
+        let m = crate::name_matches;
+        let [x, y] = self.pair();
+        (m(x, &o.a) && m(y, &o.b)) || (m(x, &o.b) && m(y, &o.a))
+    }
+
+    /// Whether this rule excuses the overlap (names match, within limits).
+    pub fn covers(&self, o: &Overlap) -> bool {
+        if !self.names_match(o) {
+            return false;
+        }
+        match self {
+            AllowRule::Pair(_) => true,
+            AllowRule::Limited { depth, max, .. } => {
+                depth.is_none_or(|d| o.depth <= d) && max.is_none_or(|m| o.fraction <= m)
+            }
+        }
+    }
+
+    /// True when one side is a bare `*`: excuses the other side against
+    /// anything, which hides real collisions.
+    pub fn is_catch_all(&self) -> bool {
+        self.pair().iter().any(|p| p == "*")
+    }
+
+    pub fn describe(&self) -> String {
+        let [x, y] = self.pair();
+        match self {
+            AllowRule::Pair(_) => format!("[{x}, {y}]"),
+            AllowRule::Limited { depth, max, .. } => {
+                let mut s = format!("[{x}, {y}");
+                if let Some(d) = depth {
+                    s += &format!(", depth <= {d} m");
+                }
+                if let Some(m) = max {
+                    s += &format!(", max {:.0}%", m * 100.0);
+                }
+                s + "]"
+            }
+        }
+    }
+}
+
+/// What a collision check found: the failing pairs, the joints (shallow or
+/// excused), and per allow rule the deep pairs it excused.
+pub struct CollisionReport {
+    pub bad: Vec<Overlap>,
+    pub joints: Vec<Overlap>,
+    pub excused: Vec<(AllowRule, Vec<Overlap>)>,
 }
 
 /// Every pair of visible closed parts that share volume, deepest first.
@@ -202,13 +282,33 @@ pub fn overlap_between(a: &Body, b: &Body) -> Option<Overlap> {
     if ov <= small * 1e-6 {
         return None;
     }
-    let at = inter.bounding_box().map_or([0.0; 3], |bb| {
+    let smaller = if ma.volume().abs() <= mb.volume().abs() {
+        a.part
+    } else {
+        b.part
+    };
+    let (slo, shi) = smaller.bounds();
+    let (at, depth) = inter.bounding_box().map_or(([0.0; 3], 0.0), |bb| {
         let (lo, hi) = (bb.min(), bb.max());
-        [
-            (lo[0] + hi[0]) * 0.5,
-            (lo[1] + hi[1]) * 0.5,
-            (lo[2] + hi[2]) * 0.5,
-        ]
+        // The axis where the shared box covers the least of the smaller
+        // part's extent is the direction it was pushed in along.
+        let mut best = (f64::MAX, 0.0);
+        for k in 0..3 {
+            let ext = hi[k] - lo[k];
+            let part_ext = f64::from(shi[k] - slo[k]).max(1e-9);
+            let ratio = ext / part_ext;
+            if ratio < best.0 {
+                best = (ratio, ext);
+            }
+        }
+        (
+            [
+                (lo[0] + hi[0]) * 0.5,
+                (lo[1] + hi[1]) * 0.5,
+                (lo[2] + hi[2]) * 0.5,
+            ],
+            best.1,
+        )
     });
     Some(Overlap {
         a: a.part.name.clone(),
@@ -216,16 +316,18 @@ pub fn overlap_between(a: &Body, b: &Body) -> Option<Overlap> {
         volume: ov,
         fraction: (ov / small).min(1.0),
         at,
+        depth,
     })
 }
 
 impl Overlap {
     pub fn describe(&self) -> String {
         format!(
-            "`{}` / `{}`: {:.0}% of the smaller inside the other ({:.3e} m³ shared, centred at [{:.3}, {:.3}, {:.3}])",
+            "`{}` / `{}`: {:.0}% of the smaller inside the other, {:.1} mm deep ({:.3e} m³ shared, centred at [{:.3}, {:.3}, {:.3}])",
             self.a,
             self.b,
             self.fraction * 100.0,
+            self.depth * 1000.0,
             self.volume,
             self.at[0],
             self.at[1],
@@ -233,21 +335,85 @@ impl Overlap {
         )
     }
 
-    /// Whether an `[x, y]` allow pair (`*` patterns, either order) covers it.
-    pub fn allowed_by(&self, allow: &[[String; 2]]) -> bool {
-        let m = crate::name_matches;
-        allow
-            .iter()
-            .any(|[x, y]| (m(x, &self.a) && m(y, &self.b)) || (m(x, &self.b) && m(y, &self.a)))
+    /// Whether any allow rule covers it.
+    pub fn allowed_by(&self, allow: &[AllowRule]) -> bool {
+        allow.iter().any(|r| r.covers(self))
+    }
+
+    /// Whether `name` is one side of the pair.
+    pub fn involves(&self, name: &str) -> bool {
+        self.a == name || self.b == name
     }
 }
 
 /// Overlaps split into collisions (more than `max` of the smaller part
-/// buried, and not allowed) and joints (shallow or allowed).
-pub fn collisions(model: &Model, allow: &[[String; 2]], max: f64) -> (Vec<Overlap>, Vec<Overlap>) {
-    overlaps(model)
+/// buried, and not allowed) and joints (shallow or allowed), with what each
+/// allow rule excused beyond `max`. `scope` keeps pairs with at least one
+/// side matching (empty = all).
+pub fn collisions(
+    model: &Model,
+    allow: &[AllowRule],
+    max: f64,
+    scope: &[String],
+) -> CollisionReport {
+    let in_scope = |o: &Overlap| {
+        scope.is_empty()
+            || scope
+                .iter()
+                .any(|p| crate::name_matches(p, &o.a) || crate::name_matches(p, &o.b))
+    };
+    let mut excused: Vec<(AllowRule, Vec<Overlap>)> =
+        allow.iter().map(|r| (r.clone(), Vec::new())).collect();
+    let (mut bad, mut joints) = (Vec::new(), Vec::new());
+    for o in overlaps(model).into_iter().filter(|o| in_scope(o)) {
+        if o.fraction <= max {
+            joints.push(o);
+            continue;
+        }
+        match excused.iter_mut().find(|(r, _)| r.covers(&o)) {
+            Some((_, list)) => {
+                list.push(o.clone());
+                joints.push(o);
+            }
+            None => bad.push(o),
+        }
+    }
+    CollisionReport {
+        bad,
+        joints,
+        excused,
+    }
+}
+
+/// Parts that stay grounded only through deep overlaps: grounded normally,
+/// but floating once overlaps burying more than `deep` of the smaller part
+/// stop counting as contacts. Each with the parts it passes through.
+pub fn held_by_deep_overlaps(model: &Model, deep: f64) -> Vec<(String, Vec<String>)> {
+    let deep_pairs: Vec<Overlap> = overlaps(model)
         .into_iter()
-        .partition(|o| o.fraction > max && !o.allowed_by(allow))
+        .filter(|o| o.fraction > deep)
+        .collect();
+    if deep_pairs.is_empty() {
+        return Vec::new();
+    }
+    let normal = floating(model);
+    let strict = floating_skipping(model, &|a, b| {
+        deep_pairs
+            .iter()
+            .any(|o| (o.a == a && o.b == b) || (o.a == b && o.b == a))
+    });
+    strict
+        .into_iter()
+        .filter(|n| !normal.contains(n))
+        .map(|n| {
+            let through: Vec<String> = deep_pairs
+                .iter()
+                .filter(|o| o.involves(&n))
+                .map(|o| if o.a == n { o.b.clone() } else { o.a.clone() })
+                .collect();
+            (n, through)
+        })
+        .collect()
 }
 
 /// Whether `a` feeds the op graph that makes `b` (directly or through
@@ -314,6 +480,11 @@ fn com_y(p: &Part) -> f32 {
 /// Visible parts that touch neither the ground nor any other visible part,
 /// by real geometry (shared volume or surfaces within [`tolerance`]).
 pub fn floating(model: &Model) -> Vec<String> {
+    floating_skipping(model, &|_, _| false)
+}
+
+/// [`floating`] ignoring the contacts `skip(a, b)` names.
+fn floating_skipping(model: &Model, skip: &dyn Fn(&str, &str) -> bool) -> Vec<String> {
     let bodies: Vec<Body> = visible(model).map(Body::new).collect();
     let ground = ground_level(model);
     // Grounded = connected to the ground through a chain of contacts, so two
@@ -325,7 +496,10 @@ pub fn floating(model: &Model) -> Vec<String> {
     let mut frontier: Vec<usize> = (0..bodies.len()).filter(|&i| reached[i]).collect();
     while let Some(i) = frontier.pop() {
         for j in 0..bodies.len() {
-            if !reached[j] && contact(&bodies[i], &bodies[j]).is_some() {
+            if !reached[j]
+                && !skip(&bodies[i].part.name, &bodies[j].part.name)
+                && contact(&bodies[i], &bodies[j]).is_some()
+            {
                 reached[j] = true;
                 frontier.push(j);
             }

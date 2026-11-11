@@ -734,6 +734,13 @@ pub enum Op {
         /// primitive + transform pair for rotated primitives.
         #[serde(default)]
         rotation: Option<[f32; 4]>,
+        /// Build in another part's own coordinates: `"paper"` or
+        /// `"paper:top-front"` (an anchor on its local box). `translation`
+        /// and `rotation` are then relative to that part's transform, with
+        /// the origin at the anchor (default: the part's own origin), and the
+        /// primitive follows when that part moves or turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<String>,
     },
     /// A 2D footprint extruded straight up (y = 0..height) via Manifold.
     /// `profile` rings are [x, z]; inner rings are holes.
@@ -858,6 +865,10 @@ pub enum Op {
         /// (default), up, left, right, back, front.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         toward: Option<String>,
+        /// `place`: each matched part travels on its own (keys dropping
+        /// onto a sloped deck), instead of the set moving as one body.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        each: bool,
     },
     /// A light: `point`, `spot` or `directional` (see `crate::light`). Writes
     /// no part; collected after the graph, following `attach`'s moves.
@@ -974,6 +985,10 @@ pub enum Op {
         count: u32,
         #[serde(default)]
         offset: [f32; 3],
+        /// Step `offset` in the source part's own axes (rotated by its
+        /// rotation): lines down a tilted page.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        local: bool,
     },
     /// Mirrors an earlier part across the plane `axis = offset[axis]` (axis is
     /// "x", "y" or "z"). The mesh is baked: verts reflected, winding flipped,

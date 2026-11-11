@@ -51,6 +51,7 @@ pub enum BatchItem {
         at: Option<[f32; 2]>,
         gap: Option<f32>,
         toward: Option<String>,
+        each: bool,
     },
 }
 
@@ -103,9 +104,16 @@ pub struct VerifySpec {
     /// Names that must be visible parts; extras are fine. Trailing `*` = prefix.
     #[serde(default)]
     pub includes: Option<Vec<String>>,
-    /// Every visible part touches the ground (y = 0) or another part.
+    /// Every visible part reaches the ground through touching parts. The
+    /// result notes parts held up only by passing deep (> 20%) into another;
+    /// `"strict"` fails them.
     #[serde(default)]
-    pub grounded: Option<bool>,
+    pub grounded: Option<GroundedSpec>,
+    /// Limit the checks to these parts (`*` globs): grounded / supported /
+    /// validate / bounds / stable report only them (grounding still uses
+    /// every part), collisions keep pairs with at least one side in scope.
+    #[serde(default)]
+    pub scope: Option<Vec<String>>,
     /// World bounds of visible parts; `null` entries skip an axis.
     #[serde(default)]
     pub bounds: Option<BoundsSpec>,
@@ -135,14 +143,24 @@ pub struct VerifySpec {
     pub collisions: Option<CollisionSpec>,
 }
 
+/// `grounded: true` or `"strict"`.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum GroundedSpec {
+    On(bool),
+    Mode(String),
+}
+
 /// `collisions: true` or `{allow, max}`.
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum CollisionSpec {
     On(bool),
     With {
+        /// `[a, b]` pairs (`*` globs, either order), or `{"pair": [a, b],
+        /// "depth": 0.003, "max": 0.5}` to allow only shallow overlaps.
         #[serde(default)]
-        allow: Vec<[String; 2]>,
+        allow: Vec<crate::contact::AllowRule>,
         #[serde(default)]
         max: Option<f64>,
     },
@@ -559,6 +577,7 @@ impl Session {
                 size,
                 translation,
                 rotation,
+                frame: None,
             },
             &format!("op primitive `{name}` ({kind})"),
         )
@@ -661,6 +680,7 @@ impl Session {
                 input: input.into(),
                 count,
                 offset,
+                local: false,
             },
             &format!("op linear `{name}` = {count} x `{input}`"),
         )
@@ -983,22 +1003,29 @@ impl Session {
             }
             merged.insert(k, v);
         }
-        // Parse everything first, against the merged parameters (over the
-        // style's number tokens) with the style's tokens expanded.
+        // Loops first: every repeat becomes plain items (its variable
+        // substituted), so each copy gets its own template below.
+        // Parse everything against the merged parameters (over the style's
+        // number tokens) with the style's tokens expanded.
         let style = self.model.style.clone();
         let full = style.params_under(&merged);
+        let items = crate::spec::expand_repeats(&items, &full)
+            .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
-        for (i, raw) in items.iter().enumerate() {
+        for (i, (raw, from)) in items.iter().enumerate() {
+            let from = from
+                .as_ref()
+                .map_or_else(String::new, |n| format!(" [from {n}]"));
             let resolved = crate::style::expand(raw, &style)
                 .and_then(|v| crate::params::resolve(&v, &full))
-                .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+                .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             let mut item = crate::spec::parse_item(i, &resolved)
-                .map_err(|e| format!("{e}\n(nothing was applied)"))?;
+                .map_err(|e| format!("{e}{from}\n(nothing was applied)"))?;
             self.resolve_pbr(&mut item)
-                .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+                .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             if let BatchItem::Op(op) = &mut item {
                 self.resolve_prefab(op)
-                    .map_err(|e| format!("op #{i}: {e}\n(nothing was applied)"))?;
+                    .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             }
             let template = (!crate::params::refs(raw).is_empty()
                 || crate::style::reads_style(raw, &style))
@@ -1410,6 +1437,7 @@ impl Session {
                     at,
                     gap,
                     toward,
+                    each,
                 } => self
                     .move_parts(
                         name,
@@ -1417,7 +1445,7 @@ impl Session {
                         translation,
                         rotation,
                         pivot,
-                        (on, at, gap, toward),
+                        (on, at, gap, toward, each),
                     )
                     .map_err(fail)?,
                 BatchItem::Uvs { part, projection } => {
@@ -1466,11 +1494,12 @@ impl Session {
         translation: Option<[f32; 3]>,
         rotation: Option<[f32; 4]>,
         pivot: Option<PivotSpec>,
-        (on, at, gap, toward): (
+        (on, at, gap, toward, each): (
             Option<String>,
             Option<[f32; 2]>,
             Option<f32>,
             Option<String>,
+            bool,
         ),
     ) -> CmdResult {
         if !self.model.derived_from_ops {
@@ -1559,6 +1588,7 @@ impl Session {
                 at,
                 gap,
                 toward: toward.clone(),
+                each,
             },
             &label,
         )?;
@@ -1681,6 +1711,23 @@ impl Session {
 
     /// The checks behind [`Self::verify`] as (name, passed, detail).
     pub fn verify_checks(&self, spec: &VerifySpec) -> Vec<(String, bool, String)> {
+        let scope: Vec<String> = spec.scope.clone().unwrap_or_default();
+        let in_scope =
+            |n: &str| scope.is_empty() || scope.iter().any(|p| crate::name_matches(p, n));
+        // Per-part checks on just the scoped parts (graph kept for diagnosis).
+        let scoped_model = (!scope.is_empty()).then(|| {
+            let mut m = Model::named(&self.model.name);
+            m.ops = self.model.ops.clone();
+            m.parts = self
+                .model
+                .parts
+                .iter()
+                .filter(|p| in_scope(&p.name))
+                .cloned()
+                .collect();
+            m
+        });
+        let view = scoped_model.as_ref().unwrap_or(&self.model);
         let empty = spec.parts.is_none()
             && spec.includes.is_none()
             && spec.grounded.is_none()
@@ -1705,21 +1752,72 @@ impl Session {
                 crate::verify::expect_includes(&self.model, w).map_err(|e| e.to_string()),
             );
         }
-        if spec.grounded == Some(true) {
-            record(
-                "grounded",
-                crate::verify::expect_grounded(&self.model).map_err(|e| e.to_string()),
-            );
+        let strict = match &spec.grounded {
+            Some(GroundedSpec::Mode(m)) if m == "strict" => Some(true),
+            Some(GroundedSpec::Mode(m)) => {
+                record(
+                    "grounded",
+                    Err(format!("grounded: `{m}` (use true or \"strict\")")),
+                );
+                None
+            }
+            Some(GroundedSpec::On(true)) => Some(false),
+            _ => None,
+        };
+        if let Some(strict) = strict {
+            let floating: Vec<String> = crate::contact::floating(&self.model)
+                .into_iter()
+                .filter(|n| in_scope(n))
+                .collect();
+            let deep: Vec<String> = crate::contact::held_by_deep_overlaps(&self.model, 0.2)
+                .into_iter()
+                .filter(|(n, _)| in_scope(n))
+                .map(|(n, through)| {
+                    format!(
+                        "`{n}` (through {})",
+                        crate::compact_names(&through).join(", ")
+                    )
+                })
+                .collect();
+            let deep_txt = if deep.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; held up only by passing deep into another part: {} (a collision holding it up? verify grounded: \"strict\" fails these)",
+                    deep.join(", ")
+                )
+            };
+            if !floating.is_empty() {
+                record(
+                    "grounded",
+                    Err(format!(
+                        "floating (not connected to the ground through touching parts): {}{deep_txt}",
+                        crate::compact_names(&floating).join(", ")
+                    )),
+                );
+            } else if strict && !deep.is_empty() {
+                record(
+                    "grounded",
+                    Err(deep_txt.trim_start_matches("; ").to_string()),
+                );
+            } else {
+                record(
+                    "grounded",
+                    Ok(format!(
+                        "every {}visible part reaches the ground through touching parts{deep_txt}",
+                        if scope.is_empty() { "" } else { "scoped " }
+                    )),
+                );
+            }
         }
         if let Some(b) = &spec.bounds {
             record(
                 "bounds",
-                self.expect_bounds(b.min, b.max, b.tol)
-                    .map_err(|e| e.to_string()),
+                crate::verify::expect_bounds(view, b.min, b.max, b.tol).map_err(|e| e.to_string()),
             );
         }
         if spec.validate.unwrap_or(empty) {
-            let v = self.validate();
+            let v = crate::verify::validate(view);
             if v.starts_with("all parts") || v.starts_with("no parts") {
                 record("validate", Ok(v));
             } else {
@@ -1730,7 +1828,10 @@ impl Session {
             record("rebuild", self.check_rebuild().map_err(|e| e.to_string()));
         }
         if spec.supported == Some(true) {
-            let bad = crate::contact::unsupported(&self.model);
+            let bad: Vec<(String, Vec<String>)> = crate::contact::unsupported(&self.model)
+                .into_iter()
+                .filter(|(n, _)| in_scope(n))
+                .collect();
             if bad.is_empty() {
                 record(
                     "supported",
@@ -1770,7 +1871,31 @@ impl Session {
             _ => None,
         };
         if let Some((allow, max)) = coll {
-            let (bad, joints) = crate::contact::collisions(&self.model, &allow, max);
+            let report = crate::contact::collisions(&self.model, &allow, max, &scope);
+            let (bad, joints) = (&report.bad, &report.joints);
+            // What each allow rule excused beyond `max`, deepest first, and a
+            // note when a catch-all rule hides a deep overlap.
+            let mut excused_txt = String::new();
+            for (rule, list) in &report.excused {
+                if list.is_empty() {
+                    continue;
+                }
+                let deepest = list.iter().max_by(|a, b| a.depth.total_cmp(&b.depth));
+                if let Some(d) = deepest {
+                    excused_txt += &format!(
+                        "\n  allow {} excused {} pair(s); deepest `{}`/`{}` {:.0}%, {:.1} mm",
+                        rule.describe(),
+                        list.len(),
+                        d.a,
+                        d.b,
+                        d.fraction * 100.0,
+                        d.depth * 1000.0
+                    );
+                    if rule.is_catch_all() {
+                        excused_txt += " (note: a catch-all `*` allow hides real collisions: name the actual partner, or add a depth limit)";
+                    }
+                }
+            }
             let joints_txt = if joints.is_empty() {
                 String::new()
             } else {
@@ -1790,7 +1915,7 @@ impl Session {
                 record(
                     "collisions",
                     Ok(format!(
-                        "no part is more than {:.0}% inside another{joints_txt}",
+                        "no part is more than {:.0}% inside another{joints_txt}{excused_txt}",
                         max * 100.0
                     )),
                 );
@@ -1805,7 +1930,7 @@ impl Session {
                 record(
                     "collisions",
                     Err(format!(
-                        "{} pair(s) pass through each other: {} (intended joints go in `allow: [[a, b]]`){joints_txt}",
+                        "{} pair(s) pass through each other: {} (intended joints go in `allow: [[a, b]]`, or `{{\"pair\": [a, b], \"depth\": 0.003}}` for shallow ones){joints_txt}{excused_txt}",
                         bad.len(),
                         list.join("; ")
                     )),
@@ -1813,7 +1938,7 @@ impl Session {
             }
         }
         if spec.stable == Some(true) {
-            let (text, json) = crate::inspect::mass(&self.model, &Default::default(), 1000.0);
+            let (text, json) = crate::inspect::mass(view, &Default::default(), 1000.0);
             let first = text.lines().nth(1).unwrap_or("").to_string();
             if json["stability"]["stable"].as_bool() == Some(true) {
                 record("stable", Ok(first));
@@ -2866,6 +2991,7 @@ mod tests {
             size: [1.0, 1.0, 1.0],
             translation,
             rotation: None,
+            frame: None,
         }
     }
 
@@ -2945,6 +3071,60 @@ mod tests {
         ok(s.scene("close", Some("scn_map")));
         assert_eq!(s.doc_names(), vec!["scn_crate".to_string()]);
         assert!(crate::catalog::open_doc("scn_map").is_none());
+    }
+
+    #[test]
+    fn verify_sees_collisions_a_catch_all_allow_hid() {
+        // The typewriter bug: a bar sunk 2 cm into the body, held up only by
+        // that overlap, excused by a catch-all allow.
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "body", "kind": "box", "size": [0.3, 0.1, 0.2],
+                       "translation": [0, 0.05, 0]}),
+                json!({"type": "primitive", "name": "bar", "kind": "box", "size": [0.0016, 0.0022, 0.05],
+                       "translation": [0, 0.06, 0.11]}),
+            ],
+        ));
+        let spec = |j: serde_json::Value| -> VerifySpec { ok(serde_json::from_value(j)) };
+        // Depth is along the bar, not its 1.6 mm thickness.
+        let o = crate::contact::overlaps(&s.model);
+        let bar = o.iter().find(|o| o.involves("bar"));
+        let depth = bar.map_or(0.0, |o| o.depth);
+        assert!((depth - 0.015).abs() < 1e-4, "depth {depth}");
+        // Catch-all allow passes but says what it excused.
+        let (pass, text) = s.verify(&spec(json!({"collisions": {"allow": [["bar", "*"]]}})));
+        assert!(pass, "{text}");
+        assert!(
+            text.contains("excused 1 pair") && text.contains("catch-all"),
+            "{text}"
+        );
+        // A depth-limited allow fails it.
+        let (pass, text) = s.verify(&spec(json!({"collisions": {"allow": [
+            {"pair": ["bar", "body"], "depth": 0.002}]}})));
+        assert!(!pass, "{text}");
+        assert!(text.contains("15.0 mm deep"), "{text}");
+        // Grounded passes but names the deep joint; strict fails it.
+        let (pass, text) = s.verify(&spec(json!({"grounded": true})));
+        assert!(
+            pass && text.contains("passing deep") && text.contains("`bar`"),
+            "{text}"
+        );
+        let (pass, text) = s.verify(&spec(json!({"grounded": "strict"})));
+        assert!(!pass, "{text}");
+        // Scope: only the cap's checks (it floats; the bar's collision drops out).
+        ok(s.apply_values(
+            None,
+            vec![json!({"type": "primitive", "name": "cap", "kind": "box", "size": [0.02, 0.002, 0.02],
+                        "translation": [0.1, 0.2, 0]})],
+        ));
+        let (pass, text) = s.verify(&spec(json!({"scope": ["cap"], "grounded": true,
+            "collisions": true, "validate": true})));
+        assert!(!pass, "{text}");
+        assert!(text.contains("floating") && text.contains("cap"), "{text}");
+        assert!(!text.contains("`bar`"), "{text}");
+        assert!(text.contains("PASS collisions"), "{text}");
     }
 
     #[test]
@@ -4091,6 +4271,151 @@ mod tests {
         let bad = s.apply_values_as(
             None,
             vec![serde_json::json!({"type": "place", "parts": ["puck"], "on": "nope"})],
+            true,
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn framed_primitives_and_local_arrays_follow_a_retilted_part() {
+        let mut s = Session::default();
+        let items = vec![
+            serde_json::json!({"type": "primitive", "name": "paper", "kind": "box", "size": [0.2, 0.3, 0.002], "translation": [0.1, 0.5, 0], "rotation": {"x": "$tilt"}}),
+            serde_json::json!({"type": "primitive", "name": "line", "kind": "box", "size": [0.15, 0.004, 0.001], "frame": "paper:top-front", "translation": [0, -0.02, 0.0005]}),
+            serde_json::json!({"type": "linear_array", "name": "line", "input": "line", "count": 5, "offset": [0, -0.02, 0], "local": true}),
+        ];
+        let check = |s: &Session, tilt: f32| {
+            let r = bevy::math::Quat::from_rotation_x(tilt.to_radians());
+            let want = Vec3::new(0.1, 0.5, 0.0) + r * Vec3::new(0.0, 0.15 - 0.02 - 0.08, 0.0015);
+            let Some(p) = s.model.part("line_4") else {
+                panic!("no line_4");
+            };
+            let got = Vec3::from(p.translation);
+            assert!(
+                (got - want).length() < 1e-5,
+                "tilt {tilt}: {got:?} vs {want:?}"
+            );
+            let q = crate::quat_of(p.rotation);
+            assert!(
+                q.dot(r).abs() > 1.0 - 1e-5,
+                "line rotation follows the paper: {q:?} vs {r:?}"
+            );
+        };
+        s.apply_values_as(
+            Some([("tilt".to_string(), -20.0)].into_iter().collect()),
+            items,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        check(&s, -20.0);
+        s.apply_values_as(
+            Some([("tilt".to_string(), -40.0)].into_iter().collect()),
+            vec![],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        check(&s, -40.0);
+        let bad = s.apply_values_as(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "x", "kind": "box", "size": 0.1, "frame": "paper:upper"})],
+            true,
+        );
+        assert!(bad.is_err_and(|e| e.to_string().contains("upper")));
+    }
+
+    #[test]
+    fn repeat_expands_nested_loops_and_follows_params() {
+        let mut s = Session::default();
+        s.apply_values_as(
+            Some([("h".to_string(), 0.1)].into_iter().collect()),
+            vec![
+                serde_json::json!({"type": "repeat", "var": "row", "values": [0, 1, 2], "items": [
+                    {"type": "repeat", "var": "k", "count": "=4 - $row", "items": [
+                        {"type": "primitive", "name": "key{row}_{k}", "kind": "box", "size": 0.01,
+                         "translation": ["=$k * 0.02", "=$h + $row * 0.0025", "$row"]}
+                    ]}
+                ]}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let at = |s: &Session, n: &str| {
+            s.model
+                .part(n)
+                .map(|p| Vec3::from(p.translation))
+                .unwrap_or_else(|| panic!("no {n}"))
+        };
+        assert!(s.model.part("key0_3").is_some() && s.model.part("key2_1").is_some());
+        assert!(s.model.part("key2_2").is_none(), "row 2 has 2 keys");
+        let p = at(&s, "key2_1");
+        assert!((p - Vec3::new(0.02, 0.105, 2.0)).length() < 1e-5, "{p:?}");
+        // Each copy keeps its own template: a param change re-derives it.
+        s.apply_values_as(
+            Some([("h".to_string(), 0.2)].into_iter().collect()),
+            vec![],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!((at(&s, "key2_1").y - 0.205).abs() < 1e-5);
+        // Two copies making the same part: an error naming the variable.
+        let dup = s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "repeat", "var": "r", "count": 2, "items": [
+                    {"type": "primitive", "name": "same", "kind": "box", "size": 0.01}
+                ]}),
+            ],
+            true,
+        );
+        assert!(dup.is_err_and(|e| e.to_string().contains("{r}")));
+        // A bad inner item says which repeat value it came from.
+        let bad = s.apply_values_as(
+            None,
+            vec![serde_json::json!({"type": "repeat", "var": "r", "values": ["box", "blob"], "items": [
+                {"type": "primitive", "name": "b{r}", "kind": "{r}", "size": 0.1}
+            ]})],
+            true,
+        );
+        let Err(e) = bad else {
+            panic!("bad size should fail");
+        };
+        assert!(e.to_string().contains("repeat r=blob"), "{e}");
+    }
+
+    #[test]
+    fn place_each_drops_every_part_onto_a_slope() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "deck", "kind": "box", "size": [1, 0.05, 0.4], "translation": [0, 0.3, 0], "rotation": {"z": 15}},
+                {"type": "primitive", "name": "key", "kind": "box", "size": [0.04, 0.02, 0.04], "translation": [-0.4, 1, 0]},
+                {"type": "linear_array", "name": "key", "input": "key", "count": 10, "offset": [0.09, 0, 0]},
+                {"type": "place", "name": "keys_on", "parts": ["key*"], "on": "deck", "each": true}
+            ]),
+        );
+        let mut last = f32::MIN;
+        for i in 0..10 {
+            let n = if i == 0 {
+                "key".to_string()
+            } else {
+                format!("key_{i}")
+            };
+            let Some(p) = s.model.part(&n) else {
+                panic!("no {n}");
+            };
+            let (lo, hi) = p.bounds();
+            assert!(
+                (lo.x + hi.x) * 0.5 - (-0.4 + 0.09 * i as f32) < 1e-4,
+                "{n} slid"
+            );
+            assert!(lo.y > last, "{n} at {} not above the previous key", lo.y);
+            last = lo.y;
+            crate::contact::rests_on(&s.model, &n, "deck").unwrap_or_else(|e| panic!("{n}: {e}"));
+        }
+        let bad = s.apply_values_as(
+            None,
+            vec![serde_json::json!({"type": "place", "parts": ["key*"], "on": "deck", "each": true, "at": [0, 0]})],
             true,
         );
         assert!(bad.is_err());

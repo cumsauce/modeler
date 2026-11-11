@@ -157,6 +157,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             at,
             gap,
             toward,
+            each,
         } = op
         else {
             continue;
@@ -182,6 +183,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 *at,
                 gap.unwrap_or(0.0),
                 toward.as_deref().unwrap_or("down"),
+                *each,
             )?;
         }
     }
@@ -242,6 +244,7 @@ fn place_on(
     at: Option<[f32; 2]>,
     gap: f32,
     toward: &str,
+    each: bool,
 ) -> Result<(), ModelerError> {
     // Travel axis k with sign, and the two cross axes `at` names.
     let (k, sign, (u, w)) = match toward {
@@ -268,6 +271,38 @@ fn place_on(
     if moving.is_empty() {
         return Err(format!("place `{move_name}`: no part matches {patterns:?}").into());
     }
+    let groups: Vec<Vec<usize>> = if each {
+        moving.iter().map(|&i| vec![i]).collect()
+    } else {
+        vec![moving]
+    };
+    let s_tris = crate::contact::world_tris(&support);
+    for moving in groups {
+        place_group(
+            named, move_name, patterns, on, at, gap, toward, &support, &s_tris, &moving, d, u, w,
+        )?;
+    }
+    Ok(())
+}
+
+/// One rigid group of [`place_on`]: slide to `at`, then travel along `d`
+/// until it meets `support`.
+#[allow(clippy::too_many_arguments)]
+fn place_group(
+    named: &mut Named,
+    move_name: &str,
+    patterns: &[String],
+    on: &str,
+    at: Option<[f32; 2]>,
+    gap: f32,
+    toward: &str,
+    support: &Part,
+    s_tris: &[[Vec3; 3]],
+    moving: &[usize],
+    d: Vec3,
+    u: usize,
+    w: usize,
+) -> Result<(), ModelerError> {
     let bounds = |named: &Named| {
         moving.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), &i| {
             let (a, b) = named[i].1.bounds();
@@ -279,12 +314,11 @@ fn place_on(
         let mut shift = Vec3::ZERO;
         shift[u] = a0 - (lo[u] + hi[u]) * 0.5;
         shift[w] = a1 - (lo[w] + hi[w]) * 0.5;
-        for &i in &moving {
+        for &i in moving {
             let p = Arc::make_mut(&mut named[i].1);
             p.translation = (Vec3::from(p.translation) + shift).to_array();
         }
     }
-    let s_tris = crate::contact::world_tris(&support);
     let m_tris: Vec<[Vec3; 3]> = moving
         .iter()
         .flat_map(|&i| crate::contact::world_tris(&named[i].1))
@@ -299,7 +333,7 @@ fn place_on(
     let at_h = |v: Vec3, hh: f32| v + d * (h(v) - hh);
     // The support's surface facing the parts, from their side; the parts'
     // leading surface, from the support's side.
-    let surface = |v: Vec3| crate::contact::ray_tris(at_h(v, top), d, &s_tris).map(|t| top - t);
+    let surface = |v: Vec3| crate::contact::ray_tris(at_h(v, top), d, s_tris).map(|t| top - t);
     let leading =
         |v: Vec3| crate::contact::ray_tris(at_h(v, bottom), -d, &m_tris).map(|t| bottom + t);
     let mut clearance = f32::MAX;
@@ -321,7 +355,7 @@ fn place_on(
         .into());
     }
     let shift = d * (clearance - gap);
-    for &i in &moving {
+    for &i in moving {
         let p = Arc::make_mut(&mut named[i].1);
         p.translation = (Vec3::from(p.translation) + shift).to_array();
     }
@@ -433,12 +467,18 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             size,
             translation,
             rotation,
+            frame,
         } => {
             let mut part =
                 primitives::primitive(*kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
             part.translation = *translation;
             if let Some(r) = rotation {
                 part.rotation = *r;
+            }
+            if let Some(frame) = frame {
+                let (t, r) = frame_of(named, name, frame)?;
+                part.translation = (t + r * Vec3::from(part.translation)).to_array();
+                part.rotation = (r * quat_of(part.rotation)).to_array();
             }
             upsert(named, name, part);
         }
@@ -662,11 +702,17 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             input,
             count,
             offset,
+            local,
         } => {
             let source = lookup(named, input)?;
             if *count == 0 {
                 return Err(format!("{name}: count must be at least 1").into());
             }
+            let offset = if *local {
+                (quat_of(source.rotation) * Vec3::from(*offset)).to_array()
+            } else {
+                *offset
+            };
             // The source is copy 0; copies 1..count step away from it,
             // so nothing overlaps the input.
             for i in 1..*count {
@@ -962,7 +1008,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Light { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
-        | Op::Primitive { .. }
+        | Op::Primitive { frame: None, .. }
         | Op::Extrude { .. }
         | Op::Revolve { .. }
         | Op::Sweep { .. }
@@ -982,7 +1028,42 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         }
         Op::Round { input, .. } => vec![input],
         Op::Shell { input, .. } => vec![input],
+        Op::Primitive {
+            frame: Some(frame), ..
+        } => vec![frame_part(frame)],
     }
+}
+
+/// The part a `frame` names (`"paper"` of `"paper:top-front"`).
+pub fn frame_part(frame: &str) -> &str {
+    frame.split_once(':').map_or(frame, |(p, _)| p)
+}
+
+/// The world origin and rotation of a `frame`: the part's transform, with
+/// the origin moved to the anchor on its local (unscaled-mesh) box.
+fn frame_of(
+    named: &Named,
+    name: &str,
+    frame: &str,
+) -> Result<(Vec3, bevy::math::Quat), ModelerError> {
+    let base = lookup(named, frame_part(frame)).map_err(|e| format!("{name}: frame: {e}"))?;
+    let r = quat_of(base.rotation);
+    let mut origin = Vec3::ZERO;
+    if let Some((_, words)) = frame.split_once(':') {
+        let (lo, hi) = base
+            .verts
+            .iter()
+            .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
+                (lo.min(Vec3::from(*v)), hi.max(Vec3::from(*v)))
+            });
+        if lo.x > hi.x {
+            return Err(format!("{name}: frame `{frame}` has no geometry").into());
+        }
+        let a = crate::commands::anchor_point(words, lo, hi)
+            .map_err(|e| format!("{name}: frame: {e}"))?;
+        origin = Vec3::from(a) * Vec3::from(base.scale);
+    }
+    Ok((Vec3::from(base.translation) + r * origin, r))
 }
 
 /// One line per op with its full parameters, for summaries and the `ops`
@@ -1057,6 +1138,7 @@ pub fn describe(ops: &[Op]) -> String {
                 at,
                 gap,
                 toward,
+                each,
             } => {
                 let mut s = match on {
                     Some(on) => format!("#{i} place `{name}` parts={parts:?} on=`{on}`"),
@@ -1070,6 +1152,9 @@ pub fn describe(ops: &[Op]) -> String {
                 }
                 if let Some(t) = toward {
                     s += &format!(" toward={t}");
+                }
+                if *each {
+                    s += " each";
                 }
                 if let Some(r) = rotation {
                     s += &format!(" rot={r:?}");
@@ -1085,9 +1170,13 @@ pub fn describe(ops: &[Op]) -> String {
                 size,
                 translation,
                 rotation,
+                frame,
             } => format!(
-                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}",
-                rotation.map_or_else(String::new, |r| format!(" rot={r:?}"))
+                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}{}",
+                rotation.map_or_else(String::new, |r| format!(" rot={r:?}")),
+                frame
+                    .as_ref()
+                    .map_or_else(String::new, |f| format!(" frame=`{f}`"))
             ),
             Op::Extrude {
                 name,
@@ -1225,7 +1314,11 @@ pub fn describe(ops: &[Op]) -> String {
                 input,
                 count,
                 offset,
-            } => format!("#{i} linear `{name}` = {count} x `{input}` stepping {offset:?}"),
+                local,
+            } => format!(
+                "#{i} linear `{name}` = {count} x `{input}` stepping {offset:?}{}",
+                if *local { " (local)" } else { "" }
+            ),
             Op::Mirror {
                 name,
                 input,
@@ -1305,6 +1398,7 @@ mod tests {
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
             Op::Transform {
                 name: "lifted".into(),
@@ -1354,6 +1448,7 @@ mod tests {
                 size: [0.08, 0.75, 0.08],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1405,6 +1500,7 @@ mod tests {
                 size: [1.0, 1.0, 1.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
             Op::Primitive {
                 name: "b".into(),
@@ -1412,6 +1508,7 @@ mod tests {
                 size: [0.5, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
             Op::Primitive {
                 name: "a".into(),
@@ -1419,6 +1516,7 @@ mod tests {
                 size: [0.1, 2.0, 0.0],
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
         ];
         let parts = evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
@@ -1436,6 +1534,7 @@ mod tests {
                 size: [0.1, 0.0, 0.0],
                 translation: [0.0, 0.0, 0.5],
                 rotation: None,
+                frame: None,
             },
             Op::RadialArray {
                 name: "ring".into(),
@@ -1468,12 +1567,14 @@ mod tests {
                 size: [0.05, 1.0, 0.0],
                 translation: [0.0, 0.5, 0.0],
                 rotation: None,
+                frame: None,
             },
             Op::LinearArray {
                 name: "fence".into(),
                 input: "post".into(),
                 count: 4,
                 offset: [1.0, 0.0, 0.0],
+                local: false,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1492,6 +1593,7 @@ mod tests {
                 size: [0.2, 0.2, 0.6],
                 translation: [0.5, 0.0, 0.0],
                 rotation: None,
+                frame: None,
             },
             Op::Mirror {
                 name: "arm_m".into(),
@@ -1566,6 +1668,7 @@ mod tests {
             size: [1.0; 3],
             translation: [0.0; 3],
             rotation: None,
+            frame: None,
         }
     }
 
@@ -1587,6 +1690,7 @@ mod tests {
             input: "p".into(),
             count: 3,
             offset: [1.0, 0.0, 0.0],
+            local: false,
         };
         assert_eq!(outputs(&linear), ["l_1", "l_2"]);
     }
@@ -1609,6 +1713,7 @@ mod tests {
                 input: "p".into(),
                 count: 3,
                 offset: [2.0, 0.0, 0.0],
+                local: false,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1666,6 +1771,7 @@ mod tests {
                 size: [1.0; 3],
                 translation: [1.0, 2.0, 3.0],
                 rotation: None,
+                frame: None,
             },
             Op::Transform {
                 name: "b".into(),

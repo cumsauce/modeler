@@ -118,7 +118,8 @@ fn ensure_project_gitignore() {
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */session.json\n*/open_docs.json\n*.tmp\n*/*.tmp\n",
+         */session.json\n*/open_docs.json\n*/session.lock\n*/daemon.log\n*/daemon.log.1\n\
+         *.tmp\n*/*.tmp\n",
     );
 }
 
@@ -290,6 +291,9 @@ fn session_state_path() -> Result<PathBuf, ModelerError> {
 /// Failures are reported but never fatal: losing an autosave must not break
 /// the tool call that triggered it.
 pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
+    if autosave_owner().is_some() {
+        return Ok(()); // another live server owns the autosave
+    }
     ensure_project_gitignore();
     let path = session_state_path()?;
     if let Some(parent) = path.parent() {
@@ -305,6 +309,9 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
 /// Autosaves any per-kind session state (e.g. the working materials) as
 /// `session.json` in that kind's folder.
 pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), ModelerError> {
+    if autosave_owner().is_some() {
+        return Ok(());
+    }
     let dir = kind_dir(kind)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
@@ -321,6 +328,9 @@ pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> 
 /// Autosaves the inactive open documents (`open_docs.json`), so a restart
 /// restores every open scene, not just the active one.
 pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
+    if autosave_owner().is_some() {
+        return Ok(());
+    }
     let dir = catalog_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
@@ -344,6 +354,146 @@ pub fn load_open_docs() -> Vec<Model> {
             m
         })
         .collect()
+}
+
+/// Who may autosave: the outcome of taking `session.lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// This process holds the lock and autosaves.
+    Owner,
+    /// Another live server (this pid) holds it; this one does not autosave.
+    HeldBy(u32),
+}
+
+/// The lock this process took at startup ([`acquire_session_lock`]). `None`
+/// (tests, library use) means autosave as usual.
+static SESSION_LOCK: std::sync::Mutex<Option<(PathBuf, LockOutcome)>> = std::sync::Mutex::new(None);
+
+/// `session.lock` next to the autosave: the pid of the server that owns it.
+pub fn session_lock_path() -> Result<PathBuf, ModelerError> {
+    Ok(catalog_dir()?.join("session.lock"))
+}
+
+/// Whether a process with this pid exists (a pid we may not signal still
+/// counts as alive).
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks that the pid exists.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn lock_holder(path: &std::path::Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Takes the lock file at `path` for `pid` unless another live pid holds it.
+/// A lock left by a dead process is taken over. The file appears with its
+/// content in one step (hard link of a written temp file), so a reader never
+/// sees it empty.
+pub fn acquire_lock_at(path: &std::path::Path, pid: u32) -> Result<LockOutcome, ModelerError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{pid}.tmp"));
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, format!("{pid}\n"))
+        .map_err(|e| ModelerError::Io(format!("writing {}: {e}", tmp.display())))?;
+    let mut outcome = Err(ModelerError::Io(format!(
+        "could not take {} (it keeps changing hands)",
+        path.display()
+    )));
+    for _ in 0..3 {
+        match fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                outcome = Ok(LockOutcome::Owner);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match lock_holder(path) {
+                Some(h) if h == pid => {
+                    outcome = Ok(LockOutcome::Owner);
+                    break;
+                }
+                Some(h) if pid_alive(h) => {
+                    outcome = Ok(LockOutcome::HeldBy(h));
+                    break;
+                }
+                // Dead holder or unreadable file: stale, take it over.
+                _ => {
+                    let _ = fs::remove_file(path);
+                }
+            },
+            Err(e) => {
+                outcome = Err(ModelerError::Io(format!("linking {}: {e}", path.display())));
+                break;
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    outcome
+}
+
+/// Removes the lock at `path` if `pid` holds it (never another server's).
+pub fn release_lock_at(path: &std::path::Path, pid: u32) {
+    if lock_holder(path) == Some(pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Startup: takes `<catalog dir>/session.lock` for this process, so only one
+/// live server autosaves `session.json` / `open_docs.json` into a catalog
+/// dir. A second server still works but does not autosave.
+pub fn acquire_session_lock() -> Result<LockOutcome, ModelerError> {
+    let path = session_lock_path()?;
+    let outcome = acquire_lock_at(&path, std::process::id())?;
+    let mut g = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some((path, outcome));
+    Ok(outcome)
+}
+
+/// The other live server's pid when it owns the autosave and this one does
+/// not (`None`: this server autosaves). When that server has since exited,
+/// this one takes the lock over and autosaves from then on.
+pub fn autosave_owner() -> Option<u32> {
+    let mut g = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, outcome) = g.as_mut()?;
+    let LockOutcome::HeldBy(other) = *outcome else {
+        return None;
+    };
+    if pid_alive(other) {
+        return Some(other);
+    }
+    match acquire_lock_at(path, std::process::id()) {
+        Ok(o) => *outcome = o,
+        Err(_) => return Some(other),
+    }
+    match *outcome {
+        LockOutcome::HeldBy(pid) => Some(pid),
+        LockOutcome::Owner => None,
+    }
+}
+
+/// Clean exit: removes `session.lock` if this process holds it.
+pub fn release_session_lock() {
+    let g = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((path, LockOutcome::Owner)) = g.as_ref() {
+        release_lock_at(path, std::process::id());
+    }
 }
 
 /// The last autosaved session model, if one exists and parses. Missing or
@@ -615,6 +765,7 @@ mod tests {
             size: [1.0, 1.0, 1.0],
             translation: [0.0, 0.5, 0.0],
             rotation: None,
+            frame: None,
         });
         model.refresh().unwrap();
         save_session_state(&model).unwrap();
@@ -627,6 +778,36 @@ mod tests {
         model.name = "wip2".into();
         save_session_state(&model).unwrap();
         assert_eq!(load_session_state().unwrap().name, "wip2");
+    }
+
+    #[test]
+    fn session_lock_second_acquirer_sees_the_first_pid() {
+        let dir = temp_root("lock");
+        let path = dir.join("session.lock");
+        let me = std::process::id();
+        assert_eq!(acquire_lock_at(&path, me).unwrap(), LockOutcome::Owner);
+        // A second server (another pid) finds us alive and does not own it.
+        let other = me.wrapping_add(7919);
+        assert_eq!(
+            acquire_lock_at(&path, other).unwrap(),
+            LockOutcome::HeldBy(me)
+        );
+        // Re-acquiring our own lock is fine; releasing someone else's is not.
+        assert_eq!(acquire_lock_at(&path, me).unwrap(), LockOutcome::Owner);
+        release_lock_at(&path, other);
+        assert!(path.exists(), "only the holder removes the lock");
+
+        // A lock left by a dead process is stale and taken over.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        fs::write(&path, format!("{dead}\n")).unwrap();
+        assert!(!pid_alive(dead));
+        assert_eq!(acquire_lock_at(&path, me).unwrap(), LockOutcome::Owner);
+        assert_eq!(lock_holder(&path), Some(me));
+        release_lock_at(&path, me);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

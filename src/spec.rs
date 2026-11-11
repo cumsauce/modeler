@@ -236,9 +236,15 @@ pub struct PrimitiveSpec {
     /// Position [x, y, z]; default origin. Alias: "position".
     #[serde(default, alias = "position")]
     translation: [f32; 3],
-    /// Optional rotation, quaternion [x, y, z, w].
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
+    /// Build in another part's own coordinates: "paper" or "paper:top-front"
+    /// (an anchor on its local box: left/right, bottom/top, back/front,
+    /// center). translation and rotation are then relative to that part, and
+    /// this primitive follows it when it moves or turns.
+    #[serde(default)]
+    frame: Option<String>,
 }
 
 /// One entry of a profile ring: a point [a, b], or an arc that expands to
@@ -344,9 +350,9 @@ pub struct ExtrudeSpec {
     round: f32,
     #[serde(default, alias = "position")]
     translation: [f32; 3],
-    /// Quaternion [x, y, z, w].
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
 }
 
 fn one2() -> [f32; 2] {
@@ -372,9 +378,9 @@ pub struct RevolveSpec {
     round: f32,
     #[serde(default, alias = "position")]
     translation: [f32; 3],
-    /// Quaternion [x, y, z, w].
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -476,9 +482,9 @@ pub struct TransformSpec {
     input: String,
     #[serde(default, alias = "position")]
     translation: Option<[f32; 3]>,
-    /// Quaternion [x, y, z, w].
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
     #[serde(default)]
     scale: Option<[f32; 3]>,
     /// true: values are offsets from the input (translation adds, rotation
@@ -503,9 +509,9 @@ pub struct MoveSpec {
     parts: Vec<String>,
     #[serde(default, alias = "position")]
     translation: Option<[f32; 3]>,
-    /// Quaternion [x, y, z, w]; or give axis + degrees instead.
+    /// Rotation ([x, y, z, w], {"axis", "degrees"} or {"x", "y", "z"} degrees); or give axis + degrees instead.
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
     /// Rotation axis for `degrees`, e.g. [1, 0, 0].
     #[serde(default)]
     axis: Option<[f32; 3]>,
@@ -543,6 +549,11 @@ pub struct PlaceSpec {
     /// "left").
     #[serde(default)]
     toward: Option<String>,
+    /// Each matched part travels on its own and keeps its footprint (43
+    /// keys each dropping onto a sloped deck), instead of the set moving as
+    /// one body. Not with `at`.
+    #[serde(default)]
+    each: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -590,6 +601,10 @@ pub struct LinearArraySpec {
     /// Per-copy step; copy i sits at input + i * offset.
     #[serde(default)]
     offset: [f32; 3],
+    /// Step `offset` along the source part's own (rotated) axes: lines
+    /// stepping down a tilted page.
+    #[serde(default)]
+    local: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -681,9 +696,9 @@ pub struct PrefabSpec {
     prefab: String,
     #[serde(default, alias = "position")]
     translation: [f32; 3],
-    /// Quaternion [x, y, z, w].
+    /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
     #[serde(default)]
-    rotation: Option<[f32; 4]>,
+    rotation: Option<RotationSpec>,
     #[serde(default)]
     scale: Option<[f32; 3]>,
     /// "scene": re-derive the prefab with the scene's style layered over its
@@ -807,6 +822,7 @@ pub enum OpSpec {
 }
 
 pub const OP_TYPES: &[&str] = &[
+    "repeat",
     "light",
     "collider",
     "marker",
@@ -834,6 +850,244 @@ pub const OP_TYPES: &[&str] = &[
     "uvs",
     "prefab",
 ];
+
+/// A rotation in any of three forms: a quaternion `[x, y, z, w]`,
+/// `{"axis": [1, 0, 0], "degrees": -20}`, or `{"x": -20, "y": 90, "z": 0}`
+/// (degrees about the world axes, applied x, then y, then z).
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RotationSpec {
+    Quat([f32; 4]),
+    AxisAngle(AxisAngle),
+    Euler(Euler),
+}
+
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AxisAngle {
+    axis: [f32; 3],
+    degrees: f32,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Euler {
+    #[serde(default)]
+    x: f32,
+    #[serde(default)]
+    y: f32,
+    #[serde(default)]
+    z: f32,
+}
+
+impl RotationSpec {
+    pub fn quat(&self) -> Result<[f32; 4], String> {
+        use crate::{Quat, Vec3};
+        Ok(match self {
+            RotationSpec::Quat(q) => {
+                let n = Quat::from_array(*q);
+                if n.length().is_nan() || n.length() <= 1e-6 {
+                    return Err("rotation: quaternion is zero".into());
+                }
+                n.normalize().to_array()
+            }
+            RotationSpec::AxisAngle(AxisAngle { axis, degrees }) => {
+                let a = Vec3::from(*axis);
+                if a.length() < 1e-9 {
+                    return Err("rotation: axis is zero".into());
+                }
+                Quat::from_axis_angle(a.normalize(), degrees.to_radians()).to_array()
+            }
+            RotationSpec::Euler(Euler { x, y, z }) => (Quat::from_rotation_z(z.to_radians())
+                * Quat::from_rotation_y(y.to_radians())
+                * Quat::from_rotation_x(x.to_radians()))
+            .to_array(),
+        })
+    }
+}
+
+/// An optional rotation as a quaternion, with the item named in errors.
+fn rot(ctx: &str, r: &Option<RotationSpec>) -> Result<Option<[f32; 4]>, String> {
+    r.as_ref()
+        .map(|r| r.quat().map_err(|e| format!("{ctx}: {e}")))
+        .transpose()
+}
+
+/// A loop over items, expanded before anything else reads the batch.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatSpec {
+    /// The loop variable: `{r}` in any string becomes its value ("key{r}"),
+    /// and `$r` in an expression or as a whole value is the number
+    /// ("=$h + $r * 0.0025"). `{r_i}` / `$r_i` is the index (0, 1, ...).
+    var: String,
+    /// Run for 0..count (the value is the index).
+    #[serde(default)]
+    count: Option<u32>,
+    /// Or run once per value (numbers or strings).
+    #[serde(default)]
+    values: Option<Vec<Value>>,
+    /// The items to repeat; they may hold repeats themselves (nested loops).
+    items: Vec<Value>,
+}
+
+/// Expands every `repeat` item (nested ones too) into copies of its items
+/// with the loop variable substituted. Each output carries a note naming
+/// the repeat it came from, for error messages. Two copies making the same
+/// part (same type and name) are an error: the name needs `{var}`.
+/// `count` and `values` may read params (`"=$rows - 1"`).
+pub fn expand_repeats(
+    items: &[Value],
+    params: &crate::params::Params,
+) -> Result<Vec<(Value, Option<String>)>, String> {
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        expand_one(item, &format!("op #{i} (repeat)"), None, params, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn expand_one(
+    item: &Value,
+    ctx: &str,
+    note: Option<&str>,
+    params: &crate::params::Params,
+    out: &mut Vec<(Value, Option<String>)>,
+) -> Result<(), String> {
+    if item.get("type").and_then(Value::as_str) != Some("repeat") {
+        out.push((item.clone(), note.map(str::to_string)));
+        return Ok(());
+    }
+    let mut body = item.clone();
+    if let Some(o) = body.as_object_mut() {
+        o.remove("type");
+        for k in ["count", "values"] {
+            if let Some(v) = o.get_mut(k) {
+                *v = crate::params::resolve(v, params).map_err(|e| format!("{ctx}: {k}: {e}"))?;
+            }
+        }
+    }
+    let r: RepeatSpec = de(ctx, &body)?;
+    let var = r.var.trim_start_matches('$');
+    if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "{ctx}: var: `{}` must be a plain name (letters, digits, _)",
+            r.var
+        ));
+    }
+    let values: Vec<Value> = match (r.count, r.values) {
+        (Some(n), None) => (0..n).map(Value::from).collect(),
+        (None, Some(v)) => v,
+        (Some(_), Some(_)) => return Err(format!("{ctx}: give count or values, not both")),
+        (None, None) => return Err(format!("{ctx}: needs count or values")),
+    };
+    if r.items.is_empty() {
+        return Err(format!("{ctx}: items is empty"));
+    }
+    let mut seen: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for (idx, value) in values.iter().enumerate() {
+        if !(value.is_number() || value.is_string()) {
+            return Err(format!("{ctx}: values[{idx}] must be a number or a string"));
+        }
+        let shown = match value {
+            Value::String(s) => s.clone(),
+            v => v.to_string(),
+        };
+        let here = format!("repeat {var}={shown}");
+        let note = match note {
+            Some(n) => format!("{n}, {here}"),
+            None => here.clone(),
+        };
+        let binds = [
+            (format!("{var}_i"), Value::from(idx)),
+            (var.to_string(), value.clone()),
+        ];
+        for (k, inner) in r.items.iter().enumerate() {
+            let v = substitute(inner, &binds);
+            let before = out.len();
+            expand_one(
+                &v,
+                &format!("{ctx} > {here} > item {k}"),
+                Some(&note),
+                params,
+                out,
+            )?;
+            for (made, _) in &out[before..] {
+                let (Some(t), Some(n)) = (
+                    made.get("type").and_then(Value::as_str),
+                    made.get("name").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let key = (t.to_string(), n.to_string());
+                if let Some(prev) = seen.get(&key) {
+                    return Err(format!(
+                        "{ctx}: {prev} and {here} both make {t} `{n}`: put {{{var}}} in its name"
+                    ));
+                }
+                seen.insert(key, here.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `{name}` and `$name` substituted in every string of `v`; a string that is
+/// exactly `$name` or `{name}` becomes the value itself (a number stays a
+/// number).
+fn substitute(v: &Value, binds: &[(String, Value)]) -> Value {
+    match v {
+        Value::String(s) => {
+            for (k, val) in binds {
+                if *s == format!("${k}") || *s == format!("{{{k}}}") {
+                    return val.clone();
+                }
+            }
+            let mut s = s.clone();
+            for (k, val) in binds {
+                let text = match val {
+                    Value::String(t) => t.clone(),
+                    Value::Number(n) => match n.as_f64() {
+                        Some(x) if x < 0.0 => format!("({n})"),
+                        _ => n.to_string(),
+                    },
+                    other => other.to_string(),
+                };
+                s = s.replace(&format!("{{{k}}}"), &text);
+                s = replace_ref(&s, k, &text);
+            }
+            Value::String(s)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|x| substitute(x, binds)).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), substitute(x, binds)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Replaces `$name` where the next character does not continue an
+/// identifier (`$r` leaves `$row` and `$r_i` alone).
+fn replace_ref(s: &str, name: &str, with: &str) -> String {
+    let pat = format!("${name}");
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(&pat) {
+        let after = &rest[at + pat.len()..];
+        let continues = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(&rest[..at]);
+        out.push_str(if continues { &pat } else { with });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
 
 fn de<T: DeserializeOwned>(ctx: &str, body: &Value) -> Result<T, String> {
     serde_path_to_error::deserialize(body).map_err(|e| {
@@ -901,7 +1155,24 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 kind: s.kind,
                 size,
                 translation: s.translation,
-                rotation: s.rotation,
+                rotation: rot(&ctx, &s.rotation)?,
+                frame: match s.frame {
+                    Some(f) => {
+                        if let Some((p, words)) = f.split_once(':') {
+                            if p.is_empty() {
+                                return Err(format!("{ctx}: frame: `{f}` names no part"));
+                            }
+                            crate::commands::anchor_point(
+                                words,
+                                bevy::math::Vec3::ZERO,
+                                bevy::math::Vec3::ONE,
+                            )
+                            .map_err(|e| format!("{ctx}: frame: {e}"))?;
+                        }
+                        Some(f)
+                    }
+                    None => None,
+                },
             })
         }
         "extrude" => {
@@ -918,7 +1189,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 scale_top: s.scale_top,
                 slices: s.slices,
                 translation: s.translation,
-                rotation: s.rotation,
+                rotation: rot(&ctx, &s.rotation)?,
             })
         }
         "revolve" => {
@@ -933,7 +1204,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 degrees: s.degrees,
                 segments: s.segments,
                 translation: s.translation,
-                rotation: s.rotation,
+                rotation: rot(&ctx, &s.rotation)?,
             })
         }
         "sweep" => {
@@ -1008,7 +1279,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 input: s.input,
                 translation: s.translation,
-                rotation: s.rotation,
+                rotation: rot(&ctx, &s.rotation)?,
                 scale: s.scale,
                 relative: s.relative,
                 pivot: s.pivot,
@@ -1100,7 +1371,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         }
         "move" => {
             let s: MoveSpec = de(&ctx, &body)?;
-            let rotation = match (s.rotation, s.axis, s.degrees) {
+            let rotation = match (rot(&ctx, &s.rotation)?, s.axis, s.degrees) {
                 (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                     return Err(format!(
                         "{ctx}: give rotation (a quaternion) or axis + degrees, not both"
@@ -1132,12 +1403,23 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 at: None,
                 gap: None,
                 toward: None,
+                each: false,
             }
+        }
+        "repeat" => {
+            return Err(format!(
+                "{ctx}: repeat is expanded by apply_ops before parsing; nest it in an apply_ops batch"
+            ));
         }
         "place" => {
             let s: PlaceSpec = de(&ctx, &body)?;
             if s.parts.is_empty() {
                 return Err(format!("{ctx}: parts is empty"));
+            }
+            if s.each && s.at.is_some() {
+                return Err(format!(
+                    "{ctx}: each and at don't mix: with each, every part keeps its own footprint"
+                ));
             }
             if let Some(t) = &s.toward
                 && !["down", "up", "left", "right", "back", "front"].contains(&t.as_str())
@@ -1156,6 +1438,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 at: s.at,
                 gap: s.gap,
                 toward: s.toward.filter(|t| t != "down"),
+                each: s.each,
             }
         }
         "boolean" => {
@@ -1187,6 +1470,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 input: s.input,
                 count: s.count,
                 offset: s.offset,
+                local: s.local,
             })
         }
         "mirror" => {
@@ -1283,7 +1567,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 prefab: s.prefab,
                 translation: s.translation,
-                rotation: s.rotation,
+                rotation: rot(&ctx, &s.rotation)?,
                 scale: s.scale,
                 parts,
                 digest,
@@ -1341,6 +1625,11 @@ pub fn example(ty: &str) -> Option<Value> {
         }
         "transform" => {
             json!({"type": "transform", "name": "leg_raised", "input": "leg", "translation": [0, 0.1, 0], "relative": true})
+        }
+        "repeat" => {
+            json!({"type": "repeat", "var": "r", "count": 4, "items": [
+                {"type": "primitive", "name": "key{r}", "kind": "box", "size": [0.012, 0.004, 0.012], "translation": ["=$r * 0.019", 0.1, 0]}
+            ]})
         }
         "place" => {
             json!({"type": "place", "name": "mug_on_desk", "parts": ["mug"], "on": "desk_top", "at": [-0.4, 0.1]})
@@ -1418,6 +1707,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
+        "repeat" => schemars::schema_for!(RepeatSpec),
         "light" => schemars::schema_for!(LightSpec),
         "collider" => schemars::schema_for!(ColliderSpec),
         "marker" => schemars::schema_for!(MarkerSpec),
@@ -1455,6 +1745,37 @@ mod tests {
 
     fn one(v: Value) -> Result<BatchItem, String> {
         parse_item(3, &v)
+    }
+
+    #[test]
+    fn rotation_forms_agree() {
+        let rot = |r: Value| -> [f32; 4] {
+            let item = one(
+                json!({"type": "primitive", "name": "p", "kind": "box", "size": 1, "rotation": r}),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let BatchItem::Op(Op::Primitive { rotation, .. }) = item else {
+                panic!("not a primitive");
+            };
+            rotation.unwrap_or_else(|| panic!("no rotation"))
+        };
+        let s = (-10.0f32).to_radians().sin();
+        let c = (-10.0f32).to_radians().cos();
+        let quat = rot(json!([s, 0, 0, c]));
+        let axis = rot(json!({"axis": [2, 0, 0], "degrees": -20}));
+        let euler = rot(json!({"x": -20}));
+        for (a, b) in [(quat, axis), (quat, euler)] {
+            for k in 0..4 {
+                assert!((a[k] - b[k]).abs() < 1e-5, "{a:?} vs {b:?}");
+            }
+        }
+        // Euler applies x, then y, then z about the world axes.
+        let e = rot(json!({"x": 90, "y": 90}));
+        let q = crate::quat_of(e);
+        let v = q * bevy::math::Vec3::Y;
+        assert!((v - bevy::math::Vec3::X).length() < 1e-5, "{v:?}");
+        assert!(one(json!({"type": "primitive", "name": "p", "kind": "box", "size": 1, "rotation": {"axis": [0, 0, 0], "degrees": 5}})).is_err());
+        assert!(one(json!({"type": "primitive", "name": "p", "kind": "box", "size": 1, "rotation": {"x": 5, "w": 1}})).is_err());
     }
 
     #[test]
@@ -1547,7 +1868,13 @@ mod tests {
             if *t == "prefab" {
                 continue; // needs a catalog entry
             }
-            parse_item(0, &e).unwrap_or_else(|err| panic!("{t}: {err}"));
+            let none = crate::params::Params::default();
+            for (item, _) in expand_repeats(&[e], &none).unwrap_or_else(|err| panic!("{t}: {err}"))
+            {
+                let item =
+                    crate::params::resolve(&item, &none).unwrap_or_else(|err| panic!("{t}: {err}"));
+                parse_item(0, &item).unwrap_or_else(|err| panic!("{t}: {err}"));
+            }
             describe_type(Some(t)).unwrap_or_else(|err| panic!("{t}: {err}"));
         }
         assert!(describe_type(None).is_ok_and(|s| s.contains("radial_array")));

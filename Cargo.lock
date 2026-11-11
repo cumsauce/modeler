@@ -3875,6 +3875,7 @@ dependencies = [
  "base64 0.22.1",
  "bevy",
  "gltf",
+ "libc",
  "manifold-csg",
  "png",
  "rayon",

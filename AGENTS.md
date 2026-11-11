@@ -27,8 +27,11 @@ python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
 Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
 array of `{"name", "args"}`), one batch per step, and `{"name": "quit"}` when
 done. If the daemon's server has died (killed, crashed), the next call
-restarts it from the autosave and says so; with no daemon at all the
-client prints the start command. Typical first calls: `scene_summary` (also shows the autosaved session,
+restarts it from the autosave and says why it had exited ("code 0: window
+closed"); with no daemon at all the client prints the start command, and a
+second `--daemon` on the same socket refuses to start ("a modeler daemon is
+already running"). `--save-shot PATH` names the run's first image PATH and
+every later one PATH_2, PATH_3, ...; each result lists `saved_images`. Typical first calls: `scene_summary` (also shows the autosaved session,
 if any), `catalog_list`, then `new_model` + `apply_ops` to build. If your
 session's MCP tool list has no `mcp__modeler__*` tools, this driver is the
 documented fallback — it speaks the same tool surface over stdio. Each
@@ -81,7 +84,7 @@ type, so there is no need to memorise field names.
 
 | type | fields (optional in []) |
 |---|---|
-| `primitive` | name, kind, size, [translation / position], [rotation quat] |
+| `primitive` | name, kind, size, [translation / position], [rotation], [frame] |
 | `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round] |
@@ -91,10 +94,10 @@ type, so there is no need to memorise field names.
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
 | `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot: point or anchor] |
-| `place` | [name], parts, on, [at], [gap], [toward down] (drop onto `on`, or mount against a wall) |
+| `place` | [name], parts, on, [at], [gap], [toward down], [each] (drop onto `on`, or mount against a wall) |
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
-| `linear_array` | name, input, count, offset |
+| `linear_array` | name, input, count, offset, [local] |
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
 | `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
@@ -106,6 +109,7 @@ type, so there is no need to memorise field names.
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
+| `repeat` | var, count or values, items (a loop, expanded before anything else) |
 
 A `material` item may also carry `pbr` (a procedural material by name, see
 **Procedural materials** below), with `params` overrides and `scale`.
@@ -126,6 +130,10 @@ A `material` item may also carry `pbr` (a procedural material by name, see
     `[x, y, z]`), or an object (`{radius, height}`, `{width, height, depth}`).
     A sphere is round: flatten it with a transform's scale.
   - colours: `[r, g, b]`, `[r, g, b, a]`, 0..1 or 0..255, or `"#rgb"` or `"#rrggbb(aa)"`.
+  - `rotation` (every item that has one): a quat `[x, y, z, w]`,
+    `{"axis": [1, 0, 0], "degrees": -20}`, or Euler degrees
+    `{"x": -20, "y": 90}` (applied x, then y, then z, about world axes).
+    Stored as a quat, so saved files are unchanged.
 - **Materials follow lineage.** An in-place material on X runs before every
   op that copies or cuts X, wherever it sits in the batch, so arrays, mirrors
   and transforms of X inherit the colour.
@@ -161,7 +169,20 @@ A `material` item may also carry `pbr` (a procedural material by name, see
   "toward": "left", "at": [-0.4, 1.5]}`. A place runs after any move/place
   that moves the part it lands on (a pot on a sill mounted on a wall),
   whatever order they are written in. List every part that should move
-  (`"bracket*"` takes the array copies too).
+  (`"bracket*"` takes the array copies too). `each: true` places every
+  matched part on its own instead of as one body: each keeps its footprint
+  and travels until it meets `on`, so 43 keys land on a sloped deck in one
+  item (`{"type": "place", "name": "keys_on", "parts": ["key*"], "on":
+  "deck", "each": true}`; not with `at`).
+- **Frames** build in another part's own coordinates: a primitive with
+  `frame: "paper"` (or `"paper:top-front"`, an anchor on that part's local
+  box, same words as pivots) takes `translation` / `rotation` relative to
+  that part's transform, origin at the anchor (default its own origin). It
+  is a real dependency: tilt the paper (a param, a re-issue) and the framed
+  parts follow. A post-graph `move` of the frame part does not carry them:
+  list them in the move too. Pair with `linear_array` `local: true`, which
+  steps `offset` along the source part's rotated axes (typed lines stepping
+  down a tilted page).
 - **Anchor pivots**: a move's `pivot` may be a point or an anchor on a
   bounding box: `"bottom-back"` (the moved parts' own box) or
   `"laptop_screen:bottom-front"` (another part's box; `*` patterns work).
@@ -175,6 +196,7 @@ A `material` item may also carry `pbr` (a procedural material by name, see
   new copies `name_0..` start at `start_degrees` and the source stays put.
   `axis` "x"/"z" makes horizontal rings (windmill blades).
 - **Linear arrays**: the source is copy 0; outputs `name_1..{count-1}`.
+  `local: true` rotates `offset` by the source's rotation.
 - **Extrude / revolve** build closed solids from 2D profiles (Manifold),
   ready for booleans. `profile` is one ring `[[a, b], ...]` or a list of
   rings; inner rings are holes, orientation doesn't matter (even-odd).
@@ -231,6 +253,17 @@ A `material` item may also carry `pbr` (a procedural material by name, see
   remembers which ops read which params, so a later
   `apply_ops({"params": {"tower_h": 3}})` re-derives all of them in one
   history step.
+- **Loops (`repeat`)**: `{"type": "repeat", "var": "r", "count": 4, "items":
+  [...]}` (or `"values": [0.0, 0.0025, ...]`, numbers or strings) copies its
+  items once per value before style and params are read. In the copies,
+  `{r}` inside any string becomes the value (`"name": "key{r}"`), `$r` in an
+  expression or as a whole value is the number (`"=$h + $r * 0.0025"`), and
+  `{r_i}` / `$r_i` is the index. `count` / `values` may read params
+  (`"=$rows - 1"`) and repeats nest (`"count": "=4 - $row"` inside a row
+  loop). Each copy is an ordinary item with its own template, so a later
+  param change re-derives it. Two copies making the same part (same type and
+  name) are an error naming the variable; an error inside a copy says which
+  value it came from (`[from repeat r=2]`).
 - **Prefabs as parts**: `{"type": "prefab", "name": "lamp1", "prefab": "lamp"}`
   instances a saved catalog model; its visible parts become `lamp1.pole`,
   `lamp1.shade`, ... and feed later ops like any part. The part list is
@@ -260,8 +293,14 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, scope?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
+  - `scope: ["bars_*", "basket"]` limits what the other checks report to
+    those parts (`*` globs): grounded / supported / rests / bounds /
+    validate / stable look only at them (grounding still travels through
+    every part, so a scoped part may rest on an unscoped one), and
+    collisions keep pairs with at least one side in scope. `parts` stays an
+    exact check of the whole model.
   - `parts`: exact part names, order-insensitive; reports missing and
     unexpected names. `*` matches any run of characters (`"gz.*"` covers a
     prefab instance).
@@ -271,6 +310,10 @@ name: the producer first, then in-place material/visibility/transform edits).
     mid-air both float), by real geometry: shared volume, or surfaces within 0.2% of the smaller
     part's size (10 µm..1 mm), so a 0.8 mm gap under a laptop screen fails.
     (The `scene_summary` floating warning is a cheap bounding-box version.)
+    A PASS also names parts **held up only by passing deep into another**
+    (over 20% of the smaller part inside: "`bar` (through body)"), which
+    usually means a collision is doing the holding; `grounded: "strict"`
+    fails them.
   - `supported`: nothing hangs. Each part is on the ground, shares volume
     with another (a joint), or touches another BELOW its centre of mass.
     Catches a part only wedged against something above it, which
@@ -294,7 +337,14 @@ name: the producer first, then in-place material/visibility/transform edits).
     when the model knows: `[x is an input of y and still visible: hide it]`
     (a blank, cutter or array source left showing) or `[entirely hidden
     inside]`. Intended embeds (a chimney through a roof, a seat post in its
-    tube, a bulb in a shade) go in `allow`.
+    tube, a bulb in a shade) go in `allow`. Every overlap reports its
+    **depth** (penetration along the axis it covers least of the smaller
+    part). An allow entry is `[a, b]` or `{"pair": [a, b], "depth": 0.003,
+    "max": 0.5}`: excused only while no deeper than 3 mm / 50%. The PASS
+    lists what each allow excused and its deepest pair, and an allow with a
+    bare `*` side (`["bars_*", "*"]`) that hides an overlap over `max` gets a
+    `note:` to name the real partner: a catch-all once hid typebars sunk
+    into a typewriter body.
 
   Each check prints PASS/FAIL; structured clients get `{ok, checks}`.
 - `probe_ray(origin, dir, all_hits?)`: the first part hit (or `all_hits`:
@@ -699,8 +749,17 @@ Material toggles match O, S and M.
   stops it. The default throwaway mode spawns and kills a server per
   invocation — window flashes open/closed, state restored from autosave.
 
-- `MODELER_STDERR=<file>` on the daemon keeps the server's stderr (panics,
-  bake errors); it is discarded otherwise.
+- The daemon keeps the server's stderr (panics, bake errors) in
+  `<catalog dir>/daemon.log` (rotated to `daemon.log.1` past 1 MB at each
+  spawn; `MODELER_STDERR=<file>` overrides). The server's last line there
+  is `modeler: exit: <reason>` (window closed / stdin EOF (MCP client gone)
+  / panic in thread ...), which the restart note quotes.
+- **One autosaver per catalog dir**: at startup the server writes
+  `<catalog dir>/session.lock` with its pid; a second live server finds it
+  held, logs "autosave OFF" and skips the `session.json` / `open_docs.json`
+  / materials autosaves (`catalog::autosave_owner()` names the owner), so
+  servers don't clobber each other. A dead holder's lock is taken over, also
+  mid-session; a clean exit removes it.
 - rmcp 1.8 server runs a tokio current-thread on a spawned thread; the Bevy
   app owns the main thread (winit on macOS). Bridge = tokio mpsc + oneshot.
 - `--headless` uses MinimalPlugins — don't add ScheduleRunnerPlugin again.

@@ -16,14 +16,55 @@ mod server;
 
 use prelude::*;
 
+/// Why the MCP side stopped (stdin EOF, transport error), set by its thread.
+static MCP_STOP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The last panic's message, for the exit line.
+static LAST_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// One line on stderr saying why the server exits. The daemon in
+/// `mcp_driver.py` greps for this prefix and quotes it in its restart note.
+fn log_exit(reason: &str) {
+    eprintln!("modeler: exit: {reason}");
+}
+
+/// Logs every panic with its thread and location (then the default report),
+/// and remembers it for the exit line.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string payload".into());
+        let at = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let thread = thread::current();
+        let line = format!(
+            "panic in thread '{}': {msg}{at}",
+            thread.name().unwrap_or("?")
+        );
+        eprintln!("modeler: {line}");
+        if let Ok(mut g) = LAST_PANIC.lock() {
+            *g = Some(line);
+        }
+        default(info);
+    }));
+}
+
 fn main() -> AppExit {
     let mut headless = false;
+    let mut print_catalog_dir = false;
     let mut model_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--headless" => headless = true,
             "--model" => model_path = args.next().map(PathBuf::from),
+            "--print-catalog-dir" => print_catalog_dir = true,
             "--project" => {
                 let Some(dir) = args.next() else {
                     eprintln!("--project needs a directory");
@@ -34,9 +75,34 @@ fn main() -> AppExit {
                 unsafe { std::env::set_var("MODELER_PROJECT", dir) };
             }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless] [--model <path.json>] [--project <game dir>])"
+                "unknown argument `{other}` (usage: modeler [--headless] [--model <path.json>] [--project <game dir>] [--print-catalog-dir])"
             ),
         }
+    }
+    if print_catalog_dir {
+        // For mcp_driver.py: where the autosave (and daemon.log) live.
+        return match catalog::catalog_dir() {
+            Ok(dir) => {
+                println!("{}", dir.display());
+                AppExit::Success
+            }
+            Err(e) => {
+                eprintln!("modeler: {e}");
+                AppExit::error()
+            }
+        };
+    }
+    install_panic_hook();
+
+    // One autosaving server per catalog dir: a second live server would
+    // clobber the first's session.json, so it runs without autosave.
+    match catalog::acquire_session_lock() {
+        Ok(catalog::LockOutcome::Owner) => {}
+        Ok(catalog::LockOutcome::HeldBy(pid)) => eprintln!(
+            "modeler: autosave OFF: server pid {pid} holds the session lock in this catalog dir \
+             (this server's work is not autosaved; save_prefab still works)"
+        ),
+        Err(e) => eprintln!("modeler: could not take the session lock: {e}"),
     }
 
     let mut session = Session::default();
@@ -113,9 +179,12 @@ fn main() -> AppExit {
                         return;
                     }
                 };
-                if let Err(e) = server.waiting().await {
-                    eprintln!("modeler: MCP server stopped: {e}");
-                }
+                let why = match server.waiting().await {
+                    Ok(_) => "stdin EOF (MCP client gone)".to_string(),
+                    Err(e) => format!("MCP server stopped: {e}"),
+                };
+                eprintln!("modeler: {why}");
+                let _ = MCP_STOP.set(why);
                 done.server_done.store(true, Ordering::Relaxed);
             });
         });
@@ -204,5 +273,33 @@ fn main() -> AppExit {
         .add_systems(Update, (sync_toolbar, sync_doc_tabs))
         .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }
-    app.run()
+    // Catch a main-thread panic so the exit line and lock cleanup still run.
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.run()));
+    catalog::release_session_lock();
+    match run {
+        Ok(exit) => {
+            let mcp = MCP_STOP.get().cloned();
+            let reason = match (headless, mcp) {
+                (true, Some(why)) => why,
+                (false, Some(why)) => format!("window closed (after {why})"),
+                (false, None) => "window closed".to_string(),
+                (true, None) => "app exited".to_string(),
+            };
+            let reason = match &exit {
+                AppExit::Success => reason,
+                AppExit::Error(code) => format!("{reason}, error code {code}"),
+            };
+            log_exit(&reason);
+            exit
+        }
+        Err(_) => {
+            let what = LAST_PANIC
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| "panic".into());
+            log_exit(&what);
+            AppExit::from_code(101)
+        }
+    }
 }
