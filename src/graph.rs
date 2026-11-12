@@ -1150,10 +1150,10 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let mut model = load_prefab_guarded(prefab)?;
             if let Some(st) = restyle {
                 let mut s = crate::commands::Session::default();
-                s.model = model;
+                s.model = (*model).clone();
                 s.set_style(st.clone())
                     .map_err(|e| format!("{name}: restyling prefab `{prefab}`: {e}"))?;
-                model = s.model;
+                model = Arc::new(s.model);
             }
             let (it, ir) = (
                 Vec3::from(*translation),
@@ -1198,7 +1198,7 @@ thread_local! {
 
 /// Loads a catalog prefab for instancing, refusing runaway nesting (a prefab
 /// that instances itself, directly or not).
-fn load_prefab_guarded(name: &str) -> Result<crate::Model, ModelerError> {
+fn load_prefab_guarded(name: &str) -> Result<Arc<crate::Model>, ModelerError> {
     let depth = PREFAB_DEPTH.with(|d| d.get());
     if depth >= 8 {
         return Err(
@@ -1206,7 +1206,7 @@ fn load_prefab_guarded(name: &str) -> Result<crate::Model, ModelerError> {
         );
     }
     PREFAB_DEPTH.with(|d| d.set(depth + 1));
-    let loaded = crate::catalog::load_prefab(name);
+    let loaded = crate::catalog::prefab_instance(name);
     PREFAB_DEPTH.with(|d| d.set(depth));
     loaded
 }

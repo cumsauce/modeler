@@ -80,7 +80,7 @@ fn a_map_stays_fast() {
     }
     let t0 = Instant::now();
     apply(&mut s, items);
-    budget("build the map", t0.elapsed(), 4000);
+    budget("build the map", t0.elapsed(), 1000);
 
     let edit = median(5, |i| {
         apply(
@@ -89,13 +89,13 @@ fn a_map_stays_fast() {
                         "translation": [i as f64, 0, -10]})],
         );
     });
-    budget("one marker edit on the map", edit, 300);
+    budget("one marker edit on the map", edit, 50);
 
     let markers = median(5, |_| {
         let m = modeler::game::markers(&s.model).unwrap_or_else(|e| panic!("{e}"));
         assert!(m.len() >= 42);
     });
-    budget("markers() with prefab instances", markers, 60);
+    budget("markers() with prefab instances", markers, 10);
 
     // Two agents alternating: switch away and back.
     let switch = median(5, |_| {
@@ -117,7 +117,7 @@ fn a_map_stays_fast() {
             assert!(!hits.is_empty());
         }
     });
-    budget("20 rays down onto the map", rays, 150);
+    budget("20 rays down onto the map", rays, 30);
 
     let spec: modeler::commands::VerifySpec =
         serde_json::from_value(json!({"grounded": true})).unwrap_or_else(|e| panic!("{e}"));

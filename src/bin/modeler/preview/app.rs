@@ -805,42 +805,47 @@ pub(crate) fn marker_previews(
     let mut out = Vec::new();
     // Previews stand on the ground (markers sit at y = 0; the game snaps to
     // the terrain), hidden terrain included.
-    let mut ground = modeler::Model::named("ground");
-    for p in &model.parts {
-        if model
-            .ops
-            .iter()
-            .any(|o| matches!(o, modeler::Op::Terrain { name, .. } if *name == p.name))
-        {
-            let mut p = (**p).clone();
-            p.visible = true;
-            ground.parts.push(std::sync::Arc::new(p));
-        }
-    }
+    let terrains: std::collections::HashSet<&str> = model
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            modeler::Op::Terrain { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let ground: Vec<&modeler::Part> = model
+        .parts
+        .iter()
+        .map(|p| &**p)
+        .filter(|p| terrains.contains(p.name.as_str()))
+        .collect();
     for mut m in markers {
         let Some(name) = m.preview.clone() else {
             continue;
         };
         let name = name.as_str();
-        if !ground.parts.is_empty()
-            && let Some(hit) = modeler::contact::ray_cast(
-                &ground,
-                Vec3::new(m.position.x, 10_000.0, m.position.z),
-                Vec3::NEG_Y,
-                None,
-            )
-            .first()
+        let top = Vec3::new(m.position.x, 10_000.0, m.position.z);
+        if let Some(t) = ground
+            .iter()
+            .filter_map(|p| modeler::contact::ray_part(p, top, Vec3::NEG_Y))
+            .min_by(f32::total_cmp)
         {
-            m.position.y = hit.point.y;
+            m.position.y = top.y - t;
         }
         if !loaded.contains_key(name) {
             let parts = modeler::catalog::with_project(model.project.clone(), || {
-                let Ok(mut src) = modeler::catalog::load_prefab(name) else {
+                let Ok(src) = modeler::catalog::prefab_instance(name) else {
                     return Vec::new();
                 };
-                if src.parts.is_empty() && !src.ops.is_empty() && src.refresh().is_err() {
-                    return Vec::new();
-                }
+                let src = if src.parts.is_empty() && !src.ops.is_empty() {
+                    let mut m = (*src).clone();
+                    if m.refresh().is_err() {
+                        return Vec::new();
+                    }
+                    std::sync::Arc::new(m)
+                } else {
+                    src
+                };
                 src.parts
                     .iter()
                     .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())

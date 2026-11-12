@@ -103,7 +103,7 @@ fn unmoved_markers(
                 scale,
                 ..
             } => {
-                let Ok(src) = crate::catalog::load_prefab(prefab) else {
+                let Ok(src) = crate::catalog::prefab_instance(prefab) else {
                     continue;
                 };
                 let (t, r) = (
@@ -145,7 +145,7 @@ fn rules(model: &Model, depth: u32) -> Vec<Rule> {
                 sensor: *sensor,
             }),
             Op::Prefab { name, prefab, .. } => {
-                let Ok(src) = crate::catalog::load_prefab(prefab) else {
+                let Ok(src) = crate::catalog::prefab_instance(prefab) else {
                     continue;
                 };
                 // The prefab's own rules apply to its parts in this scene;

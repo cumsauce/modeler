@@ -3825,7 +3825,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         "prefab" => {
             let s: PrefabSpec = de(&ctx, &body)?;
             let model =
-                crate::catalog::load_prefab(&s.prefab).map_err(|e| format!("{ctx}: {e}"))?;
+                crate::catalog::prefab_instance(&s.prefab).map_err(|e| format!("{ctx}: {e}"))?;
             let parts: Vec<String> = model
                 .parts
                 .iter()

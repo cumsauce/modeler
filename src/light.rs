@@ -112,7 +112,7 @@ fn unmoved(model: &Model, depth: u32) -> Result<Vec<(Light, Option<String>)>, Mo
                 scale,
                 ..
             } => {
-                let Ok(src) = crate::catalog::load_prefab(prefab) else {
+                let Ok(src) = crate::catalog::prefab_instance(prefab) else {
                     continue;
                 };
                 let (t, r) = (

@@ -539,7 +539,7 @@ pub fn export_scene(
             continue;
         };
         owned.push(format!("{name}."));
-        let source = crate::catalog::load_prefab(prefab).ok();
+        let source = crate::catalog::prefab_instance(prefab).ok();
         let gltf = match exported.get(prefab) {
             Some(g) => g.clone(),
             None => {
@@ -586,7 +586,7 @@ pub fn export_scene(
             kind: None,
             size: None,
             raw: components.clone(),
-            transform: instance_transform(model, name, source.as_ref(), fallback),
+            transform: instance_transform(model, name, source.as_deref(), fallback),
             gltf: Some(gltf),
             components: resolve_components(vocab.as_ref(), components)
                 .map_err(|e| format!("instance `{name}`: {e}"))?,

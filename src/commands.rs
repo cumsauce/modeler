@@ -1648,7 +1648,7 @@ impl Session {
         else {
             return Ok(false);
         };
-        let src = crate::catalog::load_prefab(prefab)?;
+        let src = crate::catalog::prefab_instance(prefab)?;
         let new_restyle = match style {
             None => None,
             Some(mode) => {

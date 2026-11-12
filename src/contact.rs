@@ -928,11 +928,8 @@ pub fn ray_cast(model: &Model, origin: Vec3, dir: Vec3, only: Option<&[String]>)
     let mut hits: Vec<RayHit> = visible(model)
         .filter(|p| only.is_none_or(|o| o.iter().any(|n| crate::name_matches(n, &p.name))))
         .filter_map(|p| {
-            let best = world_tris(p)
-                .iter()
-                .filter_map(|t| ray_tri(origin, d, t))
-                .fold(f32::MAX, f32::min);
-            (best < f32::MAX).then(|| RayHit {
+            let best = ray_part(p, origin, d)?;
+            Some(RayHit {
                 part: p.name.clone(),
                 t: best,
                 point: origin + d * best,
@@ -941,6 +938,165 @@ pub fn ray_cast(model: &Model, origin: Vec3, dir: Vec3, only: Option<&[String]>)
         .collect();
     hits.sort_by(|a, b| a.t.total_cmp(&b.t));
     hits
+}
+
+/// The nearest hit of a ray (unit `d`) on one part, whatever its
+/// visibility. Uses a world-space BVH cached per mesh and transform, so
+/// repeated rays on a big terrain cost a few dozen triangle tests each.
+pub fn ray_part(p: &Part, origin: Vec3, d: Vec3) -> Option<f32> {
+    if p.verts.is_empty() || p.indices.len() < 3 {
+        return None;
+    }
+    let bvh = part_bvh(p);
+    bvh.cast(origin, d)
+}
+
+struct Bvh {
+    tris: Vec<[Vec3; 3]>,
+    /// (min, max, first, count): count 0 = inner node, children at `first`
+    /// and `first + 1`.
+    nodes: Vec<(Vec3, Vec3, u32, u32)>,
+}
+
+impl Bvh {
+    fn build(mut tris: Vec<[Vec3; 3]>) -> Bvh {
+        let mut nodes = vec![(Vec3::ZERO, Vec3::ZERO, 0, 0)];
+        let mut stack = vec![(0usize, 0usize, tris.len())];
+        while let Some((ni, lo, hi)) = stack.pop() {
+            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            let (mut cmn, mut cmx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for t in &tris[lo..hi] {
+                for v in t {
+                    mn = mn.min(*v);
+                    mx = mx.max(*v);
+                }
+                let c = (t[0] + t[1] + t[2]) / 3.0;
+                cmn = cmn.min(c);
+                cmx = cmx.max(c);
+            }
+            if hi - lo <= 6 {
+                nodes[ni] = (mn, mx, lo as u32, (hi - lo) as u32);
+                continue;
+            }
+            let ext = cmx - cmn;
+            let axis = if ext.x >= ext.y && ext.x >= ext.z {
+                0
+            } else if ext.y >= ext.z {
+                1
+            } else {
+                2
+            };
+            let mid = (lo + hi) / 2;
+            tris[lo..hi].select_nth_unstable_by(mid - lo, |a, b| {
+                let ca = a[0][axis] + a[1][axis] + a[2][axis];
+                let cb = b[0][axis] + b[1][axis] + b[2][axis];
+                ca.total_cmp(&cb)
+            });
+            let first = nodes.len();
+            nodes.push((Vec3::ZERO, Vec3::ZERO, 0, 0));
+            nodes.push((Vec3::ZERO, Vec3::ZERO, 0, 0));
+            nodes[ni] = (mn, mx, first as u32, 0);
+            stack.push((first, lo, mid));
+            stack.push((first + 1, mid, hi));
+        }
+        Bvh { tris, nodes }
+    }
+
+    fn cast(&self, o: Vec3, d: Vec3) -> Option<f32> {
+        let inv = Vec3::ONE / d;
+        let slab = |mn: Vec3, mx: Vec3| -> Option<f32> {
+            // Pad the box a little: ray_tri accepts hits just past an edge.
+            let pad = (mx - mn).max_element() * 1e-5 + 1e-6;
+            let (mn, mx) = (mn - pad, mx + pad);
+            let (mut t0, mut t1) = (f32::MIN, f32::MAX);
+            for a in 0..3 {
+                if d[a] == 0.0 {
+                    if o[a] < mn[a] || o[a] > mx[a] {
+                        return None;
+                    }
+                    continue;
+                }
+                let (x, y) = ((mn[a] - o[a]) * inv[a], (mx[a] - o[a]) * inv[a]);
+                t0 = t0.max(x.min(y));
+                t1 = t1.min(x.max(y));
+            }
+            (t1 >= t0.max(-1e-4)).then_some(t0)
+        };
+        let mut best = f32::MAX;
+        let mut stack = vec![0usize];
+        while let Some(ni) = stack.pop() {
+            let (mn, mx, first, count) = self.nodes[ni];
+            let Some(t0) = slab(mn, mx) else { continue };
+            if t0 > best {
+                continue;
+            }
+            if count > 0 {
+                for t in &self.tris[first as usize..(first + count) as usize] {
+                    if let Some(h) = ray_tri(o, d, t) {
+                        best = best.min(h);
+                    }
+                }
+            } else {
+                stack.push(first as usize);
+                stack.push(first as usize + 1);
+            }
+        }
+        (best < f32::MAX).then_some(best)
+    }
+}
+
+type BvhKey = (usize, usize, usize, [u32; 10], u64);
+static BVHS: std::sync::Mutex<Option<std::collections::HashMap<BvhKey, std::sync::Arc<Bvh>>>> =
+    std::sync::Mutex::new(None);
+
+fn part_bvh(p: &Part) -> std::sync::Arc<Bvh> {
+    let mut tf = [0u32; 10];
+    for (i, v) in p
+        .translation
+        .iter()
+        .chain(p.rotation.iter())
+        .chain(p.scale.iter())
+        .enumerate()
+    {
+        tf[i] = v.to_bits();
+    }
+    // Freed meshes can come back at the same address: fingerprint a sample
+    // of the content too.
+    let sample = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let (nv, ni) = (p.verts.len(), p.indices.len());
+        for k in 0..64 {
+            let v = p.verts[k * nv / 64];
+            v.map(f32::to_bits).hash(&mut h);
+            p.indices[k * ni / 64].hash(&mut h);
+        }
+        h.finish()
+    };
+    let key = (
+        p.verts.as_ptr() as usize,
+        p.verts.len(),
+        p.indices.len(),
+        tf,
+        sample,
+    );
+    if let Ok(g) = BVHS.lock()
+        && let Some(b) = g.as_ref().and_then(|m| m.get(&key))
+    {
+        return b.clone();
+    }
+    let b = std::sync::Arc::new(Bvh::build(world_tris(p)));
+    // Small meshes are cheaper to rebuild than to keep.
+    if p.indices.len() >= 3 * 64
+        && let Ok(mut g) = BVHS.lock()
+    {
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() >= 512 {
+            m.clear();
+        }
+        m.insert(key, b.clone());
+    }
+    b
 }
 
 /// The `probe_ray` report.

@@ -1000,13 +1000,14 @@ pub fn delete_doc(kind: Kind, name: &str) -> Result<(), ModelerError> {
 /// opens fully evaluated.
 pub fn load_prefab(name: &str) -> Result<Model, ModelerError> {
     if let Some(m) = open_doc(name) {
-        return Ok(m);
+        return Ok((*m).clone());
     }
     load_prefab_file(name)
 }
 
-static OPEN_DOCS: std::sync::Mutex<Option<std::collections::HashMap<String, Model>>> =
-    std::sync::Mutex::new(None);
+static OPEN_DOCS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<Model>>>,
+> = std::sync::Mutex::new(None);
 
 /// Registers (or with `None` removes) a document open in the session, so
 /// prefab instances of that name resolve to the live doc before the file.
@@ -1015,7 +1016,7 @@ pub fn set_open_doc(name: &str, model: Option<Model>) {
         let map = g.get_or_insert_with(Default::default);
         match model {
             Some(m) => {
-                map.insert(name.to_string(), m);
+                map.insert(name.to_string(), std::sync::Arc::new(m));
             }
             None => {
                 map.remove(name);
@@ -1024,12 +1025,51 @@ pub fn set_open_doc(name: &str, model: Option<Model>) {
     }
 }
 
-/// The open document named `name`, if any.
-pub fn open_doc(name: &str) -> Option<Model> {
+/// The open document named `name`, if any (shared, not copied).
+pub fn open_doc(name: &str) -> Option<std::sync::Arc<Model>> {
     OPEN_DOCS
         .lock()
         .ok()
         .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
+}
+
+type InstanceCache =
+    std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, u64, std::sync::Arc<Model>)>;
+static INSTANCES: std::sync::Mutex<Option<InstanceCache>> = std::sync::Mutex::new(None);
+
+/// A prefab for reading, not editing: the open document of that name, else
+/// the catalog file derived without its undo history, cached by path and
+/// modification time (instancing, markers, lights and scene export call this
+/// for every instance on every evaluation).
+pub fn prefab_instance(name: &str) -> Result<std::sync::Arc<Model>, ModelerError> {
+    if let Some(m) = open_doc(name) {
+        return Ok(m);
+    }
+    let dir = catalog_dir()?;
+    let path = dir.join(format!("{}.json", sanitize(name)));
+    let Ok(meta) = fs::metadata(&path) else {
+        return Err(ModelerError::Io(missing_prefab(name)));
+    };
+    let stamp = (meta.modified().ok(), meta.len());
+    if let Ok(g) = INSTANCES.lock()
+        && let Some((t, l, m)) = g.as_ref().and_then(|c| c.get(&path))
+        && (*t, *l) == stamp
+    {
+        return Ok(m.clone());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| ModelerError::Io(format!("reading {}: {e}", path.display())))?;
+    let mut model: Model = serde_json::from_str(&text)
+        .map_err(|e| ModelerError::Parse(format!("parsing {}: {e}", path.display())))?;
+    model.check_format()?;
+    model.history = Default::default();
+    model.restore_parts()?;
+    let model = std::sync::Arc::new(model);
+    if let Ok(mut g) = INSTANCES.lock() {
+        g.get_or_insert_with(Default::default)
+            .insert(path, (stamp.0, stamp.1, model.clone()));
+    }
+    Ok(model)
 }
 
 /// "no prefab `x`", with the closest catalog names (an entry the name
