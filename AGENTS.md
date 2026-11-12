@@ -1394,8 +1394,11 @@ fired.
 
 ## Preview window (human side)
 
-Left/middle/right-drag = orbit/pan (pan follows the cursor, with a floor so
-large scenes stay quick to pan when zoomed in), scroll = zoom (trackpad pixel
+Left-drag = orbit, middle-drag = pan (pan follows the cursor, with a floor so
+large scenes stay quick to pan when zoomed in), right-drag = look around
+from where the camera is, and while it is held WASD fly along the view, Q / E
+down / up, Shift 4x (speed scales with the scene; S doesn't toggle the style
+pane then), scroll = zoom (trackpad pixel
 scroll is scaled to wheel lines), arrows + PageUp/Down too.
 Auto-drift stops once the human steers; a new model re-frames the camera
 around true world bounds (bounds include part transforms), while edits to

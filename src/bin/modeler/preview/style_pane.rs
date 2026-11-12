@@ -50,6 +50,7 @@ pub(crate) fn update_style_pane(
     scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<PrimaryWindow>>,
     typing: Res<PinTyping>,
+    mouse: Res<ButtonInput<MouseButton>>,
     modeler: Res<Modeler>,
     mut pane: ResMut<StylePane>,
     mut hud: Query<(&mut Visibility, &ComputedNode, &UiGlobalTransform), With<StyleHud>>,
@@ -58,7 +59,7 @@ pub(crate) fn update_style_pane(
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
-    if keys.just_pressed(KeyCode::KeyS) && !typing.open {
+    if keys.just_pressed(KeyCode::KeyS) && !typing.open && !crate::preview::camera::flying(&mouse) {
         pane.visible = !pane.visible;
     }
     let Ok((mut vis, computed, xf)) = hud.single_mut() else {

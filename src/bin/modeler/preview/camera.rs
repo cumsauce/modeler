@@ -47,7 +47,8 @@ pub(crate) struct CameraDrag {
 #[derive(Component)]
 pub(crate) struct MainCamera;
 
-/// Mouse and keyboard camera control: left-drag orbits, middle/right-drag pans,
+/// Mouse and keyboard camera control: left-drag orbits, middle-drag pans,
+/// right-drag looks around and flies with WASD / Q E (Shift faster),
 /// scroll wheel zooms, arrows/PageUp/PageDown still work. A slow auto-drift runs
 /// until the user first moves the camera themselves.
 pub(crate) fn orbit_camera(
@@ -106,7 +107,16 @@ pub(crate) fn orbit_camera(
                         orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-1.4, 1.4);
                         orbit.user = true;
                     }
-                    // Middle/right-drag pans the target in the camera's screen plane.
+                    // Right-drag looks around from where the camera is (fly
+                    // mode, with WASD below): the eye stays, the target turns.
+                    MouseButton::Right => {
+                        let eye = orbit_eye(&orbit);
+                        orbit.yaw += d.x * 0.004;
+                        orbit.pitch = (orbit.pitch + d.y * 0.004).clamp(-1.5, 1.5);
+                        orbit.target = eye - orbit_dir(&orbit) * orbit.dist;
+                        orbit.user = true;
+                    }
+                    // Middle-drag pans the target in the camera's screen plane.
                     _ => {
                         let (sin_y, cos_y) = orbit.yaw.sin_cos();
                         let (sin_p, cos_p) = orbit.pitch.sin_cos();
@@ -150,11 +160,56 @@ pub(crate) fn orbit_camera(
         orbit.pitch = (orbit.pitch - spin).max(-1.4);
         orbit.user = true;
     }
-    let (sin_y, cos_y) = orbit.yaw.sin_cos();
-    let (sin_p, cos_p) = orbit.pitch.sin_cos();
-    let eye = orbit.target + Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p) * orbit.dist;
+    // Fly: hold the right button and WASD moves along the view, Q/E down /
+    // up, Shift 4x. Speed scales with the scene (a 200 m map flies faster
+    // than a mug).
+    if mouse.pressed(MouseButton::Right) && drag.button == Some(MouseButton::Right) {
+        let f = -orbit_dir(&orbit);
+        let right = Vec3::new(orbit.yaw.sin(), 0.0, -orbit.yaw.cos());
+        let mut v = Vec3::ZERO;
+        for (k, d) in [
+            (KeyCode::KeyW, f),
+            (KeyCode::KeyS, -f),
+            (KeyCode::KeyD, right),
+            (KeyCode::KeyA, -right),
+            (KeyCode::KeyE, Vec3::Y),
+            (KeyCode::KeyQ, -Vec3::Y),
+        ] {
+            if keys.pressed(k) {
+                v += d;
+            }
+        }
+        if v != Vec3::ZERO {
+            let fast = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+                4.0
+            } else {
+                1.0
+            };
+            let speed = (orbit.scene_radius * 0.25).clamp(1.0, 40.0) * fast;
+            orbit.target += v.normalize() * speed * time.delta_secs();
+            orbit.user = true;
+        }
+    }
+    let eye = orbit_eye(&orbit);
     let Ok(mut cam) = camera.single_mut() else {
         return;
     };
     *cam = Transform::from_translation(eye).looking_at(orbit.target, Vec3::Y);
+}
+
+/// From the target toward the eye (unit).
+pub(crate) fn orbit_dir(o: &Orbit) -> Vec3 {
+    let (sin_y, cos_y) = o.yaw.sin_cos();
+    let (sin_p, cos_p) = o.pitch.sin_cos();
+    Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p)
+}
+
+pub(crate) fn orbit_eye(o: &Orbit) -> Vec3 {
+    o.target + orbit_dir(o) * o.dist
+}
+
+/// True while the right button flies the camera: single-key shortcuts
+/// (S for the style pane, ...) stand aside so WASD only moves.
+pub(crate) fn flying(mouse: &ButtonInput<MouseButton>) -> bool {
+    mouse.pressed(MouseButton::Right)
 }
