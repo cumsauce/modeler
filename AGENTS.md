@@ -143,13 +143,13 @@ type, so there is no need to memorise field names.
 | `path_array` | name, input, path, count or spacing, [smooth], [closed], [align true], [roll_step] |
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
-| `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale] |
+| `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale], [components] |
 | `hide_part` / `show_part` | part (`*` matches anything: `"cut*"` hides every cutter, `"*_raw"` every raw blank) |
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
-| `marker` | name, kind, [translation], [yaw], [size], [data], [attach] |
+| `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [components] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
 | `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
@@ -925,6 +925,32 @@ lights only (studio off, faint environment) to judge how the level is lit.
 
   Markers the same way: read `extras.marker` and spawn your own
   components at the node's `Transform`.
+
+**Level scenes (`.bsn`):** a map document (terrain, roads, `prefab`
+instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
+(`src/scene.rs`), in jackdaw's BSN format (Bevy 0.20 syntax), which
+`jackdaw_runtime`'s `JackdawSceneRoot` spawns:
+
+- every `prefab` item is an entity with a `GltfSource` pointing at
+  `models/prefabs/<prefab>.gltf`, exported once (`optimize: "game"`) and
+  again only when the prefab file is newer: instances by reference, not
+  baked copies;
+- every `marker` is an entity at its spot (yaw as rotation);
+- the document's own visible parts (ground, roads) become one glTF beside
+  the scene and one `<stem>_ground` entity;
+- each `terrain` writes `<stem>.<terrain>.heights` (magic `MHT1`; u32 nx, nz;
+  f32 x0, z0, cell, h_min, h_max; nx*nz u16 heights, row-major by z; nx*nz
+  u8 mask, bit 0 path, bit 1 pad), so the game reads ground height without
+  the scene (`scene::read_heights`).
+- Entities are sorted by name with stable `SceneNodeId`s (a hash of scene
+  and name), so re-exports diff cleanly.
+- **Components**: `prefab` and `marker` items take `components:
+  {"Place": {"name": "wendys"}}`, checked when applied against the game's
+  vocabulary `.modeler/components.json`: `{"header": ["// ..."],
+  "components": {"Place": {"type": "my_game::places::Place", "fields":
+  {"name": "string"}, "doc": "..."}}}` (field types string, f32, i32, u32,
+  bool, vec2, vec3; omitted fields keep the component default). `header`
+  lines open every scene file (a project's required comment).
 
 **Skeletons and animation:** Rig a model after its shape and materials are done: shape, then materials,
 then the rig. Rig items are `apply_ops` items like any other (upserts,

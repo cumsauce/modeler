@@ -2081,6 +2081,11 @@ pub struct PrefabSpec {
     #[serde(default)]
     #[schemars(with = "Option<serde_json::Value>")]
     style: Option<serde_json::Value>,
+    /// Game components from the project's vocabulary (.modeler/components.json):
+    /// {"Place": {"name": "wendys"}}. Written by a .bsn scene export.
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    components: serde_json::Map<String, Value>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2158,6 +2163,11 @@ pub struct MarkerSpec {
     /// A part the marker rides with through moves and places.
     #[serde(default)]
     attach: Option<String>,
+    /// Game components from the project's vocabulary (.modeler/components.json):
+    /// {"Place": {"name": "wendys"}}. Written by a .bsn scene export.
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    components: serde_json::Map<String, Value>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3592,6 +3602,11 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 size: s.size,
                 data: s.data,
                 attach: s.attach,
+                components: {
+                    crate::scene::check_components(&s.components)
+                        .map_err(|e| format!("{ctx}: {e}"))?;
+                    s.components
+                },
             })
         }
         "light" => {
@@ -3844,6 +3859,11 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     }
                 },
                 restyle: None,
+                components: {
+                    crate::scene::check_components(&s.components)
+                        .map_err(|e| format!("{ctx}: {e}"))?;
+                    s.components
+                },
             })
         }
         other => {

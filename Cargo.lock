@@ -3225,6 +3225,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
+name = "jackdaw_bsn"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edefe90f16cdc66e5eea768bc2c5768dc84411d29b61b03906047b6279c55194"
+dependencies = [
+ "bevy",
+ "bevy_reflect",
+ "log",
+ "nom",
+ "path-slash",
+ "pathdiff",
+ "serde",
+ "smol_str",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3575,6 +3592,7 @@ dependencies = [
  "base64 0.22.1",
  "bevy",
  "gltf",
+ "jackdaw_bsn",
  "ktx2",
  "libc",
  "manifold-csg",
@@ -4207,6 +4225,18 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "path-slash"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e91099d4268b0e11973f036e885d652fb0b21fedcf69738c627f94db6a44f42"
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "percent-encoding"

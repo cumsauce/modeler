@@ -359,6 +359,7 @@ mod tests {
             digest: 0,
             style: None,
             restyle: None,
+            components: Default::default(),
         });
         let p = Part {
             name: "lamp1.pole".into(),

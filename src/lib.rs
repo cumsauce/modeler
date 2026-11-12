@@ -86,6 +86,7 @@ pub mod params;
 pub mod primitives;
 pub mod raster;
 pub mod scatter;
+pub mod scene;
 pub mod sdf;
 pub mod simplify;
 pub mod smooth;
@@ -1220,6 +1221,10 @@ pub enum Op {
         data: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach: Option<String>,
+        /// Game components from the project's vocabulary (`components.json`),
+        /// written on this entity by a `.bsn` scene export.
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        components: serde_json::Map<String, serde_json::Value>,
     },
     /// A skeleton: bones with world-aligned rest frames (see `crate::anim`).
     /// Writes no part.
@@ -1356,6 +1361,10 @@ pub enum Op {
         /// `style` by the session, so evaluation needs no scene context).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restyle: Option<crate::style::Style>,
+        /// Game components from the project's vocabulary (`components.json`),
+        /// written on this entity by a `.bsn` scene export.
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        components: serde_json::Map<String, serde_json::Value>,
     },
 }
 

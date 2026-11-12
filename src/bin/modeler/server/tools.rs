@@ -596,7 +596,11 @@ Style::default()
     /// "merge_keep": ["door*"]}` for one draw call per material,
     /// `{"emissive_strength": 4}` for bloom, `{"lods": [0.5, 0.2]}` for
     /// simplified `<part>.lod1/.lod2` nodes with distance ranges in extras.lod.
-    /// The result reports before -> after.
+    /// The result reports before -> after. A path ending in `.bsn` writes a
+    /// level scene (jackdaw's format): prefab instances by reference (each
+    /// prefab exported once to models/prefabs/), markers, the document's own
+    /// geometry as one glTF, a heights file per terrain, and `components`
+    /// from the project's .modeler/components.json vocabulary.
     #[tool]
     async fn export_model(
         &self,
@@ -612,6 +616,7 @@ Style::default()
                 .and_then(|e| e.to_str())
             {
                 Some("glb") => "glb".into(),
+                Some("bsn") => "bsn".into(),
                 _ => "gltf".into(),
             }
         });
@@ -628,12 +633,20 @@ Style::default()
                 &optimize.clone().unwrap_or(serde_json::Value::Null),
             )?;
             let report = match format.as_str() {
+                "bsn" => {
+                    let mut so = modeler::scene::SceneOptions::default();
+                    if optimize.is_some() {
+                        so.optimize = opts;
+                    }
+                    modeler::scene::export_scene(&s.model, &path, &so)?
+                }
                 "glb" => gltf::export_glb_with(&s.model, &path, &opts)?,
                 "gltf" => gltf::export_gltf_with(&s.model, &path, &opts)?,
                 other => {
-                    return Err(
-                        format!("unknown format `{other}` (use \"gltf\" or \"glb\")").into(),
-                    );
+                    return Err(format!(
+                        "unknown format `{other}` (use \"gltf\", \"glb\" or \"bsn\")"
+                    )
+                    .into());
                 }
             };
             Ok(format!(

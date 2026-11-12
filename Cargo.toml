@@ -44,6 +44,7 @@ winit = { version = "0.30", default-features = false, features = ["wayland-dlope
 [dev-dependencies]
 gltf = "1"
 ktx2 = "0.5"
+jackdaw_bsn = "0.20.2"
 
 [lints.clippy]
 unwrap_used = "deny"

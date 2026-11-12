@@ -79,6 +79,7 @@ fn unmoved_markers(
                 size,
                 data,
                 attach,
+                ..
             } => out.push((
                 Marker {
                     name: name.clone(),
