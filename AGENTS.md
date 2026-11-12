@@ -1114,8 +1114,9 @@ the same model keep a camera the human steered.
 Layout (`ui::apply_layout`; the 3D camera renders to an image the size of
 what is left (`View3d`), shown by a UI node, so `screenshot` never includes a
 pane and screen-space reflections line up: a camera viewport inside the
-window misplaced them), every pane open by default
-(`MODELER_OUTLINE=0` / `MODELER_STYLE=0` / `MODELER_MATERIALS=0` close one):
+window misplaced them). Every pane starts closed, just the 3D view
+(`MODELER_OUTLINE=1` / `MODELER_STYLE=1` / `MODELER_MATERIALS=1` open one at
+start; the keys toggle them):
 
 - **O**, the outliner, top of the left column (40%, `PANE_FRACTION`): files
   first (`outline::build_files`): the active document (expanded into its
@@ -1130,6 +1131,18 @@ window misplaced them), every pane open by default
 - **S**, the style pane, under the outliner (`preview/style_pane.rs`): the
   model's tokens, read-only: the brief, colour chips with hex, material
   presets, numbers and defaults. It follows every `style` call.
+- **G**, the grid (`preview/grid.rs`, `MODELER_GRID=1` at start): every
+  open document (up to 9) side by side in the 3D area, so a human can watch
+  several agents build at once. Each tile is labelled with the document,
+  its visible part count, the agent that made its latest step (`by
+  <client>`) and when it last changed; "(active)" marks the active one.
+  Click a tile to switch to that document and leave the grid. Cheap by
+  design: each tile is its own camera on its own render layer rendering
+  into its own image, active only for a few frames after its document
+  changes (or the tile resizes), so an idle grid renders no 3D at all; the
+  window camera (TAA + SSR) pauses while the grid is up, tile cameras skip
+  SSR / TAA / SSAO and shadows, and the app loop drops to ~30 fps. A
+  `screenshot` in the grid captures the window (tiles and labels).
 - **M**, the material strip along the bottom under both: the active
   material's graph by dependency level with a live thumbnail per node, a lit
   sphere and the channels; clicking a node shows its output large (click
@@ -1141,7 +1154,7 @@ outliner row (a group comments on all its parts) or a material node / the
 preview sphere; Enter commits, Esc cancels. The UI uses Bevy Feathers
 (`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close
 button, and a toolbar at the 3D view's top right whose Outliner / Style /
-Material toggles match O, S and M.
+Material / Grid toggles match O, S, M and G.
 
 ## Dev notes / gotchas
 

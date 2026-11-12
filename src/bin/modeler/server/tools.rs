@@ -761,7 +761,9 @@ Style::default()
 
     /// Grab the current preview render as a PNG image so you can see the model.
     /// With no window (--offscreen) it renders the same camera (set_camera
-    /// and auto-framing steer it) offscreen; fails in --headless mode.
+    /// and auto-framing steer it) offscreen; fails in --headless mode. When
+    /// the human has the grid view (G) up, it captures that window: every
+    /// open document's tile.
     #[tool]
     async fn screenshot(&self) -> Result<CallToolResult, ErrorData> {
         self.grab_screenshot().await

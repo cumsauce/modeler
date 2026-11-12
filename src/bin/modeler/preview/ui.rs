@@ -142,10 +142,18 @@ pub(crate) enum PaneToggle {
     Style,
     Material,
     Outline,
+    Grid,
 }
 
-fn toggle(which: PaneToggle, style: &mut StylePane, mat: &mut MatPane, outline: &mut OutlinePane) {
+fn toggle(
+    which: PaneToggle,
+    style: &mut StylePane,
+    mat: &mut MatPane,
+    outline: &mut OutlinePane,
+    grid: &mut Grid,
+) {
     match which {
+        PaneToggle::Grid => grid.on = !grid.on,
         PaneToggle::Outline => outline.visible = !outline.visible,
         PaneToggle::Style => style.visible = !style.visible,
         PaneToggle::Material => mat.visible = !mat.visible,
@@ -158,9 +166,10 @@ fn on_toggle(
     mut style: ResMut<StylePane>,
     mut mat: ResMut<MatPane>,
     mut outline: ResMut<OutlinePane>,
+    mut grid: ResMut<Grid>,
 ) {
     if let Ok(w) = which.get(activate.event_target()) {
-        toggle(*w, &mut style, &mut mat, &mut outline);
+        toggle(*w, &mut style, &mut mat, &mut outline, &mut grid);
     }
 }
 
@@ -242,6 +251,7 @@ pub(crate) fn setup_toolbar(mut commands: Commands) {
         (PaneToggle::Outline, "Outliner  O"),
         (PaneToggle::Style, "Style  S"),
         (PaneToggle::Material, "Material  M"),
+        (PaneToggle::Grid, "Grid  G"),
     ] {
         commands
             .spawn_scene(bsn! {
@@ -264,6 +274,7 @@ pub(crate) fn sync_toolbar(
     style: Res<StylePane>,
     mat: Res<MatPane>,
     outline: Res<OutlinePane>,
+    grid: Res<Grid>,
     mut buttons: Query<(&PaneToggle, &mut ButtonVariant), With<ToolbarToggle>>,
 ) {
     for (which, mut variant) in &mut buttons {
@@ -271,6 +282,7 @@ pub(crate) fn sync_toolbar(
             PaneToggle::Style => style.visible,
             PaneToggle::Material => mat.visible,
             PaneToggle::Outline => outline.visible,
+            PaneToggle::Grid => grid.on,
         };
         let want = ButtonVariant::selected(open);
         if *variant != want {
@@ -292,13 +304,23 @@ pub(crate) fn sync_doc_tabs(
     mut commands: Commands,
     modeler: Res<Modeler>,
     view: Option<Res<View3d>>,
+    grid: Option<Res<Grid>>,
     mut bars: Query<(Entity, &mut Node), With<DocTabs>>,
     mut shown: Local<Vec<String>>,
 ) {
     let left = view.map(|v| v.rect.min.x + 8.0).unwrap_or(8.0);
+    // The grid labels every document itself.
+    let display = if grid.is_some_and(|g| g.on) {
+        Display::None
+    } else {
+        Display::Flex
+    };
     for (_, mut node) in &mut bars {
         if node.left != Val::Px(left) {
             node.left = Val::Px(left);
+        }
+        if node.display != display {
+            node.display = display;
         }
     }
     let names = modeler.session.doc_names();

@@ -233,16 +233,20 @@ fn main() -> AppExit {
     .insert_resource(Orbit::default())
     .init_resource::<CameraDrag>()
     .insert_resource(StylePane::open(
-        std::env::var("MODELER_STYLE").map_or(true, |v| v != "0"),
+        std::env::var("MODELER_STYLE").is_ok_and(|v| v == "1"),
     ))
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
-    // The outliner and material strip are open unless set to 0.
+    // Every pane starts closed (just the 3D view) unless set to 1; O, S, M
+    // and G (the grid of open documents) toggle them.
     .insert_resource(MatPane::open(
-        std::env::var("MODELER_MATERIALS").map_or(true, |v| v != "0"),
+        std::env::var("MODELER_MATERIALS").is_ok_and(|v| v == "1"),
     ))
     .insert_resource(OutlinePane::open(
-        std::env::var("MODELER_OUTLINE").map_or(true, |v| v != "0"),
+        std::env::var("MODELER_OUTLINE").is_ok_and(|v| v == "1"),
+    ))
+    .insert_resource(Grid::open(
+        std::env::var("MODELER_GRID").is_ok_and(|v| v == "1"),
     ))
     .init_resource::<PinTyping>()
     .init_resource::<CommentBox>()
@@ -256,8 +260,8 @@ fn main() -> AppExit {
             take_screenshot.run_if(windowed),
             rebuild_scene.run_if(windowed),
             draw_game_gizmos.run_if(windowed),
-            orbit_camera.run_if(windowed),
-            pin_on_click.run_if(windowed),
+            orbit_camera.run_if(windowed).run_if(grid_off),
+            pin_on_click.run_if(windowed).run_if(grid_off),
             spawn_pin_markers.run_if(windowed),
             comment_box.run_if(windowed),
             update_typing_hud.run_if(windowed),
@@ -319,6 +323,10 @@ fn main() -> AppExit {
                 (setup_toolbar, setup_outline_pane, setup_style_pane),
             )
             .add_systems(Update, (sync_toolbar, sync_doc_tabs))
+            .add_systems(
+                Update,
+                (toggle_grid_key, update_grid.after(apply_layout)).run_if(windowed),
+            )
             .add_systems(Update, (process_agent_shot.run_if(windowed),));
     }
     // Catch a main-thread panic so the exit line and lock cleanup still run.

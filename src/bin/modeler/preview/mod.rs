@@ -20,5 +20,7 @@ mod style_pane;
 pub(crate) use style_pane::*;
 mod picking;
 pub(crate) use picking::*;
+mod grid;
+pub(crate) use grid::*;
 mod ui;
 pub(crate) use ui::*;

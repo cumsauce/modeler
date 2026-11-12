@@ -55,6 +55,10 @@ Point your agent's MCP config at the `modeler` binary
 
 ## Preview window controls
 
-Mouse drag orbits / pans, scroll zooms, `G` toggles the graph + history
-panel, `M` the material pane (the active material's nodes with live
-thumbnails and a lit preview), click a part then type to annotate (Enter commits, Esc cancels).
+The window opens on just the 3D view. Mouse drag orbits / pans, scroll
+zooms; `O` toggles the outliner, `S` the style pane, `M` the material pane
+(the active material's nodes with live thumbnails and a lit preview), and
+`G` the grid: every open document side by side, labelled with the agent
+that last changed it, so you can watch several agents at once (click a
+tile to switch to it). Click a part then type to annotate (Enter commits,
+Esc cancels).
