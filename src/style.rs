@@ -474,6 +474,10 @@ pub fn expand(raw: &Value, style: &Style) -> Result<Value, String> {
         if ty == "prefab" {
             return Ok(v);
         }
+        // A terrain's `style` is its shape (hills / ridges / dunes / ...).
+        if ty == "terrain" && m.get("style").is_some_and(|s| s.is_string()) {
+            return Ok(v);
+        }
         if let Some(name) = m.remove("style") {
             let name = name
                 .as_str()
@@ -521,6 +525,12 @@ pub fn expand(raw: &Value, style: &Style) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_terrain_keeps_its_own_style_under_a_scene_style() {
+        let item = json!({"type": "terrain", "name": "g", "style": "flat"});
+        assert_eq!(expand(&item, &toy()), Ok(item));
+    }
 
     fn toy() -> Style {
         let mut s = Style::default();
