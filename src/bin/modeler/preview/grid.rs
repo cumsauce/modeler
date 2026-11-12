@@ -367,6 +367,9 @@ pub(crate) fn update_grid(
                             is_active: true,
                             ..default()
                         },
+                        // Deferred lighting needs the depth prepass too:
+                        // without it tiles shaded flat and washed out.
+                        bevy::core_pipeline::prepass::DepthPrepass,
                         bevy::core_pipeline::prepass::DeferredPrepass,
                         Msaa::Off,
                         env.clone(),
@@ -379,19 +382,32 @@ pub(crate) fn update_grid(
                     ))
                     .insert(RenderTarget::Image(image.clone().into()))
                     .with_children(|c| {
+                        // The window's lights: the shadowed sun (fixed in the
+                        // world; the tile view is fixed, so a constant local
+                        // rotation keeps it there) and the view fill.
+                        let view = Transform::default()
+                            .looking_to(
+                                -(Quat::from_euler(EulerRot::YXZ, 0.62, -0.42, 0.0) * Vec3::Z),
+                                Vec3::Y,
+                            )
+                            .rotation;
+                        let sun = Quat::from_euler(EulerRot::XYZ, -0.9, 0.5, 0.0);
                         c.spawn((
                             DirectionalLight {
-                                illuminance: 6000.0,
-                                shadow_maps_enabled: false,
+                                illuminance: 8000.0,
+                                shadow_maps_enabled: true,
                                 ..default()
                             },
                             RenderLayers::layer(layer),
-                            Transform::from_rotation(Quat::from_euler(
-                                EulerRot::YXZ,
-                                0.5,
-                                -0.6,
-                                0.0,
-                            )),
+                            Transform::from_rotation(view.inverse() * sun),
+                        ));
+                        c.spawn((
+                            DirectionalLight {
+                                illuminance: 500.0,
+                                ..default()
+                            },
+                            RenderLayers::layer(layer),
+                            Transform::default(),
                         ));
                     })
                     .id();
