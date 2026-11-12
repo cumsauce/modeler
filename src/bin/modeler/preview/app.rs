@@ -265,11 +265,12 @@ pub(crate) fn rebuild_scene(
             .model
             .parts
             .iter()
-            .filter(|p| p.visible && !p.verts.is_empty())
+            .filter(|p| !p.verts.is_empty() && drawn(&modeler.session.model, p))
             .map(|p| &**p),
     );
     for part in &modeler.session.model.parts {
-        if part.verts.is_empty() || part.indices.is_empty() || !part.visible {
+        if part.verts.is_empty() || part.indices.is_empty() || !drawn(&modeler.session.model, part)
+        {
             continue;
         }
         commands.spawn((
@@ -759,4 +760,16 @@ pub(crate) fn draw_game_gizmos(
             color,
         );
     }
+}
+
+/// Whether the window (and the grid) draws a part: every visible part, and
+/// a hidden terrain too. A map hides its ground so the export leaves it to
+/// the game (which builds it from the heights file), but without it the
+/// window showed only marker gizmos over empty space.
+pub(crate) fn drawn(model: &modeler::Model, part: &modeler::Part) -> bool {
+    part.visible
+        || model
+            .ops
+            .iter()
+            .any(|o| matches!(o, modeler::Op::Terrain { name, .. } if *name == part.name))
 }

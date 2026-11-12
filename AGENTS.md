@@ -965,6 +965,10 @@ instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
   exist; omitted fields keep the component default; a component with no
   `fields` is a marker component, written as `{}`). `header` lines open
   every scene file (a project's required comment).
+- A map may hide its `terrain` so the export leaves the ground to the
+  game (built from the heights file); the window and grid still draw a
+  hidden terrain, so the map isn't only marker gizmos over empty space.
+  Agent views, verify and exports leave it out as usual.
 - **Plain data**: `<stem>.map.json` beside the scene holds the same
   entities (`scene::MapFile`): name, marker `kind` and `size`,
   `translation`, `rotation` (quaternion), `yaw` (degrees, 0 = +z),

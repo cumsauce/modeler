@@ -549,7 +549,11 @@ pub(crate) fn update_grid(
                 .parts
                 .iter()
                 .map(|p| &**p)
-                .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
+                .filter(|p| {
+                    !p.verts.is_empty()
+                        && !p.indices.is_empty()
+                        && crate::preview::app::drawn(model, p)
+                })
                 .collect();
             modeler::material::pbr::prebake(visible.iter().copied());
             tile.parts_n = visible.len();

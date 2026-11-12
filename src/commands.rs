@@ -1731,6 +1731,8 @@ impl Session {
         if let Err(e) = r {
             eprintln!("deriving `{}`: {e}", self.model.name);
         }
+        // Panes that drew the bare document redraw.
+        self.model.version += 1;
     }
 
     /// Open documents: `list`, `open` (an open doc, the catalog entry, or a
