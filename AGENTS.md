@@ -27,10 +27,18 @@ first use, detached, so it outlives the sessions). The `mcp__modeler__*`
 tools and the driver below therefore talk to the same server and the same
 preview window. Each session is its own client (per-client active
 documents, authorship, undo guards). Closing the window ends the server;
-the next call restarts it from autosave. The shared library uses
-`/tmp/modeler-mcp.sock`; a game project gets its own daemon and socket
-(`/tmp/modeler-mcp-<hash>.sock`, server working in that project), since a
-server works in one project at a time. After `cargo build`, restart the
+the next call restarts it from autosave. **Every project shares that one
+daemon** (`/tmp/modeler-mcp.sock`): each session's proxy names its project
+(the game project its working directory is in, or none for the shared
+library) in every call's `_meta` (`modeler/project`), and the server
+switches the catalog, exports and prefab lookups to it for that call
+(`catalog::set_call_project`; autosaves and the session lock stay in the
+server's own home library). Documents remember their project
+(`Model.project`, autosave only), a document of the same name from another
+project is refused rather than taken over, and `new_model` starts a
+document beside another agent's (or another project's) instead of
+replacing it. A new agent's first call brings the window to the front.
+After `cargo build`, restart the
 server with `pkill -f target/debug/modeler` (the daemon respawns it on the
 next call) or stop everything with a `quit` call.
 
@@ -1094,8 +1102,10 @@ re-derives it with the scene's tokens layered over its own (scene wins;
 re-themes with `style set` on the scene); an object patches tokens for that
 instance (`{"colors": {"primary": "#c33"}}`, a red-alert variant). Only
 items that read tokens (`@color`, presets) follow. The inactive docs
-autosave to `open_docs.json` and come back with `--restore`; the preview window
-shows tabs for open docs (click to switch).
+autosave to `open_docs.json`; on `--restore` only **unsaved** documents come
+back (`Session::close_saved_documents`): one that matches its catalog file
+stays closed and reopens from the catalog on demand. The window's outliner
+lists the open documents (click to switch).
 
 Saved documents nobody has touched for 20 minutes are **closed
 automatically** (`IDLE_CLOSE`): only when unchanged since they were saved or
@@ -1374,14 +1384,18 @@ the same model keep a camera the human steered.
 Layout (`ui::apply_layout`; the 3D camera renders to an image the size of
 what is left (`View3d`), shown by a UI node, so `screenshot` never includes a
 pane and screen-space reflections line up: a camera viewport inside the
-window misplaced them). Every pane starts closed, just the 3D view
-(`MODELER_OUTLINE=1` / `MODELER_STYLE=1` / `MODELER_MATERIALS=1` open one at
-start; the keys toggle them):
+window misplaced them). The outliner and the grid start open, the style
+and material panes closed (`MODELER_OUTLINE=0` / `MODELER_STYLE=1` /
+`MODELER_MATERIALS=1` change that at start; the keys toggle them):
 
-- **O**, the outliner, top of the left column (40%, `PANE_FRACTION`): files
-  first (`outline::build_files`): the active document (expanded into its
-  part tree), the other open documents (click to switch) and a `library`
-  group of catalog prefabs not open (click to open). Inside the document
+- **O**, the outliner, the document list down the left column (40%,
+  `PANE_FRACTION`; there is no tab strip): files first
+  (`outline::build_files`): every open document, grouped by project when
+  more than one project has documents open (named after the git repo,
+  `friendSLOP/crates/game`), each saying who made its latest step; the
+  active one expanded into its part tree; click another to switch. Then a
+  `library` group of the active project's catalog prefabs not open (click
+  to open). Inside the document
   the scene is a hierarchy (`src/outline.rs`): prefab instances and array
   runs fold into expandable groups (an instance row says `prefab <name>`
   and its `open` button opens the source), hidden parts (cutters, blanks,
@@ -1398,9 +1412,7 @@ start; the keys toggle them):
   often it changes, one not shown takes the front slot when it changes and
   the stalest tile drops off; a line says how many more are open. The
   window's own scene is not rebuilt while the grid covers it (parallel
-  agents switch the active document on nearly every call). The tab strip
-  (grid off) follows the same order, as many tabs as fit, then `+N more`
-  (opens the grid). Each tile is labelled with the document,
+  agents switch the active document on nearly every call). Each tile is labelled with the document,
   its visible part count, the agent that made its latest step (`by
   <client>`) and when it last changed; "(active)" marks the active one.
   Click a tile to switch to that document and leave the grid. Cheap by

@@ -181,9 +181,19 @@ fn main() -> AppExit {
             .into_iter()
             .filter(|m| m.name != active)
             .collect();
+        // Only unsaved work comes back: documents that match their
+        // catalog file stay closed (they reopen from the catalog).
+        let closed = session.close_saved_documents();
+        if !closed.is_empty() {
+            eprintln!(
+                "left {} saved document(s) closed: {}",
+                closed.len(),
+                closed.join(", ")
+            );
+        }
         session.register_docs();
         if !session.others.is_empty() {
-            eprintln!("restored {} other open document(s)", session.others.len());
+            eprintln!("restored {} unsaved open document(s)", session.others.len());
         }
         session.materials = modeler::material::Library::restore();
         if !session.materials.docs.is_empty() {
@@ -252,13 +262,15 @@ fn main() -> AppExit {
     ))
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
-    // Every pane starts closed unless set to 1; O, S, M and G (the grid of
-    // open documents, open by default) toggle them.
+    // The style and material panes start closed unless set to 1; O, S, M
+    // and G (the grid of open documents) toggle them.
     .insert_resource(MatPane::open(
         std::env::var("MODELER_MATERIALS").is_ok_and(|v| v == "1"),
     ))
+    // The outliner is the document list (grouped by project): open by
+    // default in the window, MODELER_OUTLINE=0 starts without.
     .insert_resource(OutlinePane::open(
-        std::env::var("MODELER_OUTLINE").is_ok_and(|v| v == "1"),
+        !offscreen && std::env::var("MODELER_OUTLINE").map_or(true, |v| v != "0"),
     ))
     // The grid is the default view in the window (not offscreen, where
     // `screenshot` renders the window camera); MODELER_GRID=0 starts without.
@@ -348,7 +360,7 @@ fn main() -> AppExit {
                 Startup,
                 (setup_toolbar, setup_outline_pane, setup_style_pane),
             )
-            .add_systems(Update, (sync_toolbar, sync_doc_tabs))
+            .add_systems(Update, (sync_toolbar, focus_on_new_agent))
             .add_systems(
                 Update,
                 (toggle_grid_key, update_grid.after(apply_layout)).run_if(windowed),

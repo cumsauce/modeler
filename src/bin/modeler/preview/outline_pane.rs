@@ -127,14 +127,27 @@ pub(crate) fn update_outline_pane(
         .as_ref()
         .is_none_or(|s| s.0 != model.version || s.2 != want.2)
     {
-        let library: Vec<String> = modeler::catalog::list()
-            .map(|es| es.into_iter().map(|e| e.name).collect())
-            .unwrap_or_default();
+        let library: Vec<String> =
+            modeler::catalog::with_project(model.project.clone(), modeler::catalog::list)
+                .map(|es| es.into_iter().map(|e| e.name).collect())
+                .unwrap_or_default();
         let others: Vec<&modeler::Model> = session.others.iter().collect();
         pane.tree = outline::build_files(model, &others, &library);
         let key = format!("doc:{}", model.name);
         if pane.auto_opened.insert(key.clone()) {
             pane.expanded.insert(key);
+        }
+        // Project groups start open.
+        let groups: Vec<String> = pane
+            .tree
+            .iter()
+            .filter(|r| r.key.starts_with("project:"))
+            .map(|r| r.key.clone())
+            .collect();
+        for g in groups {
+            if pane.auto_opened.insert(g.clone()) {
+                pane.expanded.insert(g);
+            }
         }
         // Keep the selection on the same row if it still exists.
         let keys: Vec<(String, Vec<String>)> = outline::flatten(&pane.tree, &|_| true)
@@ -325,7 +338,15 @@ fn on_row_click(
         && chevrons.get(target).is_err()
     {
         let s = &mut modeler.session;
-        match s.scene("open", Some(&doc)) {
+        // An open document switches (in its own project); a catalog entry
+        // opens from the active document's project.
+        let opened = if s.others.iter().any(|m| m.name == doc) {
+            s.scene("open", Some(&doc))
+        } else {
+            let p = s.model.project.clone();
+            modeler::catalog::with_project(p, || s.scene("open", Some(&doc)))
+        };
+        match opened {
             Ok(_) => s.mark_autosave(true, true, false),
             Err(e) => eprintln!("opening `{doc}`: {e}"),
         }

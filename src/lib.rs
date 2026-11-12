@@ -250,6 +250,11 @@ pub struct Model {
     /// it existed read as 0 and load unchanged.
     #[serde(default)]
     pub format_version: u32,
+    /// The game project this document belongs to (None: the shared
+    /// library), set by the server from the calls that work in it. Only the
+    /// session autosave keeps it; prefab files never do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<std::path::PathBuf>,
     pub name: String,
     /// Shared so history snapshots reuse unchanged parts instead of cloning
     /// their meshes; mutate through `Arc::make_mut` (copy-on-write).
@@ -322,6 +327,7 @@ impl Model {
             templates: self.templates.clone(),
             style: self.style.clone(),
             derived_from_ops: self.derived_from_ops,
+            project: None,
         }
     }
 

@@ -1597,10 +1597,14 @@ impl rmcp::ServerHandler for Tools {
                 .and_then(|v| v.as_str().map(String::from))
         };
         let (client, pin) = (meta("modeler/client"), meta("modeler/doc"));
+        // The caller's game project ("" = the shared library): one server
+        // serves every project, switching per call.
+        let project =
+            meta("modeler/project").map(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
         let note = match &client {
             Some(c) => {
                 let (c, pin) = (c.clone(), pin.clone());
-                self.exec(move |s| s.begin_call(Some(&c), pin.as_deref()))
+                self.exec(move |s| s.begin_call(Some(&c), pin.as_deref(), project))
                     .await
                     .flatten()
             }

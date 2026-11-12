@@ -10,9 +10,9 @@ Claude session):
         session's proxy shares that one daemon, so there is one modeler server
         and one preview window however many sessions are open. Closing the
         window ends the server; the next call restarts it from autosave.
-        The socket is /tmp/modeler-mcp.sock for the shared library and one
-        per game project (/tmp/modeler-mcp-<hash>.sock, with the server
-        working in that project), the same default --daemon and --connect use.
+        The socket is /tmp/modeler-mcp.sock for every project: each call
+        names the caller's project (`_meta` "modeler/project") and the server
+        works in it for that call, so one window shows all the work.
 
 Daemon (keeps ONE modeler process — and its preview window — alive across
 many driver invocations):
@@ -398,7 +398,7 @@ def daemon_mode(socket_path, mode):
 
     def serve(conn):
         shots = ShotNamer()  # one --save-shot counter per client run
-        client, pin, pending_note = None, None, None
+        client, pin, project, pending_note = None, None, None, None
         with conn:
             f = conn.makefile("r")
             for line in f:
@@ -409,7 +409,7 @@ def daemon_mode(socket_path, mode):
                     c = json.loads(line)
                     if isinstance(c, dict) and "hello" in c:
                         h = c["hello"]
-                        client, pin = h.get("client"), h.get("doc")
+                        client, pin, project = h.get("client"), h.get("doc"), h.get("project")
                         with lock:
                             session = state["session"]
                             if session.slot_note and (client, session.proc.pid) not in told_slot:
@@ -445,6 +445,8 @@ def daemon_mode(socket_path, mode):
                                     params = dict(params or {})
                                     m = dict(params.get("_meta") or {})
                                     m.setdefault("modeler/client", client)
+                                    if project is not None:
+                                        m.setdefault("modeler/project", project)
                                     params["_meta"] = m
                                 out = session.raw(req.get("method"), params)
                         if pending_note:
@@ -462,6 +464,8 @@ def daemon_mode(socket_path, mode):
                         meta["modeler/client"] = client
                     if pin:
                         meta["modeler/doc"] = pin
+                    if project is not None:
+                        meta["modeler/project"] = project
                     with lock:
                         session, note = live_session()
                         out = session.call(c["name"], c.get("args", {}),
@@ -517,13 +521,15 @@ def find_project(start):
 
 
 def default_socket(cwd=None):
-    """One shared daemon per library: SOCKET for the shared library, one
-    socket per game project (a server works in one project at a time)."""
-    root = find_project(cwd or os.getcwd())
-    if not root:
-        return SOCKET
-    import hashlib
-    return f"/tmp/modeler-mcp-{hashlib.sha1(root.encode()).hexdigest()[:8]}.sock"
+    """The one shared daemon: a single server (and preview window) serves
+    every project, switching to each caller's project per call."""
+    return SOCKET
+
+
+def project_of(cwd=None):
+    """The caller's project for `_meta` "modeler/project": its path, or ""
+    for the shared library."""
+    return find_project(cwd or os.getcwd()) or ""
 
 
 def ensure_daemon(socket_path, mode="windowed", wait=90):
@@ -540,17 +546,17 @@ def ensure_daemon(socket_path, mode="windowed", wait=90):
     s = connect()
     if s:
         return s
-    root = find_project(os.getcwd())
+    # The server's own home is the shared library: each call names the
+    # caller's project (`_meta` "modeler/project").
     env = dict(os.environ)
-    if root:
-        env["MODELER_PROJECT"] = root
+    env.pop("MODELER_PROJECT", None)
     cmd = [sys.executable, os.path.abspath(__file__), "--daemon", "--socket", socket_path]
     if mode == "windowed":
         cmd.append("--windowed")
     elif mode == "headless":
         cmd.append("--headless")
     # A racing second proxy starts one too: claim_socket makes it exit.
-    subprocess.Popen(cmd, cwd=root or os.path.expanduser("~"), env=env,
+    subprocess.Popen(cmd, cwd=os.path.expanduser("~"), env=env,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
     deadline = time.time() + wait
@@ -575,7 +581,8 @@ def proxy_mode(socket_path, mode):
     def link():
         s = ensure_daemon(socket_path, mode)
         conn["s"], conn["f"] = s, s.makefile("r")
-        s.sendall((json.dumps({"hello": {"client": client}}) + "\n").encode())
+        s.sendall((json.dumps({"hello": {"client": client, "project": project_of()}})
+                   + "\n").encode())
 
     def ask(payload):
         for attempt in (0, 1):  # the daemon was stopped: start it again once
@@ -647,7 +654,7 @@ def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, js
         sys.exit(1)
     with s:
         f = s.makefile("r")
-        hello = {"client": client_identity()}
+        hello = {"client": client_identity(), "project": project_of()}
         if "--doc" in sys.argv:
             hello["doc"] = sys.argv[sys.argv.index("--doc") + 1]
         s.sendall((json.dumps({"hello": hello}) + "\n").encode())

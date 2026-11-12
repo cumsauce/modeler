@@ -46,6 +46,17 @@ pub fn catalog_dir() -> Result<PathBuf, ModelerError> {
 /// `<data>/friendslop/modeler/<kind>`. `FRIENDSLOP_DATA_DIR` overrides both
 /// (tests).
 pub fn kind_dir(kind: Kind) -> Result<PathBuf, ModelerError> {
+    kind_dir_for(kind, project_root())
+}
+
+/// [`kind_dir`] of the server's own project ([`home_project`]), whatever
+/// project the current call works in: autosaves and the session lock are
+/// the server's, not a project's.
+pub fn home_dir(kind: Kind) -> Result<PathBuf, ModelerError> {
+    kind_dir_for(kind, home_project())
+}
+
+fn kind_dir_for(kind: Kind, project: Option<PathBuf>) -> Result<PathBuf, ModelerError> {
     if let Ok(dir) = std::env::var("FRIENDSLOP_DATA_DIR")
         && !dir.is_empty()
     {
@@ -54,7 +65,7 @@ pub fn kind_dir(kind: Kind) -> Result<PathBuf, ModelerError> {
             .join("modeler")
             .join(kind.dir_name()));
     }
-    if let Some(root) = project_root() {
+    if let Some(root) = project {
         return Ok(root.join(PROJECT_DIR).join(kind.dir_name()));
     }
     Ok(native_data_dir()?
@@ -71,6 +82,65 @@ pub const PROJECT_DIR: &str = ".modeler";
 /// that has a `.modeler/` folder, or a `Cargo.toml` next to an `assets/`
 /// folder (a Bevy game). None = the shared library.
 pub fn project_root() -> Option<PathBuf> {
+    if let Ok(g) = CALL_PROJECT.read()
+        && let Some(p) = g.as_ref()
+    {
+        return p.clone();
+    }
+    home_project()
+}
+
+/// The project the current call works in, when it says (`Some(None)` = the
+/// shared library). One server serves every project: each call names its
+/// caller's project and the catalog, exports and prefab lookups follow it.
+static CALL_PROJECT: std::sync::RwLock<Option<Option<PathBuf>>> = std::sync::RwLock::new(None);
+
+/// Sets the current call's project (`None`: back to [`home_project`]);
+/// returns the previous setting.
+pub fn set_call_project(project: Option<Option<PathBuf>>) -> Option<Option<PathBuf>> {
+    match CALL_PROJECT.write() {
+        Ok(mut g) => std::mem::replace(&mut *g, project),
+        Err(_) => None,
+    }
+}
+
+/// A project's display name: its git repository's folder name, with the
+/// path inside the repository when the project is a subfolder
+/// (`friendSLOP/crates/game`), else its own folder name.
+pub fn project_name(p: &Path) -> String {
+    let own = || {
+        p.file_name()
+            .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into())
+    };
+    let Some(repo) = p.ancestors().find(|a| a.join(".git").exists()) else {
+        return own();
+    };
+    let name = repo
+        .file_name()
+        .map_or_else(own, |n| n.to_string_lossy().into_owned());
+    match p.strip_prefix(repo) {
+        Ok(rest) if !rest.as_os_str().is_empty() => format!("{name}/{}", rest.display()),
+        _ => name,
+    }
+}
+
+/// The current call's project, when one is set.
+pub fn call_project() -> Option<Option<PathBuf>> {
+    CALL_PROJECT.read().ok().and_then(|g| g.clone())
+}
+
+/// Runs `f` with the catalog in `project` (`None` = the shared library),
+/// then puts the previous setting back.
+pub fn with_project<R>(project: Option<PathBuf>, f: impl FnOnce() -> R) -> R {
+    let old = set_call_project(Some(project));
+    let r = f();
+    set_call_project(old);
+    r
+}
+
+/// The server's own project: `MODELER_PROJECT` / `--project`, else the one
+/// its working directory is in, else none (the shared library).
+pub fn home_project() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("MODELER_PROJECT")
         && !dir.is_empty()
     {
@@ -296,7 +366,7 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), M
 /// Where the session autosave lives: `session.json` next to the prefabs, or
 /// `session.<slot>.json` while another server owns the main autosave.
 fn session_state_path() -> Result<PathBuf, ModelerError> {
-    Ok(catalog_dir()?.join(autosave_file("session")))
+    Ok(home_dir(Kind::Prefabs)?.join(autosave_file("session")))
 }
 
 /// This server's own autosave name while another server holds the session
@@ -389,7 +459,7 @@ struct JournalLine {
 
 fn journal_path() -> Result<PathBuf, ModelerError> {
     let name = autosave_file("session").replace(".json", ".history.jsonl");
-    Ok(catalog_dir()?.join(name))
+    Ok(home_dir(Kind::Prefabs)?.join(name))
 }
 
 fn node_key(n: &crate::Snapshot) -> (Option<usize>, String, u64) {
@@ -528,10 +598,10 @@ fn autosave_files() -> Vec<(PathBuf, PathBuf)> {
     if let Ok(p) = journal_path() {
         out.push(prev(p));
     }
-    if let Ok(d) = catalog_dir() {
+    if let Ok(d) = home_dir(Kind::Prefabs) {
         out.push(prev(d.join(autosave_file("open_docs"))));
     }
-    if let Ok(d) = kind_dir(Kind::Materials) {
+    if let Ok(d) = home_dir(Kind::Materials) {
         out.push(prev(d.join(autosave_file("session"))));
     }
     out
@@ -568,7 +638,7 @@ pub fn reclaim_previous_session() -> usize {
 /// Autosaves any per-kind session state (e.g. the working materials) as
 /// `session.json` in that kind's folder.
 pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), ModelerError> {
-    let dir = kind_dir(kind)?;
+    let dir = home_dir(kind)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
     let text = serde_json::to_string(state).map_err(|e| ModelerError::Parse(e.to_string()))?;
@@ -577,14 +647,14 @@ pub fn save_kind_state<T: Serialize>(kind: Kind, state: &T) -> Result<(), Modele
 
 /// The autosaved per-kind session state, if present and parseable.
 pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> {
-    let text = read_autosave(&kind_dir(kind).ok()?, "session")?;
+    let text = read_autosave(&home_dir(kind).ok()?, "session")?;
     serde_json::from_str(&text).ok()
 }
 
 /// Autosaves the inactive open documents (`open_docs.json`), so a restart
 /// restores every open scene, not just the active one.
 pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
-    let dir = catalog_dir()?;
+    let dir = home_dir(Kind::Prefabs)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
     let slim: Vec<std::borrow::Cow<'_, Model>> = docs.iter().map(slim).collect();
@@ -594,7 +664,7 @@ pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
 
 /// The autosaved inactive documents (empty when missing or unreadable).
 pub fn load_open_docs() -> Vec<Model> {
-    let Ok(dir) = catalog_dir() else {
+    let Ok(dir) = home_dir(Kind::Prefabs) else {
         return Vec::new();
     };
     let Some(text) = read_autosave(&dir, "open_docs") else {
@@ -625,7 +695,7 @@ static SESSION_LOCK: std::sync::Mutex<Option<(PathBuf, LockOutcome)>> = std::syn
 
 /// `session.lock` next to the autosave: the pid of the server that owns it.
 pub fn session_lock_path() -> Result<PathBuf, ModelerError> {
-    Ok(catalog_dir()?.join("session.lock"))
+    Ok(home_dir(Kind::Prefabs)?.join("session.lock"))
 }
 
 /// Whether a process with this pid exists (a pid we may not signal still
@@ -753,7 +823,7 @@ pub fn release_session_lock() {
 /// The last autosaved session model, if one exists and parses. Missing or
 /// corrupt state just means a fresh session.
 pub fn load_session_state() -> Option<Model> {
-    let text = read_autosave(&catalog_dir().ok()?, "session")?;
+    let text = read_autosave(&home_dir(Kind::Prefabs).ok()?, "session")?;
     let mut model: Model = serde_json::from_str(&text).ok()?;
     if let Err(e) = model.check_format() {
         eprintln!("ignoring session autosave: {e}");
@@ -761,7 +831,7 @@ pub fn load_session_state() -> Option<Model> {
     }
     // The journal next to whichever session file was read (this server's
     // slot, or the main one).
-    let dir = catalog_dir().ok()?;
+    let dir = home_dir(Kind::Prefabs).ok()?;
     let slot = format!("session.{}.json", autosave_slot());
     let jname = if autosave_owner().is_some() && dir.join(&slot).exists() {
         slot.replace(".json", ".history.jsonl")
@@ -1259,6 +1329,87 @@ mod tests {
         assert!(s.model.part("b").is_some());
     }
 
+    /// A restart brings back only unsaved documents; an active document that
+    /// matches its file leaves an unsaved one (or an empty one) in front.
+    #[test]
+    fn a_restart_reopens_only_unsaved_documents() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("restart")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let box_ = |n: &str| {
+            vec![serde_json::json!({"type": "primitive", "name": n, "kind": "box", "size": 1})]
+        };
+        let mut s = crate::commands::Session::default();
+        for name in ["saved", "draft", "front"] {
+            ok(s.scene("open", Some(name)));
+            ok(s.apply_values(None, box_("b")));
+            if name != "draft" {
+                s.save_prefab_checked("x", &[], "x", false)
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        // What a restore hands over: the active document and the others.
+        let mut fresh = crate::commands::Session::default();
+        fresh.model = s.model.clone();
+        fresh.others = s.others.clone();
+        let mut closed = fresh.close_saved_documents();
+        closed.sort();
+        assert_eq!(closed, ["front", "saved"]);
+        assert_eq!(fresh.model.name, "draft");
+        assert!(fresh.others.is_empty());
+    }
+
+    /// Calls name their project: the catalog follows it, and a document of
+    /// the same name from another project is not taken over.
+    #[test]
+    fn each_call_works_in_its_callers_project() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::remove_var("FRIENDSLOP_DATA_DIR") };
+        let root = temp_root("projects");
+        let (a, b) = (root.join("game_a"), root.join("game_b"));
+        for p in [&a, &b] {
+            fs::create_dir_all(p.join(PROJECT_DIR)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        s.begin_call(Some("A"), None, Some(Some(a.clone())));
+        assert_eq!(project_root(), Some(a.clone()));
+        ok(s.scene("open", Some("crate")));
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "b", "kind": "box", "size": 1})],
+        ));
+        s.save_prefab_checked("x", &[], "x", false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.end_call();
+        assert_eq!(s.model.project, Some(a.clone()));
+        assert!(a.join(".modeler/prefabs/crate.json").is_file());
+        assert!(!b.join(".modeler/prefabs/crate.json").exists());
+        assert_eq!(call_project(), None);
+        ok(s.scene("open", Some("other")));
+        s.begin_call(Some("B"), None, Some(Some(b.clone())));
+        let clash = s.scene("open", Some("crate"));
+        assert!(
+            clash
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("game_a")),
+            "{clash:?}"
+        );
+        s.end_call();
+        // B starting a model while A's document is in front keeps A's open.
+        s.begin_call(Some("A"), None, Some(Some(a.clone())));
+        assert_eq!(s.model.name, "crate");
+        s.end_call();
+        s.begin_call(Some("B"), None, Some(Some(b.clone())));
+        ok(s.new_model("b_doc"));
+        assert!(s.others.iter().any(|m| m.name == "crate"));
+        s.end_call();
+        assert_eq!(s.model.project, Some(b.clone()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Two agents sharing one server: each keeps its document, edits are
     /// credited, undo won't revert the other's step unasked, and a prefab
     /// file another server wrote is not silently overwritten.
@@ -1273,23 +1424,23 @@ mod tests {
         };
         let mut s = crate::commands::Session::default();
         // A opens its doc and builds.
-        s.begin_call(Some("A"), None);
+        s.begin_call(Some("A"), None, None);
         ok(s.scene("open", Some("shed")));
         ok(s.apply_values(None, box_("wall", 1.0)));
         ok(s.save_prefab_checked("d", &[], "p", false).map(|r| r.0));
         s.end_call();
         // B works elsewhere.
-        s.begin_call(Some("B"), None);
+        s.begin_call(Some("B"), None, None);
         ok(s.scene("open", Some("cart")));
         ok(s.apply_values(None, box_("bed", 1.0)));
         s.end_call();
         // A is put back on its own doc.
-        let note = s.begin_call(Some("A"), None).unwrap_or_default();
+        let note = s.begin_call(Some("A"), None, None).unwrap_or_default();
         assert_eq!(s.model.name, "shed");
         assert!(note.contains("switched back to your `shed`"), "{note}");
         s.end_call();
         // B edits A's doc (pinned), replacing A's op: warned.
-        s.begin_call(Some("B"), Some("shed"));
+        s.begin_call(Some("B"), Some("shed"), None);
         let out = ok(s.apply_values(None, box_("wall", 2.0)));
         assert!(
             out.contains("another agent wrote") && out.contains("(by A)"),
@@ -1297,7 +1448,7 @@ mod tests {
         );
         s.end_call();
         // A hears about it, and its undo is refused until forced.
-        let note = s.begin_call(Some("A"), None).unwrap_or_default();
+        let note = s.begin_call(Some("A"), None, None).unwrap_or_default();
         assert!(note.contains("B made 1 edit"), "{note}");
         let e = s.undo_checked(false).map_err(|e| e.to_string());
         assert!(e.is_err_and(|e| e.contains("another agent (B)")));

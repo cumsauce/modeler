@@ -27,7 +27,9 @@ one server and one preview window:
 ```
 
 The first session starts the shared daemon (windowed); later sessions join
-it. Pointing the config at `target/debug/modeler` instead gives each session
+it, whatever project they are in: one window shows every agent's work, its
+outliner lists the open documents grouped by project, and a new agent
+brings it to the front. A restart reopens only unsaved documents. Pointing the config at `target/debug/modeler` instead gives each session
 its own server and window.
 
 ## In CI (Linux, headless)

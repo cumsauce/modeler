@@ -193,19 +193,29 @@ pub fn build(model: &Model) -> Vec<Row> {
     out
 }
 
-/// The files level: the active document (its part tree as children), the
-/// other open documents, then a `library` group of the catalog `prefabs`
-/// that are not open. Keys: `doc:<name>`, `library`, `lib:<name>`.
+/// The files level: every open document (the active one with its part
+/// tree as children), grouped by project when documents from more than one
+/// are open (`project:<label>` groups), then a `library` group of the
+/// catalog `prefabs` (the active document's project) that are not open.
+/// Each document says who made its latest step. Keys: `doc:<name>`,
+/// `project:<label>`, `library`, `lib:<name>`.
 pub fn build_files(active: &Model, others: &[&Model], prefabs: &[String]) -> Vec<Row> {
     let doc = |m: &Model, children: Vec<Row>, open: bool| {
         let n = m.parts.iter().filter(|p| p.visible).count();
+        let by = m
+            .history
+            .current
+            .and_then(|c| m.history.nodes.get(c))
+            .and_then(|s| s.author.clone())
+            .map(|a| format!(" · by {a}"))
+            .unwrap_or_default();
         Row {
             key: format!("doc:{}", m.name),
             label: m.name.clone(),
             detail: if open {
-                format!("open · {n} parts")
+                format!("{n} parts{by}")
             } else {
-                format!("{n} parts")
+                format!("editing · {n} parts{by}")
             },
             swatch: if open {
                 [0.45, 0.5, 0.58]
@@ -222,13 +232,47 @@ pub fn build_files(active: &Model, others: &[&Model], prefabs: &[String]) -> Vec
             open_doc: open.then(|| m.name.clone()),
         }
     };
-    let mut out = vec![doc(active, build(active), false)];
+    let label = |m: &Model| match &m.project {
+        None => "shared library".to_string(),
+        Some(p) => crate::catalog::project_name(p),
+    };
+    let mut docs: Vec<(String, Row)> = vec![(label(active), doc(active, build(active), false))];
     let mut names: Vec<&str> = vec![active.name.as_str()];
     let mut rest: Vec<&&Model> = others.iter().collect();
     rest.sort_by(|a, b| a.name.cmp(&b.name));
     for m in rest {
         names.push(&m.name);
-        out.push(doc(m, Vec::new(), true));
+        docs.push((label(m), doc(m, Vec::new(), true)));
+    }
+    let mut projects: Vec<String> = docs.iter().map(|(p, _)| p.clone()).collect();
+    projects.dedup();
+    let mut out = Vec::new();
+    if projects.len() < 2 {
+        out.extend(docs.into_iter().map(|(_, r)| r));
+    } else {
+        // The active document's project first, then by name.
+        let first = docs[0].0.clone();
+        projects.sort();
+        projects.retain(|p| *p != first);
+        projects.insert(0, first);
+        for p in projects {
+            let kids: Vec<Row> = docs
+                .iter()
+                .filter(|(q, _)| *q == p)
+                .map(|(_, r)| r.clone())
+                .collect();
+            let n = kids.len();
+            out.push(Row {
+                key: format!("project:{p}"),
+                label: p,
+                detail: format!("{n} open"),
+                swatch: [0.55, 0.45, 0.75],
+                parts: Vec::new(),
+                children: kids,
+                dim: false,
+                open_doc: None,
+            });
+        }
     }
     let lib: Vec<Row> = prefabs
         .iter()
@@ -383,5 +427,14 @@ mod tests {
         assert_eq!(inst.and_then(|r| r.open_doc.as_deref()), Some("lamp"));
         let lib: Vec<&str> = t[2].children.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(lib, ["lamp", "tree"]);
+        // Documents from two projects group under them, the active one's first.
+        let mut game = Model::named("map");
+        game.project = Some("/x/friendSLOP".into());
+        let t = build_files(&s.model, &[&other, &game], &[]);
+        let labels: Vec<&str> = t.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["shared library", "friendSLOP"], "{t:#?}");
+        let kids: Vec<&str> = t[0].children.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(kids, ["model", "shed"]);
+        assert_eq!(t[1].children[0].open_doc.as_deref(), Some("map"));
     }
 }

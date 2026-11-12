@@ -289,6 +289,21 @@ pub struct Session {
     idle_checked: Option<std::time::Instant>,
     /// Restored documents found to differ from their catalog file.
     unsaved_checked: std::collections::HashSet<String>,
+    /// Set when an agent the server hasn't seen makes its first call: the
+    /// window comes to the front so the human sees the new work.
+    pub focus_requested: bool,
+}
+
+/// "the shared library" or "project `name`" for messages.
+pub fn project_label(p: Option<&std::path::Path>) -> String {
+    match p {
+        None => "the shared library".into(),
+        Some(p) => format!(
+            "project `{}`",
+            p.file_name()
+                .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into())
+        ),
+    }
 }
 
 /// Saved, unchanged documents nobody has worked in for this long are closed
@@ -340,6 +355,7 @@ impl Default for Session {
             started: std::time::Instant::now(),
             idle_checked: None,
             unsaved_checked: Default::default(),
+            focus_requested: false,
         }
     }
 }
@@ -941,6 +957,32 @@ impl Session {
     /// in the (carried-over) history tree first, so it is one `undo` away —
     /// reset without losing work.
     pub fn new_model(&mut self, name: &str) -> CmdResult {
+        // Another agent's document, or one from another project: keep it
+        // open and start the new one beside it instead of replacing it.
+        let theirs = self
+            .clients
+            .iter()
+            .any(|(c, v)| self.client.as_ref() != Some(c) && v.doc == self.model.name);
+        let elsewhere = crate::catalog::call_project().is_some_and(|p| p != self.model.project)
+            && !(self.model.ops.is_empty() && self.model.parts.is_empty());
+        if theirs || elsewhere {
+            let old = self.model.name.clone();
+            let mut model = Model::named(name);
+            model.version = self.model.version + 1;
+            model.project = crate::catalog::project_root();
+            let outgoing = std::mem::replace(&mut self.model, model);
+            crate::catalog::set_open_doc(&outgoing.name, Some(outgoing.clone_without_history()));
+            self.others.push(outgoing);
+            self.pending_pin = None;
+            return Ok(format!(
+                "started new model `{name}` as its own document (`{old}` stays open: {})",
+                if theirs {
+                    "another agent is working in it"
+                } else {
+                    "it belongs to another project"
+                }
+            ));
+        }
         let history = std::mem::take(&mut self.model.history);
         let snapshot = self.model.clone();
         let mut model = Model::named(name);
@@ -1722,6 +1764,17 @@ impl Session {
                 if name == self.model.name {
                     return Ok(format!("`{name}` is already the active document"));
                 }
+                if let Some(want) = crate::catalog::call_project()
+                    && let Some(other) = self.others.iter().find(|m| m.name == name)
+                    && other.project != want
+                {
+                    return Err(format!(
+                        "a document named `{name}` from {} is open; this call works in {}. Close it (scene close) or pick another name",
+                        project_label(other.project.as_deref()),
+                        project_label(want.as_deref())
+                    )
+                    .into());
+                }
                 let (incoming, how) =
                     if let Some(i) = self.others.iter().position(|m| m.name == name) {
                         (self.others.remove(i), "switched to")
@@ -1735,6 +1788,7 @@ impl Session {
                         match crate::catalog::load_prefab_file(name) {
                             Ok(mut m) => {
                                 m.name = name.to_string();
+                                m.project = crate::catalog::project_root();
                                 if let Some(h) = crate::catalog::prefab_file_hash(name) {
                                     self.catalog_base.insert(crate::catalog::sanitize(name), h);
                                 }
@@ -1744,7 +1798,11 @@ impl Session {
                                 );
                                 (m, "opened catalog entry")
                             }
-                            Err(_) => (Model::named(name), "opened new empty document"),
+                            Err(_) => {
+                                let mut m = Model::named(name);
+                                m.project = crate::catalog::project_root();
+                                (m, "opened new empty document")
+                            }
                         }
                     };
                 let bump = self.model.version.max(incoming.version) + 1;
@@ -1757,7 +1815,14 @@ impl Session {
                 self.others.push(outgoing);
                 self.model.version = bump;
                 self.pending_pin = None;
-                let synced = self.sync_prefabs()?;
+                // The window switching documents (no call): look prefabs up
+                // in the incoming document's own project.
+                let synced = if crate::catalog::call_project().is_none() {
+                    let p = self.model.project.clone();
+                    crate::catalog::with_project(p, || self.sync_prefabs())?
+                } else {
+                    self.sync_prefabs()?
+                };
                 let mut s = format!("{how} `{name}` (open: {})", self.doc_names().join(", "));
                 if !synced.is_empty() {
                     s += &format!(
@@ -1800,9 +1865,20 @@ impl Session {
     /// client switched away from it (or opens `pin`, the driver's --doc),
     /// and says what other clients did to it since this client's last
     /// call. Returns a note for the result, if any.
-    pub fn begin_call(&mut self, client: Option<&str>, pin: Option<&str>) -> Option<String> {
+    pub fn begin_call(
+        &mut self,
+        client: Option<&str>,
+        pin: Option<&str>,
+        project: Option<Option<std::path::PathBuf>>,
+    ) -> Option<String> {
         self.client = client.map(String::from);
+        if project.is_some() {
+            crate::catalog::set_call_project(project);
+        }
         let me = client?;
+        if !self.clients.contains_key(me) {
+            self.focus_requested = true;
+        }
         let mut notes = Vec::new();
         let active = self.model.name.clone();
         let mine = pin
@@ -1886,6 +1962,9 @@ impl Session {
     /// Ends a call: remembers the client's document and how much of its
     /// history it has seen.
     pub fn end_call(&mut self) {
+        if let Some(p) = crate::catalog::set_call_project(None) {
+            self.model.project = p;
+        }
         self.touched
             .insert(self.model.name.clone(), std::time::Instant::now());
         if let Some(me) = self.client.take() {
@@ -1925,7 +2004,9 @@ impl Session {
         // file once.
         for m in &self.others {
             if !self.saved_state.contains_key(&m.name) && !self.unsaved_checked.contains(&m.name) {
-                if crate::catalog::matches_prefab_file(m) {
+                if crate::catalog::with_project(m.project.clone(), || {
+                    crate::catalog::matches_prefab_file(m)
+                }) {
                     self.saved_state
                         .insert(m.name.clone(), (m.history.nodes.len(), m.history.current));
                 } else {
@@ -1954,6 +2035,44 @@ impl Session {
         }
         if !closed.is_empty() {
             self.mark_autosave(false, true, false);
+        }
+        closed
+    }
+
+    /// After restoring an autosave: closes every document that matches its
+    /// catalog file (it reopens from there on demand), so a restart brings
+    /// back only unsaved work, not every document that was open. An active
+    /// document that goes leaves an empty one in its place. Returns the
+    /// closed names.
+    pub fn close_saved_documents(&mut self) -> Vec<String> {
+        let saved = |m: &Model| {
+            m.ops.is_empty() && m.parts.is_empty()
+                || crate::catalog::with_project(m.project.clone(), || {
+                    crate::catalog::matches_prefab_file(m)
+                })
+        };
+        let mut closed = Vec::new();
+        let empty = |m: &Model| m.ops.is_empty() && m.parts.is_empty();
+        self.others.retain(|m| {
+            let keep = !saved(m);
+            if !keep && !empty(m) {
+                closed.push(m.name.clone());
+            }
+            keep
+        });
+        if saved(&self.model) {
+            if !empty(&self.model) {
+                closed.push(self.model.name.clone());
+            }
+            let version = self.model.version + 1;
+            self.model = self.others.pop().unwrap_or_else(|| Model::named("model"));
+            self.model.version = self.model.version.max(version);
+        }
+        for n in &closed {
+            crate::catalog::set_open_doc(n, None);
+        }
+        if !closed.is_empty() {
+            self.mark_autosave(true, true, false);
         }
         closed
     }
