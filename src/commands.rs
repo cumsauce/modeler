@@ -557,6 +557,24 @@ impl Session {
 
     /// Records the just-mutated model in the history tree under `label`. The
     /// tree lives on the model, so it travels with saves and prefab loads.
+    /// A copy of the live model without its history tree, for rolling back
+    /// a failed edit: cloning the tree copied every snapshot (minutes and
+    /// gigabytes on a long session).
+    fn model_without_history(&mut self) -> Model {
+        let history = std::mem::take(&mut self.model.history);
+        let copy = self.model.clone();
+        self.model.history = history;
+        copy
+    }
+
+    /// Puts back a [`Self::model_without_history`] copy, keeping the live
+    /// history tree.
+    fn restore_model(&mut self, before: Model) {
+        let history = std::mem::take(&mut self.model.history);
+        self.model = before;
+        self.model.history = history;
+    }
+
     fn commit(&mut self, label: &str) {
         if self.batch_depth > 0 {
             self.model.version += 1;
@@ -874,9 +892,10 @@ impl Session {
     /// in the (carried-over) history tree first, so it is one `undo` away —
     /// reset without losing work.
     pub fn new_model(&mut self, name: &str) -> CmdResult {
+        let history = std::mem::take(&mut self.model.history);
         let snapshot = self.model.clone();
         let mut model = Model::named(name);
-        model.history = std::mem::take(&mut self.model.history);
+        model.history = history;
         model.version = self.model.version + 1;
         model
             .history
@@ -1113,7 +1132,7 @@ impl Session {
             return Ok(0);
         };
         let graph = std::sync::Arc::new(doc.graph());
-        let before = self.model.clone();
+        let before = self.model_without_history();
         let mut n = 0;
         for op in &mut self.model.ops {
             if let Op::Material { pbr: Some(r), .. } = op
@@ -1127,7 +1146,7 @@ impl Session {
             return Ok(0);
         }
         if let Err(e) = self.model.refresh() {
-            self.model = before;
+            self.restore_model(before);
             return Err(format!("re-applying `{material}` to the model failed: {e}"));
         }
         self.commit(&format!("material {material} edited"));
@@ -1361,7 +1380,7 @@ impl Session {
         if !changed.is_empty() {
             // One history step for the whole change: swap the dependent ops in
             // place, re-derive once, commit once (undo restores both).
-            let before = self.model.clone();
+            let before = self.model_without_history();
             self.model.params = merged;
             let n = stale.len();
             for (item, _) in stale {
@@ -1374,7 +1393,7 @@ impl Session {
                 }
             }
             if let Err(e) = self.model.refresh() {
-                self.model = before;
+                self.restore_model(before);
                 return Err(format!("re-deriving ops for changed params failed: {e}").into());
             }
             self.commit(&format!("params {}", changed.join(", ")));
@@ -1585,10 +1604,10 @@ impl Session {
         if changed.is_empty() {
             return Ok(changed);
         }
-        let before = self.model.clone();
+        let before = self.model_without_history();
         self.model.ops = ops;
         if let Err(e) = self.model.refresh() {
-            self.model = before;
+            self.restore_model(before);
             return Err(format!("re-deriving prefab instances failed: {e}").into());
         }
         self.commit("sync prefabs");
@@ -1884,7 +1903,7 @@ impl Session {
 
     pub fn set_style(&mut self, new: crate::style::Style) -> CmdResult {
         new.check()?;
-        let before = self.model.clone();
+        let before = self.model_without_history();
         let live: Vec<String> = self.model.ops.iter().map(Self::template_key).collect();
         self.model.templates.retain(|k, _| live.contains(k));
         let full = new.params_under(&self.model.params);
@@ -1919,7 +1938,7 @@ impl Session {
         }
         self.model.style = new;
         if let Err(e) = self.model.refresh() {
-            self.model = before;
+            self.restore_model(before);
             return Err(format!("re-deriving restyled ops failed: {e}\n(style unchanged)").into());
         }
         self.commit("style");

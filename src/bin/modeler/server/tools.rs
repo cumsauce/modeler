@@ -699,8 +699,7 @@ Style::default()
             }
             let mut model = model;
             model.version = s.model.version + 1;
-            let snapshot = s.model.clone();
-            s.model.history.record(snapshot, format!("load `{name}`"));
+            // The prefab brings its own history tree (its saved story).
             s.model = model;
             Ok(format!("loaded prefab `{name}`\n{}", s.load_brief()))
         })
@@ -715,8 +714,9 @@ Style::default()
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             s.model.name = name.clone();
-            let snapshot = s.model.clone();
-            s.model.history.record(snapshot, format!("name `{name}`"));
+            let mut history = std::mem::take(&mut s.model.history);
+            history.record(s.model.clone(), format!("name `{name}`"));
+            s.model.history = history;
             Ok(format!("model renamed to `{name}`"))
         })
         .await
@@ -1477,9 +1477,6 @@ impl rmcp::ServerHandler for Tools {
         if client.is_some() {
             self.exec(|s| s.end_call()).await;
         }
-        if let (Some(note), Ok(r)) = (note, result.as_mut()) {
-            r.content.insert(0, rmcp::model::Content::text(note));
-        }
         let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
         let error = match &result {
             Err(e) => e.message.to_string(),
@@ -1491,6 +1488,11 @@ impl rmcp::ServerHandler for Tools {
                 .join("\n"),
             Ok(_) => String::new(),
         };
+        // The agent note goes in after the error is read: logged first, it
+        // became the failure's "cause" and hid the real error.
+        if let (Some(note), Ok(r)) = (note, result.as_mut()) {
+            r.content.insert(0, rmcp::model::Content::text(note));
+        }
         log_call_full(&name, ok, started.elapsed().as_millis(), &args, &error);
         result
     }

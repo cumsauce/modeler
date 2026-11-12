@@ -428,6 +428,10 @@ impl Doc for Model {
             // Parts are the cached evaluation of ops.
             self.parts.clear();
         }
+        // A snapshot never nests a tree of its own: one recorded with its
+        // history still attached kept a full copy of the tree in memory per
+        // rename or load (gigabytes on a long session).
+        self.history = History::default();
     }
     fn for_file(&self) -> Self {
         let mut m = self.clone();
@@ -1339,6 +1343,26 @@ pub enum AnnotationTarget {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_recorded_snapshot_never_nests_the_tree() {
+        let mut m = Model::named("m");
+        for i in 0..3 {
+            let mut history = std::mem::take(&mut m.history);
+            history.record(m.clone(), format!("step {i}"));
+            m.history = history;
+        }
+        // Recorded with its history still attached (the old rename path).
+        let snap = m.clone();
+        m.history.record(snap, "rename");
+        assert_eq!(m.history.nodes.len(), 4);
+        assert!(
+            m.history
+                .nodes
+                .iter()
+                .all(|n| n.model.history.nodes.is_empty())
+        );
+    }
+
     #[test]
     fn compact_names_folds_array_runs() {
         let n: Vec<String> = ["book", "book_1", "book_2", "book_3", "x_1", "x_2", "y"]
