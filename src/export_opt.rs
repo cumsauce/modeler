@@ -323,6 +323,9 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
         let mut dropped_contact = 0;
         let mut dropped_view = 0;
         for (p, k) in parts.iter_mut().zip(&keep) {
+            if p.rig.is_some() {
+                continue; // animated: what is covered at rest shows in motion
+            }
             let mut idx = Vec::with_capacity(p.indices.len());
             for (t, why) in p.indices.as_chunks::<3>().0.iter().zip(k) {
                 match why {
@@ -434,6 +437,10 @@ fn add_lods(
     let (mut tris_before, mut tris_after, mut chains) = (0usize, 0usize, 0usize);
     for i in 0..n {
         if parts[i].indices.len() / 3 < o.lod_min_tris || meshes[i] != MeshRef::Own {
+            continue;
+        }
+        // Skinned meshes keep one level (the simplifier would drop weights).
+        if parts[i].rig.as_ref().is_some_and(|b| b.bone.is_none()) {
             continue;
         }
         chains += 1;
@@ -698,7 +705,11 @@ fn cull(parts: &[Part], o: &Options) -> Vec<Vec<Keep>> {
             )
         })
         .collect();
-    let occluder: Vec<bool> = parts.iter().map(occludes).collect();
+    // Animated parts move away from what they cover: never occluders.
+    let occluder: Vec<bool> = parts
+        .iter()
+        .map(|p| p.rig.is_none() && occludes(p))
+        .collect();
     // One BVH per occluding part (point-in-solid), one over every occluder
     // (visibility rays).
     let solids: Vec<Option<Bvh>> = tris
@@ -821,6 +832,8 @@ fn compact(p: &mut Part, weld: bool) {
     let mut map: HashMap<[u32; 8], u32> = HashMap::new();
     let mut remap = vec![u32::MAX; p.verts.len()];
     let (mut v, mut nrm, mut uv) = (Vec::new(), Vec::new(), Vec::new());
+    // Old index of every kept vertex, to carry per-vertex skin weights.
+    let mut kept: Vec<usize> = Vec::new();
     for i in p.indices.iter_mut() {
         let old = *i as usize;
         if remap[old] == u32::MAX || weld {
@@ -844,6 +857,7 @@ fn compact(p: &mut Part, weld: bool) {
                     v.push(p.verts[old]);
                     nrm.push(p.normals.get(old).copied().unwrap_or_default());
                     uv.push(p.uvs.get(old).copied().unwrap_or_default());
+                    kept.push(old);
                     (v.len() - 1) as u32
                 })
             } else {
@@ -851,6 +865,7 @@ fn compact(p: &mut Part, weld: bool) {
                     v.push(p.verts[old]);
                     nrm.push(p.normals.get(old).copied().unwrap_or_default());
                     uv.push(p.uvs.get(old).copied().unwrap_or_default());
+                    kept.push(old);
                     remap[old] = (v.len() - 1) as u32;
                 }
                 remap[old]
@@ -862,6 +877,20 @@ fn compact(p: &mut Part, weld: bool) {
     p.verts = v;
     p.normals = nrm;
     p.uvs = uv;
+    if let Some(b) = &p.rig
+        && b.bone.is_none()
+    {
+        let mut nb = (**b).clone();
+        nb.joints = kept
+            .iter()
+            .map(|&o| b.joints.get(o).copied().unwrap_or_default())
+            .collect();
+        nb.weights = kept
+            .iter()
+            .map(|&o| b.weights.get(o).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        p.rig = Some(std::sync::Arc::new(nb));
+    }
 }
 
 // ------------------------------------------------------------- instancing
@@ -884,7 +913,7 @@ fn find_instances(parts: &[Part]) -> Vec<MeshRef> {
     let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
     let mut out = vec![MeshRef::Own; parts.len()];
     for (i, p) in parts.iter().enumerate() {
-        if p.verts.is_empty() {
+        if p.verts.is_empty() || p.rig.is_some() {
             continue;
         }
         let key = (shape_key(p), mat_key(p));
@@ -933,7 +962,8 @@ fn merge(parts: Vec<Part>, keep: &[String]) -> Vec<Part> {
     let mut out: Vec<Part> = Vec::new();
     let mut by_mat: Vec<(String, Part)> = Vec::new();
     for p in parts {
-        if keep.iter().any(|k| glob(k, &p.name)) {
+        // Kept by name, or bound to a skeleton (it moves on its own).
+        if p.rig.is_some() || keep.iter().any(|k| glob(k, &p.name)) {
             out.push(p);
             continue;
         }

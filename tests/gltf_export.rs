@@ -553,3 +553,87 @@ fn lods_add_simplified_nodes_with_ranges() {
     assert_eq!(l1["level"], 1);
     assert_eq!(l0["far"], l1["near"]);
 }
+
+/// Skeletons export as joint node trees with a skin (joints / weights on
+/// the smooth part, inverse binds), rigid parts under their joint, and one
+/// animation per clip.
+#[test]
+fn skins_and_clips_export() {
+    let mut s = modeler::commands::Session::default();
+    let items = serde_json::json!([
+        {"type": "sdf", "name": "arm", "shapes": [{"shape": "capsule", "from": [0, 1, 0], "to": [1, 1, 0], "radius": 0.08}]},
+        {"type": "primitive", "name": "hand", "kind": "box", "size": [0.1, 0.1, 0.1], "translation": [1.15, 1.0, 0.0]},
+        {"type": "skeleton", "name": "rig", "bones": {
+            "upper": {"head": [0, 1, 0], "radius": 0.08},
+            "lower": {"parent": "upper", "head": [0.5, 1, 0], "tail": [1.1, 1, 0], "radius": 0.08}}},
+        {"type": "bind", "name": "skin", "skeleton": "rig", "parts": ["arm"]},
+        {"type": "bind", "name": "grip", "skeleton": "rig", "parts": ["hand"], "bone": "lower"},
+        {"type": "material", "name": "arm", "color": "#c08060", "flat": true},
+        {"type": "material", "name": "hand", "color": "#806040", "flat": true},
+        {"type": "clip", "name": "wave", "skeleton": "rig", "duration": 1.0,
+         "tracks": {"lower": {"rotate": [[0, {"z": 0}], [0.5, {"z": 60}], [1, {"z": 0}]]}}}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    for (tag, optimize) in [
+        ("plain", serde_json::json!("none")),
+        ("game", serde_json::json!("game")),
+    ] {
+        let opts = modeler::export_opt::Options::parse(&optimize).unwrap();
+        let dir = temp_dir(&format!("skin-{tag}"));
+        let path = dir.join("arm.glb");
+        let report = modeler::gltf::export_glb_with(&s.model, &path, &opts).unwrap();
+        assert!(report.contains("rig: 1 skeleton"), "{report}");
+        let (doc, buffers, _) = gltf::import(&path).expect("imports");
+        let skin = doc.skins().next().expect("a skin");
+        let joints: Vec<String> = skin
+            .joints()
+            .filter_map(|j| j.name().map(String::from))
+            .collect();
+        assert_eq!(joints, ["upper", "lower"]);
+        let ibm: Vec<[[f32; 4]; 4]> = skin
+            .reader(|b| Some(&buffers[b.index()]))
+            .read_inverse_bind_matrices()
+            .unwrap()
+            .collect();
+        assert!(
+            (ibm[1][3][0] + 0.5).abs() < 1e-5 && (ibm[1][3][1] + 1.0).abs() < 1e-5,
+            "{ibm:?}"
+        );
+        let arm = doc.nodes().find(|n| n.name() == Some("arm")).unwrap();
+        assert_eq!(arm.skin().map(|k| k.index()), Some(0));
+        let prim = arm.mesh().unwrap().primitives().next().unwrap();
+        let r = prim.reader(|b| Some(&buffers[b.index()]));
+        let w: Vec<[f32; 4]> = r.read_weights(0).unwrap().into_f32().collect();
+        let n = r.read_positions().unwrap().count();
+        assert_eq!(w.len(), n);
+        assert!(w.iter().all(|w| (w.iter().sum::<f32>() - 1.0).abs() < 1e-3));
+        let j: Vec<[u16; 4]> = r.read_joints(0).unwrap().into_u16().collect();
+        assert!(
+            j.iter().any(|j| j[0] == 1),
+            "some vertices ride the lower bone"
+        );
+        // The hand is a child of the lower joint, placed relative to it.
+        let lower = doc.nodes().find(|n| n.name() == Some("lower")).unwrap();
+        let kid = lower
+            .children()
+            .find(|c| c.name() == Some("hand"))
+            .expect("hand under lower");
+        let (t, _, _) = kid.transform().decomposed();
+        assert!((t[0] - 0.65).abs() < 1e-4, "{t:?}");
+        let anim = doc.animations().next().expect("an animation");
+        assert_eq!(anim.name(), Some("wave"));
+        let ch = anim.channels().next().unwrap();
+        assert_eq!(ch.target().node().name(), Some("lower"));
+        let rd = ch.reader(|b| Some(&buffers[b.index()]));
+        let times: Vec<f32> = rd.read_inputs().unwrap().collect();
+        assert!(times.len() >= 31 && (times[times.len() - 1] - 1.0).abs() < 1e-4);
+        let Some(gltf::animation::util::ReadOutputs::Rotations(rot)) = rd.read_outputs() else {
+            panic!("rotation channel")
+        };
+        let rot: Vec<[f32; 4]> = rot.into_f32().collect();
+        let mid = times.iter().position(|t| (t - 0.5).abs() < 1e-4).unwrap();
+        let angle = 2.0 * rot[mid][3].clamp(-1.0, 1.0).acos().to_degrees();
+        assert!((angle - 60.0).abs() < 0.5, "{angle}");
+    }
+}

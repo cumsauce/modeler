@@ -241,7 +241,25 @@ pub(crate) fn build_with(
     for (i, part) in visible.iter().enumerate() {
         check_part(i, part)?;
     }
-    let prepared = crate::export_opt::prepare(visible, opts);
+    let mut prepared = crate::export_opt::prepare(visible, opts);
+    // Skinned meshes are drawn by their joints alone (glTF ignores the
+    // node's transform), and their weights were found in world space:
+    // bake each one's transform into its vertices.
+    for p in prepared.parts.iter_mut() {
+        if p.rig.as_ref().is_some_and(|b| b.bone.is_none()) {
+            let q = crate::quat_of(p.rotation);
+            let (t, sc) = (glam_v(p.translation), glam_v(p.scale));
+            for v in p.verts.iter_mut() {
+                *v = (q * (glam_v(*v) * sc) + t).to_array();
+            }
+            for n in p.normals.iter_mut() {
+                *n = (q * (glam_v(*n) / sc)).normalize_or_zero().to_array();
+            }
+            p.translation = [0.0; 3];
+            p.rotation = [0.0, 0.0, 0.0, 1.0];
+            p.scale = [1.0; 3];
+        }
+    }
     let exported = &prepared.parts;
     crate::material::pbr::prebake(
         exported
@@ -260,6 +278,8 @@ pub(crate) fn build_with(
     let mut material_ids: HashMap<String, usize> = HashMap::new();
     // Part index -> its mesh index (instanced copies point at the source's).
     let mut mesh_of: Vec<usize> = Vec::with_capacity(exported.len());
+    // Part index -> its node index.
+    let mut part_nodes: Vec<usize> = Vec::with_capacity(exported.len());
     let mut texture_bytes = 0usize;
     // Shared texture files: written, reused (already on disk), per-part
     // (object-domain bakes, unique to one mesh).
@@ -549,6 +569,16 @@ pub(crate) fn build_with(
                         .collect();
                     b.accessor(&bytes, part.indices.len(), "SCALAR", 5125, true)
                 };
+                if let Some(rig) = part.rig.as_ref().filter(|b| b.bone.is_none()) {
+                    let j: Vec<u8> = rig
+                        .joints
+                        .iter()
+                        .flat_map(|j| j.iter().flat_map(|x| x.to_le_bytes()))
+                        .collect();
+                    attributes["JOINTS_0"] = json!(b.accessor(&j, n, "VEC4", 5123, false));
+                    attributes["WEIGHTS_0"] =
+                        json!(b.accessor(&le_f32s(&rig.weights), n, "VEC4", 5126, false));
+                }
                 if textured {
                     let tan: Vec<u8> = tangents(part)
                         .iter()
@@ -593,8 +623,18 @@ pub(crate) fn build_with(
             }
             node["extras"] = extras;
         }
+        part_nodes.push(nodes.len());
         nodes.push(node);
     }
+    let mut children = std::collections::HashSet::new();
+    let (skins, animations, rig_report) = rig_nodes(
+        model,
+        exported,
+        &part_nodes,
+        &mut nodes,
+        &mut children,
+        &mut b,
+    )?;
     // Lights (KHR_lights_punctual, which Bevy's glTF loader reads). glTF
     // point/spot intensity is candela; Bevy multiplies by 4 pi back to lumens.
     let lights = crate::light::collect(model)?;
@@ -637,7 +677,6 @@ pub(crate) fn build_with(
     // part's node as its child when the body moves; `mesh` marks the part's
     // own node) and markers (empty nodes).
     let colliders = crate::game::colliders(model)?;
-    let mut children = std::collections::HashSet::new();
     let mut unplaced = Vec::new();
     for c in &colliders {
         let at = nodes
@@ -738,6 +777,12 @@ pub(crate) fn build_with(
         "bufferViews": b.views,
         "buffers": [buffer],
     });
+    if !skins.is_empty() {
+        doc["skins"] = json!(skins);
+    }
+    if !animations.is_empty() {
+        doc["animations"] = json!(animations);
+    }
     if !extensions.is_empty() {
         doc["extensionsUsed"] = json!(extensions);
     }
@@ -794,6 +839,9 @@ pub(crate) fn build_with(
     );
     for l in &r.lines {
         report += &format!("\n- {l}");
+    }
+    if let Some(r) = rig_report {
+        report += &format!("\n- {r}");
     }
     if !colliders.is_empty() {
         let count = |s: &str| colliders.iter().filter(|c| c.shape == s).count();
@@ -924,4 +972,236 @@ pub fn export_glb_with(
     fs::write(path, &out)
         .map_err(|e| crate::ModelerError::Io(format!("writing {}: {e}", path.display())))?;
     Ok(format!("{report}\nfile: {} KB", out.len() / 1024))
+}
+
+fn glam_v(a: [f32; 3]) -> bevy::math::Vec3 {
+    bevy::math::Vec3::from(a)
+}
+
+/// Skeletons, skins and clips: a joint node tree per skeleton used by an
+/// exported part (under a root node named after the skeleton), a skin per
+/// skeleton for its smooth parts (`skin` on their nodes), rigid parts moved
+/// under their bone's joint node, and one animation per clip (every
+/// animated bone's translation / rotation / scale sampled at 30 fps plus
+/// its key times, LINEAR, so it plays exactly as the modeler poses it).
+fn rig_nodes(
+    model: &Model,
+    exported: &[Part],
+    part_nodes: &[usize],
+    nodes: &mut Vec<Value>,
+    children: &mut std::collections::HashSet<usize>,
+    b: &mut Builder,
+) -> Result<(Vec<Value>, Vec<Value>, Option<String>), crate::ModelerError> {
+    use bevy::math::Mat4;
+    let (mut skins, mut animations) = (Vec::new(), Vec::new());
+    if !exported.iter().any(|p| p.rig.is_some()) {
+        return Ok((skins, animations, None));
+    }
+    let skels = crate::anim::skeletons(model)?;
+    let clips = crate::anim::clips(model)?;
+    let (mut joint_count, mut key_count) = (0usize, 0usize);
+    let mut used = Vec::new();
+    for skel in &skels {
+        let users: Vec<usize> = exported
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.rig.as_ref().is_some_and(|r| r.skeleton == skel.name))
+            .map(|(i, _)| i)
+            .collect();
+        if users.is_empty() {
+            continue;
+        }
+        used.push(skel.name.clone());
+        // Joint nodes, parents first (the skeleton's order).
+        let first = nodes.len();
+        for bone in &skel.bones {
+            let local = match bone.parent {
+                Some(p) => bone.head - skel.bones[p].head,
+                None => bone.head,
+            };
+            nodes.push(json!({"name": bone.name, "translation": local.to_array()}));
+        }
+        joint_count += skel.bones.len();
+        for (i, bone) in skel.bones.iter().enumerate() {
+            if let Some(p) = bone.parent {
+                let arr = nodes[first + p]
+                    .as_object_mut()
+                    .map(|o| o.entry("children").or_insert_with(|| json!([])));
+                if let Some(Value::Array(a)) = arr {
+                    a.push(json!(first + i));
+                }
+                children.insert(first + i);
+            }
+        }
+        let roots: Vec<usize> = skel
+            .bones
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.parent.is_none())
+            .map(|(i, _)| first + i)
+            .collect();
+        for r in &roots {
+            children.insert(*r);
+        }
+        let root = nodes.len();
+        nodes
+            .push(json!({"name": skel.name, "children": roots, "extras": {"skeleton": skel.name}}));
+        // Rigid parts ride their joint: local = inverse(joint rest) * part.
+        for &pi in &users {
+            let Some(rig) = &exported[pi].rig else {
+                continue;
+            };
+            let Some(bone) = rig.bone else { continue };
+            let n = part_nodes[pi];
+            let head = skel.bones[bone].head;
+            let t = &nodes[n]["translation"];
+            let local: Vec<f32> = (0..3)
+                .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - head[k])
+                .collect();
+            nodes[n]["translation"] = json!(local);
+            let j = first + bone;
+            if let Some(Value::Array(a)) = nodes[j]
+                .as_object_mut()
+                .map(|o| o.entry("children").or_insert_with(|| json!([])))
+            {
+                a.push(json!(n));
+            }
+            children.insert(n);
+        }
+        // The skin for smooth parts.
+        if users
+            .iter()
+            .any(|&pi| exported[pi].rig.as_ref().is_some_and(|r| r.bone.is_none()))
+        {
+            let ibm: Vec<[f32; 16]> = skel
+                .bones
+                .iter()
+                .map(|bone| Mat4::from_translation(-bone.head).to_cols_array())
+                .collect();
+            let view = b.view(&le_f32s(&ibm), None);
+            b.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": ibm.len(), "type": "MAT4"}));
+            let acc = b.accessors.len() - 1;
+            skins.push(json!({
+                "name": skel.name,
+                "inverseBindMatrices": acc,
+                "joints": (first..first + skel.bones.len()).collect::<Vec<_>>(),
+                "skeleton": root,
+            }));
+            let k = skins.len() - 1;
+            for &pi in &users {
+                if exported[pi].rig.as_ref().is_some_and(|r| r.bone.is_none()) {
+                    nodes[part_nodes[pi]]["skin"] = json!(k);
+                }
+            }
+        }
+        // Clips of this skeleton.
+        for (clip, _) in clips.iter().filter(|(c, _)| c.skeleton == skel.name) {
+            let fps = 30.0f32;
+            let mut times: Vec<f32> = (0..=((clip.duration * fps).ceil() as usize))
+                .map(|i| (i as f32 / fps).min(clip.duration))
+                .collect();
+            for (_, track, _, shift) in &clip.tracks {
+                for ch in [&track.rotate, &track.translate, &track.scale]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let crate::anim::Channel::Keys { keys, .. } = ch {
+                        for (t, _) in keys {
+                            times.push(clip.wrap(t - shift));
+                        }
+                    }
+                }
+            }
+            times.sort_by(f32::total_cmp);
+            times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            let poses: Vec<crate::anim::Pose> = times
+                .iter()
+                .map(|&t| {
+                    // A loop's end samples the seam from below, not t = 0.
+                    let t = if clip.looping && t >= clip.duration - 1e-6 {
+                        clip.duration - 1e-4
+                    } else {
+                        t
+                    };
+                    clip.sample(skel, t)
+                })
+                .collect();
+            let tview = b.view(
+                &le_f32s(times.iter().map(std::array::from_ref)),
+                None,
+            );
+            b.accessors.push(json!({
+                "bufferView": tview, "componentType": 5126, "count": times.len(), "type": "SCALAR",
+                "min": [times.first().copied().unwrap_or(0.0)], "max": [times.last().copied().unwrap_or(0.0)],
+            }));
+            let input = b.accessors.len() - 1;
+            let (mut samplers, mut channels) = (Vec::new(), Vec::new());
+            let mut animated: Vec<(usize, bool, bool, bool)> = Vec::new();
+            for (bone, track, _, _) in &clip.tracks {
+                animated.push((
+                    *bone,
+                    track.translate.is_some(),
+                    track.rotate.is_some(),
+                    track.scale.is_some(),
+                ));
+            }
+            for (bone, tr, rot, sc) in animated {
+                let rest = match skel.bones[bone].parent {
+                    Some(p) => skel.bones[bone].head - skel.bones[p].head,
+                    None => skel.bones[bone].head,
+                };
+                let mut push = |path: &str, bytes: Vec<u8>, kind: &str| {
+                    let v = b.view(&bytes, None);
+                    b.accessors.push(json!({"bufferView": v, "componentType": 5126, "count": times.len(), "type": kind}));
+                    samplers.push(json!({"input": input, "output": b.accessors.len() - 1, "interpolation": "LINEAR"}));
+                    channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": first + bone, "path": path}}));
+                };
+                if tr {
+                    let v: Vec<[f32; 3]> = poses
+                        .iter()
+                        .map(|p| (rest + p[bone].0).to_array())
+                        .collect();
+                    push("translation", le_f32s(&v), "VEC3");
+                }
+                if rot {
+                    let mut prev: Option<bevy::math::Quat> = None;
+                    let v: Vec<[f32; 4]> = poses
+                        .iter()
+                        .map(|p| {
+                            let mut q = p[bone].1;
+                            if prev.is_some_and(|pq| pq.dot(q) < 0.0) {
+                                q = -q; // keep the shortest path between samples
+                            }
+                            prev = Some(q);
+                            q.to_array()
+                        })
+                        .collect();
+                    push("rotation", le_f32s(&v), "VEC4");
+                }
+                if sc {
+                    let v: Vec<[f32; 3]> = poses.iter().map(|p| p[bone].2.to_array()).collect();
+                    push("scale", le_f32s(&v), "VEC3");
+                }
+            }
+            key_count += times.len() * channels.len();
+            if !channels.is_empty() {
+                animations.push(json!({
+                    "name": clip.name,
+                    "samplers": samplers,
+                    "channels": channels,
+                    "extras": {"loop": clip.looping, "duration": clip.duration},
+                }));
+            }
+        }
+    }
+    let report = (!used.is_empty()).then(|| {
+        format!(
+            "rig: {} skeleton(s) ({}), {joint_count} joint node(s), {} skin(s), {} clip(s), {key_count} keyframe value(s)",
+            used.len(),
+            used.join(", "),
+            skins.len(),
+            animations.len()
+        )
+    });
+    Ok((skins, animations, report))
 }
