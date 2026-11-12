@@ -1112,13 +1112,34 @@ impl Session {
     fn expand_material_globs(
         &self,
         items: Vec<(serde_json::Value, Option<String>)>,
+        style: &crate::style::Style,
+        full: &crate::params::Params,
     ) -> Result<Vec<(serde_json::Value, Option<String>)>, String> {
         let mut names: Vec<String> = self.model.parts.iter().map(|p| p.name.clone()).collect();
         for (raw, _) in &items {
+            // Moves, places, colliders, lights and markers are named too,
+            // but make no part: `"bottle_*"` must not match `bottle_on`.
+            let makes_part = !matches!(
+                raw.get("type").and_then(|v| v.as_str()),
+                Some("move" | "place" | "collider" | "light" | "marker")
+            );
             if let Some(n) = raw.get("name").and_then(|v| v.as_str())
+                && makes_part
                 && !n.contains('*')
             {
                 names.push(n.to_string());
+                // Every part the op declares, when the item already parses
+                // (a path_array by spacing, a split's halves). A scatter
+                // declares every slot it might fill (up to `max`), so it
+                // keeps the literal-count guess below.
+                let ty0 = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty0 != "scatter"
+                    && let Ok(v) = crate::style::expand(raw, style)
+                    && let Ok(v) = crate::params::resolve(&v, full)
+                    && let Ok(BatchItem::Op(op)) = crate::spec::parse_item(0, &v)
+                {
+                    names.extend(crate::graph::outputs(&op));
+                }
                 // Parts an item writes besides its name (before params are
                 // read, so only literal counts): lsystem leaves, array copies.
                 let ty = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1159,7 +1180,39 @@ impl Session {
                     match ty {
                         "linear_array" => names.extend((1..c).map(|i| format!("{n}_{i}"))),
                         "path_array" => names.extend((0..c).map(|i| format!("{n}_{i}"))),
-                        "scatter" => names.extend((0..c).map(|i| format!("{n}_{i}"))),
+                        "scatter" => {
+                            // Each copy of a set gets its members' suffixes
+                            // (`trees_0`, `trees_0_leaves`); globs resolve later.
+                            let sets: Vec<Vec<String>> = match raw.get("input") {
+                                Some(serde_json::Value::String(x)) => vec![vec![x.clone()]],
+                                Some(serde_json::Value::Array(a)) => a
+                                    .iter()
+                                    .map(|v| match v {
+                                        serde_json::Value::Array(m) => m
+                                            .iter()
+                                            .filter_map(|x| x.as_str().map(String::from))
+                                            .collect(),
+                                        v => v.as_str().map(String::from).into_iter().collect(),
+                                    })
+                                    .filter(|s: &Vec<String>| !s.is_empty())
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            let mut sfx: Vec<String> = Vec::new();
+                            for set in &sets {
+                                for x in crate::scatter::member_suffixes(set) {
+                                    if !sfx.contains(&x) {
+                                        sfx.push(x);
+                                    }
+                                }
+                            }
+                            if sfx.is_empty() {
+                                sfx.push(String::new());
+                            }
+                            for i in 0..c {
+                                names.extend(sfx.iter().map(|x| format!("{n}_{i}{x}")));
+                            }
+                        }
                         "radial_array" => {
                             let first =
                                 raw.get("include_source").and_then(|v| v.as_bool()) != Some(false);
@@ -1223,7 +1276,7 @@ impl Session {
         let items = crate::spec::expand_repeats(&items, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let items = self
-            .expand_material_globs(items)
+            .expand_material_globs(items, &style, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
         for (i, (raw, from)) in items.iter().enumerate() {

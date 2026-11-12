@@ -382,7 +382,9 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   an upright trunk; at most 15% of the copy's height): `verify grounded`
   passes; `sink` pushes them further in. Steep spots tilt copies into the
   slope (a big rock on a cliff fails `collisions`), so give rocks and trees
-  a `max_slope`. Separate scatters don't avoid each other (grass may grow
+  a `max_slope`. A `"rocks_*"` material colours the copies that were
+  placed (slots that didn't fit are skipped, also after a re-seed); colouring
+  the source works too, copies inherit it. Separate scatters don't avoid each other (grass may grow
   inside a rock). `rotate`: `random_y` (default),
   `random` (tumbled rocks) or `none`; `align` 0 stays upright (trees), 1
   stands on the normal (mushrooms round a log with `faces: "all"`).

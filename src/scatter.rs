@@ -584,6 +584,35 @@ mod tests {
     }
 
     #[test]
+    fn a_glob_material_skips_slots_that_did_not_fit() {
+        // 500 rocks can't fit 10 x 10 m at the default spacing: the pattern
+        // material must colour the ones placed and skip the rest, and names
+        // of moves and places never count as parts.
+        let mut s = scene(0.0);
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "scatter", "name": "rocks", "input": "rock", "on": "ground",
+                       "count": 500, "seed": 1, "min_spacing": 2}),
+                json!({"type": "move", "name": "rocks_nudge", "parts": ["rocks_0"],
+                       "translation": [0, 0, 0]}),
+                json!({"type": "material", "name": "rocks_*", "color": "#a33", "flat": true}),
+                json!({"type": "hide_part", "part": "rock"}),
+            ],
+        ));
+        let placed = copies(&s).len();
+        assert!(placed > 0 && placed < 500, "{placed}");
+        for p in s
+            .model
+            .parts
+            .iter()
+            .filter(|p| p.name.starts_with("rocks_"))
+        {
+            assert!(p.material.base_color[0] > 0.5, "{} not coloured", p.name);
+        }
+    }
+
+    #[test]
     fn density_sets_and_lsystem_leaves_come_along() {
         let mut s = scene(0.0);
         ok(s.apply_values(

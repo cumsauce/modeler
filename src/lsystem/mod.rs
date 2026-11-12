@@ -511,7 +511,10 @@ fn tube(part: &mut Part, pts: &[(Vec3, f32)], sides: usize) {
         }
         for k in 0..ring {
             let th = k as f32 / sides as f32 * std::f32::consts::TAU;
-            let radial = normal * th.cos() + bin * th.sin();
+            // The seam column repeats column 0 exactly (only its uv differs),
+            // so welding by position always closes it.
+            let a = if k == sides { 0.0 } else { th };
+            let radial = normal * a.cos() + bin * a.sin();
             part.verts.push((p + radial * r).to_array());
             part.normals.push(radial.to_array());
             part.uvs.push([th * r, along]);
@@ -937,6 +940,33 @@ mod parametric_tests {
                 })
                 .sum();
             assert!(vol > 0.0, "{shape} wound inward ({vol})");
+        }
+    }
+}
+#[cfg(test)]
+mod seed_tests {
+    /// Tube seams once differed by float noise and sometimes straddled the
+    /// validator's weld grid: every preset and seed must come out closed.
+    #[test]
+    fn every_preset_is_closed_for_many_seeds() {
+        for preset in ["tree", "pine", "bush", "fern", "weed", "roots"] {
+            for seed in 0..6u64 {
+                let mut ls = crate::spec::lsystem_preset(preset).unwrap_or_else(|e| panic!("{e}"));
+                ls.seed = seed;
+                let d = super::build("t", &ls).unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(
+                    crate::verify::open_edge_count(&d.wood),
+                    0,
+                    "{preset} {seed} wood"
+                );
+                if let Some(l) = d.leaves {
+                    assert_eq!(
+                        crate::verify::open_edge_count(&l),
+                        0,
+                        "{preset} {seed} leaves"
+                    );
+                }
+            }
         }
     }
 }

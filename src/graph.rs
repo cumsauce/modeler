@@ -75,12 +75,27 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     // Content hash of each named part: the key of the op run that wrote it,
     // combined with the output name.
     let mut hashes: HashMap<String, u64> = HashMap::new();
+    // A scatter's `count` is a target: slots it could not fill are never
+    // made. In-place edits of those (a `"trees_*"` material, a hide) skip
+    // them instead of failing, so a re-seed that fits fewer copies works.
+    let unfilled_ok: std::collections::HashSet<String> = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Scatter { .. }))
+        .flat_map(outputs)
+        .collect();
     for i in order {
         let op = &ops[i];
         if matches!(
             op,
             Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. }
         ) {
+            continue;
+        }
+        if let [input] = inputs(op).as_slice()
+            && outputs(op).first().map(String::as_str) == Some(*input)
+            && unfilled_ok.contains(*input)
+            && !named.iter().any(|(n, _)| n == input)
+        {
             continue;
         }
         let input_hashes: Vec<u64> = inputs(op)

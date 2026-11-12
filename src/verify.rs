@@ -193,38 +193,63 @@ fn weld_grid(p: &Part) -> f64 {
 /// in the last bits) and exact positions (Manifold outputs keep distinct
 /// vertices closer than any grid). A genuinely open mesh is open under both.
 pub fn open_edge_count(p: &Part) -> usize {
-    let inv = 1.0 / weld_grid(p);
-    let grid = open_edges_with(p, |v| {
-        [
-            (v[0] as f64 * inv).round() as i64,
-            (v[1] as f64 * inv).round() as i64,
-            (v[2] as f64 * inv).round() as i64,
-        ]
-    });
+    let grid = open_edges_with(p, &weld_near(&p.verts, weld_grid(p)));
     if grid == 0 {
         return 0;
     }
     // +0.0 so -0.0 and 0.0 weld together.
-    let exact = open_edges_with(p, |v| {
-        [
-            (v[0] + 0.0).to_bits() as i64,
-            (v[1] + 0.0).to_bits() as i64,
-            (v[2] + 0.0).to_bits() as i64,
-        ]
-    });
-    grid.min(exact)
-}
-
-fn open_edges_with(p: &Part, key: impl Fn(&[f32; 3]) -> [i64; 3]) -> usize {
-    let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
-    let welded: Vec<u32> = p
+    let mut ids: std::collections::HashMap<[u32; 3], u32> = std::collections::HashMap::new();
+    let exact: Vec<u32> = p
         .verts
         .iter()
         .map(|v| {
             let next = ids.len() as u32;
-            *ids.entry(key(v)).or_insert(next)
+            *ids.entry(v.map(|c| (c + 0.0).to_bits())).or_insert(next)
         })
         .collect();
+    grid.min(open_edges_with(p, &exact))
+}
+
+/// Welds positions within `cell` of each other: grid cells plus their
+/// neighbours, so two copies of a seam vertex one ulp apart still weld when
+/// they straddle a cell border. Returns an id per vertex.
+pub(crate) fn weld_near(verts: &[[f32; 3]], cell: f64) -> Vec<u32> {
+    let inv = 1.0 / cell;
+    let key = |v: &[f32; 3]| v.map(|c| (f64::from(c) * inv).round() as i64);
+    let mut cells: std::collections::HashMap<[i64; 3], Vec<usize>> = Default::default();
+    let mut id = vec![0u32; verts.len()];
+    let mut next = 0u32;
+    for (i, v) in verts.iter().enumerate() {
+        let k = key(v);
+        let mut found = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(list) = cells.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) else {
+                        continue;
+                    };
+                    for &j in list {
+                        let d2: f64 = (0..3)
+                            .map(|a| (f64::from(v[a]) - f64::from(verts[j][a])).powi(2))
+                            .sum();
+                        if d2 <= cell * cell {
+                            found = Some(id[j]);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        id[i] = found.unwrap_or_else(|| {
+            cells.entry(k).or_default().push(i);
+            next += 1;
+            next - 1
+        });
+    }
+    id
+}
+
+fn open_edges_with(p: &Part, welded: &[u32]) -> usize {
     // Net directed count per undirected edge: +1 a->b, -1 b->a. A closed,
     // consistently wound surface uses every edge once each way (net 0). Two
     // surfaces touching along a line (Manifold keeps them as separate
