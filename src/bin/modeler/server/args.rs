@@ -148,8 +148,16 @@ pub(crate) struct AddAnnotationArgs {
     /// library name), optionally on one of its nodes with `node`.
     pub(crate) material: Option<String>,
     pub(crate) node: Option<String>,
-    /// The comment text.
+    /// The comment text; with `resolve`, the reply saying what was done.
+    #[serde(default)]
     pub(crate) text: String,
+    /// Resolve the open comment with this id instead of adding one: `text`
+    /// says what was done about it. The human sees the reply and the pin
+    /// greys out.
+    pub(crate) resolve: Option<u32>,
+    /// With `resolve`: open that comment again instead.
+    #[serde(default)]
+    pub(crate) reopen: bool,
     /// Optional triangle index to pin the comment to.
     pub(crate) face: Option<u32>,
     /// Optional vertex index to pin the comment to.

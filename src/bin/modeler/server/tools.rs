@@ -1442,6 +1442,11 @@ Style::default()
     /// live view, that click is used automatically (so prefer omitting them when a pin
     /// is pending — the summary tells you when one is). Annotations persist in prefabs
     /// and show up in every scene_summary.
+    ///
+    /// When you have dealt with a human's comment, resolve it:
+    /// `{resolve: id, text: "what you did"}` (the reply shows under the
+    /// comment in the window and its pin greys out). Don't delete comments
+    /// you worked on; resolve them.
     #[tool]
     async fn add_annotation(
         &self,
@@ -1453,8 +1458,15 @@ Style::default()
             face,
             vertex,
             position,
+            resolve,
+            reopen,
         }): Parameters<AddAnnotationArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(id) = resolve {
+            return self
+                .run(move |s| s.resolve_annotation(id, &text, reopen))
+                .await;
+        }
         self.run(move |s| match material {
             Some(material) => s.annotate(
                 &modeler::AnnotationTarget::Material { material, node },
@@ -1657,6 +1669,7 @@ impl rmcp::ServerHandler for Tools {
         const INSTRUCTIONS: &str = "Operating guidance for this modeling server:
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
+- The human's comments (annotations) are requests: scene_summary lists the open ones. When you have dealt with one, resolve it with add_annotation {resolve: id, text: what you did}; don't delete it.
 - Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, smooth, decimate, split, round, deform, shell, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, collider, marker, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall.
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.

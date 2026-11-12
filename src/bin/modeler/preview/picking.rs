@@ -124,12 +124,17 @@ pub(crate) fn sync_pins(
     wb: Res<Workbench>,
     pins: Query<(Entity, Option<&PinCommitted>), With<AnnotationPin>>,
     mut commands: Commands,
-    mut shown: Local<Option<(u64, usize, String)>>,
+    mut shown: Local<Option<(u64, usize, usize, String)>>,
 ) {
     let model = &modeler.session.model;
-    let want = wb
-        .show_comments
-        .then(|| (model.version, model.annotations.len(), model.name.clone()));
+    let want = wb.show_comments.then(|| {
+        (
+            model.version,
+            model.annotations.len(),
+            model.annotations.iter().filter(|a| !a.is_open()).count(),
+            model.name.clone(),
+        )
+    });
     let have = pins.iter().any(|(_, c)| c.is_some());
     if *shown == want && (have || want.is_none() || model.annotations.is_empty()) {
         return;
@@ -146,6 +151,9 @@ pub(crate) fn sync_pins(
     for a in model.annotations.iter().filter(|a| a.material.is_none()) {
         let pin = spawn_pin(&mut commands, a.id, Vec3::from_array(a.position));
         commands.entity(pin).insert(PinCommitted);
+        if !a.is_open() {
+            commands.entity(pin).insert(PinResolved);
+        }
     }
 }
 
@@ -174,6 +182,10 @@ pub(crate) fn spawn_pin(commands: &mut Commands, id: u32, point: Vec3) -> Entity
 #[derive(Component)]
 pub(crate) struct PinId(pub(crate) u32);
 
+/// A pin whose comment is resolved: drawn greyed out.
+#[derive(Component)]
+pub(crate) struct PinResolved;
+
 /// The on-screen badge drawn for a pin.
 #[derive(Component)]
 pub(crate) struct PinBadge(Entity);
@@ -183,7 +195,16 @@ pub(crate) struct PinBadge(Entity);
 /// for its comment is a hollow ring), kept on its spot as the camera moves
 /// and hidden when the spot is behind the camera or outside the view.
 pub(crate) fn pin_badges(
-    pins: Query<(Entity, &GlobalTransform, &PinId, Has<PinCommitted>), With<AnnotationPin>>,
+    pins: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &PinId,
+            Has<PinCommitted>,
+            Has<PinResolved>,
+        ),
+        With<AnnotationPin>,
+    >,
     mut badges: Query<(Entity, &PinBadge, &mut Node, &mut Visibility)>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -196,7 +217,7 @@ pub(crate) fn pin_badges(
     let cam = cameras.single().ok();
     let mut have = std::collections::HashSet::new();
     for (e, badge, mut node, mut vis) in &mut badges {
-        let Ok((_, at, _, _)) = pins.get(badge.0) else {
+        let Ok((_, at, ..)) = pins.get(badge.0) else {
             commands.entity(e).despawn();
             continue;
         };
@@ -220,14 +241,14 @@ pub(crate) fn pin_badges(
             }
         }
     }
-    for (pin, _, id, committed) in &pins {
+    for (pin, _, id, committed, resolved) in &pins {
         if have.contains(&pin) {
             continue;
         }
-        let (fill, ink) = if committed {
-            (ds::ACCENT, ds::ON_ACCENT)
-        } else {
-            (ds::BG.with_alpha(0.85), ds::ACCENT)
+        let (fill, ink, edge) = match (committed, resolved) {
+            (_, true) => (ds::RAISE, ds::DIM, ds::LINE),
+            (true, false) => (ds::ACCENT, ds::ON_ACCENT, ds::FG),
+            (false, _) => (ds::BG.with_alpha(0.85), ds::ACCENT, ds::ACCENT),
         };
         let badge = commands
             .spawn((
@@ -244,7 +265,7 @@ pub(crate) fn pin_badges(
                     ..default()
                 },
                 BackgroundColor(fill),
-                BorderColor::all(if committed { ds::FG } else { ds::ACCENT }),
+                BorderColor::all(edge),
                 BoxShadow::new(
                     Color::BLACK.with_alpha(0.45),
                     Val::Px(0.0),
@@ -281,7 +302,7 @@ pub(crate) fn pin_badges(
                 height: Val::Px(7.0),
                 ..default()
             },
-            BackgroundColor(if committed { ds::FG } else { ds::ACCENT }),
+            BackgroundColor(edge),
             Pickable::IGNORE,
             ChildOf(badge),
         ));

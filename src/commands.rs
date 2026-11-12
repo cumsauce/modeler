@@ -3182,6 +3182,7 @@ impl Session {
             "annotations": self.model.annotations.iter().map(|a| json!({
                 "id": a.id, "part": a.part, "text": a.text, "face": a.face, "vertex": a.vertex,
                 "group": a.group, "material": a.material, "node": a.node,
+                "resolved": a.resolved.as_ref().map(|r| json!({"reply": r.reply, "by": r.by})),
             })).collect::<Vec<_>>(),
         })
     }
@@ -3744,6 +3745,7 @@ impl Session {
             group: None,
             material: None,
             node: None,
+            resolved: None,
         };
         self.model.annotations.push(annotation);
         Ok(format!(
@@ -3802,31 +3804,79 @@ impl Session {
             group,
             material,
             node,
+            resolved: None,
         };
         let msg = format!("annotation #{id} on {}: '{text}'", a.target());
         self.model.annotations.push(a);
         Ok(msg)
     }
 
-    /// Every annotation, one line each, so the AI can read the human's comments.
+    /// Every annotation, one line each, so the AI can read the human's
+    /// comments: the open ones first (the work to do), then the resolved.
     pub fn list_annotations(&self) -> String {
         if self.model.annotations.is_empty() {
             return "no annotations yet".into();
         }
-        let mut out = format!("{} annotations\n", self.model.annotations.len());
-        for a in &self.model.annotations {
-            out += &format!(
-                "#{} {} '{}'{}{}\n",
-                a.id,
-                a.target(),
-                a.text,
-                a.face.map(|f| format!(" @face {f}")).unwrap_or_default(),
-                a.vertex
-                    .map(|v| format!(" @vertex {v}"))
-                    .unwrap_or_default(),
-            );
+        let open: Vec<_> = self
+            .model
+            .annotations
+            .iter()
+            .filter(|a| a.is_open())
+            .collect();
+        let done: Vec<_> = self
+            .model
+            .annotations
+            .iter()
+            .filter(|a| !a.is_open())
+            .collect();
+        let mut out = format!("{} open annotation(s)", open.len());
+        if !done.is_empty() {
+            out += &format!(", {} resolved", done.len());
+        }
+        out += "\n";
+        for a in &open {
+            out += &format!("{}\n", a.line());
+        }
+        if !done.is_empty() {
+            out += "resolved:\n";
+            for a in &done {
+                out += &format!("{}\n", a.line());
+            }
+        }
+        if !open.is_empty() {
+            out +=
+                "Once a comment is dealt with: add_annotation {resolve: id, text: what you did}.\n";
         }
         out
+    }
+
+    /// Mark a comment resolved with a reply (`reopen`: open it again).
+    pub fn resolve_annotation(&mut self, id: u32, reply: &str, reopen: bool) -> CmdResult {
+        let by = self.client.clone();
+        let a = self
+            .model
+            .annotations
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| ModelerError::Invalid(format!("no annotation #{id}")))?;
+        if reopen {
+            a.resolved = None;
+            return Ok(format!("reopened annotation #{id} ({})", a.target()));
+        }
+        let reply = reply.trim();
+        if reply.is_empty() {
+            return Err(ModelerError::Invalid(
+                "resolve: say in `text` what was done about the comment".into(),
+            ));
+        }
+        a.resolved = Some(crate::Resolution {
+            reply: reply.to_string(),
+            by,
+        });
+        Ok(format!(
+            "resolved annotation #{id} ({}): '{reply}'",
+            a.target()
+        ))
     }
 
     /// Remove one annotation by id.
@@ -3893,7 +3943,17 @@ impl Session {
             s += &format!("named moves/places: {}\n", moves.join(", "));
         }
         if !self.model.annotations.is_empty() {
-            s += &format!("annotations: {}\n", self.model.annotations.len());
+            let open = self
+                .model
+                .annotations
+                .iter()
+                .filter(|a| a.is_open())
+                .count();
+            s += &format!(
+                "annotations: {open} open, {} resolved{}\n",
+                self.model.annotations.len() - open,
+                if open > 0 { " (list_annotations)" } else { "" }
+            );
         }
         let lints = self.lints();
         if lints.is_empty() {
@@ -3968,18 +4028,22 @@ impl Session {
         if self.model.annotations.is_empty() {
             s += "annotations: none\n";
         } else {
-            s += &format!("annotations ({})\n", self.model.annotations.len());
-            for a in &self.model.annotations {
-                s += &format!(
-                    "- #{} {} '{}'{}{}\n",
-                    a.id,
-                    a.target(),
-                    a.text,
-                    a.face.map(|f| format!(" @face {f}")).unwrap_or_default(),
-                    a.vertex
-                        .map(|v| format!(" @vertex {v}"))
-                        .unwrap_or_default(),
-                );
+            let open = self
+                .model
+                .annotations
+                .iter()
+                .filter(|a| a.is_open())
+                .count();
+            s += &format!(
+                "annotations ({open} open, {} resolved)\n",
+                self.model.annotations.len() - open
+            );
+            // Open comments are the human's requests: list them in full.
+            for a in self.model.annotations.iter().filter(|a| a.is_open()) {
+                s += &format!("- {}\n", a.line());
+            }
+            if open > 0 {
+                s += "  resolve each when done: add_annotation {resolve: id, text: what you did}\n";
             }
         }
         if self.pending_pin.is_some() {
@@ -4011,6 +4075,30 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         s
+    }
+
+    #[test]
+    fn resolving_keeps_the_comment_with_a_reply() {
+        let mut s = session_with_part();
+        s.add_annotation("leg", "too thin", None, None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.resolve_annotation(0, "  ", false).is_err());
+        assert!(s.resolve_annotation(7, "x", false).is_err());
+        s.resolve_annotation(0, "made it 4 cm", false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let a = &s.model.annotations[0];
+        assert!(!a.is_open());
+        assert!(
+            s.list_annotations()
+                .contains("0 open annotation(s), 1 resolved")
+        );
+        assert!(s.list_annotations().contains("'made it 4 cm'"));
+        let json = serde_json::to_string(&s.model).unwrap_or_else(|e| panic!("{e}"));
+        let back: crate::Model = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back.annotations[0].resolved, a.resolved);
+        s.resolve_annotation(0, "", true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.model.annotations[0].is_open());
     }
 
     #[test]

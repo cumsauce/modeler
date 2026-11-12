@@ -1147,7 +1147,7 @@ opened from the catalog (restored ones are compared with their file), so no
 work is lost; opening one again loads it from the catalog. Unsaved
 documents stay open.
 
-**Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
+**Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`; `add_annotation(resolve: id, text: "what you did")` resolves a comment you dealt with (`reopen: true` opens it again): the reply shows under it in the window, its pin greys out, and it moves under "Resolved". `scene_summary` lists the open ones in full; resolve them rather than deleting them
 (omit the optionals to consume a spot the human clicked; `material` + optional `node`
 comments on a procedural material or one of its nodes; humans also comment on
 outliner groups, listed with their parts), `list_annotations`,

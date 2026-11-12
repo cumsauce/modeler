@@ -1419,9 +1419,52 @@ pub struct Annotation {
     pub material: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Set when an agent (or the human) has dealt with the comment: what
+    /// was done, and by whom. Resolved comments stay, folded away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<Resolution>,
+}
+
+/// How a comment was resolved.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Resolution {
+    /// The reply: what was done about it ("moved the sign 20 cm left").
+    pub reply: String,
+    /// Who resolved it (the agent's client name), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 impl Annotation {
+    pub fn is_open(&self) -> bool {
+        self.resolved.is_none()
+    }
+
+    /// One listing line: `#3 walls 'too tall'`, plus where it is pinned and,
+    /// when resolved, the reply.
+    pub fn line(&self) -> String {
+        let mut s = format!(
+            "#{} {} '{}'{}{}",
+            self.id,
+            self.target(),
+            self.text,
+            self.face.map(|f| format!(" @face {f}")).unwrap_or_default(),
+            self.vertex
+                .map(|v| format!(" @vertex {v}"))
+                .unwrap_or_default(),
+        );
+        if let Some(r) = &self.resolved {
+            s += &format!(
+                " -> resolved{}: '{}'",
+                r.by.as_ref()
+                    .map(|b| format!(" by {b}"))
+                    .unwrap_or_default(),
+                r.reply
+            );
+        }
+        s
+    }
+
     /// What the comment is on, for listings: `part`, `group (parts)` or
     /// `material m node n`.
     pub fn target(&self) -> String {

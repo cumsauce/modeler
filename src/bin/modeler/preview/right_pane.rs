@@ -29,6 +29,7 @@ pub(crate) struct RightPane {
 /// What the pane was last built for.
 #[derive(PartialEq, Clone)]
 struct Key {
+    resolved: usize,
     box_open: bool,
     mode: Mode,
     selected: Option<String>,
@@ -119,6 +120,7 @@ fn update_right_pane(
         doc: model.name.clone(),
         version: model.version,
         annotations: model.annotations.len(),
+        resolved: model.annotations.iter().filter(|a| !a.is_open()).count(),
         box_open: cb.is_open(),
     };
     if pane.shown.as_ref() == Some(&key) {
@@ -167,9 +169,7 @@ fn update_right_pane(
             (!notes.is_empty()).then_some(notes.len()),
         );
         let list = b.section(&mut commands);
-        for a in &mine {
-            b.comment(&mut commands, list, a);
-        }
+        b.comments(&mut commands, list, &mine);
         if !cb.is_open() {
             let host = b.host(&mut commands);
             cb.set_host(Some(host));
@@ -178,7 +178,10 @@ fn update_right_pane(
     } else {
         b.header(
             &mut commands,
-            &format!("Comments · {}", notes.len()),
+            &format!(
+                "Comments · {}",
+                notes.iter().filter(|a| a.is_open()).count()
+            ),
             PaneButton::CloseComments,
         );
         if cb.is_open() {
@@ -189,9 +192,7 @@ fn update_right_pane(
         if notes.is_empty() {
             b.hint(&mut commands, list, "No comments yet.");
         }
-        for a in &notes {
-            b.comment(&mut commands, list, a);
-        }
+        b.comments(&mut commands, list, &notes);
         if !cb.is_open() {
             let host = b.host(&mut commands);
             cb.set_host(Some(host));
@@ -420,7 +421,34 @@ impl Build<'_> {
 
     /// One comment: its pin number in a yellow disc, the part, the text;
     /// a click selects the part, × deletes it.
+    /// Open comments, then the resolved ones under their own caption,
+    /// dimmed, each with the reply.
+    fn comments(&self, c: &mut Commands, parent: Entity, list: &[&modeler::Annotation]) {
+        for a in list.iter().filter(|a| a.is_open()) {
+            self.comment(c, parent, a);
+        }
+        let done: Vec<_> = list.iter().filter(|a| !a.is_open()).collect();
+        if !done.is_empty() {
+            c.spawn((
+                ds::text(
+                    self.assets,
+                    ds::Type::Caption,
+                    format!("Resolved · {}", done.len()),
+                ),
+                Node {
+                    margin: UiRect::top(Val::Px(12.0)),
+                    ..default()
+                },
+                ChildOf(parent),
+            ));
+            for a in done {
+                self.comment(c, parent, a);
+            }
+        }
+    }
+
     fn comment(&self, c: &mut Commands, parent: Entity, a: &modeler::Annotation) {
+        let open = a.is_open();
         let row = c
             .spawn((
                 CommentRow(a.part.clone()),
@@ -447,7 +475,7 @@ impl Build<'_> {
                     border_radius: BorderRadius::all(Val::Px(10.0)),
                     ..default()
                 },
-                BackgroundColor(ds::ACCENT),
+                BackgroundColor(if open { ds::ACCENT } else { ds::RAISE }),
                 ChildOf(row),
             ))
             .id();
@@ -456,7 +484,7 @@ impl Build<'_> {
                 self.assets,
                 ds::Type::Meta,
                 format!("{}", a.id),
-                ds::ON_ACCENT,
+                if open { ds::ON_ACCENT } else { ds::DIM },
             ),
             ChildOf(disc),
         ));
@@ -482,9 +510,50 @@ impl Build<'_> {
             ChildOf(body),
         ));
         c.spawn((
-            ds::text_wrap(self.assets, ds::Type::Small, a.text.clone()),
+            ds::text_wrap_in(
+                self.assets,
+                ds::Type::Small,
+                a.text.clone(),
+                if open { ds::FG } else { ds::DIM },
+            ),
             ChildOf(body),
         ));
+        if let Some(r) = &a.resolved {
+            // The reply, set off by a green rule, then "Reopen".
+            let reply = c
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        margin: UiRect::top(Val::Px(4.0)),
+                        padding: UiRect::left(Val::Px(8.0)),
+                        border: UiRect::left(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(ds::OK),
+                    ChildOf(body),
+                ))
+                .id();
+            c.spawn((
+                ds::text_in(
+                    self.assets,
+                    ds::Type::Meta,
+                    format!("resolved by {}", r.by.as_deref().unwrap_or("an agent")),
+                    ds::OK,
+                ),
+                ChildOf(reply),
+            ));
+            c.spawn((
+                ds::text_wrap_in(self.assets, ds::Type::Small, r.reply.clone(), ds::FG),
+                ChildOf(reply),
+            ));
+            c.spawn((
+                ds::text_in(self.assets, ds::Type::Meta, "Reopen", ds::ACCENT),
+                ReopenComment(a.id),
+                ChildOf(body),
+            ))
+            .observe(on_reopen);
+        }
         let b = self.x_button(c, row, DeleteComment(a.id));
         c.entity(b).observe(on_delete);
     }
@@ -575,7 +644,7 @@ fn comments_chip(
         .model
         .annotations
         .iter()
-        .filter(|a| a.material.is_none())
+        .filter(|a| a.material.is_none() && a.is_open())
         .count();
     let text = n.to_string();
     let Ok(mut ui) = chip.single_mut() else {
@@ -625,5 +694,29 @@ fn comments_chip(
 fn on_chip(click: On<PointerClick>, mut wb: ResMut<Workbench>) {
     if click.button == PointerButton::Primary {
         wb.show_comments = !wb.show_comments;
+    }
+}
+
+/// "Reopen" under a resolved comment.
+#[derive(Component)]
+struct ReopenComment(u32);
+
+fn on_reopen(
+    click: On<PointerClick>,
+    ids: Query<&ReopenComment>,
+    mut modeler: ResMut<Modeler>,
+    mut cb: ResMut<CommentBox>,
+    time: Res<Time>,
+) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
+    if let Ok(r) = ids.get(click.event_target()) {
+        let msg = match modeler.session.resolve_annotation(r.0, "", true) {
+            Ok(m) => m,
+            Err(e) => e.to_string(),
+        };
+        modeler.session.mark_autosave(true, false, false);
+        cb.say(msg, time.elapsed_secs_f64());
     }
 }
