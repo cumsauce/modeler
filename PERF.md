@@ -1,6 +1,6 @@
 # Performance findings
 
-A read-only review, done in three parts: the preview window, the core library and the server path. Nothing has been changed yet.
+A review done in three parts: the preview window, the core library and the server path. The fixes have since landed; see **Status** at the end.
 
 **Baseline.** `cargo test --test perf` passes every budget comfortably:
 
@@ -58,3 +58,23 @@ The perf test has no map case, and maps are where the slowness lives. **Add a ma
 2. #4 + #6 + #10: one diffed part-to-entity map with shared handles, used by both the window and the grid.
 3. #2 (daemon multiplexing) and #5 + #8 (switching cost). These matter most with several agents.
 4. #9 (BVH and verify broadphase), then the smaller items.
+
+## Status (fixed)
+
+| # | What changed |
+|---|---|
+| map case | `tests/perf_map.rs`. Build 8 ms, a marker edit 2 ms, `markers()` 0.2 ms, 20 rays 3 ms, verify grounded 190 ms cold / 60 ms warm. |
+| 1 | Each call awaits one main-loop trip. `begin_call`, `end_call` and `close_idle` are sent without waiting, and every send wakes winit (`bridge::WAKE`). Five calls went from 0.68 s to 0.37 s. |
+| 2 | The daemon sends calls concurrently. A reader thread routes responses by id, and the lock only guards respawning. A `scene_summary` takes 0.15 s during another agent's 0.9 s render. |
+| 3, 7, 8 | `catalog::prefab_instance` returns a cached `Arc<Model>` (no history, keyed by mtime), and `OPEN_DOCS` holds `Arc`s. It is used by instancing, markers, rules, lights, scene export, `sync_prefabs` and marker previews. Previews ray-cast the terrain in place. |
+| 4, 6, 10 | `PbrCache` shares meshes by content and flat materials by look across rebuilds, instances, copies, grid tiles and agent views. Pbr materials are evicted least recently used first. The selection pulses a per-part copy. Entities are still respawned, which is cheap. Meshes keep their main-world data because picking ray-casts them. |
+| 5 | One journal per open document (`session.history.<doc>.jsonl`), and `open_docs.json` without histories. A journal is appended to across restarts. |
+| 9 | Rays use a cached world-space BVH. Manifold solids are cached across verifies. `floating` uses the culled, parallel contact pairs. |
+| small | Op memo keys and bake keys hash serde output as it streams. The op cache evicts its least recently used half. Geometry hashes are memoised. `drawn()` is a set lookup. The outliner hashes names. The window idles at 4 fps after 2 s of stillness. |
+
+**Not done**, because the gain is too small at current sizes:
+- a `Named` hash index (lookups are linear, a few ms at 2k parts);
+- a retained gizmo asset (gizmos are already cached per version);
+- moving `close_idle` to a timer (it already runs at most once a minute).
+
+Also fixed on the way: agent views rendered a stale scene while the grid was up. The window scene now rebuilds while shots are pending.

@@ -1445,7 +1445,7 @@ and material panes closed (`MODELER_OUTLINE=0` / `MODELER_STYLE=1` /
   into its own image, active only for a few frames after its document
   changes (or the tile resizes), so an idle grid renders no 3D at all; the
   window camera (TAA + SSR) pauses while the grid is up, tile cameras skip
-  SSR / TAA / SSAO and shadows, and the app loop drops to ~30 fps. A
+  SSR / TAA / SSAO and shadows, and the app loop drops to ~30 fps. With the grid off the loop runs at full rate while anything moves (input, the camera, edits, playback, agent shots) and for 2 s after, then idles at 4 fps; server calls wake it at once. A
   `screenshot` in the grid captures the window (tiles and labels).
 - **M**, the material strip along the bottom under both: the active
   material's graph by dependency level with a live thumbnail per node, a lit
