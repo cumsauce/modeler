@@ -89,6 +89,26 @@ jobs:
           tar -xzf modeler-linux-x86_64.tar.gz
           ci/smoke.sh modeler/modeler
 
+  # Renders with no GPU: --offscreen on Mesa's software Vulkan (lavapipe).
+  render:
+    needs: linux
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: modeler-linux-x86_64
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers python3
+          tar -xzf modeler-linux-x86_64.tar.gz
+          SMOKE_IMAGE=view.png ci/smoke.sh modeler/modeler render
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-smoke
+          path: view.png
+
   # The action, installed the way another repo would use it.
   action:
     needs: linux
@@ -101,3 +121,10 @@ jobs:
       - run: |
           cat .mcp.json
           ci/smoke.sh "${{ steps.modeler.outputs.bin }}"
+      - id: rendering
+        uses: ./
+        with:
+          render: true
+      - run: |
+          grep -q -- --offscreen .mcp.json
+          ci/smoke.sh "${{ steps.rendering.outputs.bin }}" render

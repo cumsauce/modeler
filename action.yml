@@ -1,6 +1,7 @@
 # Installs the modeler (Linux x86_64, headless) in another repo's workflow
 # and registers it as an MCP server, so a Claude Code run in that job gets
-# the mcp__modeler__* tools.
+# the mcp__modeler__* tools. `render: true` makes the renders work too
+# (software Vulkan, no GPU needed).
 #
 #   - uses: cumsauce/modeler@main
 #   - uses: anthropics/claude-code-action@v1
@@ -15,6 +16,9 @@ inputs:
   mcp-config:
     description: MCP config file to add the server to (created if missing)
     default: .mcp.json
+  render:
+    description: Make agent_views and screenshot work with no GPU (installs Mesa's software Vulkan, runs --offscreen)
+    default: "false"
   project:
     description: Game project the server works in (its .modeler/ and assets/); default the repo root
     default: ${{ github.workspace }}
@@ -31,6 +35,7 @@ runs:
         REL: ${{ inputs.release }}
         CFG: ${{ inputs.mcp-config }}
         PROJ: ${{ inputs.project }}
+        RENDER: ${{ inputs.render }}
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
@@ -43,17 +48,24 @@ runs:
           | tar -xz -C "$dir" --strip-components=1
         chmod +x "$dir/modeler"
         echo "$dir" >> "$GITHUB_PATH"
+        mode=--headless
+        if [ "$RENDER" = "true" ]; then
+          # A CPU Vulkan driver: wgpu renders the agent views on it.
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libvulkan1 mesa-vulkan-drivers
+          mode=--offscreen
+        fi
         echo "bin=$dir/modeler" >> "$GITHUB_OUTPUT"
-        python3 - "$CFG" "$dir/modeler" "$PROJ" <<'PY'
+        python3 - "$CFG" "$dir/modeler" "$PROJ" "$mode" <<'PY'
         import json, os, sys
-        cfg, binary, project = sys.argv[1:4]
+        cfg, binary, project, mode = sys.argv[1:5]
         data = {}
         if os.path.exists(cfg):
             with open(cfg) as f:
                 data = json.load(f)
         data.setdefault("mcpServers", {})["modeler"] = {
             "command": binary,
-            "args": ["--headless", "--project", project],
+            "args": [mode, "--project", project],
         }
         with open(cfg, "w") as f:
             json.dump(data, f, indent=2)

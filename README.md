@@ -53,11 +53,20 @@ jobs:
 
 The action adds `{"modeler": {"command": ..., "args": ["--headless",
 "--project", <repo root>]}}` to `.mcp.json` (inputs: `release`, `mcp-config`,
-`project`; output: `bin`). Headless means every tool but the renders
-(`agent_views`, `screenshot`): build, `verify`, `inspect`, `probe_ray`,
-`material_view` (CPU) and `export_model` all work, and relative exports land
-in the project's `assets/`. Anywhere else on Linux, download the tarball from
-the release and run `modeler --headless`.
+`project`, `render`; output: `bin`); relative exports land in the project's
+`assets/`. `--headless` runs every tool but the renders (`agent_views`,
+`screenshot`). For those too, pass `render: true`: the action installs
+Mesa's software Vulkan driver (lavapipe, CPU only, no GPU needed) and runs
+`--offscreen`, the full renderer with no window. Renders take a few seconds
+each on the CPU.
+
+Anywhere else on Linux (a container, a cloud session), download the tarball
+from the release and run `modeler --headless`, or for renders:
+
+```sh
+apt-get install -y libvulkan1 mesa-vulkan-drivers
+modeler --offscreen
+```
 
 ## What's inside
 
