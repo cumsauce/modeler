@@ -11,6 +11,7 @@ pub(crate) fn take_screenshot(
     mut pending: ResMut<PendingShots>,
     view: Res<View3d>,
     grid: Option<Res<Grid>>,
+    wb: Option<Res<Workbench>>,
     env_ready: Query<(), (With<MainCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
 ) {
@@ -29,7 +30,7 @@ pub(crate) fn take_screenshot(
     };
     // The 3D view's own image: never a pane. In the grid view, the window
     // (every document's tile, as the human sees it).
-    let shot = if grid.is_some_and(|g| g.on) {
+    let shot = if grid.is_some_and(|g| g.on) || wb.is_some_and(|w| w.capture_window) {
         Screenshot::primary_window()
     } else {
         Screenshot::image(view.image.clone())

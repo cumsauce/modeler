@@ -126,22 +126,20 @@ enum Icon {
 }
 
 impl Icon {
-    fn badge(self) -> (&'static str, [f32; 3]) {
+    fn ds(self) -> ds::Icon {
         match self {
-            Icon::Part => ("P", [0.45, 0.55, 0.7]),
-            Icon::Instance => ("I", [0.35, 0.62, 0.95]),
-            Icon::Array => ("A", [0.55, 0.45, 0.85]),
-            Icon::Hidden => ("H", [0.4, 0.4, 0.44]),
-            Icon::Material => ("M", [0.85, 0.55, 0.3]),
-            Icon::Library => ("L", [0.55, 0.5, 0.42]),
-            Icon::Clip => ("C", [0.3, 0.72, 0.55]),
-            Icon::Skeleton => ("S", [0.75, 0.68, 0.35]),
-            Icon::Bone => ("B", [0.62, 0.58, 0.4]),
-            Icon::Terrain => ("T", [0.4, 0.62, 0.35]),
-            Icon::GameBuilt => ("G", [0.85, 0.45, 0.6]),
-            Icon::Marker => ("K", [0.95, 0.3, 0.8]),
-            Icon::Collider => ("X", [0.35, 0.8, 0.45]),
-            Icon::Light => ("L", [0.95, 0.8, 0.35]),
+            Icon::Part => ds::Icon::Part,
+            Icon::Instance => ds::Icon::House,
+            Icon::Array => ds::Icon::Block,
+            Icon::Hidden => ds::Icon::Hide,
+            Icon::Material | Icon::Library => ds::Icon::Swatch,
+            Icon::Clip => ds::Icon::Play,
+            Icon::Skeleton | Icon::Bone => ds::Icon::Bone,
+            Icon::Terrain => ds::Icon::Mount,
+            Icon::GameBuilt => ds::Icon::Cube,
+            Icon::Marker => ds::Icon::Pin,
+            Icon::Collider => ds::Icon::Zone,
+            Icon::Light => ds::Icon::Light,
         }
     }
 }
@@ -262,9 +260,8 @@ pub(crate) struct OutlineRow {
 #[derive(Component)]
 pub(crate) struct OutlineChevron;
 
-const ROW_H: f32 = 22.0;
+const ROW_H: f32 = 26.0;
 const INDENT: f32 = 14.0;
-const SELECTED: Color = Color::srgba(0.25, 0.45, 0.85, 0.45);
 
 fn hash_of(v: impl std::hash::Hash) -> u64 {
     use std::hash::Hasher;
@@ -286,9 +283,10 @@ pub(crate) fn update_outline_pane(
     mut hud: Query<&mut Visibility, With<OutlineHud>>,
     mut list: Query<(Entity, &mut ScrollPosition), With<OutlineList>>,
     mut title: Query<&mut Text, With<OutlineTitle>>,
-    mut rows: Query<(&OutlineRow, &mut BackgroundColor)>,
+    mut rows: Query<(&OutlineRow, &mut ds::Ui)>,
     assets: Res<AssetServer>,
     mut commands: Commands,
+    (mut icons, mut images): (ResMut<ds::Icons>, ResMut<Assets<Image>>),
 ) {
     let Ok(mut vis) = hud.single_mut() else {
         return;
@@ -369,7 +367,14 @@ pub(crate) fn update_outline_pane(
             pane.selected = None;
             pane.selected_parts.clear();
         }
-        spawn_rows(&mut commands, list_e, &pane.items, &layers, &assets);
+        spawn_rows(
+            &mut commands,
+            list_e,
+            &pane.items,
+            &layers,
+            &assets,
+            (&mut icons, &mut images),
+        );
         return;
     }
 
@@ -385,9 +390,8 @@ pub(crate) fn update_outline_pane(
             || k.strip_prefix("lib:")
                 .is_some_and(|m| Some(m) == active_mat)
             || k.strip_prefix("clip:").is_some_and(|c| Some(c) == clip);
-        let want = if on { SELECTED } else { Color::NONE };
-        if bg.0 != want {
-            bg.0 = want;
+        if bg.on != on {
+            bg.on = on;
         }
     }
     let _ = &mut wb;
@@ -414,7 +418,6 @@ fn model_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
             it.detail = r.detail.clone();
             it.depth = depth;
             it.icon = Some(icon_for(r));
-            it.swatch = Some(r.swatch);
             it.dim = r.dim;
             it.group = !r.children.is_empty();
             it.open = expanded.contains(&r.key);
@@ -422,6 +425,19 @@ fn model_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
             it
         })
         .collect()
+}
+
+/// A pbr part's mean baked colour (sRGB), from the bake cache the preview
+/// fills anyway; its base colour factor alone is white.
+fn baked_swatch(p: &Part) -> Option<[f32; 4]> {
+    let ch = modeler::material::pbr::bake_part(p).ok()??;
+    let n = ch.base_color.len().max(1) as f32;
+    let m = ch
+        .base_color
+        .iter()
+        .fold([0.0f32; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
+    let c = Color::linear_rgb(m[0] / n, m[1] / n, m[2] / n).to_srgba();
+    Some([c.red, c.green, c.blue, 1.0])
 }
 
 fn material_items(session: &Session, expanded: &HashSet<String>) -> Vec<Item> {
@@ -441,7 +457,7 @@ fn material_items(session: &Session, expanded: &HashSet<String>) -> Vec<Item> {
                 )
             }
         };
-        let c = p.material.base_color;
+        let c = baked_swatch(p).unwrap_or(p.material.base_color);
         match used.iter_mut().find(|(n, _, _)| *n == name) {
             Some((_, _, parts)) => parts.push(p.name.clone()),
             None => used.push((name, [c[0], c[1], c[2]], vec![p.name.clone()])),
@@ -672,6 +688,7 @@ fn spawn_rows(
     items: &[Item],
     layers: &LayerVisibility,
     assets: &AssetServer,
+    (icons, images): (&mut ds::Icons, &mut Assets<Image>),
 ) {
     let _ = layers;
     commands.entity(list_e).despawn_children();
@@ -680,15 +697,12 @@ fn spawn_rows(
     for it in items {
         if it.act == Act::Heading && it.key.starts_with("h:") {
             commands.spawn((
-                Text::new(it.label.to_uppercase()),
-                ui_text(assets, 11.0, true),
-                ui_color(true),
-                TextLayout::no_wrap(),
+                ds::text(assets, ds::Type::Caption, it.label.clone()),
                 Node {
                     margin: UiRect {
-                        top: Val::Px(8.0),
-                        bottom: Val::Px(2.0),
-                        left: Val::Px(8.0),
+                        top: Val::Px(14.0),
+                        bottom: Val::Px(4.0),
+                        left: Val::Px(12.0),
                         ..default()
                     },
                     ..default()
@@ -703,22 +717,23 @@ fn spawn_rows(
                 OutlineRow {
                     key: it.key.clone(),
                 },
-                Node {
-                    height: Val::Px(ROW_H),
-                    min_height: Val::Px(ROW_H),
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    padding: UiRect {
-                        left: Val::Px(6.0 + it.depth as f32 * INDENT),
-                        right: Val::Px(8.0),
-                        ..default()
-                    },
-                    ..default()
-                },
-                BackgroundColor(Color::NONE),
+                ds::piece(ds::Kind::Row),
                 ChildOf(list_e),
             ))
+            .insert((Node {
+                height: Val::Px(ROW_H),
+                min_height: Val::Px(ROW_H),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                padding: UiRect {
+                    left: Val::Px(4.0 + it.depth as f32 * INDENT),
+                    right: Val::Px(8.0),
+                    ..default()
+                },
+                border_radius: BorderRadius::all(Val::Px(5.0)),
+                ..default()
+            },))
             .observe(on_row_click)
             .id();
         let mut chev = commands.spawn((
@@ -737,43 +752,31 @@ fn spawn_rows(
                 } else {
                     chevron_right.clone()
                 })
-                .with_color(Color::srgba(0.85, 0.87, 0.9, 0.9)),
+                .with_color(ds::FAINT),
                 OutlineChevron,
             ));
         }
-        if let Some(icon) = it.icon {
-            let (letter, [r, g, b]) = icon.badge();
-            let badge = commands
-                .spawn((
-                    Node {
-                        width: Val::Px(15.0),
-                        height: Val::Px(15.0),
-                        flex_shrink: 0.0,
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border_radius: BorderRadius::all(Val::Px(3.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(r, g, b, if it.dim { 0.35 } else { 0.85 })),
-                    Pickable::IGNORE,
-                    ChildOf(row),
-                ))
-                .id();
+        if let Some(icon) = it.icon
+            && it.swatch.is_none()
+        {
             commands.spawn((
-                Text::new(letter),
-                ui_text(assets, 10.0, true),
-                TextColor(Color::srgb(0.06, 0.07, 0.09)),
+                ds::icon(icons, images, icon.ds(), 14.0, ds::DIM),
+                if it.dim {
+                    ds::Ink::Fixed
+                } else {
+                    ds::Ink::Meta
+                },
                 Pickable::IGNORE,
-                ChildOf(badge),
+                ChildOf(row),
             ));
         }
         if let Some([cr, cg, cb]) = it.swatch {
             commands.spawn((
                 Node {
-                    width: Val::Px(10.0),
-                    height: Val::Px(10.0),
+                    width: Val::Px(14.0),
+                    height: Val::Px(14.0),
                     flex_shrink: 0.0,
-                    border_radius: BorderRadius::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
                     ..default()
                 },
                 BackgroundColor(Color::srgb(cr, cg, cb).with_alpha(if it.dim { 0.4 } else { 1.0 })),
@@ -782,10 +785,17 @@ fn spawn_rows(
             ));
         }
         commands.spawn((
-            Text::new(it.label.clone()),
-            ui_text(assets, 13.0, it.group && it.depth == 0),
-            ui_color(it.dim),
-            TextLayout::no_wrap(),
+            ds::text_in(
+                assets,
+                ds::Type::Body,
+                it.label.clone(),
+                if it.dim { ds::FAINT } else { ds::FG },
+            ),
+            if it.dim {
+                ds::Ink::Fixed
+            } else {
+                ds::Ink::Main
+            },
             Node {
                 flex_shrink: 1.0,
                 overflow: Overflow::clip(),
@@ -803,10 +813,8 @@ fn spawn_rows(
             ChildOf(row),
         ));
         commands.spawn((
-            Text::new(it.detail.clone()),
-            ui_text(assets, 11.0, false),
-            ui_color(true),
-            TextLayout::no_wrap(),
+            ds::text(assets, ds::Type::Meta, it.detail.clone()),
+            ds::Ink::Meta,
             Pickable::IGNORE,
             ChildOf(row),
         ));
@@ -950,6 +958,10 @@ pub(crate) fn setup_outline_pane(mut commands: Commands, assets: Res<AssetServer
             right: Val::Px(0.0),
             bottom: Val::Px(0.0),
             flex_direction: FlexDirection::Column,
+            // Rows inset from the pane edge (padding, not row margins: a
+            // margin on a zero-width list makes a negative row, which
+            // Bevy's border-radius clamp panics on).
+            padding: UiRect::horizontal(Val::Px(6.0)),
             overflow: Overflow::scroll_y(),
             ..default()
         },

@@ -91,20 +91,12 @@ pub(crate) fn shading_plugin(app: &mut App) {
         );
 }
 
-fn chip() -> (Node, BackgroundColor, BlocksCamera) {
-    (
-        Node {
-            padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.09, 0.1, 0.12, 0.88)),
-        BlocksCamera,
-    )
-}
-
-fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
+fn setup_hud(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mut icons: ResMut<ds::Icons>,
+    mut images: ResMut<Assets<Image>>,
+) {
     let row = commands
         .spawn((
             Name::new("hud row"),
@@ -112,8 +104,8 @@ fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
             InSlot(PaneSlot::Centre),
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(8.0),
-                right: Val::Px(8.0),
+                top: Val::Px(10.0),
+                right: Val::Px(10.0),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(6.0),
@@ -122,52 +114,68 @@ fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
             Pickable::IGNORE,
         ))
         .id();
-    // Fly / Orbit (Map mode only).
+    // Fly / Orbit (Map mode only): a chip-styled segment of two tabs.
     let seg = commands
         .spawn((
             NavSegment,
             Node {
                 flex_direction: FlexDirection::Row,
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                overflow: Overflow::clip(),
+                padding: UiRect::all(Val::Px(2.0)),
+                column_gap: Val::Px(2.0),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(ds::RADIUS)),
                 display: Display::None,
                 ..default()
             },
+            BackgroundColor(ds::CHIP_BG),
+            BorderColor::all(ds::LINE),
             BlocksCamera,
             ChildOf(row),
         ))
         .id();
     for (fly, label) in [(true, "Fly"), (false, "Orbit")] {
         let b = commands
-            .spawn((
-                HudButton::Nav(fly),
-                Node {
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.09, 0.1, 0.12, 0.88)),
-                ChildOf(seg),
-            ))
+            .spawn((ds::piece(ds::Kind::Tab), HudButton::Nav(fly), ChildOf(seg)))
+            .insert(Node {
+                padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            })
             .observe(on_hud_click)
             .id();
         commands.spawn((
-            Text::new(label),
-            ui_text(&assets, 12.0, false),
-            ui_color(false),
+            ds::text(&assets, ds::Type::Small, label),
+            ds::Ink::Main,
             Pickable::IGNORE,
             ChildOf(b),
         ));
     }
     // The View chip and its menu.
     let view = commands
-        .spawn((HudButton::View, chip(), ChildOf(row)))
+        .spawn((
+            ds::piece(ds::Kind::Chip),
+            HudButton::View,
+            BlocksCamera,
+            ChildOf(row),
+        ))
         .observe(on_hud_click)
         .id();
     commands.spawn((
+        ds::icon(&mut icons, &mut images, ds::Icon::View, 13.0, ds::DIM),
+        ds::Ink::Icon,
+        Pickable::IGNORE,
+        ChildOf(view),
+    ));
+    commands.spawn((
         ViewLabel,
-        Text::new("View: Lit ▾"),
-        ui_text(&assets, 12.0, false),
-        ui_color(false),
+        ds::text(&assets, ds::Type::Small, "Lit"),
+        ds::Ink::Main,
+        Pickable::IGNORE,
+        ChildOf(view),
+    ));
+    commands.spawn((
+        ds::icon(&mut icons, &mut images, ds::Icon::Chevron, 11.0, ds::DIM),
+        ds::Ink::Meta,
         Pickable::IGNORE,
         ChildOf(view),
     ));
@@ -177,15 +185,18 @@ fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
             InSlot(PaneSlot::Centre),
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(40.0),
-                right: Val::Px(8.0),
-                width: Val::Px(260.0),
+                top: Val::Px(44.0),
+                right: Val::Px(10.0),
+                width: Val::Px(250.0),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(4.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
+                row_gap: Val::Px(2.0),
+                padding: UiRect::all(Val::Px(5.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.07, 0.08, 0.1, 0.96)),
+            BackgroundColor(ds::PANEL),
+            BorderColor::all(ds::LINE),
             BlocksCamera,
             GlobalZIndex(20),
             Visibility::Hidden,
@@ -193,30 +204,26 @@ fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
         .id();
     for s in [Shading::Lit, Shading::Clay, Shading::Parts] {
         let item = commands
-            .spawn((
-                HudButton::Pick(s),
-                Node {
-                    flex_direction: FlexDirection::Column,
-                    padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::NONE),
-                ChildOf(menu),
-            ))
+            .spawn((ds::piece(ds::Kind::Row), HudButton::Pick(s), ChildOf(menu)))
+            .insert(Node {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: Val::Px(2.0),
+                padding: UiRect::axes(Val::Px(9.0), Val::Px(6.0)),
+                border_radius: BorderRadius::all(Val::Px(5.0)),
+                ..default()
+            })
             .observe(on_hud_click)
             .id();
         commands.spawn((
-            Text::new(s.label()),
-            ui_text(&assets, 13.0, true),
-            ui_color(false),
+            ds::text(&assets, ds::Type::Body, s.label()),
+            ds::Ink::Main,
             Pickable::IGNORE,
             ChildOf(item),
         ));
         commands.spawn((
-            Text::new(s.about()),
-            ui_text(&assets, 11.0, false),
-            ui_color(true),
+            ds::text_wrap(&assets, ds::Type::Meta, s.about()),
+            ds::Ink::Meta,
             Pickable::IGNORE,
             ChildOf(item),
         ));
@@ -265,7 +272,7 @@ fn sync_hud(
     mut label: Query<&mut Text, With<ViewLabel>>,
     mut menu: Query<&mut Visibility, With<ViewMenu>>,
     mut seg: Query<&mut Node, With<NavSegment>>,
-    mut items: Query<(&HudButton, &mut BackgroundColor)>,
+    mut items: Query<(&HudButton, &mut ds::Ui)>,
 ) {
     // A click in the 3D view closes the menu.
     if open.0 && mouse.just_pressed(MouseButton::Left) && !wb.ui_hover {
@@ -276,7 +283,7 @@ fn sync_hud(
         open.0 = false;
     }
     if let Ok(mut t) = label.single_mut() {
-        let want = format!("View: {} ▾", wb.shading.label());
+        let want = wb.shading.label().to_string();
         if t.0 != want {
             t.0 = want;
         }
@@ -304,14 +311,8 @@ fn sync_hud(
             HudButton::Nav(fly) => fly == nav.fly,
             HudButton::View => continue,
         };
-        let want = match (b, on) {
-            (HudButton::Nav(_), true) => Color::srgba(0.25, 0.45, 0.85, 0.95),
-            (HudButton::Nav(_), false) => Color::srgba(0.09, 0.1, 0.12, 0.88),
-            (_, true) => Color::srgba(1.0, 1.0, 1.0, 0.08),
-            _ => Color::NONE,
-        };
-        if bg.0 != want {
-            bg.0 = want;
+        if bg.on != on {
+            bg.on = on;
         }
     }
     // The View chip hides with the 3D view (Material shows the graph).

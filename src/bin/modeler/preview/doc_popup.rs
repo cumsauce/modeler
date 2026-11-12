@@ -214,7 +214,7 @@ fn doc_popup(
                 if live {
                     live_color(true)
                 } else if is_active {
-                    Color::srgb(0.35, 0.62, 0.95)
+                    ds::ACCENT
                 } else {
                     live_color(false)
                 },
@@ -313,11 +313,7 @@ fn row(commands: &mut Commands, list: Entity, pick: Option<Pick>, active: bool) 
             padding: UiRect::horizontal(Val::Px(10.0)),
             ..default()
         },
-        BackgroundColor(if active {
-            Color::srgba(0.35, 0.62, 0.95, 0.18)
-        } else {
-            Color::NONE
-        }),
+        BackgroundColor(if active { ds::ACCENT_SOFT } else { Color::NONE }),
         ChildOf(list),
     ));
     if let Some(p) = pick {

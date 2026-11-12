@@ -138,6 +138,7 @@ pub(crate) fn drain_commands(
     mut agent_shots: ResMut<PendingAgentShots>,
     mut orbit: ResMut<Orbit>,
     mut playback: ResMut<Playback>,
+    (mut wb, mut grid): (ResMut<Workbench>, ResMut<Grid>),
 ) {
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
@@ -183,6 +184,7 @@ pub(crate) fn drain_commands(
                 pitch,
                 dist,
                 play,
+                ui,
                 reply,
             } => {
                 if headless.0 {
@@ -203,10 +205,21 @@ pub(crate) fn drain_commands(
                         orbit.dist = dist.clamp(0.2, 200.0);
                         orbit.user = true;
                     }
-                    let msg = match play {
+                    let mut msg = match play {
                         Some(r) => playback.request(&modeler.session.model, &r),
                         None => Ok(String::new()),
                     };
+                    if let (Some(u), Ok(m)) = (ui, &mut msg) {
+                        match apply_ui(&u, &modeler.session.model, &mut wb, &mut grid) {
+                            Ok(said) => {
+                                if !m.is_empty() {
+                                    m.push('\n');
+                                }
+                                m.push_str(&said);
+                            }
+                            Err(e) => msg = Err(e),
+                        }
+                    }
                     let _ = reply.send(msg.map(String::into_bytes));
                 }
             }
@@ -230,6 +243,63 @@ pub(crate) fn drain_commands(
             }
         }
     }
+}
+
+/// `set_camera(ui: ...)`: the window's UI as the human would set it.
+fn apply_ui(
+    u: &crate::server::UiArg,
+    model: &Model,
+    wb: &mut Workbench,
+    grid: &mut Grid,
+) -> Result<String, String> {
+    let mut said = Vec::new();
+    if let Some(m) = &u.mode {
+        if m == "grid" {
+            grid.on = true;
+        } else {
+            let mode = Mode::ALL
+                .into_iter()
+                .find(|x| x.label().eq_ignore_ascii_case(m))
+                .ok_or_else(|| {
+                    format!("ui.mode: `{m}` is not model / material / animate / map / grid")
+                })?;
+            mode_available(model, mode).map_err(|why| format!("ui.mode {m}: {why}"))?;
+            wb.mode = mode;
+            wb.mode_doc = model.name.clone();
+            grid.on = false;
+        }
+        said.push(format!("mode {m}"));
+    }
+    if let Some(p) = &u.select {
+        wb.selected = (!p.is_empty()).then(|| p.clone());
+        said.push(if p.is_empty() {
+            "deselected".into()
+        } else {
+            format!("selected {p}")
+        });
+    }
+    if let Some(c) = u.comments {
+        wb.show_comments = c;
+        said.push(format!("comments {}", if c { "open" } else { "closed" }));
+    }
+    if let Some(s) = &u.shading {
+        wb.shading = match s.as_str() {
+            "lit" => Shading::Lit,
+            "clay" => Shading::Clay,
+            "parts" => Shading::Parts,
+            _ => return Err(format!("ui.shading: `{s}` is not lit / clay / parts")),
+        };
+        said.push(format!("shading {s}"));
+    }
+    if let Some(c) = &u.capture {
+        wb.capture_window = match c.as_str() {
+            "window" => true,
+            "view" => false,
+            _ => return Err(format!("ui.capture: `{c}` is not window / view")),
+        };
+        said.push(format!("screenshot captures the {c}"));
+    }
+    Ok(format!("ui: {}", said.join(", ")))
 }
 
 /// Rebuilds one entity per part whenever the model version moves, and re-frames the

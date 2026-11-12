@@ -1,17 +1,11 @@
-//! Shared window chrome built on Bevy Feathers (the editor widget set): the
-//! dark theme, Fira fonts and pane headers with a close button. The layout
+//! Shared window chrome built on Bevy Feathers (the editor widget set):
+//! Fira fonts and the panes' caption headers (the palette and components are
+//! `ds.rs`). The layout
 //! is `workbench.rs`, the top bar `top_bar.rs`.
 
-use bevy::feathers::constants::{fonts, icons, size};
-use bevy::feathers::controls::{ButtonVariant, FeathersToolButton};
-
-use bevy::feathers::display::icon;
-use bevy::feathers::theme::{
-    InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemedText,
-};
+use bevy::feathers::constants::{fonts, size};
+use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor};
 use bevy::feathers::tokens;
-use bevy::scene::{CommandsSceneExt, bsn};
-use bevy::ui_widgets::Activate;
 
 use crate::prelude::*;
 
@@ -22,7 +16,13 @@ pub(crate) const HEADER_H: f32 = 30.0;
 pub(crate) fn ui_text(assets: &AssetServer, px: f32, bold: bool) -> TextFont {
     TextFont {
         font: assets
-            .load(if bold { fonts::BOLD } else { fonts::REGULAR })
+            // Fira Bold is heavier than the concept's 600 weight: keep it
+            // for titles (14 px and up); smaller emphasis is colour only.
+            .load(if bold && px >= 14.0 {
+                fonts::BOLD
+            } else {
+                fonts::REGULAR
+            })
             .into(),
         font_size: FontSize::Px(px),
         ..default()
@@ -52,23 +52,8 @@ pub(crate) enum PaneToggle {
     Material,
 }
 
-pub(crate) fn on_toggle(
-    activate: On<Activate>,
-    which: Query<&PaneToggle>,
-    mut outline: ResMut<OutlinePane>,
-    mut wb: ResMut<Workbench>,
-) {
-    let Ok(w) = which.get(activate.event_target()) else {
-        return;
-    };
-    match w {
-        PaneToggle::Outline => outline.visible = !outline.visible,
-        PaneToggle::Material => wb.mode = Mode::Model,
-    }
-}
-
-/// A pane's header row: a bold title (the returned text entity, for live
-/// titles) and a close button. Spawned as a child of `pane`.
+/// A pane's header row: a quiet caption (`title` carries the text, for live
+/// titles). Spawned as a child of `pane`.
 pub(crate) fn spawn_pane_header(
     commands: &mut Commands,
     assets: &AssetServer,
@@ -76,6 +61,9 @@ pub(crate) fn spawn_pane_header(
     which: PaneToggle,
     title: impl Bundle,
 ) {
+    // The concept's panes have no title bar: a quiet caption over the list
+    // (the panes come and go with the mode, so no close button).
+    let _ = which;
     let header = commands
         .spawn((
             Name::new("pane header"),
@@ -87,23 +75,19 @@ pub(crate) fn spawn_pane_header(
                 height: Val::Px(HEADER_H),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
-                justify_content: JustifyContent::SpaceBetween,
-                padding: UiRect::horizontal(Val::Px(8.0)),
-                border: UiRect::bottom(Val::Px(1.0)),
+                padding: UiRect::horizontal(Val::Px(ds::PAD)),
                 ..default()
             },
-            ThemeBackgroundColor(tokens::PANE_HEADER_BG),
-            ThemeBorderColor(tokens::PANE_HEADER_BORDER),
-            InheritableThemeTextColor(tokens::PANE_HEADER_TEXT),
+            BackgroundColor(ds::PANEL),
             GlobalZIndex(2),
             ChildOf(pane),
         ))
         .id();
     commands.spawn((
         title,
-        ui_text(assets, 13.0, true),
+        ui_text(assets, 11.0, false),
+        TextColor(ds::FAINT),
         TextLayout::no_wrap(),
-        ThemedText,
         Node {
             flex_shrink: 1.0,
             overflow: Overflow::clip(),
@@ -111,15 +95,6 @@ pub(crate) fn spawn_pane_header(
         },
         ChildOf(header),
     ));
-    commands
-        .spawn_scene(bsn! {
-            @FeathersToolButton {
-                @variant: ButtonVariant::Plain,
-                @caption: bsn! { @icon(icons::X) }
-            }
-        })
-        .insert((which, ChildOf(header)))
-        .observe(on_toggle);
 }
 
 /// An agent the server hasn't seen made its first call: bring the window

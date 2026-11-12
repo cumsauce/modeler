@@ -126,7 +126,7 @@ fn chip(bg: f32) -> (Node, BackgroundColor) {
             align_items: AlignItems::Center,
             ..default()
         },
-        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, bg)),
+        BackgroundColor(if bg > 0.0 { ds::RAISE } else { Color::NONE }),
     )
 }
 
@@ -142,7 +142,7 @@ fn setup_dock(mut commands: Commands, assets: Res<AssetServer>) {
                 border: UiRect::top(Val::Px(1.0)),
                 ..default()
             },
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.08)),
+            BorderColor::all(ds::LINE),
         ))
         .id();
     let header = commands
@@ -203,7 +203,7 @@ fn setup_dock(mut commands: Commands, assets: Res<AssetServer>) {
                 border: UiRect::vertical(Val::Px(1.0)),
                 ..default()
             },
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.08)),
+            BorderColor::all(ds::LINE),
             ChildOf(body),
         ))
         .id();
@@ -222,7 +222,7 @@ fn setup_dock(mut commands: Commands, assets: Res<AssetServer>) {
                 flex_grow: 1.0,
                 ..default()
             },
-            BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.03)),
+            BackgroundColor(ds::BG),
             ChildOf(ruler_row),
         ))
         .id();
@@ -237,7 +237,7 @@ fn setup_dock(mut commands: Commands, assets: Res<AssetServer>) {
                 height: Val::Px(if i % 5 == 0 { 8.0 } else { 4.0 }),
                 ..default()
             },
-            BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.3)),
+            BackgroundColor(ds::FAINT),
             Pickable::IGNORE,
             ChildOf(ruler),
         ));
@@ -294,7 +294,7 @@ fn setup_dock(mut commands: Commands, assets: Res<AssetServer>) {
             bottom: Val::Px(0.0),
             ..default()
         },
-        BackgroundColor(Color::srgb(1.0, 0.55, 0.2)),
+        BackgroundColor(ds::ACCENT),
         Pickable::IGNORE,
         ChildOf(overlay),
     ));
@@ -536,7 +536,7 @@ fn build_lanes(
                     border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
-                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.04)),
+                BorderColor::all(ds::LINE.with_alpha(0.5)),
                 ChildOf(lbox),
             ))
             .id();
@@ -576,15 +576,15 @@ fn build_lanes(
                     ..default()
                 },
                 BackgroundColor(if lane.wave {
-                    Color::srgba(0.4, 0.75, 1.0, 0.45)
+                    ds::ACCENT.with_alpha(0.45)
                 } else {
-                    Color::srgba(0.6, 0.9, 0.5, 0.35)
+                    ds::OK.with_alpha(0.35)
                 }),
                 ChildOf(track),
             ));
         }
         for (t, hollow) in &lane.keys {
-            let col = Color::srgb(1.0, 0.8, 0.3);
+            let col = ds::WARN;
             commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -688,7 +688,7 @@ fn draw_bones(
             .flat_map(|s| s.posed_segments(&s.rest()))
             .collect(),
     };
-    let col = Color::srgb(1.0, 0.75, 0.25);
+    let col = ds::WARN;
     for (a, b) in segs {
         gizmos.line(a, b, col);
         let r = ((b - a).length() * 0.06).clamp(0.004, 0.05);

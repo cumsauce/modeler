@@ -806,6 +806,12 @@ name: the producer first, then in-place material/visibility/transform edits).
   same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an
   image after building**: the data can be right while the render is wrong.
+- `set_camera(ui: {mode, select, comments, shading, capture})` drives the
+  window's workbench for checking the UI: `mode` model / material /
+  animate / map / grid, `select` a part (`""` clears), `comments` open or
+  closed, `shading` lit / clay / parts, and `capture: "window"` makes
+  `screenshot` capture the whole window (panes included) instead of the 3D
+  view.
 
 **History:**
 
@@ -1405,6 +1411,17 @@ scroll is scaled to wheel lines), arrows + PageUp/Down too.
 Auto-drift stops once the human steers; a new model re-frames the camera
 around true world bounds (bounds include part transforms), while edits to
 the same model keep a camera the human steered.
+
+**Design system** (`preview/ds.rs`): every pane builds from its tokens
+(the concept's colours `BG` / `PANEL` / `RAISE` / `LINE` / `FG` / `DIM` /
+`FAINT` / `ACCENT`, type scale `ds::Type`, `ds::theme()` retuning Feathers'
+widgets to the same palette), its line icons (`ds::Icon`, rasterized once,
+tinted) and its pieces (`ds::piece(Kind::Tab | Row | Chip | Button |
+IconButton ...)` + `ds::Ui { on, disabled }`; `ds::paint` restyles fill,
+border and `ds::Ink` children from that state and `Hovered`). New UI uses
+these instead of literal colours or Feathers buttons. Never give a UI node
+a margin that can exceed its parent's width (rows in a list: pad the list):
+Bevy's border-radius clamp panics on a negative size.
 
 Layout (`preview/workbench.rs`, after `design/workbench-concept.html`):
 a top bar, then either **All documents** (the grid, on by default;

@@ -103,6 +103,8 @@ pub(crate) struct Workbench {
     /// The cursor is over UI, not the 3D view: the camera and picking
     /// leave the mouse alone.
     pub(crate) ui_hover: bool,
+    /// `screenshot` captures the whole window (set_camera ui.capture).
+    pub(crate) capture_window: bool,
     /// Logical rects of the slots this frame (zero size when hidden).
     pub(crate) rects: SlotRects,
 }

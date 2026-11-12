@@ -12,6 +12,7 @@ pub(crate) enum Cmd {
         pitch: Option<f32>,
         dist: Option<f32>,
         play: Option<crate::preview::PlayRequest>,
+        ui: Option<crate::server::UiArg>,
         reply: ShotReply,
     },
     AgentShot {

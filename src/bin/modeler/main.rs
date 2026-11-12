@@ -352,14 +352,13 @@ fn main() -> AppExit {
             )
             .add_systems(Startup, setup_agent_camera)
             .add_plugins(bevy::feathers::FeathersPlugins)
-            .insert_resource(bevy::feathers::theme::UiTheme(
-                bevy::feathers::dark_theme::create_dark_theme(),
-            ))
+            .insert_resource(bevy::feathers::theme::UiTheme(crate::preview::ds::theme()))
             .add_systems(Startup, setup_outline_pane)
             .add_systems(Update, focus_on_new_agent)
             // The workbench and its panes (each file registers its own systems).
             .add_plugins((
                 workbench_plugin,
+                crate::preview::ds::ds_plugin,
                 top_bar_plugin,
                 doc_popup_plugin,
                 right_pane_plugin,

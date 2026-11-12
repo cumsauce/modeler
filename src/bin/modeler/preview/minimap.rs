@@ -60,7 +60,7 @@ fn setup_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         Camera {
             is_active: false,
             order: -2,
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.11, 0.12, 0.14)),
+            clear_color: ClearColorConfig::Custom(ds::BG),
             ..default()
         },
         RenderTarget::Image(image.clone().into()),
@@ -98,7 +98,7 @@ fn setup_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.2)),
+            BorderColor::all(ds::LINE),
             BlocksCamera,
             Visibility::Hidden,
         ))
@@ -111,7 +111,7 @@ fn setup_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             height: Val::Px(2.0),
             ..default()
         },
-        BackgroundColor(Color::srgb(1.0, 0.55, 0.2)),
+        BackgroundColor(ds::ACCENT),
         Pickable::IGNORE,
         ChildOf(node),
     ));
@@ -124,7 +124,7 @@ fn setup_minimap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
             border_radius: BorderRadius::all(Val::Px(4.0)),
             ..default()
         },
-        BackgroundColor(Color::srgb(1.0, 0.55, 0.2)),
+        BackgroundColor(ds::ACCENT),
         Pickable::IGNORE,
         ChildOf(node),
     ));

@@ -422,8 +422,8 @@ pub(crate) fn update_material_pane(
                             border_radius: BorderRadius::all(Val::Px(6.0)),
                             ..default()
                         },
-                        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.08)),
-                        BackgroundColor(Color::srgb(0.13, 0.135, 0.15)),
+                        BorderColor::all(ds::LINE),
+                        BackgroundColor(ds::PANEL),
                     ))
                     .with_children(|b| {
                         // The type's colour as a strip on the left edge.
@@ -457,7 +457,7 @@ pub(crate) fn update_material_pane(
                             t.spawn((
                                 Text::new(p.name.clone()),
                                 ui_text(&assets, 12.0, false),
-                                TextColor(Color::srgb(0.92, 0.93, 0.95)),
+                                TextColor(ds::FG),
                             ));
                             t.spawn((
                                 Text::new(p.ty.clone()),
@@ -501,11 +501,7 @@ pub(crate) fn update_material_pane(
             .boxes
             .get(b.0)
             .is_some_and(|x| Some(&x.0) == sel.as_ref());
-        let want = BorderColor::all(if on {
-            Color::srgb(1.0, 0.82, 0.3)
-        } else {
-            Color::srgba(1.0, 1.0, 1.0, 0.08)
-        });
+        let want = BorderColor::all(if on { ds::ACCENT } else { ds::LINE });
         if *border != want {
             *border = want;
         }
@@ -602,7 +598,7 @@ pub(crate) fn update_material_pane(
                     Some(s) => format!("node {s}"),
                     None => "material".to_string(),
                 }),
-                ui_text(&assets, 13.0, true),
+                ui_text(&assets, 14.0, true),
                 ui_color(false),
                 Node {
                     margin: UiRect::bottom(Val::Px(4.0)),
@@ -650,7 +646,7 @@ pub(crate) fn setup_material_pane(
                 overflow: Overflow::clip(),
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.075, 0.078, 0.088)),
+            BackgroundColor(ds::BG),
         ))
         .with_children(|p| {
             p.spawn((
@@ -713,7 +709,7 @@ pub(crate) fn setup_material_pane(
         .with_children(|p| {
             p.spawn((
                 Text::new("Preview"),
-                ui_text(&assets, 13.0, true),
+                ui_text(&assets, 14.0, true),
                 ui_color(false),
             ));
             p.spawn((

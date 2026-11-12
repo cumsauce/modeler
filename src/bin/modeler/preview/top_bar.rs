@@ -10,8 +10,6 @@
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use bevy::feathers::constants::icons;
-
 use crate::prelude::*;
 
 /// A client counts as live this long after its document last changed.
@@ -54,12 +52,13 @@ fn setup_top_bar(mut commands: Commands, assets: Res<AssetServer>) {
             height: Val::Percent(100.0),
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            column_gap: Val::Px(14.0),
-            padding: UiRect::horizontal(Val::Px(10.0)),
+            column_gap: Val::Px(12.0),
+            padding: UiRect::horizontal(Val::Px(12.0)),
             border: UiRect::bottom(Val::Px(1.0)),
             ..default()
         },
-        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.08)),
+        BackgroundColor(ds::PANEL),
+        BorderColor::all(ds::LINE),
     ));
     commands.spawn((
         Name::new("top bar tooltip"),
@@ -112,6 +111,8 @@ fn sync_top_bar(
     root: Query<Entity, With<TopBarRoot>>,
     assets: Res<AssetServer>,
     mut commands: Commands,
+    icons_res: ResMut<ds::Icons>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let Ok(root) = root.single() else {
         return;
@@ -136,94 +137,90 @@ fn sync_top_bar(
     shown.0 = Some(key);
     commands.entity(root).despawn_children();
 
-    // The segmented switch.
+    let mut icons = icons_res;
+    let images = &mut *images;
+    // The segmented switch: one bordered group of two tabs.
     let seg = commands
         .spawn((
             Node {
                 flex_direction: FlexDirection::Row,
-                height: Val::Px(30.0),
+                align_items: AlignItems::Center,
+                padding: UiRect::all(Val::Px(2.0)),
+                column_gap: Val::Px(2.0),
                 border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                overflow: Overflow::clip(),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
-            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.14)),
+            BackgroundColor(ds::BG),
+            BorderColor::all(ds::LINE),
             ChildOf(root),
         ))
         .id();
-    let half = |commands: &mut Commands, which: TopButton, on: bool| {
+    let tab = |commands: &mut Commands, parent: Entity, which: TopButton, on: bool, ok: bool| {
+        let mut ui = ds::Ui::new(ds::Kind::Tab).on(on);
+        ui.disabled = !ok;
         commands
-            .spawn((
-                which,
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    padding: UiRect::horizontal(Val::Px(10.0)),
-                    ..default()
-                },
-                BackgroundColor(if on {
-                    Color::srgba(0.35, 0.62, 0.95, 0.28)
-                } else {
-                    Color::NONE
-                }),
-                ChildOf(seg),
-            ))
+            .spawn((ds::piece(ds::Kind::Tab), which, ChildOf(parent)))
+            .insert(ui)
             .observe(on_click)
             .id()
     };
-    let all = half(&mut commands, TopButton::AllDocuments, grid.on);
-    grid_icon(&mut commands, all);
-    text(
+    let all = tab(&mut commands, seg, TopButton::AllDocuments, grid.on, true);
+    commands.spawn((
+        ds::icon(&mut icons, images, ds::Icon::Grid, 14.0, ds::DIM),
+        ds::Ink::Icon,
+        Pickable::IGNORE,
+        ChildOf(all),
+    ));
+    commands.spawn((
+        ds::text(&assets, ds::Type::Body, "All documents"),
+        ds::Ink::Main,
+        Pickable::IGNORE,
+        ChildOf(all),
+    ));
+    commands.spawn((
+        ds::text(&assets, ds::Type::Meta, format!("{open}")),
+        ds::Ink::Meta,
+        Pickable::IGNORE,
+        ChildOf(all),
+    ));
+    let doc = tab(
         &mut commands,
-        &assets,
-        all,
-        "All documents",
-        13.0,
-        false,
-        false,
-    );
-    text(
-        &mut commands,
-        &assets,
-        all,
-        &format!("{open} open"),
-        11.0,
-        false,
+        seg,
+        TopButton::Document,
+        !grid.on || wb.doc_popup,
         true,
     );
-    commands.spawn((
-        Node {
-            width: Val::Px(1.0),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.14)),
-        ChildOf(seg),
-    ));
-    let doc = half(&mut commands, TopButton::Document, !grid.on || wb.doc_popup);
     commands
         .entity(doc)
         .insert(TopTip("Switch document  ⌘K".into()));
-    text(
-        &mut commands,
-        &assets,
-        doc,
-        &format!("{project} /"),
-        12.0,
-        false,
-        true,
-    );
-    text(&mut commands, &assets, doc, &model.name, 14.0, true, false);
     commands.spawn((
-        Node {
-            width: Val::Px(12.0),
-            height: Val::Px(12.0),
-            ..default()
-        },
-        ImageNode::new(assets.load(icons::CHEVRON_DOWN))
-            .with_color(Color::srgba(0.85, 0.87, 0.9, 0.7)),
+        ds::text(&assets, ds::Type::Small, format!("{project} /")),
+        ds::Ink::Meta,
         Pickable::IGNORE,
         ChildOf(doc),
+    ));
+    commands.spawn((
+        ds::text(&assets, ds::Type::Title, model.name.clone()),
+        ds::Ink::Main,
+        Pickable::IGNORE,
+        ChildOf(doc),
+    ));
+    commands.spawn((
+        ds::icon(&mut icons, images, ds::Icon::Chevron, 12.0, ds::DIM),
+        ds::Ink::Icon,
+        Pickable::IGNORE,
+        ChildOf(doc),
+    ));
+
+    commands.spawn((
+        Node {
+            width: Val::Px(1.0),
+            height: Val::Px(22.0),
+            ..default()
+        },
+        BackgroundColor(ds::LINE),
+        ChildOf(root),
     ));
 
     // Modes.
@@ -240,40 +237,18 @@ fn sync_top_bar(
     for (i, m) in Mode::ALL.into_iter().enumerate() {
         let ok = avail[i].is_ok();
         let on = ok && !grid.on && wb.mode == m;
-        let b = commands
-            .spawn((
-                TopButton::Mode(m),
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    height: Val::Px(28.0),
-                    padding: UiRect::horizontal(Val::Px(10.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
-                    ..default()
-                },
-                BackgroundColor(if on {
-                    Color::srgba(0.35, 0.62, 0.95, 0.28)
-                } else {
-                    Color::NONE
-                }),
-                ChildOf(modes),
-            ))
-            .observe(on_click)
-            .id();
+        let b = tab(&mut commands, modes, TopButton::Mode(m), on, ok);
         if let Err(why) = avail[i] {
             commands.entity(b).insert(TopTip(why.to_string()));
         }
-        text(&mut commands, &assets, b, m.label(), 13.0, on, !ok);
-        text(
-            &mut commands,
-            &assets,
-            b,
-            &format!("{}", i + 1),
-            10.0,
-            false,
-            true,
-        );
+        commands.spawn((
+            ds::text(&assets, ds::Type::Body, m.label()),
+            ds::Ink::Main,
+            Pickable::IGNORE,
+            ChildOf(b),
+        ));
+        let k = ds::kbd(&mut commands, &assets, b, &format!("{}", i + 1));
+        commands.entity(k).insert(Pickable::IGNORE);
     }
 
     // Agents, right-aligned.
@@ -296,19 +271,44 @@ fn sync_top_bar(
                 Node {
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
-                    column_gap: Val::Px(5.0),
-                    height: Val::Px(22.0),
-                    padding: UiRect::horizontal(Val::Px(8.0)),
-                    border_radius: BorderRadius::all(Val::Px(11.0)),
+                    column_gap: Val::Px(6.0),
+                    height: Val::Px(24.0),
+                    padding: UiRect::horizontal(Val::Px(9.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.07)),
+                BackgroundColor(ds::BG),
+                BorderColor::all(if live {
+                    ds::agent_color(&name).with_alpha(0.6)
+                } else {
+                    ds::LINE
+                }),
                 ChildOf(root),
             ))
             .id();
-        dot(&mut commands, pill, live_color(live));
+        commands.spawn((
+            ds::dot(
+                if live {
+                    ds::agent_color(&name)
+                } else {
+                    ds::FAINT
+                },
+                7.0,
+            ),
+            ChildOf(pill),
+        ));
         let short: String = name.chars().take(18).collect();
-        text(&mut commands, &assets, pill, &short, 11.0, false, !live);
+        commands.spawn((
+            ds::text_in(
+                &assets,
+                ds::Type::Small,
+                short,
+                if live { ds::FG } else { ds::DIM },
+            ),
+            Pickable::IGNORE,
+            ChildOf(pill),
+        ));
     }
 }
 
@@ -420,36 +420,5 @@ fn tooltip(
         None => {
             vis.set_if_neq(Visibility::Hidden);
         }
-    }
-}
-
-/// Four small squares: the All documents icon.
-fn grid_icon(commands: &mut Commands, parent: Entity) {
-    let g = commands
-        .spawn((
-            Node {
-                width: Val::Px(11.0),
-                height: Val::Px(11.0),
-                flex_wrap: FlexWrap::Wrap,
-                row_gap: Val::Px(1.0),
-                column_gap: Val::Px(1.0),
-                ..default()
-            },
-            Pickable::IGNORE,
-            ChildOf(parent),
-        ))
-        .id();
-    for _ in 0..4 {
-        commands.spawn((
-            Node {
-                width: Val::Px(5.0),
-                height: Val::Px(5.0),
-                border_radius: BorderRadius::all(Val::Px(1.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.85, 0.87, 0.9, 0.8)),
-            Pickable::IGNORE,
-            ChildOf(g),
-        ));
     }
 }

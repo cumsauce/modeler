@@ -328,8 +328,7 @@ fn hash_of(v: impl std::hash::Hash) -> u64 {
 
 /// A steady colour per agent (the feed's dots).
 fn agent_color(name: &str) -> Color {
-    let h = (hash_of(name) % 360) as f32;
-    Color::hsl(h, 0.65, 0.62)
+    ds::agent_color(name)
 }
 
 fn project_of(m: &Model) -> String {
@@ -419,7 +418,7 @@ pub(crate) fn update_grid(
         Query<&mut Visibility, Without<View3dNode>>,
     ),
     (mut filter_buttons, inputs): (
-        Query<(&GridFilterButton, &mut BackgroundColor)>,
+        Query<(&GridFilterButton, &mut ds::Ui)>,
         Query<(&EditableText, &ChildOf)>,
     ),
     recency: Res<Recency>,
@@ -479,14 +478,10 @@ pub(crate) fn update_grid(
             grid.scroll = 0.0;
         }
     }
-    for (b, mut bg) in &mut filter_buttons {
-        let want = if b.0 == grid.filter {
-            Color::srgba(0.35, 0.55, 0.95, 0.45)
-        } else {
-            Color::srgba(1.0, 1.0, 1.0, 0.06)
-        };
-        if bg.0 != want {
-            bg.0 = want;
+    for (b, mut ui) in &mut filter_buttons {
+        let on = b.0 == grid.filter;
+        if ui.on != on {
+            ui.on = on;
         }
     }
 
@@ -833,10 +828,7 @@ pub(crate) fn update_grid(
                 set_text(&mut t, m);
             }
             if let Ok(mut t) = texts.get_mut(tile.working) {
-                set_text(
-                    &mut t,
-                    format!("{} editing", author.unwrap_or("agent")),
-                );
+                set_text(&mut t, format!("{} editing", author.unwrap_or("agent")));
             }
             if let Ok(mut v) = vis.get_mut(tile.working) {
                 v.set_if_neq(if is_working {
@@ -864,8 +856,8 @@ pub(crate) fn update_grid(
 /// The grid's fixed UI: a root over the centre slot with the filter bar,
 /// the clipped tile area and the feed column.
 fn spawn_grid_ui(commands: &mut Commands, assets: &AssetServer) -> GridUi {
-    let line = Color::srgba(1.0, 1.0, 1.0, 0.08);
-    let bg = Color::srgb(0.075, 0.08, 0.095);
+    let line = ds::LINE;
+    let bg = ds::BG;
     let root = commands
         .spawn((
             Name::new("all documents"),
@@ -921,9 +913,7 @@ fn spawn_grid_ui(commands: &mut Commands, assets: &AssetServer) -> GridUi {
         ))
         .id();
     commands.spawn((
-        Text::new("Filter"),
-        ui_text(assets, 12.0, false),
-        ui_color(true),
+        ds::text_in(assets, ds::Type::Small, "Filter", ds::DIM),
         Pickable::IGNORE,
         ChildOf(bar),
     ));
@@ -936,30 +926,40 @@ fn spawn_grid_ui(commands: &mut Commands, assets: &AssetServer) -> GridUi {
         })
         .insert(ChildOf(bar))
         .id();
+    let seg = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                padding: UiRect::all(Val::Px(2.0)),
+                column_gap: Val::Px(2.0),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
+                margin: UiRect::left(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(ds::PANEL),
+            BorderColor::all(ds::LINE),
+            ChildOf(bar),
+        ))
+        .id();
     for (f, label) in [
         (GridFilter::All, "All"),
         (GridFilter::Working, "Agent working"),
         (GridFilter::Unsaved, "Unsaved"),
     ] {
         let b = commands
-            .spawn((
-                GridFilterButton(f),
-                Node {
-                    height: Val::Px(26.0),
-                    padding: UiRect::horizontal(Val::Px(10.0)),
-                    align_items: AlignItems::Center,
-                    border_radius: BorderRadius::all(Val::Px(6.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::NONE),
-                ChildOf(bar),
-            ))
+            .spawn((ds::piece(ds::Kind::Tab), GridFilterButton(f), ChildOf(seg)))
+            .insert(Node {
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                border_radius: BorderRadius::all(Val::Px(5.0)),
+                align_items: AlignItems::Center,
+                ..default()
+            })
             .observe(on_filter_click)
             .id();
         commands.spawn((
-            Text::new(label),
-            ui_text(assets, 12.0, false),
-            ui_color(false),
+            ds::text(assets, ds::Type::Small, label),
+            ds::Ink::Main,
             Pickable::IGNORE,
             ChildOf(b),
         ));
@@ -1002,9 +1002,7 @@ fn spawn_grid_ui(commands: &mut Commands, assets: &AssetServer) -> GridUi {
         ))
         .id();
     commands.spawn((
-        Text::new("Agent activity"),
-        ui_text(assets, 13.0, true),
-        ui_color(false),
+        ds::text(assets, ds::Type::Caption, "Agent activity"),
         Node {
             margin: UiRect {
                 left: Val::Px(12.0),

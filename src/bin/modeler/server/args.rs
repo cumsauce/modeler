@@ -320,6 +320,28 @@ pub(crate) struct SetCameraArgs {
     /// [ ] and , . in the window.
     #[serde(default)]
     pub(crate) play: Option<PlayArg>,
+    /// Drive the window's UI the way the human would: {"mode"?: "model" |
+    /// "material" | "animate" | "map" | "grid", "select"?: part ("" clears),
+    /// "comments"?: bool, "shading"?: "lit" | "clay" | "parts", "capture"?:
+    /// "window" (`screenshot` then shows the whole window, panes included)
+    /// or "view" (the 3D view only, the default)}.
+    #[serde(default)]
+    pub(crate) ui: Option<UiArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UiArg {
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    #[serde(default)]
+    pub(crate) select: Option<String>,
+    #[serde(default)]
+    pub(crate) comments: Option<bool>,
+    #[serde(default)]
+    pub(crate) shading: Option<String>,
+    #[serde(default)]
+    pub(crate) capture: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

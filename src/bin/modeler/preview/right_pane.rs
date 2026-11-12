@@ -11,10 +11,6 @@
 //! content hides there.
 
 use bevy::feathers::constants::icons;
-use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersToolButton};
-use bevy::feathers::display::{caption, icon};
-use bevy::scene::{CommandsSceneExt, bsn};
-use bevy::ui_widgets::Activate;
 use modeler::AnnotationTarget;
 
 use crate::prelude::*;
@@ -76,7 +72,8 @@ fn setup_right_pane(mut commands: Commands) {
             border: UiRect::left(Val::Px(1.0)),
             ..default()
         },
-        BorderColor::all(Color::srgb(0.18, 0.2, 0.24)),
+        BackgroundColor(ds::PANEL),
+        BorderColor::all(ds::LINE),
         ScrollPosition::default(),
     ));
 }
@@ -291,6 +288,25 @@ struct Build<'a> {
 const PAD: f32 = 12.0;
 
 impl Build<'_> {
+    /// A small × (or other) icon button.
+    fn x_button(&self, c: &mut Commands, parent: Entity, what: impl Bundle) -> Entity {
+        let b = c
+            .spawn((ds::piece(ds::Kind::IconButton), what, ChildOf(parent)))
+            .id();
+        c.spawn((
+            ImageNode::new(self.assets.load(icons::X)).with_color(ds::DIM),
+            Node {
+                width: Val::Px(13.0),
+                height: Val::Px(13.0),
+                ..default()
+            },
+            ds::Ink::Icon,
+            Pickable::IGNORE,
+            ChildOf(b),
+        ));
+        b
+    }
+
     fn header(&self, c: &mut Commands, title: &str, close: PaneButton) {
         let row = c
             .spawn((
@@ -298,34 +314,28 @@ impl Build<'_> {
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
                     justify_content: JustifyContent::SpaceBetween,
-                    padding: UiRect::new(Val::Px(PAD), Val::Px(4.0), Val::Px(6.0), Val::Px(2.0)),
-                    min_height: Val::Px(HEADER_H),
+                    padding: UiRect::new(Val::Px(PAD), Val::Px(8.0), Val::Px(10.0), Val::Px(10.0)),
+                    border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
+                BorderColor::all(ds::LINE),
                 ChildOf(self.root),
             ))
             .id();
         c.spawn((
-            Text::new(title),
-            ui_text(self.assets, 14.0, true),
-            ui_color(false),
+            ds::text(self.assets, ds::Type::Title, title),
             Node {
                 flex_shrink: 1.0,
+                overflow: Overflow::clip(),
                 ..default()
             },
             ChildOf(row),
         ));
-        c.spawn_scene(bsn! {
-            @FeathersToolButton {
-                @variant: ButtonVariant::Plain,
-                @caption: bsn! { @icon(icons::X) }
-            }
-        })
-        .insert((close, ChildOf(row)))
-        .observe(on_button);
+        let b = self.x_button(c, row, close);
+        c.entity(b).observe(on_button);
     }
 
-    /// A small uppercase heading, with an "all N" button when given.
+    /// A small uppercase heading, with an "all N" link when given.
     fn subheader(&self, c: &mut Commands, title: &str, all: Option<usize>) {
         let row = c
             .spawn((
@@ -333,28 +343,30 @@ impl Build<'_> {
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
                     justify_content: JustifyContent::SpaceBetween,
-                    padding: UiRect::new(Val::Px(PAD), Val::Px(4.0), Val::Px(14.0), Val::Px(2.0)),
+                    padding: UiRect::new(Val::Px(PAD), Val::Px(8.0), Val::Px(16.0), Val::Px(4.0)),
                     ..default()
                 },
                 ChildOf(self.root),
             ))
             .id();
         c.spawn((
-            Text::new(title.to_uppercase()),
-            ui_text(self.assets, 11.0, false),
-            ui_color(true),
+            ds::text(self.assets, ds::Type::Caption, title),
             ChildOf(row),
         ));
         if let Some(n) = all {
-            let label = format!("all {n}");
-            c.spawn_scene(bsn! {
-                @FeathersToolButton {
-                    @variant: ButtonVariant::Plain,
-                    @caption: bsn! { @caption(label) }
-                }
-            })
-            .insert((PaneButton::AllComments, ChildOf(row)))
-            .observe(on_button);
+            let b = c
+                .spawn((
+                    ds::piece(ds::Kind::IconButton),
+                    PaneButton::AllComments,
+                    ChildOf(row),
+                ))
+                .observe(on_button)
+                .id();
+            c.spawn((
+                ds::text_in(self.assets, ds::Type::Meta, format!("all {n}"), ds::ACCENT),
+                Pickable::IGNORE,
+                ChildOf(b),
+            ));
         }
     }
 
@@ -362,7 +374,7 @@ impl Build<'_> {
         c.spawn((
             Node {
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(4.0),
+                row_gap: Val::Px(3.0),
                 padding: UiRect::axes(Val::Px(PAD), Val::Px(4.0)),
                 ..default()
             },
@@ -385,44 +397,13 @@ impl Build<'_> {
     }
 
     fn kv(&self, c: &mut Commands, parent: Entity, k: &str, v: &str) {
-        let row = c
-            .spawn((
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(8.0),
-                    ..default()
-                },
-                ChildOf(parent),
-            ))
-            .id();
-        c.spawn((
-            Text::new(k),
-            ui_text(self.assets, 12.0, false),
-            ui_color(true),
-            Node {
-                width: Val::Px(80.0),
-                flex_shrink: 0.0,
-                ..default()
-            },
-            ChildOf(row),
-        ));
-        c.spawn((
-            Text::new(v),
-            ui_text(self.assets, 12.0, false),
-            ui_color(false),
-            Node {
-                flex_shrink: 1.0,
-                ..default()
-            },
-            ChildOf(row),
-        ));
+        ds::kv(c, self.assets, parent, k, v);
     }
 
     fn hint(&self, c: &mut Commands, parent: Entity, text: &str) {
         c.spawn((
-            Text::new(text),
-            ui_text(self.assets, 12.0, false),
-            ui_color(true),
+            ds::text_wrap(self.assets, ds::Type::Small, text),
+            TextColor(ds::DIM),
             ChildOf(parent),
         ));
     }
@@ -436,11 +417,11 @@ impl Build<'_> {
                 Node {
                     flex_direction: FlexDirection::Row,
                     column_gap: Val::Px(10.0),
-                    padding: UiRect::vertical(Val::Px(8.0)),
+                    padding: UiRect::vertical(Val::Px(10.0)),
                     border: UiRect::bottom(Val::Px(1.0)),
                     ..default()
                 },
-                BorderColor::all(Color::srgb(0.18, 0.2, 0.24)),
+                BorderColor::all(ds::LINE),
                 ChildOf(parent),
             ))
             .observe(on_comment_click)
@@ -456,14 +437,17 @@ impl Build<'_> {
                     border_radius: BorderRadius::all(Val::Px(10.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgb(0.89, 0.7, 0.31)),
+                BackgroundColor(ds::WARN),
                 ChildOf(row),
             ))
             .id();
         c.spawn((
-            Text::new(format!("{}", a.id)),
-            ui_text(self.assets, 11.0, true),
-            TextColor(Color::srgb(0.1, 0.08, 0.0)),
+            ds::text_in(
+                self.assets,
+                ds::Type::Meta,
+                format!("{}", a.id),
+                ds::ON_ACCENT,
+            ),
             ChildOf(disc),
         ));
         let body = c
@@ -472,50 +456,53 @@ impl Build<'_> {
                     flex_direction: FlexDirection::Column,
                     flex_grow: 1.0,
                     flex_shrink: 1.0,
-                    row_gap: Val::Px(2.0),
+                    row_gap: Val::Px(3.0),
                     ..default()
                 },
                 ChildOf(row),
             ))
             .id();
         c.spawn((
-            Text::new(a.group.clone().unwrap_or_else(|| a.part.clone())),
-            ui_text(self.assets, 12.0, true),
-            ui_color(false),
+            ds::text_in(
+                self.assets,
+                ds::Type::Mono,
+                a.group.clone().unwrap_or_else(|| a.part.clone()),
+                ds::DIM,
+            ),
             ChildOf(body),
         ));
         c.spawn((
-            Text::new(a.text.clone()),
-            ui_text(self.assets, 12.5, false),
-            ui_color(false),
+            ds::text_wrap(self.assets, ds::Type::Small, a.text.clone()),
             ChildOf(body),
         ));
-        let id = a.id;
-        c.spawn_scene(bsn! {
-            @FeathersToolButton {
-                @variant: ButtonVariant::Plain,
-                @caption: bsn! { @icon(icons::X) }
-            }
-        })
-        .insert((DeleteComment(id), ChildOf(row)))
-        .observe(on_delete);
+        let b = self.x_button(c, row, DeleteComment(a.id));
+        c.entity(b).observe(on_delete);
     }
 
     fn button(&self, c: &mut Commands, parent: Entity, label: &str, which: PaneButton) {
-        let label = label.to_string();
-        c.spawn_scene(bsn! {
-            @FeathersButton {
-                @variant: ButtonVariant::Normal,
-                @caption: bsn! { @caption(label) }
-            }
-        })
-        .insert((which, ChildOf(parent)))
-        .observe(on_button);
+        let b = c
+            .spawn((ds::piece(ds::Kind::Button), which, ChildOf(parent)))
+            .insert(Node {
+                justify_content: JustifyContent::Center,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(ds::RADIUS)),
+                margin: UiRect::top(Val::Px(6.0)),
+                ..default()
+            })
+            .observe(on_button)
+            .id();
+        c.spawn((
+            ds::text(self.assets, ds::Type::Body, label),
+            ds::Ink::Main,
+            Pickable::IGNORE,
+            ChildOf(b),
+        ));
     }
 }
 
 fn on_button(
-    activate: On<Activate>,
+    activate: On<PointerClick>,
     which: Query<&PaneButton>,
     mut wb: ResMut<Workbench>,
     mut cb: ResMut<CommentBox>,
@@ -523,6 +510,9 @@ fn on_button(
     let Ok(w) = which.get(activate.event_target()) else {
         return;
     };
+    if activate.button != PointerButton::Primary {
+        return;
+    }
     match w {
         PaneButton::Deselect => wb.selected = None,
         PaneButton::CloseComments => wb.show_comments = false,
@@ -559,13 +549,15 @@ struct CommentsChip;
 #[derive(Component)]
 struct CommentsChipLabel;
 
+#[allow(clippy::too_many_arguments)]
 fn comments_chip(
     rows: Query<Entity, With<HudRow>>,
-    chip: Query<(), With<CommentsChip>>,
+    mut chip: Query<&mut ds::Ui, With<CommentsChip>>,
     mut label: Query<&mut Text, With<CommentsChipLabel>>,
-    mut variant: Query<&mut ButtonVariant, With<CommentsChip>>,
     modeler: Res<Modeler>,
     wb: Res<Workbench>,
+    assets: Res<AssetServer>,
+    (mut icons, mut images): (ResMut<ds::Icons>, ResMut<Assets<Image>>),
     mut commands: Commands,
 ) {
     let n = modeler
@@ -575,34 +567,53 @@ fn comments_chip(
         .iter()
         .filter(|a| a.material.is_none())
         .count();
-    let text = format!("Comments {n}");
-    if chip.is_empty() {
+    let text = n.to_string();
+    let Ok(mut ui) = chip.single_mut() else {
         let Some(row) = rows.iter().next() else {
             return;
         };
         let chip = commands
-            .spawn_scene(bsn! {
-                @FeathersToolButton {
-                    @variant: ButtonVariant::Normal,
-                    @caption: bsn! { }
-                }
-            })
-            .insert((CommentsChip, ChildOf(row)))
+            .spawn((
+                ds::piece(ds::Kind::Chip),
+                CommentsChip,
+                BlocksCamera,
+                ChildOf(row),
+            ))
             .observe(on_chip)
             .id();
-        commands.spawn((CommentsChipLabel, Text::new(text), ChildOf(chip)));
+        commands.spawn((
+            ds::icon(&mut icons, &mut images, ds::Icon::Comment, 13.0, ds::DIM),
+            ds::Ink::Icon,
+            Pickable::IGNORE,
+            ChildOf(chip),
+        ));
+        commands.spawn((
+            ds::text(&assets, ds::Type::Small, "Comments"),
+            ds::Ink::Main,
+            Pickable::IGNORE,
+            ChildOf(chip),
+        ));
+        commands.spawn((
+            CommentsChipLabel,
+            ds::text(&assets, ds::Type::Meta, text),
+            ds::Ink::Meta,
+            Pickable::IGNORE,
+            ChildOf(chip),
+        ));
         return;
-    }
+    };
     for mut t in &mut label {
         if t.0 != text {
             t.0 = text.clone();
         }
     }
-    for mut v in &mut variant {
-        v.set_if_neq(ButtonVariant::selected(wb.show_comments));
+    if ui.on != wb.show_comments {
+        ui.on = wb.show_comments;
     }
 }
 
-fn on_chip(_: On<Activate>, mut wb: ResMut<Workbench>) {
-    wb.show_comments = !wb.show_comments;
+fn on_chip(click: On<PointerClick>, mut wb: ResMut<Workbench>) {
+    if click.button == PointerButton::Primary {
+        wb.show_comments = !wb.show_comments;
+    }
 }

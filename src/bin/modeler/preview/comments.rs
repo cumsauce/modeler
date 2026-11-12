@@ -109,12 +109,15 @@ fn on_cancel(_: On<Activate>, mut cb: ResMut<CommentBox>) {
 }
 
 pub(crate) fn on_delete(
-    activate: On<Activate>,
+    activate: On<PointerClick>,
     ids: Query<&DeleteComment>,
     mut modeler: ResMut<Modeler>,
     mut cb: ResMut<CommentBox>,
     time: Res<Time>,
 ) {
+    if activate.button != PointerButton::Primary {
+        return;
+    }
     if let Ok(d) = ids.get(activate.event_target()) {
         let msg = match modeler.session.delete_annotation(d.0) {
             Ok(m) => m,

@@ -1033,6 +1033,7 @@ Style::default()
             pitch,
             dist,
             play,
+            ui,
         }): Parameters<SetCameraArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1048,6 +1049,7 @@ Style::default()
                 pitch,
                 dist,
                 play,
+                ui,
                 reply: reply_tx,
             })
             .await
@@ -1070,7 +1072,7 @@ Style::default()
             parts.push(msg);
         }
         if parts.is_empty() {
-            parts.push("nothing to do: give yaw / pitch / dist and/or play".into());
+            parts.push("nothing to do: give yaw / pitch / dist, play and/or ui".into());
         }
         Ok(CallToolResult::success(vec![Content::text(
             parts.join("\n"),
