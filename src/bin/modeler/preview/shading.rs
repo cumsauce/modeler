@@ -237,6 +237,9 @@ fn on_hud_click(
     mut open: ResMut<MenuOpen>,
     mut nav: ResMut<CameraNav>,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let Ok(b) = which.get(click.entity) else {
         return;
     };

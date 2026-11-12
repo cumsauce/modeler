@@ -775,22 +775,47 @@ pub fn save_parked_docs(docs: &[Model]) -> Result<(), ModelerError> {
     atomic_write(&path, text.as_bytes())
 }
 
-/// The parked documents' autosave (empty when missing or unreadable).
+/// The parked documents' autosave (empty when missing). A file that
+/// doesn't parse, or holds a document from a newer build, is moved aside to
+/// `parked_docs.bad.<time>.json` rather than read in part: the next save
+/// would otherwise overwrite it and lose every document in it. A slot
+/// server (a second daemon) reads only its own slot's file, never the main
+/// daemon's.
 pub fn load_parked_docs() -> Vec<Model> {
     let Ok(dir) = home_dir(Kind::Prefabs) else {
         return Vec::new();
     };
-    let Some(text) = read_autosave(&dir, "parked_docs") else {
+    let path = dir.join(autosave_file("parked_docs"));
+    let Ok(text) = fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let docs: Vec<Model> = serde_json::from_str(&text).unwrap_or_default();
-    docs.into_iter()
-        .filter(|m| m.check_format().is_ok())
-        .map(|mut m| {
-            let _ = m.restore_parts();
-            m
-        })
-        .collect()
+    let docs: Option<Vec<Model>> = serde_json::from_str(&text).ok();
+    match docs {
+        Some(docs) if docs.iter().all(|m| m.check_format().is_ok()) => docs
+            .into_iter()
+            .map(|mut m| {
+                let _ = m.restore_parts();
+                m
+            })
+            .collect(),
+        _ => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let aside = path.with_file_name(format!("parked_docs.bad.{stamp}.json"));
+            match fs::rename(&path, &aside) {
+                Ok(()) => eprintln!(
+                    "parked documents unreadable by this build; kept as {}",
+                    aside.display()
+                ),
+                Err(e) => {
+                    eprintln!("parked documents unreadable, and moving them aside failed: {e}")
+                }
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// The autosaved inactive documents (empty when missing or unreadable).

@@ -406,6 +406,9 @@ fn on_dock_click(
     modeler: Res<Modeler>,
     mut pb: ResMut<Playback>,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let Ok(b) = which.get(click.entity) else {
         return;
     };
@@ -625,7 +628,7 @@ fn update_dock(
             }
             (Some(DockText(DockField::Clip)), _) => clip.map_or("no clip".into(), |c| {
                 if cache.clips > 1 {
-                    format!("{} ▸", c.name)
+                    format!("{} >", c.name)
                 } else {
                     c.name.clone()
                 }

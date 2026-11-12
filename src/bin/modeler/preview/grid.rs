@@ -1441,6 +1441,12 @@ fn on_tile_click(
     mut modeler: ResMut<Modeler>,
     mut grid: ResMut<Grid>,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
+    if click.button != PointerButton::Primary {
+        return;
+    }
     let card = click.event_target();
     let Ok(t) = tiles.get(card) else {
         return;
@@ -1519,6 +1525,9 @@ fn on_filter_click(
     buttons: Query<&GridFilterButton>,
     mut grid: ResMut<Grid>,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     if let Ok(b) = buttons.get(click.event_target()) {
         grid.filter = b.0;
         grid.scroll = 0.0;

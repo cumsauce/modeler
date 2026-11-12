@@ -29,6 +29,7 @@ pub(crate) struct RightPane {
 /// What the pane was last built for.
 #[derive(PartialEq, Clone)]
 struct Key {
+    box_open: bool,
     mode: Mode,
     selected: Option<String>,
     comments: bool,
@@ -118,6 +119,7 @@ fn update_right_pane(
         doc: model.name.clone(),
         version: model.version,
         annotations: model.annotations.len(),
+        box_open: cb.is_open(),
     };
     if pane.shown.as_ref() == Some(&key) {
         return;

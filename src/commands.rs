@@ -319,8 +319,11 @@ impl Session {
         } else {
             self.others.iter().find(|m| m.name == name)
         };
+        // An empty document (the placeholder a restart starts on) has
+        // nothing to lose.
         model.is_some_and(|m| {
-            self.saved_state.get(name) == Some(&(m.history.nodes.len(), m.history.current))
+            (m.ops.is_empty() && m.parts.is_empty())
+                || self.saved_state.get(name) == Some(&(m.history.nodes.len(), m.history.current))
         })
     }
 }
@@ -1901,7 +1904,8 @@ impl Session {
                     self.derive_if_bare();
                 } else {
                     let Some(i) = self.others.iter().position(|m| m.name == name) else {
-                        if let Some(i) = self.parked.iter().position(|m| m.name == name) {
+                        if self.parked.iter().any(|m| m.name == name) {
+                            let i = self.parked_index(name)?;
                             self.parked.remove(i);
                             self.save_parked();
                             return Ok(format!(
@@ -1926,21 +1930,7 @@ impl Session {
                         self.parked_note()
                     });
                 };
-                let Some(i) = self.parked.iter().position(|m| m.name == name) else {
-                    return Err(format!(
-                        "no parked document `{name}` ({})",
-                        if self.parked.is_empty() {
-                            "none are parked".to_string()
-                        } else {
-                            self.parked
-                                .iter()
-                                .map(|m| m.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    )
-                    .into());
-                };
+                let i = self.parked_index(name)?;
                 if self.model.name == name || self.others.iter().any(|m| m.name == name) {
                     return Err(format!(
                         "`{name}` is open already (from the catalog or new); close it first (scene close) to restore the autosaved copy"
@@ -1948,11 +1938,22 @@ impl Session {
                     .into());
                 }
                 let m = self.parked.remove(i);
-                self.save_parked();
                 let v = m.version;
                 self.others.push(m);
-                let r = self.scene("switch", Some(name))?;
-                Ok(format!("restored the autosaved `{name}` (v{v}); {r}"))
+                match self.scene("switch", Some(name)) {
+                    Ok(r) => {
+                        self.save_parked();
+                        Ok(format!("restored the autosaved `{name}` (v{v}); {r}"))
+                    }
+                    Err(e) => {
+                        // Back to parked: nothing half-restored.
+                        if let Some(k) = self.others.iter().rposition(|m| m.name == name) {
+                            let m = self.others.remove(k);
+                            self.parked.insert(i.min(self.parked.len()), m);
+                        }
+                        Err(e)
+                    }
+                }
             }
             other => Err(format!(
                 "scene: unknown action `{other}` (list, open, switch, close, restore)"
@@ -2141,6 +2142,45 @@ impl Session {
         closed
     }
 
+    /// The parked document `name` this call means: in the calling
+    /// project when the call names one, else the only one of that name
+    /// (two projects' documents of one name are refused, listing both).
+    fn parked_index(&self, name: &str) -> Result<usize, String> {
+        let all: Vec<usize> = (0..self.parked.len())
+            .filter(|&i| self.parked[i].name == name)
+            .collect();
+        let pick: Vec<usize> = match crate::catalog::call_project() {
+            Some(want) => all
+                .iter()
+                .copied()
+                .filter(|&i| self.parked[i].project == want)
+                .collect(),
+            None => all.clone(),
+        };
+        match (pick.as_slice(), all.is_empty()) {
+            ([i], _) => Ok(*i),
+            (_, true) => Err(format!(
+                "no parked document `{name}` ({})",
+                if self.parked.is_empty() {
+                    "none are parked".to_string()
+                } else {
+                    self.parked
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            )),
+            _ => Err(format!(
+                "parked documents named `{name}` exist in {}; call from that project's folder",
+                all.iter()
+                    .map(|&i| project_label(self.parked[i].project.as_deref()))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )),
+        }
+    }
+
     /// The parked documents, one line each, with how to bring one back.
     pub fn parked_note(&self) -> String {
         let mut s = String::from(
@@ -2183,6 +2223,10 @@ impl Session {
             fresh.insert(0, active);
         }
         let names: Vec<String> = fresh.iter().map(|m| m.name.clone()).collect();
+        for n in &names {
+            crate::catalog::set_open_doc(n, None);
+            self.saved_state.remove(n);
+        }
         for m in fresh {
             parked.retain(|p| !(p.name == m.name && p.project == m.project));
             parked.push(m);

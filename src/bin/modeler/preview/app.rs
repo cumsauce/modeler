@@ -259,11 +259,33 @@ fn apply_ui(
     wb: &mut Workbench,
     grid: &mut Grid,
 ) -> Result<String, String> {
-    let mut said = Vec::new();
-    if let Some(m) = &u.mode {
-        if m == "grid" {
-            grid.on = true;
-        } else {
+    // Check every field before changing anything: a refused call leaves
+    // the window as it was.
+    let shading = match u.shading.as_deref() {
+        None => None,
+        Some("lit") => Some(Shading::Lit),
+        Some("clay") => Some(Shading::Clay),
+        Some("parts") => Some(Shading::Parts),
+        Some(s) => return Err(format!("ui.shading: `{s}` is not lit / clay / parts")),
+    };
+    let capture = match u.capture.as_deref() {
+        None => None,
+        Some("window") => Some(true),
+        Some("view") => Some(false),
+        Some(c) => return Err(format!("ui.capture: `{c}` is not window / view")),
+    };
+    if let Some(p) = u.select.as_deref().filter(|p| !p.is_empty())
+        && !super::workbench::selectable(model, p)
+    {
+        return Err(format!(
+            "ui.select: `{p}` is not a part or marker of `{}`",
+            model.name
+        ));
+    }
+    let mode = match u.mode.as_deref() {
+        None => None,
+        Some(m) if m.eq_ignore_ascii_case("grid") => Some(None),
+        Some(m) => {
             let mode = Mode::ALL
                 .into_iter()
                 .find(|x| x.label().eq_ignore_ascii_case(m))
@@ -271,6 +293,14 @@ fn apply_ui(
                     format!("ui.mode: `{m}` is not model / material / animate / map / grid")
                 })?;
             mode_available(model, mode).map_err(|why| format!("ui.mode {m}: {why}"))?;
+            Some(Some(mode))
+        }
+    };
+    let mut said = Vec::new();
+    if let (Some(mode), Some(m)) = (mode, &u.mode) {
+        if mode.is_none() {
+            grid.on = true;
+        } else if let Some(mode) = mode {
             wb.mode = mode;
             wb.mode_doc = model.name.clone();
             grid.on = false;
@@ -296,21 +326,12 @@ fn apply_ui(
         wb.show_comments = c;
         said.push(format!("comments {}", if c { "open" } else { "closed" }));
     }
-    if let Some(s) = &u.shading {
-        wb.shading = match s.as_str() {
-            "lit" => Shading::Lit,
-            "clay" => Shading::Clay,
-            "parts" => Shading::Parts,
-            _ => return Err(format!("ui.shading: `{s}` is not lit / clay / parts")),
-        };
+    if let (Some(sh), Some(s)) = (shading, &u.shading) {
+        wb.shading = sh;
         said.push(format!("shading {s}"));
     }
-    if let Some(c) = &u.capture {
-        wb.capture_window = match c.as_str() {
-            "window" => true,
-            "view" => false,
-            _ => return Err(format!("ui.capture: `{c}` is not window / view")),
-        };
+    if let (Some(cw), Some(c)) = (capture, &u.capture) {
+        wb.capture_window = cw;
         said.push(format!("screenshot captures the {c}"));
     }
     Ok(format!("ui: {}", said.join(", ")))

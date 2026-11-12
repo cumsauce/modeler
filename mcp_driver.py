@@ -653,11 +653,26 @@ def proxy_mode(socket_path, mode):
                 if conn["s"] is None:
                     link()
                 conn["s"].sendall((json.dumps(payload) + "\n").encode())
-                line = conn["f"].readline()
+            except OSError:
+                pass  # not sent: safe to start the daemon and send again
+            else:
+                try:
+                    line = conn["f"].readline()
+                except OSError:
+                    line = ""
                 if line:
                     return json.loads(line)
-            except OSError:
-                pass
+                # Sent, but the daemon went away before answering: the call
+                # may have run, so don't send it twice.
+                try:
+                    conn["s"].close()
+                except OSError:
+                    pass
+                conn["s"] = None
+                return {"error": {"code": -32603, "message":
+                                  "the modeler server exited during this call; it may or may "
+                                  "not have been applied: check (scene_summary / history) "
+                                  "before retrying"}}
             try:
                 conn["s"] and conn["s"].close()
             except OSError:

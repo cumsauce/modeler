@@ -215,6 +215,10 @@ fn follow_document(modeler: Res<Modeler>, mut wb: ResMut<Workbench>) {
     } else if mode_available(model, wb.mode).is_err() {
         wb.mode = Mode::Model;
     }
+    // A part deleted or renamed by an agent drops out of the selection.
+    if wb.selected.as_ref().is_some_and(|s| !selectable(model, s)) {
+        wb.selected = None;
+    }
 }
 
 /// 1-4 switch modes (when the document has them), Esc deselects, C toggles
@@ -363,4 +367,13 @@ fn place(n: &mut Node, rect: Rect) {
     if (n.left, n.top, n.width, n.height) != want {
         (n.left, n.top, n.width, n.height) = want;
     }
+}
+
+/// A name the window can select: a part, or a marker (drawn as a gizmo).
+pub(crate) fn selectable(model: &modeler::Model, name: &str) -> bool {
+    model.parts.iter().any(|p| p.name == name)
+        || model
+            .ops
+            .iter()
+            .any(|o| matches!(o, modeler::Op::Marker { name: n, .. } if n == name))
 }

@@ -340,7 +340,7 @@ pub(crate) fn update_material_pane(
                 Ok(ev) => ev,
                 Err(e) => {
                     if let Some(mut t) = texts.p0().iter_mut().next() {
-                        t.0 = format!("material `{}`: {e}", d.name);
+                        t.0 = format!("material {}: {e}", d.name);
                     }
                     return;
                 }
@@ -487,7 +487,7 @@ pub(crate) fn update_material_pane(
         }
         if let Some(mut t) = texts.p0().iter_mut().next() {
             t.0 = format!(
-                "Material `{}` v{}  ·  {} nodes  ·  click to inspect · right-click to comment · wheel zoom · middle-drag pan",
+                "Material {} v{}  ·  {} nodes  ·  click to inspect · right-click to comment · wheel zoom · middle-drag pan",
                 d.name,
                 d.version,
                 d.nodes.len()
@@ -528,7 +528,7 @@ pub(crate) fn update_material_pane(
                     0.5
                 };
                 (
-                    format!("`{}` on a {dia:.2} m ball", d.name),
+                    format!("{} on a {dia:.2} m ball", d.name),
                     doc::sphere_preview(d, ch, 256, dia),
                 )
             }
