@@ -39,17 +39,15 @@ pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
         projected = p;
         &projected
     };
+    // In f64: a small part far from the origin (a scattered rock at x = 10)
+    // would otherwise round its vertices to f32 steps coarser than the weld
+    // grid below, splitting poles and seams.
+    let (rot, scale, t) = (rot.as_dquat(), scale.as_dvec3(), t.as_dvec3());
     let mut props = Vec::with_capacity(src.verts.len() * N_PROPS);
     for (i, v) in src.verts.iter().enumerate() {
-        let p = rot * (Vec3::from(*v) * scale) + t;
+        let p = rot * (Vec3::from(*v).as_dvec3() * scale) + t;
         let uv = src.uvs.get(i).copied().unwrap_or([0.0; 2]);
-        props.extend([
-            p.x as f64,
-            p.y as f64,
-            p.z as f64,
-            uv[0] as f64,
-            uv[1] as f64,
-        ]);
+        props.extend([p.x, p.y, p.z, uv[0] as f64, uv[1] as f64]);
     }
     let count = src.verts.len();
     let tris: Vec<usize> = if src.indices.is_empty() {

@@ -868,6 +868,8 @@ fn compact(p: &mut Part, weld: bool) {
 
 /// A part whose vertices are another's moved by one offset (and the same
 /// indices, normals, material, and uvs when textured) reuses its mesh.
+/// Rotated or scaled parts (scatter copies) reuse a mesh with identical
+/// vertices; their node keeps its own rotation and scale.
 fn find_instances(parts: &[Part]) -> Vec<MeshRef> {
     let ident = |p: &Part| p.rotation == [0.0, 0.0, 0.0, 1.0] && p.scale == [1.0, 1.0, 1.0];
     let shape_key = |p: &Part| {
@@ -882,7 +884,7 @@ fn find_instances(parts: &[Part]) -> Vec<MeshRef> {
     let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
     let mut out = vec![MeshRef::Own; parts.len()];
     for (i, p) in parts.iter().enumerate() {
-        if p.verts.is_empty() || !ident(p) {
+        if p.verts.is_empty() {
             continue;
         }
         let key = (shape_key(p), mat_key(p));
@@ -890,6 +892,11 @@ fn find_instances(parts: &[Part]) -> Vec<MeshRef> {
         let found = cands.iter().copied().find_map(|s| {
             let q = &parts[s];
             let off = Vec3::from_array(p.verts[0]) - Vec3::from_array(q.verts[0]);
+            // A node's own rotation/scale apply to the shared mesh, so only
+            // an unmoved mesh can be shared between transformed parts.
+            if (!ident(p) || !ident(q)) && off.abs().max_element() > 0.0 {
+                return None;
+            }
             let same = p.indices == q.indices
                 && p.normals
                     .iter()

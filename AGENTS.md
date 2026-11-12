@@ -101,6 +101,7 @@ type, so there is no need to memorise field names.
 | `hull` | name, inputs |
 | `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
 | `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
+| `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights] |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
 | `deform` | name, input, mode (displace / bend / twist / taper), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
@@ -364,6 +365,38 @@ A visible part with only a flat colour (no `pbr`) is a warning in
     120, "toward": "-z"}`; a curved blade bends a thin box.
   Every number takes params (`"degrees": "$curl"`), and chains of deforms
   re-derive like any op.
+- **`scatter`** strews copies of parts over another part's surface: rocks
+  on terrain, grass tufts, mushrooms on a log, rivets on a hull, a forest.
+  `{"type": "scatter", "name": "rocks", "input": ["rock_a", "rock_b"],
+  "on": "ground", "count": 40, "seed": 2, "scale": [0.6, 1.4], "rotate":
+  "random", "max_slope": 35}`. Points are sampled area-weighted on `on`'s
+  upward-facing faces (`faces: "all"` for sides and undersides), rejected
+  by `max_slope` (degrees from level), `region` (`{"min": [x, z], "max":
+  [x, z]}`) and `min_spacing` (meters; default 0.8 x the widest copy's
+  footprint, so copies don't overlap; 0 allows clumps), so `count` is a
+  target: the result says when fewer fit. `density` (copies per m², capped
+  by `max`, default 2000, at most 10000) instead of `count`. Copies are
+  `name_0..`, each standing with its base (the centroid of its lowest
+  slice: a trunk, not the crown) on the surface, sunk until that whole
+  slice is at or below the surface's tangent plane (no downhill gap under
+  an upright trunk; at most 15% of the copy's height): `verify grounded`
+  passes; `sink` pushes them further in. Steep spots tilt copies into the
+  slope (a big rock on a cliff fails `collisions`), so give rocks and trees
+  a `max_slope`. Separate scatters don't avoid each other (grass may grow
+  inside a rock). `rotate`: `random_y` (default),
+  `random` (tumbled rocks) or `none`; `align` 0 stays upright (trees), 1
+  stands on the normal (mushrooms round a log with `faces: "all"`).
+  `input` entries: a part; a list `["oak", "oak_leaves"]` moved as one set;
+  a pattern `"tree1.*"` (every visible part it matches, a prefab instance);
+  a lone lsystem name brings its leaves (`"oak"` = `["oak", "oak_leaves"]`).
+  One entry is picked per copy (`weights` for odds). Set members are named
+  `name_i` (the first), `name_i_leaves` (a member named after the first),
+  `name_i.trunk` (prefab members). Copies keep their source's material and
+  are always visible: **hide the sources**. Same seed = same layout;
+  `on` is a real dependency, so lower the ground with a param and every
+  copy follows (it reads `on` before post-graph moves/places). Exports share
+  one mesh between copies (instancing keeps each node's rotation and scale);
+  use tile pbr materials on scattered parts (object ones bake per copy).
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`blob`** melts closed solids together with a smooth fillet instead of

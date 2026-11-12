@@ -169,10 +169,21 @@ pub fn expect_bounds(
 }
 
 /// Weld grid for a part: 1e-6 of its size, clamped to [1e-9, 1e-5], so
-/// real-scale centimetre parts keep their features apart.
+/// real-scale centimetre parts keep their features apart. Sized from the
+/// local (untransformed) mesh the welds key on, so a scaled or rotated copy
+/// welds exactly like its source.
 fn weld_grid(p: &Part) -> f64 {
-    let (lo, hi) = p.bounds();
-    let d = (hi - lo).length() as f64;
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for v in &p.verts {
+        for k in 0..3 {
+            lo[k] = lo[k].min(f64::from(v[k]));
+            hi[k] = hi[k].max(f64::from(v[k]));
+        }
+    }
+    let d = (0..3)
+        .map(|k| (hi[k] - lo[k]).max(0.0).powi(2))
+        .sum::<f64>()
+        .sqrt();
     (d * 1e-6).clamp(1e-9, 1e-5)
 }
 
