@@ -8,9 +8,10 @@ pub(crate) enum Cmd {
     Exec(Box<dyn FnOnce(&mut Session) -> CmdResult + Send>),
     Screenshot(ShotReply),
     SetCamera {
-        yaw: f32,
-        pitch: f32,
-        dist: f32,
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+        dist: Option<f32>,
+        play: Option<crate::preview::PlayRequest>,
         reply: ShotReply,
     },
     AgentShot {

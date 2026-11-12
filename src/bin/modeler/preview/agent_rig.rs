@@ -349,6 +349,7 @@ pub(crate) fn process_agent_shot(
     capturing: Local<Arc<AtomicBool>>,
     mut studio: Query<(Entity, &mut DirectionalLight), With<StudioLight>>,
     mut env: Query<(&mut bevy::light::EnvironmentMapLight, &mut AmbientLight), With<AgentCamera>>,
+    playback: Res<Playback>,
     mut commands: Commands,
 ) {
     // A camera with a generated environment light draws nothing until its
@@ -488,7 +489,9 @@ pub(crate) fn process_agent_shot(
     // Part-ID stand-ins on their own layer; the camera looks only at it.
     let mut legend: Vec<(String, [u8; 4])> = Vec::new();
     let mut stand_ins: Vec<Entity> = Vec::new();
-    if style.ids || style.curvature || rig_shot {
+    // The window may be playing a clip: its meshes are posed, so draw the
+    // model from stand-ins (at rest, or this shot's own pose) instead.
+    if style.ids || style.curvature || rig_shot || playback.posed {
         let source = posed_parts.as_ref().unwrap_or(&model.parts);
         let drawable = source
             .iter()
@@ -647,7 +650,7 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
-    let ids = style.ids || style.curvature || rig_shot;
+    let ids = style.ids || style.curvature || rig_shot || playback.posed;
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands

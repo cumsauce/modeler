@@ -137,6 +137,7 @@ pub(crate) fn drain_commands(
     mut pending: ResMut<PendingShots>,
     mut agent_shots: ResMut<PendingAgentShots>,
     mut orbit: ResMut<Orbit>,
+    mut playback: ResMut<Playback>,
 ) {
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
@@ -166,7 +167,11 @@ pub(crate) fn drain_commands(
                         1280,
                         800,
                         None,
-                        ShotStyle::default(),
+                        // The window's own pose when it is playing a clip.
+                        ShotStyle {
+                            pose: playback.clip.clone().map(|c| (Some(c), playback.time)),
+                            ..default()
+                        },
                         reply,
                     ));
                 } else {
@@ -177,6 +182,7 @@ pub(crate) fn drain_commands(
                 yaw,
                 pitch,
                 dist,
+                play,
                 reply,
             } => {
                 if headless.0 {
@@ -185,11 +191,23 @@ pub(crate) fn drain_commands(
                     ));
                 } else {
                     // Same convention as agent custom cameras: yaw 0 = on +z looking -z.
-                    orbit.yaw = (90.0 - yaw).to_radians();
-                    orbit.pitch = pitch.clamp(-89.0, 89.0).to_radians();
-                    orbit.dist = dist.clamp(0.2, 200.0);
-                    orbit.user = true;
-                    let _ = reply.send(Ok(vec![]));
+                    if let Some(yaw) = yaw {
+                        orbit.yaw = (90.0 - yaw).to_radians();
+                        orbit.user = true;
+                    }
+                    if let Some(pitch) = pitch {
+                        orbit.pitch = pitch.clamp(-89.0, 89.0).to_radians();
+                        orbit.user = true;
+                    }
+                    if let Some(dist) = dist {
+                        orbit.dist = dist.clamp(0.2, 200.0);
+                        orbit.user = true;
+                    }
+                    let msg = match play {
+                        Some(r) => playback.request(&modeler.session.model, &r),
+                        None => Ok(String::new()),
+                    };
+                    let _ = reply.send(msg.map(String::into_bytes));
                 }
             }
             Cmd::AgentShot {
@@ -650,6 +668,24 @@ pub(crate) fn setup_scene(
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.5, 0.0)),
+    ));
+    commands.spawn((
+        Name::new("playback hud"),
+        PlaybackHud,
+        Text::new(String::new()),
+        ui_text(&assets, 15.0, false),
+        ui_color(false),
+        Visibility::Hidden,
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(8.0),
+            left: Val::Px(8.0),
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            ..default()
+        },
+        bevy::feathers::theme::ThemeBackgroundColor(bevy::feathers::tokens::PANE_HEADER_BG),
+        GlobalZIndex(3),
     ));
     commands.spawn((
         Name::new("typing hud"),

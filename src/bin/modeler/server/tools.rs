@@ -1023,31 +1023,59 @@ Style::default()
         .await
     }
 
-    /// Move the orbit camera: yaw/pitch in degrees and the distance from the
-    /// model center. Marks the camera user-steered (auto-drift stops). Windowed
-    /// preview only.
+    /// Move the window's orbit camera (yaw/pitch in degrees, distance from
+    /// the model center; each optional) and/or play a clip in the window
+    /// (`play`). Marks the camera user-steered (auto-drift stops).
     #[tool]
     async fn set_camera(
         &self,
-        Parameters(SetCameraArgs { yaw, pitch, dist }): Parameters<SetCameraArgs>,
+        Parameters(SetCameraArgs {
+            yaw,
+            pitch,
+            dist,
+            play,
+        }): Parameters<SetCameraArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let play = play.map(|p| crate::preview::PlayRequest {
+            clip: p.clip,
+            time: p.time,
+            speed: p.speed,
+            paused: p.paused,
+        });
         self.tx
             .send(Cmd::SetCamera {
                 yaw,
                 pitch,
                 dist,
+                play,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        match Self::await_reply(reply_rx).await {
-            Ok(_) => {}
-            Err(e) => return Err(ErrorData::internal_error(e, None)),
+        let msg = match Self::await_reply(reply_rx).await {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+            Err(e) => return Ok(err_result(e)),
+        };
+        let mut parts = Vec::new();
+        if yaw.is_some() || pitch.is_some() || dist.is_some() {
+            let f = |v: Option<f32>| v.map_or("unchanged".to_string(), |v| v.to_string());
+            parts.push(format!(
+                "camera: yaw {}, pitch {}, dist {}",
+                f(yaw),
+                f(pitch),
+                f(dist)
+            ));
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "camera set to yaw {yaw}°, pitch {pitch}°, dist {dist}"
-        ))]))
+        if !msg.is_empty() {
+            parts.push(msg);
+        }
+        if parts.is_empty() {
+            parts.push("nothing to do: give yaw / pitch / dist and/or play".into());
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            parts.join("\n"),
+        )]))
     }
 
     /// Cast a ray through the scene and report the first part it hits (name,

@@ -24,3 +24,5 @@ mod grid;
 pub(crate) use grid::*;
 mod ui;
 pub(crate) use ui::*;
+mod playback;
+pub(crate) use playback::*;

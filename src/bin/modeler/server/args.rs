@@ -304,11 +304,32 @@ pub(crate) struct CatalogDescribeArgs {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetCameraArgs {
     /// Horizontal angle in degrees: 0 = from +z (front view), 90 = from +x (right).
-    pub(crate) yaw: f32,
+    #[serde(default)]
+    pub(crate) yaw: Option<f32>,
     /// Vertical angle in degrees, -89..89.
-    pub(crate) pitch: f32,
+    #[serde(default)]
+    pub(crate) pitch: Option<f32>,
     /// Distance from the orbit target.
-    pub(crate) dist: f32,
+    #[serde(default)]
+    pub(crate) dist: Option<f32>,
+    /// Play a clip in the window: {"clip"?: "walk" ("" stops, back to
+    /// rest), "time"?: s, "speed"?: 1, "paused"?: false}. The human uses P,
+    /// [ ] and , . in the window.
+    #[serde(default)]
+    pub(crate) play: Option<PlayArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlayArg {
+    #[serde(default)]
+    pub(crate) clip: Option<String>,
+    #[serde(default)]
+    pub(crate) time: Option<f32>,
+    #[serde(default)]
+    pub(crate) speed: Option<f32>,
+    #[serde(default)]
+    pub(crate) paused: Option<bool>,
 }
 
 /// A view: a name ("front", "back", "left", "right", "top", "bottom", "iso")

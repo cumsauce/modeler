@@ -249,6 +249,7 @@ fn main() -> AppExit {
         std::env::var("MODELER_GRID").is_ok_and(|v| v == "1"),
     ))
     .init_resource::<PinTyping>()
+    .init_resource::<Playback>()
     .init_resource::<CommentBox>()
     .init_resource::<PendingPinSpawn>()
     .add_systems(
@@ -259,6 +260,10 @@ fn main() -> AppExit {
             autosave_tick,
             take_screenshot.run_if(windowed),
             rebuild_scene.run_if(windowed),
+            (playback_keys, play_animation)
+                .chain()
+                .after(rebuild_scene)
+                .run_if(windowed),
             draw_game_gizmos.run_if(windowed),
             orbit_camera.run_if(windowed).run_if(grid_off),
             pin_on_click.run_if(windowed).run_if(grid_off),

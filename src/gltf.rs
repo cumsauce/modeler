@@ -1126,10 +1126,7 @@ fn rig_nodes(
                     clip.sample(skel, t)
                 })
                 .collect();
-            let tview = b.view(
-                &le_f32s(times.iter().map(std::array::from_ref)),
-                None,
-            );
+            let tview = b.view(&le_f32s(times.iter().map(std::array::from_ref)), None);
             b.accessors.push(json!({
                 "bufferView": tview, "componentType": 5126, "count": times.len(), "type": "SCALAR",
                 "min": [times.first().copied().unwrap_or(0.0)], "max": [times.last().copied().unwrap_or(0.0)],
