@@ -1485,6 +1485,21 @@ domain, tile and params).
   (bottom right) renders only for a few frames after the model changes;
   click or drag it to move the camera target.
 
+- **Left pane** (`preview/left_pane.rs`) follows the mode: Model = the part
+  tree with a type badge per row; Material = this document's materials
+  (swatch, parts), then the library (a click makes one active); Animate =
+  clips (a click plays one), then bones as a tree; Map = layer eye toggles
+  (`LayerVisibility`, view only, read by `app.rs` `rebuild_scene` /
+  `draw_game_gizmos`), then instances and markers (a click selects and
+  frames). It rebuilds only when its content changes; selection restyles
+  rows in place.
+- **All documents** (`preview/grid.rs`): a sticky filter bar (text, All /
+  Agent working / Unsaved), sections per project, scrolling with the wheel
+  and Page Up / Down / Home / End, and only on-screen tiles exist (camera
+  and parts, at most 24). Each tile has a Feathers × button and asks inside
+  the tile before closing unsaved work. The right column is an agent feed
+  of authored history steps across open documents (a click opens one).
+
 ## Dev notes / gotchas
 
 - Agents driving the server over stdio (frozen MCP tool list) should run

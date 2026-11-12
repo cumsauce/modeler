@@ -246,21 +246,32 @@ pub(crate) fn rebuild_scene(
     existing: Query<Entity, With<PreviewPart>>,
     pins: Query<Entity, With<AnnotationPin>>,
     lights: Query<Entity, With<SceneLight>>,
+    layers: Option<Res<LayerVisibility>>,
+    mut built_layers: Local<Option<LayerVisibility>>,
 ) {
+    // Map mode's eye toggles (view only).
+    let layers = layers.map(|l| *l).unwrap_or_default();
     let version = modeler.session.model.version;
-    if built.version == Some(version) {
+    if built.version == Some(version) && *built_layers == Some(layers) {
         return;
     }
     built.version = Some(version);
+    *built_layers = Some(layers);
     pbr_cache.tick();
     for e in existing.iter().chain(&pins).chain(&lights) {
         commands.entity(e).despawn();
     }
-    spawn_lights(&mut commands, &modeler.session.model);
+    if layers.lights {
+        spawn_lights(&mut commands, &modeler.session.model);
+    }
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
     // Bake every part's material at once (in parallel) before spawning.
-    let is_drawn = drawn(&modeler.session.model);
+    let is_drawn = {
+        let model = &modeler.session.model;
+        let base = drawn(model);
+        move |p: &Part| base(p) && layers.shows_part(model, &p.name)
+    };
     modeler::material::pbr::prebake(
         modeler
             .session
@@ -285,7 +296,12 @@ pub(crate) fn rebuild_scene(
             PreviewPart,
         ));
     }
-    for (at, parts) in marker_previews(&modeler.session.model) {
+    let previews = if layers.game_built {
+        marker_previews(&modeler.session.model)
+    } else {
+        Vec::new()
+    };
+    for (at, parts) in previews {
         let root = commands
             .spawn((at, Visibility::default(), PreviewPart))
             .id();
@@ -826,7 +842,9 @@ pub(crate) fn draw_game_gizmos(
     modeler: Res<Modeler>,
     mut cache: Local<GameGizmoCache>,
     mut gizmos: Gizmos,
+    layers: Option<Res<LayerVisibility>>,
 ) {
+    let layers = layers.map(|l| *l).unwrap_or_default();
     let model = &modeler.session.model;
     if cache.version != Some(model.version) {
         cache.version = Some(model.version);
@@ -834,7 +852,7 @@ pub(crate) fn draw_game_gizmos(
         cache.colliders = modeler::game::colliders(model).unwrap_or_default();
     }
     let marker_color = Color::srgb(1.0, 0.25, 0.85);
-    for m in &cache.markers {
+    for m in cache.markers.iter().filter(|_| layers.markers) {
         let p = m.position;
         let r = 0.15;
         for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
@@ -851,7 +869,7 @@ pub(crate) fn draw_game_gizmos(
             );
         }
     }
-    for c in &cache.colliders {
+    for c in cache.colliders.iter().filter(|_| layers.colliders) {
         let color = if c.sensor {
             Color::srgba(0.3, 0.6, 1.0, 0.5)
         } else if c.body == "static" {
