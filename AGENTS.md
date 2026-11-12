@@ -1469,8 +1469,9 @@ Material / Grid toggles match O, S, M and G.
   invocation — window flashes open/closed, state restored from autosave.
 
 - **Several agents can share one daemon.** Each connection has its own
-  thread and calls interleave one at a time, so one agent's long batch
-  doesn't block the others. Every call carries its client (the agent
+  thread and calls go to the server concurrently (responses are routed by
+  JSON-RPC id), so one agent's slow render doesn't block another's quick
+  call; edits still apply one at a time on the app thread. Every call carries its client (the agent
   session behind the calling shell, or `--client NAME`) in the MCP
   `_meta` (`modeler/client`, `modeler/doc` for `--doc`), and the server
   (`Session::begin_call` / `end_call`):

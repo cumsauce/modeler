@@ -133,6 +133,15 @@ class ModelerSession:
         self.shots = ShotNamer()
         self._handshake()
         self.slot_note = self._slot_note()
+        # From here on requests may come from several threads at once (the
+        # daemon's clients): one writer lock, and a reader thread handing
+        # each response to the request that waits for its id, so a slow
+        # render doesn't hold up another agent's quick call.
+        import threading
+        self._wlock = threading.Lock()
+        self._waiting = {}
+        self._closed = False
+        threading.Thread(target=self._reader, daemon=True).start()
 
     def _slot_note(self):
         """When another server owns the main autosave, the server says so on
@@ -174,8 +183,50 @@ class ModelerSession:
         return f"code {code}: {reason}"
 
     def _send(self, obj):
-        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
-        self.proc.stdin.flush()
+        data = (json.dumps(obj) + "\n").encode()
+        lock = getattr(self, "_wlock", None)
+        if lock is None:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+            return
+        with lock:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+
+    def _reader(self):
+        """Routes every response line to the request waiting for its id."""
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                continue
+            q = self._waiting.pop(resp.get("id"), None) if isinstance(resp, dict) else None
+            if q is not None:
+                q.put(resp)
+        self._closed = True
+        for q in list(self._waiting.values()):
+            q.put(None)
+
+    def _request(self, msg):
+        """Sends one request (any thread) and waits for its response."""
+        import queue
+        with self._wlock:
+            rid = self.next_id
+            self.next_id += 1
+        msg["id"] = rid
+        q = queue.Queue(1)
+        self._waiting[rid] = q
+        if self._closed:
+            self._waiting.pop(rid, None)
+            raise RuntimeError("server closed stdout")
+        self._send(msg)
+        resp = q.get()
+        if resp is None:
+            raise RuntimeError("server closed stdout")
+        return resp
 
     def _recv(self):
         line = self.proc.stdout.readline()
@@ -194,37 +245,25 @@ class ModelerSession:
         self.next_id += 1
 
     def tool_names(self):
-        rid = self.next_id; self.next_id += 1
-        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}})
-        while True:
-            resp = self._recv()
-            if resp.get("id") == rid:
-                return sorted(t["name"] for t in resp["result"]["tools"])
+        resp = self._request({"jsonrpc": "2.0", "method": "tools/list", "params": {}})
+        return sorted(t["name"] for t in resp["result"]["tools"])
 
     def raw(self, method, params=None):
         """One JSON-RPC request passed through as is (for --proxy): returns
         {"result": ...} or {"error": ...}, images and all."""
-        rid = self.next_id; self.next_id += 1
-        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        msg = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params
-        self._send(msg)
-        while True:
-            resp = self._recv()
-            if resp.get("id") == rid:
-                return {k: resp[k] for k in ("result", "error") if k in resp}
+        resp = self._request(msg)
+        return {k: resp[k] for k in ("result", "error") if k in resp}
 
     def call(self, name, args=None, save_shot=None, save_dir=None, b64=False, shots=None,
              meta=None):
-        rid = self.next_id; self.next_id += 1
         params = {"name": name, "arguments": args or {}}
         if meta:
             params["_meta"] = meta  # which agent is calling (see daemon_mode)
-        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": params})
+        resp = self._request({"jsonrpc": "2.0", "method": "tools/call", "params": params})
         while True:
-            resp = self._recv()
-            if resp.get("id") != rid:
-                continue  # notifications
             if "error" in resp:  # JSON-RPC protocol error (bad args, unknown tool, ...)
                 err = resp["error"]
                 return {"ok": False,
@@ -370,8 +409,9 @@ def daemon_mode(socket_path, mode):
     print(f"modeler daemon ready on {socket_path}"
           + (f" (server log: {log})" if log else ""), flush=True)
     # Several agents share one daemon. Each connection gets its own thread
-    # and the calls interleave one at a time (a lock around the server), so
-    # one agent's long batch doesn't hold every other agent at the door.
+    # and calls go to the server concurrently (it answers by request id), so
+    # one agent's slow render doesn't hold every other agent at the door; the
+    # lock only guards respawning a server that exited.
     # Every call carries its agent in `_meta` ("modeler/client", plus
     # "modeler/doc" for --doc): the server keeps each agent's own active
     # document, credits history steps to it, and tells it what other agents
@@ -436,19 +476,19 @@ def daemon_mode(socket_path, mode):
                         # --proxy: MCP JSON-RPC passed through untouched.
                         with lock:
                             session, note = live_session()
-                            if "init" in c:
-                                out = {"result": session.init_result}
-                            else:
-                                req = c["raw"]
-                                params = req.get("params")
-                                if req.get("method") == "tools/call" and client:
-                                    params = dict(params or {})
-                                    m = dict(params.get("_meta") or {})
-                                    m.setdefault("modeler/client", client)
-                                    if project is not None:
-                                        m.setdefault("modeler/project", project)
-                                    params["_meta"] = m
-                                out = session.raw(req.get("method"), params)
+                        if "init" in c:
+                            out = {"result": session.init_result}
+                        else:
+                            req = c["raw"]
+                            params = req.get("params")
+                            if req.get("method") == "tools/call" and client:
+                                params = dict(params or {})
+                                m = dict(params.get("_meta") or {})
+                                m.setdefault("modeler/client", client)
+                                if project is not None:
+                                    m.setdefault("modeler/project", project)
+                                params["_meta"] = m
+                            out = session.raw(req.get("method"), params)
                         if pending_note:
                             note = f"{note}\n{pending_note}" if note else pending_note
                             pending_note = None
@@ -468,9 +508,9 @@ def daemon_mode(socket_path, mode):
                         meta["modeler/project"] = project
                     with lock:
                         session, note = live_session()
-                        out = session.call(c["name"], c.get("args", {}),
-                                           c.get("save_shot"), c.get("save_dir"),
-                                           c.get("b64", False), shots, meta)
+                    out = session.call(c["name"], c.get("args", {}),
+                                       c.get("save_shot"), c.get("save_dir"),
+                                       c.get("b64", False), shots, meta)
                     if pending_note:
                         note = f"{note}\n{pending_note}" if note else pending_note
                         pending_note = None
