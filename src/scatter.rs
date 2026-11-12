@@ -689,7 +689,14 @@ mod solid_copies {
             json!({"type":"scatter","name":"trees","input":"fir","on":"slab","count":10,"seed":7,"scale":[0.7,1.2]}),
         ]).unwrap_or_else(|e| panic!("{e}"));
         let mut bad = Vec::new();
-        for p in &s.model.parts {
+        // Leaf cards are open sheets on purpose, and copies stay cards.
+        assert!(
+            s.model
+                .parts
+                .iter()
+                .any(|p| p.name.starts_with("trees_") && p.cards)
+        );
+        for p in s.model.parts.iter().filter(|p| !p.cards) {
             if let Err(e) = crate::csg::part_to_manifold(p) {
                 bad.push(format!(
                     "{} rot={:?} scale={:?}: {}",

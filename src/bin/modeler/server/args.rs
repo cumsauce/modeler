@@ -184,7 +184,8 @@ pub(crate) struct MaterialOpsArgs {
     /// Named numbers usable as "$name" / "=expr" in node fields.
     #[serde(default)]
     pub(crate) params: Option<std::collections::BTreeMap<String, f64>>,
-    /// "tile" (default) or "object".
+    /// "tile" (default), "object" or "card" (one image over a card's own
+    /// 0..1 uvs: lsystem leaf cards).
     #[serde(default)]
     pub(crate) domain: Option<String>,
     /// Tile size in meters (tile domain; default 1).

@@ -175,6 +175,10 @@ pub struct Part {
     /// by the op; never saved.
     #[serde(skip)]
     pub detail: Option<std::sync::Arc<crate::decimate::Detail>>,
+    /// Open leaf cards on purpose (an lsystem's `card` leaves): not a
+    /// closed solid, and checks that need one skip it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cards: bool,
 }
 
 fn one() -> f32 {

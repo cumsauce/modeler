@@ -101,6 +101,20 @@ pub struct LeafStyle {
     pub fold: f32,
     /// Leaf stalk length, meters.
     pub stalk: f32,
+    /// "card": a flat quad (a few, with curl or fold) with uvs 0..1 over
+    /// it, for an alpha-cutout leaf texture (a `card`-domain material): the
+    /// game-ready way, a handful of triangles per leaf. "solid": a closed
+    /// blade modelled in its outline (no texture needed, ~60 triangles).
+    /// Files saved before cards existed read as solid.
+    #[serde(default = "solid_mode")]
+    pub mode: String,
+    /// Cards: a second card crossed at 90 degrees along the leaf, so it
+    /// has volume from every side.
+    pub cross: bool,
+}
+
+fn solid_mode() -> String {
+    "solid".into()
 }
 
 impl Default for LeafStyle {
@@ -111,9 +125,13 @@ impl Default for LeafStyle {
             curl: 0.0,
             fold: 0.0,
             stalk: 0.0,
+            mode: "card".into(),
+            cross: false,
         }
     }
 }
+
+pub const LEAF_MODES: &[&str] = &["card", "solid"];
 
 pub const LEAF_SHAPES: &[&str] = &[
     "ellipse", "lance", "round", "heart", "diamond", "needle", "maple",
@@ -215,6 +233,12 @@ impl LSystem {
                 "leaf.shape: unknown `{}` ({})",
                 self.leaf.shape,
                 LEAF_SHAPES.join(", ")
+            ));
+        }
+        if !LEAF_MODES.contains(&self.leaf.mode.as_str()) {
+            return Err(format!(
+                "leaf_mode: unknown `{}` (card or solid)",
+                self.leaf.mode
             ));
         }
         compile(self).map(|_| ())
@@ -459,14 +483,14 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     let leaves = ls.has_leaves().then(|| {
         let mut lp = Part::new(format!("{name}_leaves"));
         for (pos, rot, k) in &leaves {
-            blade(
-                &mut lp,
-                *pos,
-                *rot,
-                [ls.leaf_size[0] * k, ls.leaf_size[1] * k],
-                &ls.leaf,
-            );
+            let size = [ls.leaf_size[0] * k, ls.leaf_size[1] * k];
+            if ls.leaf.mode == "card" {
+                card(&mut lp, *pos, *rot, size, &ls.leaf);
+            } else {
+                blade(&mut lp, *pos, *rot, size, &ls.leaf);
+            }
         }
+        lp.cards = ls.leaf.mode == "card";
         place(&mut lp);
         // No `L` was reached: keep the name (materials may point at it) but
         // hide the empty part so nothing renders or exports it.
@@ -550,6 +574,66 @@ fn tube(part: &mut Part, pts: &[(Vec3, f32)], sides: usize) {
                 part.indices.extend_from_slice(&[c0, a, b]);
             } else {
                 part.indices.extend_from_slice(&[c0, b, a]);
+            }
+        }
+    }
+}
+
+/// A leaf card: the leaf's bounding rectangle (`w` wide, `len` long plus
+/// the stalk) as one open sheet facing up off the branch, with uvs 0..1
+/// across (u) and from the tip (v 0, the top of the image) to the base
+/// (v 1). A V `fold` splits it along the midrib, a `curl` bends it in a
+/// few rows; `cross` adds a second card turned 90 degrees about its
+/// length. Drawn from both sides by its (double-sided) cutout material.
+fn card(part: &mut Part, pos: Vec3, rot: Quat, [w, len]: [f32; 2], st: &LeafStyle) {
+    if w <= 0.0 || len <= 0.0 {
+        return;
+    }
+    let rot = (rot * Quat::from_axis_angle(Vec3::NEG_X, st.angle.to_radians())).normalize();
+    let len = len + st.stalk;
+    let rows = match st.curl.abs() {
+        c if c < 1e-3 => 1,
+        c if c <= 45.0 => 2,
+        _ => 3,
+    };
+    let fold = st.fold.to_radians() * 0.5;
+    let curl = st.curl.to_radians();
+    let turns: &[f32] = if st.cross { &[0.0, 90.0] } else { &[0.0] };
+    for &turn in turns {
+        let r = (rot * Quat::from_axis_angle(Vec3::Y, turn.to_radians())).normalize();
+        let (h, l, u) = (r * Vec3::Y, r * Vec3::NEG_X, r * Vec3::Z);
+        let rib = |t: f32| -> (Vec3, Vec3) {
+            let ang = curl * t;
+            let (along, up) = if curl.abs() < 1e-4 {
+                (h * len * t, Vec3::ZERO)
+            } else {
+                let rr = len / curl;
+                (h * rr * ang.sin(), -u * rr * (1.0 - ang.cos()))
+            };
+            let tangent = (h * ang.cos() - u * ang.sin()).normalize();
+            (pos + along + up, tangent.cross(l).normalize())
+        };
+        let o = part.verts.len() as u32;
+        for row in 0..=rows {
+            let t = row as f32 / rows as f32;
+            let (c, n) = rib(t);
+            let half = 0.5 * w;
+            let lift = n * half * fold.sin();
+            let side = l * half * fold.cos();
+            // Columns: left edge, midrib, right edge.
+            for (k, p) in [(0.0, c + side + lift), (0.5, c), (1.0, c - side + lift)] {
+                part.verts.push(p.to_array());
+                part.normals.push(n.to_array());
+                part.uvs.push([k, 1.0 - t]);
+            }
+        }
+        for row in 0..rows {
+            let a = o + row * 3;
+            let b = a + 3;
+            for col in 0..2 {
+                let (p0, p1, q0, q1) = (a + col, a + col + 1, b + col, b + col + 1);
+                // Wound to face +n (the card's top).
+                part.indices.extend_from_slice(&[p0, p1, q1, p0, q1, q0]);
             }
         }
     }
@@ -689,6 +773,7 @@ mod tests {
                 fold: 30.0,
                 angle: 30.0,
                 stalk: 0.02,
+                mode: "solid".into(),
                 ..LeafStyle::default()
             },
             translation: [0.0; 3],
@@ -820,9 +905,8 @@ mod parametric_tests {
             .iter()
             .find(|p| p.name == "t_leaves")
             .unwrap_or_else(|| panic!("no leaves"));
-        for p in [wood, leaves] {
-            assert_eq!(crate::verify::open_edge_count(p), 0, "{} is open", p.name);
-        }
+        assert!(leaves.cards);
+        assert_eq!(crate::verify::open_edge_count(wood), 0, "wood is open");
         // The trunk is 1 m: the first segment's length came from A(1, ..).
         let top = wood.verts.iter().map(|v| v[1]).fold(f32::MIN, f32::max);
         assert!(top > 1.5 && top < 6.0, "{top}");
@@ -917,6 +1001,39 @@ mod parametric_tests {
     }
 
     #[test]
+    fn a_card_leaf_is_a_few_triangles_with_uvs_over_the_card() {
+        let mut st = LeafStyle {
+            angle: 30.0,
+            ..LeafStyle::default()
+        };
+        let mut p = Part::new("c");
+        card(&mut p, Vec3::ZERO, Quat::IDENTITY, [0.08, 0.15], &st);
+        assert_eq!(p.tri_count(), 4);
+        let (lo, hi) = p.uvs.iter().fold(([1f32; 2], [0f32; 2]), |(a, b), u| {
+            (
+                [a[0].min(u[0]), a[1].min(u[1])],
+                [b[0].max(u[0]), b[1].max(u[1])],
+            )
+        });
+        assert_eq!((lo, hi), ([0.0, 0.0], [1.0, 1.0]));
+        // The card faces its normals: every triangle winds toward them.
+        for t in p.indices.as_chunks::<3>().0 {
+            let v = t.map(|i| Vec3::from(p.verts[i as usize]));
+            let n = (v[1] - v[0]).cross(v[2] - v[0]);
+            assert!(n.dot(Vec3::from(p.normals[t[0] as usize])) > 0.0);
+        }
+        st.curl = 40.0;
+        st.cross = true;
+        let mut q = Part::new("c");
+        card(&mut q, Vec3::ZERO, Quat::IDENTITY, [0.08, 0.15], &st);
+        assert_eq!(q.tri_count(), 2 * 2 * 4);
+        // An old file without a mode reads as solid blades.
+        let old: LeafStyle =
+            serde_json::from_str(r#"{"shape": "ellipse"}"#).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(old.mode, "solid");
+    }
+
+    #[test]
     fn every_leaf_shape_is_closed() {
         for shape in LEAF_SHAPES {
             let mut p = Part::new("l");
@@ -926,6 +1043,7 @@ mod parametric_tests {
                 curl: 50.0,
                 fold: 40.0,
                 stalk: 0.0,
+                ..LeafStyle::default()
             };
             blade(&mut p, Vec3::ZERO, Quat::IDENTITY, [0.08, 0.15], &st);
             assert_eq!(crate::verify::open_edge_count(&p), 0, "{shape} is open");
@@ -959,7 +1077,7 @@ mod seed_tests {
                     0,
                     "{preset} {seed} wood"
                 );
-                if let Some(l) = d.leaves {
+                if let Some(l) = d.leaves.filter(|l| !l.cards) {
                     assert_eq!(
                         crate::verify::open_edge_count(&l),
                         0,

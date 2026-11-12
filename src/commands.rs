@@ -2468,7 +2468,7 @@ impl Session {
                 .parts
                 .iter()
                 .map(|p| p.as_ref())
-                .filter(|p| p.visible && !p.verts.is_empty())
+                .filter(|p| p.visible && !p.verts.is_empty() && !p.cards)
                 .collect();
             if spec.self_intersections == Some(true) {
                 let bad: Vec<String> = parts

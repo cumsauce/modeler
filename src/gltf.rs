@@ -301,7 +301,16 @@ pub(crate) fn build_with(
                             _ => Kind::Linear,
                         };
                         (
-                            crate::ktx2::encode(px, t.w, t.h, kind)?,
+                            crate::ktx2::encode_with(
+                                px,
+                                t.w,
+                                t.h,
+                                kind,
+                                match (what, t.alpha) {
+                                    ("base_color", crate::material::pbr::Alpha::Mask(c)) => Some(c),
+                                    _ => None,
+                                },
+                            )?,
                             "ktx2",
                             "image/ktx2",
                         )
@@ -366,7 +375,12 @@ pub(crate) fn build_with(
                     "base": add(&t.base, "base_color")?,
                     "mr": mr,
                     "normal": add(&t.normal, "normal")?,
-                    "blend": t.blend,
+                    "alpha": match t.alpha {
+                        crate::material::pbr::Alpha::Opaque => json!(null),
+                        crate::material::pbr::Alpha::Mask(c) => json!(c),
+                        crate::material::pbr::Alpha::Blend => json!("blend"),
+                    },
+                    "double_sided": t.double_sided,
                 });
                 if packed.is_some() {
                     set["ao"] = json!(mr);
@@ -431,8 +445,14 @@ pub(crate) fn build_with(
                     }
                 }
             }
-            if set["blend"] == json!(true) {
+            if set["alpha"] == json!("blend") {
                 material["alphaMode"] = json!("BLEND");
+            } else if let Some(c) = set["alpha"].as_f64() {
+                material["alphaMode"] = json!("MASK");
+                material["alphaCutoff"] = json!(c);
+            }
+            if set["double_sided"] == json!(true) {
+                material["doubleSided"] = json!(true);
             }
             if let Some(ext) = set.get("ext").and_then(|e| e.as_object())
                 && !ext.is_empty()

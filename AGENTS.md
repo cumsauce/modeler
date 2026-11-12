@@ -95,7 +95,7 @@ type, so there is no need to memorise field names.
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round], [smooth], [samples], [twist], [scale_end] |
 | `loft` | name, sections [{profile, y / at, [rotation], [scale]} or {profile, t}...], [path], [smooth], [samples], [steps], [round] |
-| `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], ... (branching growth: wood in `name`, leaves in `name_leaves`) |
+| `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], [leaf_mode card / solid], [leaf_cross], ... (branching growth: wood in `name`, leaves in `name_leaves`, cards for an alpha-cutout leaf material) |
 | `text` | name, text, size (capital height), [depth size/8], [font sans / bold / mono / path.ttf], [align center], [line_spacing], [letter_spacing], [translation], [rotation] |
 | `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
 | `hull` | name, inputs |
@@ -298,11 +298,43 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   (`[0, -1, 0]` droops, `[0, 1, 0]` reaches up), `taper` thins along a
   branch. Each unbroken branch is ONE smooth closed tube (`sides`), so no
   gaps at bends; branches start inside their parent. Leaves (`leaf_size`
-  [width, length]) are thin closed blades in `name_leaves`: give the two
-  parts separate materials (`"*_leaves"` patterns see them). Leaf look:
-  `leaf_shape` (ellipse, lance, round, heart, diamond, needle, maple),
-  `leaf_angle` (pitch out from the stem), `leaf_curl` (tips droop),
-  `leaf_fold` (V along the midrib), `leaf_stalk` (petiole, meters).
+  [width, length]) go to `name_leaves`: give the two parts separate
+  materials (`"*_leaves"` patterns see them). Leaf look: `leaf_angle`
+  (pitch out from the stem), `leaf_curl` (tips droop), `leaf_fold` (V
+  along the midrib), `leaf_stalk` (petiole, meters).
+  **Leaves are cards by default** (`leaf_mode: "card"`), the way games draw
+  foliage: each leaf is a flat quad (2-6 triangles with curl and fold,
+  `leaf_cross: true` adds a second card at 90 degrees for volume) with uvs
+  0..1 over it, and the leaf's shape comes from an **alpha cutout**
+  material, not from polygons. Give `name_leaves` a `card`-domain material
+  whose output sets `opacity` (1 on the leaf, 0 around it); a part of cards
+  without one warns, since every leaf then draws as a rectangle. The image's
+  top (v 0) is the leaf tip, its bottom the base at the twig; it is
+  stretched over the card's width x length. A leaf (`tile` 0.1 is the
+  image's size in meters, the coordinate space of the shapes):
+  `material_ops("leaf_card", domain: "card", tile: 0.1, resolution: 256,
+  ops: [{"type": "circle", "name": "l", "center": [0.0332, 0.05], "radius":
+  0.0518}, {"type": "circle", "name": "r", "center": [0.0668, 0.05],
+  "radius": 0.0518}, {"type": "sdf_op", "name": "lens", "a": "l", "b": "r",
+  "op": "intersect"}, {"type": "mask", "name": "shape", "sdf": "lens"},
+  {"type": "segment", "name": "rib", "a": [0.05, 0.004], "b": [0.05,
+  0.098], "width": 0.0015}, {"type": "mask", "name": "vein", "sdf": "rib"},
+  {"type": "noise", "name": "n", "size": 0.02, "octaves": 3}, {"type":
+  "ramp", "name": "green", "input": "n", "stops": [[0, "#2f5a1c"], [1,
+  "#5f8f2e"]]}, {"type": "blend", "name": "col", "a": "green", "b":
+  "#a8c070", "opacity": "vein"}, {"type": "output", "name": "o",
+  "base_color": "col", "roughness": 0.6, "opacity": "shape",
+  "transmission": 0.3}])`, then `{"type": "material", "name":
+  "oak_leaves", "pbr": "leaf_card"}`. For dense crowns, draw **clusters**:
+  paint several leaves (or a twig of them) into one card image and raise
+  `leaf_size`, so one card stands for many leaves. A card material is one
+  shared texture (like a tile), so a scattered forest reuses it.
+  `leaf_mode: "solid"` models each leaf as a closed blade in its
+  `leaf_shape` outline (ellipse, lance, round, heart, diamond, needle,
+  maple; ~60 triangles a leaf, no texture needed): for close-up hero
+  plants, prints, or when the user wants geometry. Leaf cards are open
+  sheets on purpose: `validate`, `thickness` and `self_intersections` skip
+  them. Models saved before cards existed keep their solid leaves.
   **Parametric** rules carry numbers on modules, so each branch knows its
   own length, width or age: axiom `"A(1, 0.08)"`, rules
   `{"A(l, w) : l >= 0.2": "!(w)F(l)[&(40)A(l*k, w*0.6)]/(137.5)A(l*0.8, w*0.8)",
@@ -977,7 +1009,10 @@ work, and every material has its own history tree.
   everywhere. `object`: evaluated at points on the surface (`input` of
   `position` / `normal`, object space, meters): 3D noise and SDFs run through
   the solid and wrap edges with no seams. Each part gets a packed atlas
-  (box-unwrapped islands at one texel density, dilated gutter).
+  (box-unwrapped islands at one texel density, dilated gutter). `card`:
+  one `tile`-meter image (like a tile, coordinates in meters, top row =
+  v 0) laid once over each part's own 0..1 uvs instead of remapped: leaf
+  cards, decals, signs. One shared texture, like a tile.
 - **Node families.** Coords: input, transform, combine, split, polar,
   kaleido, warp, tile_grid (ports local / cell / id / edge), repeat,
   triplanar. 2D SDFs: circle, rect, segment, polygon, star, hexagon, arc,
@@ -1017,6 +1052,15 @@ work, and every material has its own history tree.
   `specular_transmission` + `thickness` + `ior` (glass, water). They show
   in the preview and export as KHR_materials_clearcoat / anisotropy /
   diffuse_transmission / transmission / volume / ior.
+- **Alpha.** `opacity` below 1 renders by `alpha`: `"mask"` (a cutout:
+  each texel fully there or not at `alpha_cutoff`, default 0.5; leaves,
+  grass, chain-link, lace; stays in the opaque pass, casts cut-out
+  shadows, needs no sorting), `"blend"` (see-through: glass, smoke, ghosts)
+  or `"opaque"`. Default: mask when the opacity is nearly all 0 or 1, else
+  blend. `double_sided` (default on for mask) draws both faces, so a card
+  shows from behind. Exports write glTF `alphaMode` MASK / BLEND,
+  `alphaCutoff` and `doubleSided`; a mask texture's mipmaps keep its
+  coverage, so foliage doesn't thin out and vanish at a distance.
 - **Layers**: `output` takes `over: [{"output": "dirt_out", "mask":
   "dirt_m"}]`, each a whole other `output` node blended in (every channel)
   where its mask is 1, in order: moss over stone, rust over paint, mud over

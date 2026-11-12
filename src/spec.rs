@@ -489,6 +489,17 @@ pub struct LSystemSpec {
     /// Leaf stalk (petiole) length, meters.
     #[serde(default)]
     leaf_stalk: Option<f32>,
+    /// "card" (default): each leaf is a flat quad with uvs 0..1, for an
+    /// alpha-cutout leaf texture (a material with domain "card" whose
+    /// output sets opacity): a few triangles a leaf, the way games draw
+    /// foliage. "solid": a closed blade modelled in its outline shape
+    /// (needs no texture, ~60 triangles a leaf).
+    #[serde(default)]
+    leaf_mode: Option<String>,
+    /// Card leaves: add a second card crossed at 90 degrees, so each leaf
+    /// has volume from every angle.
+    #[serde(default)]
+    leaf_cross: Option<bool>,
     #[serde(default, alias = "position")]
     translation: Option<[f32; 3]>,
     /// Rotation: [x, y, z, w], {"axis": [1, 0, 0], "degrees": -20} or {"x": -20} (degrees).
@@ -540,6 +551,7 @@ pub(crate) fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, Stri
             curl: 25.0,
             fold: 25.0,
             stalk: 0.0,
+            ..Default::default()
         },
         translation: [0.0; 3],
         rotation: None,
@@ -551,6 +563,7 @@ pub(crate) fn lsystem_preset(name: &str) -> Result<crate::lsystem::LSystem, Stri
             curl,
             fold,
             stalk,
+            ..Default::default()
         };
     Ok(match name {
         // A broadleaf: a trunk, then forks spreading around it (about 4-5 m).
@@ -740,7 +753,7 @@ impl LSystemSpec {
         macro_rules! leaf {
             ($($f:ident => $g:ident),*) => { $(if let Some(v) = self.$f { d.leaf.$g = v; })* };
         }
-        leaf!(leaf_shape => shape, leaf_angle => angle, leaf_curl => curl, leaf_fold => fold, leaf_stalk => stalk);
+        leaf!(leaf_shape => shape, leaf_angle => angle, leaf_curl => curl, leaf_fold => fold, leaf_stalk => stalk, leaf_mode => mode, leaf_cross => cross);
         over!(
             iterations,
             angle,

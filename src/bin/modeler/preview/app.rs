@@ -292,11 +292,12 @@ fn pbr_image(
     h: usize,
     px: &[u8],
     srgb: bool,
+    cutoff: Option<f32>,
     images: &mut Assets<Image>,
 ) -> Handle<Image> {
     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
     use bevy::render::render_resource::{Extent3d, TextureDimension};
-    let (data, levels) = modeler::material::pbr::mips(w, h, px, srgb);
+    let (data, levels) = modeler::material::pbr::mips_with(w, h, px, srgb, cutoff);
     // Built from level 0 (Image::new checks the size), then the whole chain.
     let mut img = Image::new(
         Extent3d {
@@ -361,25 +362,35 @@ fn pbr_material(
         }
     };
     let t = modeler::material::pbr::textures(&ch);
+    let cutoff = match t.alpha {
+        modeler::material::pbr::Alpha::Mask(c) => Some(c),
+        _ => None,
+    };
     let [cr, cg, cb, ca] = part.material.base_color;
     let mut m = StandardMaterial {
         base_color: Color::srgba(cr, cg, cb, ca),
         perceptual_roughness: part.material.roughness,
         metallic: part.material.metalness,
-        base_color_texture: Some(pbr_image(t.w, t.h, &t.base, true, images)),
-        metallic_roughness_texture: Some(pbr_image(t.w, t.h, &t.metal_rough, false, images)),
-        normal_map_texture: Some(pbr_image(t.w, t.h, &t.normal, false, images)),
+        base_color_texture: Some(pbr_image(t.w, t.h, &t.base, true, cutoff, images)),
+        metallic_roughness_texture: Some(pbr_image(t.w, t.h, &t.metal_rough, false, None, images)),
+        normal_map_texture: Some(pbr_image(t.w, t.h, &t.normal, false, None, images)),
         ..default()
     };
     if let Some(ao) = &t.occlusion {
-        m.occlusion_texture = Some(pbr_image(t.w, t.h, ao, false, images));
+        m.occlusion_texture = Some(pbr_image(t.w, t.h, ao, false, None, images));
     }
     if let Some(e) = &t.emissive {
-        m.emissive_texture = Some(pbr_image(t.w, t.h, e, true, images));
+        m.emissive_texture = Some(pbr_image(t.w, t.h, e, true, None, images));
         m.emissive = LinearRgba::WHITE;
     }
-    if t.blend {
-        m.alpha_mode = AlphaMode::Blend;
+    match t.alpha {
+        modeler::material::pbr::Alpha::Opaque => {}
+        modeler::material::pbr::Alpha::Mask(c) => m.alpha_mode = AlphaMode::Mask(c),
+        modeler::material::pbr::Alpha::Blend => m.alpha_mode = AlphaMode::Blend,
+    }
+    if t.double_sided {
+        m.double_sided = true;
+        m.cull_mode = None;
     }
     let x = &ch.extras;
     if let Some(v) = x.clearcoat {

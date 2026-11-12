@@ -29,7 +29,9 @@ pub struct MatDoc {
     pub format_version: u32,
     /// "tile" (a seamless square `tile` meters wide, mapped onto parts by
     /// their metric uvs) or "object" (evaluated at points on the surface:
-    /// 3D noise and SDFs wrap corners with no seams).
+    /// 3D noise and SDFs wrap corners with no seams) or "card" (one
+    /// `tile`-meter square image laid once over each card's own 0..1 uvs:
+    /// leaf cards, decals, signs; top of the image = v 0 = the card's tip).
     #[serde(default = "tile_domain")]
     pub domain: String,
     /// Tile size in meters (tile domain).
@@ -186,8 +188,10 @@ impl MatDoc {
         let mut next = self.clone();
         next.history = History::default();
         if let Some(d) = domain {
-            if d != "tile" && d != "object" {
-                return Err(format!("domain: `{d}`: use \"tile\" or \"object\""));
+            if !["tile", "object", "card"].contains(&d.as_str()) {
+                return Err(format!(
+                    "domain: `{d}`: use \"tile\", \"object\" or \"card\""
+                ));
             }
             next.domain = d;
         }

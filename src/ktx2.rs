@@ -98,6 +98,18 @@ fn downsample(px: &[u8], w: usize, h: usize, kind: Kind) -> (Vec<u8>, usize, usi
 /// Encodes an RGBA8 image as a KTX2 file: every mip level down to 1x1,
 /// block-compressed, zstd supercompressed.
 pub fn encode(rgba: &[u8], w: usize, h: usize, kind: Kind) -> Result<Vec<u8>, String> {
+    encode_with(rgba, w, h, kind, None)
+}
+
+/// [`encode`], keeping a cutout's alpha coverage at every mip level when
+/// `cutoff` is given (leaves stay leafy at a distance).
+pub fn encode_with(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    kind: Kind,
+    cutoff: Option<f32>,
+) -> Result<Vec<u8>, String> {
     if w == 0 || h == 0 || rgba.len() != w * h * 4 {
         return Err(format!("ktx2: bad image {w}x{h} ({} bytes)", rgba.len()));
     }
@@ -123,6 +135,11 @@ pub fn encode(rgba: &[u8], w: usize, h: usize, kind: Kind) -> Result<Vec<u8>, St
     // levels[i] = (zstd bytes, uncompressed length), level 0 = full size.
     let mut levels: Vec<(Vec<u8>, usize)> = Vec::new();
     let (mut px, mut lw, mut lh) = (rgba.to_vec(), w, h);
+    let target = cutoff.map(|c| {
+        let k = (c * 255.0) as u8;
+        px.as_chunks::<4>().0.iter().filter(|p| p[3] > k).count() as f32
+            / (px.len() / 4).max(1) as f32
+    });
     loop {
         let view = ImageView::rgba8(&px, lw as u32, lh as u32, lw * 4)
             .map_err(|e| format!("ktx2: {e:?}"))?;
@@ -137,6 +154,9 @@ pub fn encode(rgba: &[u8], w: usize, h: usize, kind: Kind) -> Result<Vec<u8>, St
             break;
         }
         (px, lw, lh) = downsample(&px, lw, lh, kind);
+        if let (Some(c), Some(t)) = (cutoff, target) {
+            crate::material::pbr::keep_coverage(&mut px, c, t);
+        }
     }
     debug_assert_eq!(levels[0].1, w.div_ceil(4) * h.div_ceil(4) * block_bytes);
 

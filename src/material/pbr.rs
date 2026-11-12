@@ -90,6 +90,11 @@ pub fn map_part(part: &mut Part) -> Result<(), String> {
         atlas::box_atlas(part, n);
     } else if g.domain == "object" {
         atlas::box_atlas(part, atlas_size(g));
+    } else if g.domain == "card" {
+        // The part's own uvs (0..1 per card) carry the image as authored.
+        if part.uvs.len() != part.verts.len() {
+            crate::uv::metric_box(part);
+        }
     } else {
         crate::uv::metric_box(part);
         let k = 1.0 / (g.tile * r.scale.max(1e-6)).max(1e-6);
@@ -299,8 +304,46 @@ pub struct Textures {
     pub occlusion: Option<Vec<u8>>,
     /// sRGB emission (when driven).
     pub emissive: Option<Vec<u8>>,
-    /// Any texel less than fully opaque.
-    pub blend: bool,
+    /// How opacity renders.
+    pub alpha: Alpha,
+    /// Both faces drawn (cutout cards).
+    pub double_sided: bool,
+}
+
+/// A bake's alpha mode (glTF `alphaMode`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Alpha {
+    Opaque,
+    /// A cutout at this threshold.
+    Mask(f32),
+    Blend,
+}
+
+/// The alpha mode of a bake: the output's `alpha` when given, else mask
+/// when the opacity is nearly all 0 or 1 (a cutout), blend when it has
+/// real in-between values, opaque when it is all 1.
+pub fn alpha_of(ch: &Channels) -> Alpha {
+    let cut = ch.extras.alpha_cutoff.unwrap_or(0.5).clamp(0.0, 1.0);
+    match ch.extras.alpha.as_deref() {
+        Some("opaque") => return Alpha::Opaque,
+        Some("mask") => return Alpha::Mask(cut),
+        Some("blend") => return Alpha::Blend,
+        _ => {}
+    }
+    let n = ch.opacity.len().max(1);
+    if ch.opacity.iter().all(|o| *o >= 0.999) {
+        return Alpha::Opaque;
+    }
+    let mid = ch
+        .opacity
+        .iter()
+        .filter(|o| **o > 0.05 && **o < 0.95)
+        .count();
+    if (mid as f32) < 0.1 * n as f32 {
+        Alpha::Mask(cut)
+    } else {
+        Alpha::Blend
+    }
 }
 
 pub fn textures(ch: &Channels) -> Textures {
@@ -353,13 +396,66 @@ pub fn textures(ch: &Channels) -> Textures {
         normal: nm,
         occlusion,
         emissive,
-        blend: ch.opacity.iter().any(|o| *o < 0.999),
+        alpha: alpha_of(ch),
+        double_sided: ch
+            .extras
+            .double_sided
+            .unwrap_or(matches!(alpha_of(ch), Alpha::Mask(_))),
     }
 }
 
 /// Box-filtered mip chain of an RGBA8 image (level 0 first, concatenated),
 /// with the level count. `srgb` averages in linear light.
 pub fn mips(w: usize, h: usize, px: &[u8], srgb: bool) -> (Vec<u8>, u32) {
+    mips_with(w, h, px, srgb, None)
+}
+
+/// Share of texels whose alpha passes `cutoff`.
+fn coverage(px: &[u8], cutoff: f32) -> f32 {
+    let n = (px.len() / 4).max(1);
+    let c = (cutoff * 255.0) as u8;
+    px.as_chunks::<4>().0.iter().filter(|p| p[3] > c).count() as f32 / n as f32
+}
+
+/// Scales a mip level's alpha so as many texels pass the `cutoff` as in
+/// the full-size image (`target`): box-filtered alpha otherwise thins a
+/// cutout (leaves, grass) until it vanishes at a distance.
+pub fn keep_coverage(px: &mut [u8], cutoff: f32, target: f32) {
+    let alpha: Vec<u8> = px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+    let scaled = |k: f32| -> Vec<u8> {
+        alpha
+            .iter()
+            .map(|a| (*a as f32 * k).min(255.0) as u8)
+            .collect()
+    };
+    let cov = |k: f32| {
+        let c = (cutoff * 255.0) as u8;
+        scaled(k).iter().filter(|a| **a > c).count() as f32 / alpha.len().max(1) as f32
+    };
+    let (mut lo, mut hi) = (0.25f32, 8.0f32);
+    for _ in 0..16 {
+        let mid = 0.5 * (lo + hi);
+        if cov(mid) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Coverage moves in steps on a small level: take the closer side.
+    let k = if (cov(lo) - target).abs() < (cov(hi) - target).abs() {
+        lo
+    } else {
+        hi
+    };
+    for (p, a) in px.as_chunks_mut::<4>().0.iter_mut().zip(scaled(k)) {
+        p[3] = a;
+    }
+}
+
+/// [`mips`], keeping a cutout's coverage at every level when `cutoff` is
+/// given (see [`keep_coverage`]).
+pub fn mips_with(w: usize, h: usize, px: &[u8], srgb: bool, cutoff: Option<f32>) -> (Vec<u8>, u32) {
+    let target = cutoff.map(|c| coverage(px, c));
     let lin = |c: u8| {
         let x = c as f32 / 255.0;
         if srgb {
@@ -404,6 +500,9 @@ pub fn mips(w: usize, h: usize, px: &[u8], srgb: bool) -> (Vec<u8>, u32) {
                 }
             }
         }
+        if let (Some(c), Some(t)) = (cutoff, target) {
+            keep_coverage(&mut next, c, t);
+        }
         out.extend_from_slice(&next);
         cur = next;
         cw = nw;
@@ -411,4 +510,94 @@ pub fn mips(w: usize, h: usize, px: &[u8], srgb: bool) -> (Vec<u8>, u32) {
         levels += 1;
     }
     (out, levels)
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+
+    fn ch(opacity: Vec<f32>) -> Channels {
+        let n = opacity.len();
+        Channels {
+            w: n,
+            h: 1,
+            base_color: vec![[1.0; 3]; n],
+            roughness: vec![1.0; n],
+            metallic: vec![0.0; n],
+            normal: vec![[0.0, 0.0, 1.0]; n],
+            height: vec![0.0; n],
+            ao: vec![1.0; n],
+            emissive: vec![[0.0; 3]; n],
+            opacity,
+            driven: vec![],
+            extras: Default::default(),
+            runs: 0,
+        }
+    }
+
+    #[test]
+    fn opacity_picks_mask_blend_or_opaque() {
+        assert_eq!(alpha_of(&ch(vec![1.0; 8])), Alpha::Opaque);
+        let cut = ch(vec![0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(alpha_of(&cut), Alpha::Mask(0.5));
+        assert!(textures(&cut).double_sided);
+        assert_eq!(alpha_of(&ch(vec![0.4; 8])), Alpha::Blend);
+        let mut forced = ch(vec![0.4; 8]);
+        forced.extras.alpha = Some("mask".into());
+        forced.extras.alpha_cutoff = Some(0.3);
+        assert_eq!(alpha_of(&forced), Alpha::Mask(0.3));
+    }
+
+    #[test]
+    fn cutout_mips_keep_their_coverage() {
+        // Fine scattered speckle covering about a third of the texels (thin
+        // foliage): a plain box filter drops most of it under a 0.5 cutoff.
+        let (w, h) = (64, 64);
+        let mut px = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            let r = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+            if r % 100 < 35 {
+                px[i * 4 + 3] = 255;
+            }
+        }
+        let cov = |lv: &[u8]| {
+            lv.as_chunks::<4>().0.iter().filter(|p| p[3] > 127).count() as f32
+                / (lv.len() / 4) as f32
+        };
+        let level = |data: &[u8], k: usize| {
+            let mut off = 0;
+            let (mut lw, mut lh) = (w, h);
+            for _ in 0..k {
+                off += lw * lh * 4;
+                lw = (lw / 2).max(1);
+                lh = (lh / 2).max(1);
+            }
+            data[off..off + lw * lh * 4].to_vec()
+        };
+        let (plain, _) = mips(w, h, &px, false);
+        let (kept, _) = mips_with(w, h, &px, false, Some(0.5));
+        let base = cov(&px);
+        // Plain filtering loses the speckle once a texel averages 16.
+        assert!(
+            cov(&level(&plain, 2)) < base * 0.5,
+            "{}",
+            cov(&level(&plain, 2))
+        );
+        // Stripes blur to one grey at 8x8, so coverage can't match exactly,
+        // but it stays far closer than plain filtering's.
+        let (p3, k3) = (cov(&level(&plain, 3)), cov(&level(&kept, 3)));
+        assert!(
+            (k3 - base).abs() <= (p3 - base).abs(),
+            "plain {p3} kept {k3} base {base}"
+        );
+        // Level 1 averages 4 texels, so its coverage moves in steps.
+        for (lv, tol) in [(1, 0.15), (2, 0.1), (3, 0.1)] {
+            let (p, k) = (cov(&level(&plain, lv)), cov(&level(&kept, lv)));
+            assert!((k - base).abs() < tol, "level {lv}: kept {k} vs {base}");
+            assert!(
+                (p - base).abs() >= (k - base).abs(),
+                "level {lv}: plain {p}"
+            );
+        }
+    }
 }

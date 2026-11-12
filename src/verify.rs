@@ -366,13 +366,30 @@ fn final_name_after_renames(ops: &[Op], name: &str) -> String {
 /// math — no renderer needed — so it catches inverted or torn geometry
 /// that a screenshot only suggests. Edges are welded by quantized vertex
 /// position, since primitives emit per-face vertices that share a point.
+/// A part whose material cuts its shape out of its uv square: a
+/// card-domain graph with an opacity output.
+pub fn cutout(p: &crate::Part) -> bool {
+    p.material
+        .pbr
+        .as_ref()
+        .and_then(|r| r.graph.as_ref())
+        .is_some_and(|g| {
+            g.domain == "card"
+                && g.nodes.iter().any(|n| {
+                    n.get("type").and_then(|t| t.as_str()) == Some("output")
+                        && n.get("opacity").is_some()
+                })
+        })
+}
+
 pub fn validate(model: &Model) -> String {
     let mut lines = Vec::new();
     if model.parts.is_empty() {
         return "no parts to validate".into();
     }
     for p in &model.parts {
-        if p.verts.is_empty() {
+        // Leaf cards are open sheets by design.
+        if p.verts.is_empty() || p.cards {
             continue;
         }
         let open = open_edge_count(p);
@@ -547,6 +564,24 @@ pub fn lints(model: &Model) -> Vec<String> {
                 "radial `{name}`: full ring with the source at the first copy's angle — the source and copy 0 overlap. Use count-1 copies with start_degrees = degrees/count."
             ));
         }
+    }
+    // Leaf cards show their whole rectangle unless a cutout material trims
+    // them: a card-domain material whose output sets opacity.
+    let bare_cards: Vec<&str> = model
+        .parts
+        .iter()
+        .filter(|p| p.visible && p.cards && !cutout(p))
+        .map(|p| p.name.as_str())
+        .collect();
+    if !bare_cards.is_empty() {
+        out.push(format!(
+            "leaf cards without a cutout: {} draw every leaf as a full rectangle; give them a material_ops material with domain \"card\" whose output sets opacity (a leaf shape: 1 inside, 0 outside), then {{\"type\": \"material\", \"name\": <part>, \"pbr\": <material>}}; or use leaf_mode \"solid\" for modelled blades",
+            bare_cards
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     // Parts with only a flat colour (no procedural material), unless marked
     // flat on purpose.

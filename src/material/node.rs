@@ -2016,6 +2016,20 @@ pub struct Output {
     /// Index of refraction (default 1.5).
     #[serde(default)]
     pub ior: Option<f32>,
+    /// How `opacity` renders: "mask" (a cutout: each texel fully there or
+    /// not, at `alpha_cutoff`; leaves, grass, fences, lace; sorts and shadows
+    /// like an opaque surface), "blend" (see-through: glass, smoke, ghosts)
+    /// or "opaque" (opacity ignored). Default: mask when the opacity is
+    /// nearly all 0 or 1, else blend.
+    #[serde(default)]
+    pub alpha: Option<String>,
+    /// Mask threshold, 0..1 (default 0.5).
+    #[serde(default)]
+    pub alpha_cutoff: Option<f32>,
+    /// Draw both faces (default: on for mask, so a leaf card shows from
+    /// behind).
+    #[serde(default)]
+    pub double_sided: Option<bool>,
 }
 
 /// One whole-material layer of an output.
@@ -2038,7 +2052,7 @@ impl Eval for Output {
 /// not a mode/kind/op word, as (node, port).
 pub fn refs(body: &Value) -> Vec<(String, String)> {
     const WORDS: &[&str] = &[
-        "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path",
+        "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path", "alpha",
     ];
     let mut out = Vec::new();
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {

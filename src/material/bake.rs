@@ -45,6 +45,9 @@ pub struct Extras {
     pub specular_transmission: Option<f32>,
     pub thickness: Option<f32>,
     pub ior: Option<f32>,
+    pub alpha: Option<String>,
+    pub alpha_cutoff: Option<f32>,
+    pub double_sided: Option<bool>,
 }
 
 impl Extras {
@@ -58,6 +61,9 @@ impl Extras {
             specular_transmission: o.specular_transmission,
             thickness: o.thickness,
             ior: o.ior,
+            alpha: o.alpha.clone(),
+            alpha_cutoff: o.alpha_cutoff,
+            double_sided: o.double_sided,
         }
     }
 
@@ -73,10 +79,20 @@ impl Extras {
             ("thickness", self.thickness),
             ("ior", self.ior),
         ];
-        f.iter()
+        let mut out: Vec<String> = f
+            .iter()
             .filter_map(|(k, v)| v.map(|v| format!("{k} {v}")))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect();
+        if let Some(a) = &self.alpha {
+            out.push(format!("alpha {a}"));
+        }
+        if let Some(c) = self.alpha_cutoff {
+            out.push(format!("alpha_cutoff {c}"));
+        }
+        if let Some(d) = self.double_sided {
+            out.push(format!("double_sided {d}"));
+        }
+        out.join(", ")
     }
 }
 
