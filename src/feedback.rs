@@ -48,6 +48,10 @@ pub struct Entry {
     /// The server build (package version + binary modification time).
     #[serde(default)]
     pub build: String,
+    /// Set once the cause is fixed ("<commit>: what changed"): the report
+    /// leaves resolved entries out and only counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -150,14 +154,26 @@ fn signature(detail: &str) -> String {
 /// limits it to entries newer than that many days.
 pub fn report(entries: &[Entry], since_days: Option<u64>) -> String {
     let cutoff = since_days.map(|d| now().saturating_sub(d * 86_400));
-    let es: Vec<&Entry> = entries
+    let recent: Vec<&Entry> = entries
         .iter()
         .filter(|e| cutoff.is_none_or(|c| e.ts >= c))
         .collect();
+    let n_resolved = recent.iter().filter(|e| e.resolved.is_some()).count();
+    let es: Vec<&Entry> = recent
+        .into_iter()
+        .filter(|e| e.resolved.is_none())
+        .collect();
     if es.is_empty() {
-        return "no feedback recorded yet".into();
+        return if n_resolved > 0 {
+            format!("nothing open ({n_resolved} entries resolved)")
+        } else {
+            "no feedback recorded yet".into()
+        };
     }
     let mut out = String::new();
+    if n_resolved > 0 {
+        out += &format!("({n_resolved} resolved entries left out)\n");
+    }
     // (tool, signature) -> (count, max streak, last example)
     let mut errors: BTreeMap<(String, String), (usize, u32, &Entry)> = BTreeMap::new();
     let mut slow: BTreeMap<String, (usize, u128)> = BTreeMap::new();
