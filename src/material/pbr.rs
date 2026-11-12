@@ -113,12 +113,12 @@ fn atlas_size(g: &MatGraph) -> usize {
 /// using the same material + params; object bakes are per part geometry).
 pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(&r.graph)
-        .unwrap_or_default()
-        .hash(&mut h);
-    serde_json::to_string(&r.params)
-        .unwrap_or_default()
-        .hash(&mut h);
+    // Streamed into the hasher: no string per part per lookup.
+    {
+        let mut w = HashInto(&mut h);
+        let _ = serde_json::to_writer(&mut w, &r.graph);
+        let _ = serde_json::to_writer(&mut w, &r.params);
+    }
     // Image nodes: the file's mtime, so an edited PNG re-bakes.
     if let Some(g) = &r.graph {
         for n in &g.nodes {
@@ -136,17 +136,74 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
         if let Some(d) = &p.detail {
             d.key.hash(&mut h);
         }
-        for v in p.verts.iter().chain(&p.normals) {
-            v.map(f32::to_bits).hash(&mut h);
-        }
-        for v in &p.uvs {
-            v.map(f32::to_bits).hash(&mut h);
-        }
-        p.indices.hash(&mut h);
+        geometry_hash(p).hash(&mut h);
         p.scale.map(f32::to_bits).hash(&mut h);
         hash_occluders(p, &mut h);
     }
     h.finish()
+}
+
+struct HashInto<'a, H: Hasher>(&'a mut H);
+
+impl<H: Hasher> std::io::Write for HashInto<'_, H> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+type GeomKey = (usize, usize, usize, usize, usize, usize, u64);
+static GEOMETRY: Mutex<Option<HashMap<GeomKey, u64>>> = Mutex::new(None);
+
+/// A hash of a part's vertices, normals, uvs and indices, memoised by the
+/// buffers' identity and a sample of their content (parts are shared
+/// `Arc`s, so an unchanged part isn't rehashed on every bake lookup).
+fn geometry_hash(p: &Part) -> u64 {
+    let (nv, ni) = (p.verts.len(), p.indices.len());
+    let sample = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if nv > 0 && ni > 0 {
+            for k in 0..32 {
+                p.verts[k * nv / 32].map(f32::to_bits).hash(&mut h);
+                p.indices[k * ni / 32].hash(&mut h);
+            }
+        }
+        h.finish()
+    };
+    let key = (
+        p.verts.as_ptr() as usize,
+        p.normals.as_ptr() as usize,
+        p.uvs.as_ptr() as usize,
+        nv,
+        ni,
+        p.uvs.len(),
+        sample,
+    );
+    if let Ok(g) = GEOMETRY.lock()
+        && let Some(v) = g.as_ref().and_then(|m| m.get(&key))
+    {
+        return *v;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for v in p.verts.iter().chain(&p.normals) {
+        v.map(f32::to_bits).hash(&mut h);
+    }
+    for v in &p.uvs {
+        v.map(f32::to_bits).hash(&mut h);
+    }
+    p.indices.hash(&mut h);
+    let v = h.finish();
+    if let Ok(mut g) = GEOMETRY.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() > 8192 {
+            m.clear();
+        }
+        m.insert(key, v);
+    }
+    v
 }
 
 /// Folds a part's neighbouring solids into a hash (mesh-aware bakes depend

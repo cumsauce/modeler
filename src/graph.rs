@@ -39,7 +39,32 @@ const CACHE_MAX_ENTRIES: usize = 2048;
 /// returned parts reuse meshes instead of deep-copying them.
 type Named = Vec<(String, Arc<Part>)>;
 
-type OpCache = HashMap<u64, Named>;
+/// Memoized results, each with the tick it was last used, so a full cache
+/// drops its least recently used half instead of everything.
+type OpCache = HashMap<u64, (Named, u64)>;
+
+static OP_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hashes what serde writes, without building the bytes (a terrain with
+/// long paths or a tri_mesh serializes to megabytes).
+struct HashWriter(DefaultHasher);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::hash::Hasher::write(&mut self.0, buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn op_key(op: &Op, inputs: &[u64]) -> Result<u64, ModelerError> {
+    let mut w = HashWriter(DefaultHasher::new());
+    serde_json::to_writer(&mut w, op).map_err(|e| e.to_string())?;
+    inputs.hash(&mut w.0);
+    Ok(std::hash::Hasher::finish(&w.0))
+}
 
 thread_local! {
     /// Ops actually executed (cache misses) on this thread; lets tests prove
@@ -128,15 +153,14 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             .iter()
             .map(|n| hashes.get(*n).copied().unwrap_or(0))
             .collect();
-        let key = hash_of(
-            &serde_json::to_vec(op).map_err(|e| e.to_string())?,
-            &input_hashes,
-        );
+        let key = op_key(op, &input_hashes)?;
         let hit = if use_cache && !matches!(op, Op::Rename { .. }) {
-            OP_CACHE
-                .lock()
-                .ok()
-                .and_then(|c| c.as_ref().and_then(|m| m.get(&key).cloned()))
+            OP_CACHE.lock().ok().and_then(|mut c| {
+                c.as_mut().and_then(|m| m.get_mut(&key)).map(|(p, used)| {
+                    *used = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    p.clone()
+                })
+            })
         } else {
             None
         };
@@ -174,9 +198,14 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                     if let Ok(mut c) = OP_CACHE.lock() {
                         let map = c.get_or_insert_with(HashMap::new);
                         if map.len() >= CACHE_MAX_ENTRIES {
-                            map.clear();
+                            let mut ticks: Vec<u64> = map.values().map(|(_, t)| *t).collect();
+                            let mid = ticks.len() / 2;
+                            let (_, cut, _) = ticks.select_nth_unstable(mid);
+                            let cut = *cut;
+                            map.retain(|_, (_, t)| *t > cut);
                         }
-                        map.insert(key, produced);
+                        let tick = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        map.insert(key, (produced, tick));
                     }
                 }
             }
