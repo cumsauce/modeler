@@ -304,6 +304,26 @@ impl Model {
     }
 
     /// Rejects models saved by a newer build than this one understands.
+    /// A copy without the history tree (snapshots of a long session are
+    /// most of a model's size): for lookups and checks that read only the
+    /// ops and parts.
+    pub fn clone_without_history(&self) -> Model {
+        Model {
+            format_version: self.format_version,
+            name: self.name.clone(),
+            parts: self.parts.clone(),
+            version: self.version,
+            ops: self.ops.clone(),
+            annotations: self.annotations.clone(),
+            next_annotation_id: self.next_annotation_id,
+            history: History::default(),
+            params: self.params.clone(),
+            templates: self.templates.clone(),
+            style: self.style.clone(),
+            derived_from_ops: self.derived_from_ops,
+        }
+    }
+
     pub fn check_format(&self) -> Result<(), ModelerError> {
         if self.format_version > FORMAT_VERSION {
             return Err(ModelerError::Parse(format!(

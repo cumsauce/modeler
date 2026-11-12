@@ -39,7 +39,7 @@ pub fn check_rebuild(model: &Model) -> CmdResult {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let mut clone = model.clone();
+    let mut clone = model.clone_without_history();
     clone.refresh_uncached().map_err(|e| e.to_string())?;
     if canon(model) == canon(&clone) {
         Ok(format!(

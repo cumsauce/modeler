@@ -175,6 +175,11 @@ pub struct VerifySpec {
     /// (`*` patterns, either order). Shallow overlaps are joints.
     #[serde(default)]
     pub collisions: Option<CollisionSpec>,
+    /// The checks wrapped as in `apply_ops`' `expect` (`{"expect": {...}}`):
+    /// read as if given directly.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub expect: Option<Box<VerifySpec>>,
     /// No visible part's surface passes through itself (a deform, skin or
     /// sdf warp that folded it): fails with the crossing count and where.
     #[serde(default)]
@@ -674,8 +679,15 @@ impl Session {
                     && !reads.contains(&n.as_str())
                     && !other_reads.contains(&n.as_str())
                 {
+                    let hint = if graph::kind(&op) == "decimate" {
+                        format!(
+                            ": a decimate needs its own name: rename the dense source to `{n}_hi` (re-issue it as `{n}_hi`, or a `rename`), then decimate `{n}_hi` into `{n}`"
+                        )
+                    } else {
+                        "; choose a different name".to_string()
+                    };
                     return Err(format!(
-                        "`{n}` is already produced by another op ({}); choose a different name",
+                        "`{n}` is already produced by another op ({}){hint}",
                         graph::output(other)
                     )
                     .into());
@@ -1712,7 +1724,10 @@ impl Session {
                     };
                 let bump = self.model.version.max(incoming.version) + 1;
                 let outgoing = std::mem::replace(&mut self.model, incoming);
-                crate::catalog::set_open_doc(&outgoing.name, Some(outgoing.clone()));
+                crate::catalog::set_open_doc(
+                    &outgoing.name,
+                    Some(outgoing.clone_without_history()),
+                );
                 crate::catalog::set_open_doc(name, None);
                 self.others.push(outgoing);
                 self.model.version = bump;
@@ -1923,7 +1938,7 @@ impl Session {
     /// Registers every inactive document for prefab lookup (after a restore).
     pub fn register_docs(&self) {
         for m in &self.others {
-            crate::catalog::set_open_doc(&m.name, Some(m.clone()));
+            crate::catalog::set_open_doc(&m.name, Some(m.clone_without_history()));
         }
     }
 
@@ -2339,6 +2354,9 @@ impl Session {
     /// Runs the checks in `spec` (all of validate + rebuild when `spec` is
     /// empty). Returns (all passed, one line per check).
     pub fn verify(&self, spec: &VerifySpec) -> (bool, String) {
+        if let Some(inner) = &spec.expect {
+            return self.verify(inner);
+        }
         let checks = self.verify_checks(spec);
         let ok = checks.iter().all(|c| c.1);
         let lines: Vec<String> = checks

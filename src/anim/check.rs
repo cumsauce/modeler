@@ -179,7 +179,8 @@ pub struct AnimationSpec {
     #[serde(default)]
     pub collisions: Option<crate::commands::CollisionSpec>,
     /// At every sample: nothing sinks below y = 0 by more than this (m).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "num_or_flag_0")]
+    #[schemars(with = "Option<f32>")]
     pub floor: Option<f32>,
     /// The pose at the end equals the pose at the start (default on for a
     /// looping clip).
@@ -187,8 +188,32 @@ pub struct AnimationSpec {
     pub looping: Option<bool>,
     /// The largest allowed edge stretch under skinning, as a ratio of the
     /// rest length (default 2: catches collapsing, candy-wrapper joints).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "num_or_flag_2")]
+    #[schemars(with = "Option<f32>")]
     pub stretch: Option<f32>,
+}
+
+/// A number, or `true` for the default (`false` turns the check off).
+fn num_or_flag<'de, D: serde::Deserializer<'de>>(d: D, on: f32) -> Result<Option<f32>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        B(bool),
+        N(f32),
+    }
+    Ok(match <Option<V> as serde::Deserialize>::deserialize(d)? {
+        None | Some(V::B(false)) => None,
+        Some(V::B(true)) => Some(on),
+        Some(V::N(x)) => Some(x),
+    })
+}
+
+fn num_or_flag_0<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    num_or_flag(d, 0.0)
+}
+
+fn num_or_flag_2<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    num_or_flag(d, 2.0)
 }
 
 fn times(c: &Clip, n: u32) -> Vec<f32> {

@@ -940,6 +940,39 @@ pub fn open_doc(name: &str) -> Option<Model> {
         .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
 }
 
+/// "no prefab `x`", with the closest catalog names (an entry the name
+/// starts with, e.g. a label like "de-lamp lamp 4", or one sharing a word).
+fn missing_prefab(name: &str) -> String {
+    let want = sanitize(name);
+    let first = sanitize(name.split_whitespace().next().unwrap_or(name));
+    let names: Vec<String> = load_catalog()
+        .map(|c| c.entries.into_iter().map(|e| e.name).collect())
+        .unwrap_or_default();
+    let mut close: Vec<&String> = names
+        .iter()
+        .filter(|n| {
+            **n == first
+                || want.starts_with(n.as_str())
+                || n.contains(&want)
+                || want
+                    .split('-')
+                    .filter(|w| w.len() > 3)
+                    .any(|w| n.contains(w))
+        })
+        .collect();
+    close.sort_by_key(|n| (**n != first, !want.starts_with(n.as_str()), n.len()));
+    close.truncate(5);
+    if close.is_empty() {
+        format!("no prefab `{name}` in the catalog (catalog_list shows them)")
+    } else {
+        let list: Vec<String> = close.iter().map(|n| format!("`{n}`")).collect();
+        format!(
+            "no prefab `{name}` in the catalog; did you mean {}? (load it by its exact name; catalog_list shows them)",
+            list.join(", ")
+        )
+    }
+}
+
 /// A fingerprint of the catalog file of prefab `name` (None: no file), so
 /// a save can tell whether someone else wrote it since it was loaded.
 pub fn prefab_file_hash(name: &str) -> Option<u64> {
@@ -954,6 +987,9 @@ pub fn prefab_file_hash(name: &str) -> Option<u64> {
 /// [`load_prefab`] from the catalog file only, ignoring open documents.
 pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
+    if !path.exists() {
+        return Err(ModelerError::Io(missing_prefab(name)));
+    }
     let text = fs::read_to_string(&path)
         .map_err(|e| ModelerError::Io(format!("reading {}: {e}", path.display())))?;
     let mut model: Model = serde_json::from_str(&text)

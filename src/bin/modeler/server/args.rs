@@ -119,10 +119,13 @@ pub(crate) struct ExportModelArgs {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SavePrefabArgs {
     /// Human description of what the model is.
+    #[serde(default)]
     pub(crate) description: String,
     /// Short search tags, e.g. ["furniture", "wood"].
+    #[serde(default)]
     pub(crate) tags: Vec<String>,
     /// The prompt/idea that produced this model, for future agents.
+    #[serde(default)]
     pub(crate) prompt: String,
     /// Overwrite the catalog entry even if it changed since this session
     /// loaded or saved it (refused otherwise: another agent saved it).
@@ -369,6 +372,7 @@ pub(crate) struct AgentViewsArgs {
     /// "bottom" are orthographic and auto-framed; "iso" is perspective) or a
     /// camera {yaw, pitch, dist?, target?, ortho?, fov?}. E.g.
     /// ["front", "right", "top", "iso"] or [{"yaw": 30, "pitch": 20}, ...].
+    #[serde(default = "default_views")]
     pub(crate) views: Vec<ViewArg>,
     /// Pixel width per view. Default 1280 (640 per cell in a grid, shrunk so
     /// the whole image stays under ~1.15 MP, the size a model reads at full
@@ -491,4 +495,9 @@ pub(crate) struct HistoryArgs {
     /// "model" (default) or "material:<name>".
     #[serde(default)]
     pub(crate) doc: Option<String>,
+}
+
+/// `agent_views` with no `views`: one perspective look.
+fn default_views() -> Vec<ViewArg> {
+    vec![ViewArg::Name("iso".into())]
 }

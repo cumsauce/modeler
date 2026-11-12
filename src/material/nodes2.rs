@@ -39,6 +39,7 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 #[serde(deny_unknown_fields)]
 pub struct Scatter {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     /// Grid cell in meters (snapped to divide the tile).
     pub cell: f32,
@@ -368,6 +369,7 @@ impl Eval for MeshCurvature {
 #[serde(deny_unknown_fields)]
 pub struct Gradient {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub from: Vec<f32>,
     pub to: Vec<f32>,
@@ -455,6 +457,7 @@ impl Eval for Facing {
 pub struct Image {
     pub path: String,
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     #[serde(default)]
     pub size: Option<[f32; 2]>,

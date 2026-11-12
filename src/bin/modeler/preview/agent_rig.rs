@@ -113,7 +113,7 @@ pub(crate) fn parse_agent_view(s: &str) -> Result<AgentView, String> {
         "front" => Ok(AgentView::Front),
         "back" => Ok(AgentView::Back),
         "left" => Ok(AgentView::Left),
-        "right" => Ok(AgentView::Right),
+        "right" | "side" => Ok(AgentView::Right),
         "top" => Ok(AgentView::Top),
         "bottom" => Ok(AgentView::Bottom),
         "iso" => Ok(AgentView::Iso),

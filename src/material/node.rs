@@ -395,6 +395,7 @@ impl Eval for Input {
 pub struct Transform {
     /// Coordinates to transform (default uv). vec2 or vec3.
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     /// Multiplier: a number or per-axis vector (default 1).
     #[serde(default)]
@@ -488,6 +489,7 @@ impl Eval for Split {
 #[serde(deny_unknown_fields)]
 pub struct Polar {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     #[serde(default)]
     pub center: Option<[f32; 2]>,
@@ -516,6 +518,7 @@ impl Eval for Polar {
 #[serde(deny_unknown_fields)]
 pub struct Kaleido {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub segments: u32,
     #[serde(default)]
@@ -547,6 +550,7 @@ impl Eval for Kaleido {
 #[serde(deny_unknown_fields)]
 pub struct Warp {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     /// The displacement field (a number field shifts every axis alike).
     pub by: In,
@@ -613,6 +617,7 @@ impl Eval for Warp {
 #[serde(deny_unknown_fields)]
 pub struct TileGrid {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub size: [f32; 2],
     /// Row offset as a fraction of the cell width (0.5 = running bond).
@@ -684,6 +689,7 @@ impl Eval for TileGrid {
 #[serde(deny_unknown_fields)]
 pub struct Repeat {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub period: Vec<f32>,
 }
@@ -747,6 +753,7 @@ impl Eval for Repeat {
 #[serde(deny_unknown_fields)]
 pub struct Triplanar {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
 }
 
@@ -788,6 +795,7 @@ fn at3(p: [f32; 3], c: Option<[f32; 3]>) -> [f32; 3] {
 #[serde(deny_unknown_fields)]
 pub struct Circle {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: In,
     #[serde(default)]
@@ -809,6 +817,7 @@ impl Eval for Circle {
 #[serde(deny_unknown_fields)]
 pub struct Rect {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub size: In,
     #[serde(default)]
@@ -836,6 +845,7 @@ impl Eval for Rect {
 #[serde(deny_unknown_fields)]
 pub struct Segment {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub a: [f32; 2],
     pub b: [f32; 2],
@@ -857,6 +867,7 @@ impl Eval for Segment {
 #[serde(deny_unknown_fields)]
 pub struct Polygon {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub points: Vec<[f32; 2]>,
 }
@@ -879,6 +890,7 @@ impl Eval for Polygon {
 #[serde(deny_unknown_fields)]
 pub struct Star {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: f32,
     pub inner: f32,
@@ -909,6 +921,7 @@ impl Eval for Star {
 #[serde(deny_unknown_fields)]
 pub struct Hexagon {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: In,
     #[serde(default)]
@@ -930,6 +943,7 @@ impl Eval for Hexagon {
 #[serde(deny_unknown_fields)]
 pub struct Arc2 {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: f32,
     pub from: f32,
@@ -962,6 +976,7 @@ impl Eval for Arc2 {
 #[serde(deny_unknown_fields)]
 pub struct Rings {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub spacing: f32,
     #[serde(default)]
@@ -987,6 +1002,7 @@ impl Eval for Rings {
 #[serde(deny_unknown_fields)]
 pub struct Sphere {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: In,
     #[serde(default)]
@@ -1008,6 +1024,7 @@ impl Eval for Sphere {
 #[serde(deny_unknown_fields)]
 pub struct Box3 {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub size: In,
     #[serde(default)]
@@ -1035,6 +1052,7 @@ impl Eval for Box3 {
 #[serde(deny_unknown_fields)]
 pub struct Torus {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub major: f32,
     pub minor: f32,
@@ -1059,6 +1077,7 @@ impl Eval for Torus {
 #[serde(deny_unknown_fields)]
 pub struct Capsule {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub a: [f32; 3],
     pub b: [f32; 3],
@@ -1080,6 +1099,7 @@ impl Eval for Capsule {
 #[serde(deny_unknown_fields)]
 pub struct Cylinder {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub radius: f32,
     pub height: f32,
@@ -1104,6 +1124,7 @@ impl Eval for Cylinder {
 #[serde(deny_unknown_fields)]
 pub struct Plane {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub normal: [f32; 3],
     #[serde(default)]
@@ -1271,6 +1292,7 @@ impl Eval for Mask {
 #[serde(deny_unknown_fields)]
 pub struct Noise {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     #[serde(default)]
     pub kind: Option<String>,
@@ -1330,6 +1352,7 @@ impl Eval for Noise {
 #[serde(deny_unknown_fields)]
 pub struct Worley {
     #[serde(default)]
+    #[serde(alias = "input")]
     pub coords: Option<In>,
     pub size: f32,
     #[serde(default)]
@@ -1516,6 +1539,7 @@ impl Eval for Remap {
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Random {
+    #[serde(alias = "input")]
     pub id: In,
     #[serde(default)]
     pub seed: Option<u32>,

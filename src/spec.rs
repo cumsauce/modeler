@@ -714,9 +714,9 @@ impl LSystemSpec {
     fn into_op(self, ctx: &str) -> Result<Op, String> {
         let mut d = lsystem_preset(self.preset.as_deref().unwrap_or(""))
             .map_err(|e| format!("{ctx}: {e}"))?;
-        if self.preset.is_none() && (self.axiom.is_none() || self.rules.is_none()) {
+        if self.preset.is_none() && self.axiom.is_none() {
             return Err(format!(
-                "{ctx}: give a `preset` (tree, pine, bush, fern, weed, roots) or both `axiom` and `rules`"
+                "{ctx}: give a `preset` (tree, pine, bush, fern, weed, roots) or an `axiom` (with `rules` to grow it)"
             ));
         }
         if let Some(a) = self.axiom {
@@ -2022,6 +2022,7 @@ pub struct MaterialSpec {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartSpec {
+    #[serde(alias = "name")]
     part: String,
 }
 
@@ -4197,6 +4198,20 @@ mod tests {
             panic!("radial should parse");
         };
         assert!(include_source);
+    }
+
+    #[test]
+    fn friendly_aliases_parse() {
+        let ok = |v: serde_json::Value| {
+            parse_item(0, &v).unwrap_or_else(|e| panic!("{v}: {e}"));
+        };
+        ok(serde_json::json!({"type": "hide_part", "name": "ground"}));
+        ok(serde_json::json!({"type": "lsystem", "name": "a", "axiom": "FFL", "iterations": 0}));
+        let a: crate::anim::check::AnimationSpec = serde_json::from_value(
+            serde_json::json!({"clip": "w", "stretch": true, "floor": true}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((a.stretch, a.floor), (Some(2.0), Some(0.0)));
     }
 
     #[test]

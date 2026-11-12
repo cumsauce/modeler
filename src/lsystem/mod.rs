@@ -939,11 +939,14 @@ mod op_tests {
         s.apply_values(Some([("h".to_string(), 0.6)].into()), vec![])
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(top(&s) > before * 1.8, "{before} -> {}", top(&s));
-        let Err(e) = s.apply_values(
+        // An axiom alone is drawn as written; nothing at all is an error.
+        s.apply_values(
             None,
             vec![json!({"type": "lsystem", "name": "x", "axiom": "F"})],
-        ) else {
-            panic!("no rules should fail")
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let Err(e) = s.apply_values(None, vec![json!({"type": "lsystem", "name": "y"})]) else {
+            panic!("no axiom should fail")
         };
         assert!(e.to_string().contains("preset"), "{e}");
     }
