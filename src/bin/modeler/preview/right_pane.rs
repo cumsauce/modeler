@@ -22,7 +22,7 @@ use crate::prelude::*;
 pub(crate) fn right_pane_plugin(app: &mut App) {
     app.init_resource::<RightPane>()
         .add_systems(Startup, setup_right_pane)
-        .add_systems(Update, update_right_pane.run_if(windowed));
+        .add_systems(Update, (update_right_pane, comments_chip).run_if(windowed));
 }
 
 #[derive(Resource, Default)]
@@ -549,4 +549,60 @@ fn on_comment_click(
     {
         wb.selected = Some(r.0.clone());
     }
+}
+
+/// The comments chip at the end of the 3D view's HUD row (`shading.rs`):
+/// the comment count; a click (or C) opens / closes the comments list.
+#[derive(Component)]
+struct CommentsChip;
+
+#[derive(Component)]
+struct CommentsChipLabel;
+
+fn comments_chip(
+    rows: Query<Entity, With<HudRow>>,
+    chip: Query<(), With<CommentsChip>>,
+    mut label: Query<&mut Text, With<CommentsChipLabel>>,
+    mut variant: Query<&mut ButtonVariant, With<CommentsChip>>,
+    modeler: Res<Modeler>,
+    wb: Res<Workbench>,
+    mut commands: Commands,
+) {
+    let n = modeler
+        .session
+        .model
+        .annotations
+        .iter()
+        .filter(|a| a.material.is_none())
+        .count();
+    let text = format!("Comments {n}");
+    if chip.is_empty() {
+        let Some(row) = rows.iter().next() else {
+            return;
+        };
+        let chip = commands
+            .spawn_scene(bsn! {
+                @FeathersToolButton {
+                    @variant: ButtonVariant::Normal,
+                    @caption: bsn! { }
+                }
+            })
+            .insert((CommentsChip, ChildOf(row)))
+            .observe(on_chip)
+            .id();
+        commands.spawn((CommentsChipLabel, Text::new(text), ChildOf(chip)));
+        return;
+    }
+    for mut t in &mut label {
+        if t.0 != text {
+            t.0 = text.clone();
+        }
+    }
+    for mut v in &mut variant {
+        v.set_if_neq(ButtonVariant::selected(wb.show_comments));
+    }
+}
+
+fn on_chip(_: On<Activate>, mut wb: ResMut<Workbench>) {
+    wb.show_comments = !wb.show_comments;
 }
