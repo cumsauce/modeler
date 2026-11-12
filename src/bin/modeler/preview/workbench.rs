@@ -224,8 +224,10 @@ fn mode_keys(
     mouse: Res<ButtonInput<MouseButton>>,
     mut wb: ResMut<Workbench>,
     mut grid: ResMut<Grid>,
+    focus: Res<bevy::input_focus::InputFocus>,
 ) {
-    if typing.open || flying(&mouse) {
+    // Typing in any text field (comment, search, filter) leaves keys alone.
+    if typing.open || flying(&mouse) || focus.get().is_some() {
         return;
     }
     for m in Mode::ALL {

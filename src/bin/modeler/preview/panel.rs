@@ -9,12 +9,16 @@ pub(crate) struct TypingHud;
 #[derive(Component)]
 pub(crate) struct Highlight(Handle<StandardMaterial>);
 
-/// The outliner's selected parts pulse in the 3D view. Materials are shared
-/// between parts, so a selected part pulses on its own copy.
+/// The selection (a 3D click, or the left pane's rows) pulses in the 3D
+/// view and the part under the cursor glows faintly. Materials are shared
+/// between parts, so a lit part glows on its own copy, and gets the shared
+/// one back after.
+#[allow(clippy::type_complexity)]
 pub(crate) fn highlight_selected(
     mut commands: Commands,
     time: Res<Time>,
     outline: Res<OutlinePane>,
+    wb: Res<Workbench>,
     mut parts: Query<
         (
             Entity,
@@ -27,19 +31,29 @@ pub(crate) fn highlight_selected(
     lit: Query<(), With<Highlight>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let sel: &[String] = if outline.visible {
-        &outline.selected_parts
-    } else {
-        &[]
+    let sel = |n: &str| {
+        wb.selected.as_deref() == Some(n)
+            || (outline.visible && outline.selected_parts.iter().any(|s| s == n))
     };
-    if sel.is_empty() && lit.is_empty() {
+    let hover = wb.hover.as_deref();
+    if wb.selected.is_none()
+        && outline.selected_parts.is_empty()
+        && hover.is_none()
+        && lit.is_empty()
+    {
         return;
     }
     let pulse = 0.35 + 0.25 * (time.elapsed_secs() * 5.0).sin();
     for (e, name, mut mat, lit) in &mut parts {
-        let selected = sel.iter().any(|s| s == name.as_str());
-        match (selected, lit) {
-            (true, _) => {
+        let glow = if sel(name.as_str()) {
+            Some(LinearRgba::rgb(pulse, pulse * 0.8, 0.1))
+        } else if hover == Some(name.as_str()) {
+            Some(LinearRgba::rgb(0.06, 0.12, 0.22))
+        } else {
+            None
+        };
+        match (glow, lit) {
+            (Some(g), _) => {
                 if lit.is_none() {
                     let Some(m) = materials.get(&mat.0).cloned() else {
                         continue;
@@ -52,15 +66,15 @@ pub(crate) fn highlight_selected(
                     mat.0 = own;
                 }
                 if let Some(mut m) = materials.get_mut(&mat.0) {
-                    m.emissive = LinearRgba::rgb(pulse, pulse * 0.8, 0.1);
+                    m.emissive = g;
                 }
             }
-            (false, Some(h)) => {
+            (None, Some(h)) => {
                 materials.remove(&mat.0);
                 mat.0 = h.0.clone();
                 commands.entity(e).remove::<Highlight>();
             }
-            (false, None) => {}
+            (None, None) => {}
         }
     }
 }

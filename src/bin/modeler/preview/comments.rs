@@ -1,11 +1,12 @@
 //! Comments (annotations) from the human side, on Feathers widgets.
 //!
-//! Anything can open the comment box: a click on a part in the 3D view (a
-//! pin on that spot), a right-click on an outliner row (a part or a group)
-//! or on a material node / the material preview, or the Comment buttons in
-//! the outliner and material headers (the current selection). The box shows
-//! the comments already on that target (each deletable), a text input with
-//! focus, and Cancel / Comment; Enter comments, Escape cancels.
+//! Anything can open the comment box: a click on a part in the 3D view while
+//! comments are open (a pin on that spot), "Add a comment" on the selection,
+//! a right-click on a left-pane row (a part or a group) or on a material
+//! node / the material preview. The box opens at the end of the right pane
+//! (`right_pane.rs`, which lists the comments themselves; floating at the
+//! top right when there is no pane to hold it): what it is on, a text input
+//! with focus, and Cancel / Comment; Enter comments, Escape cancels.
 
 use bevy::feathers::constants::icons;
 use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersToolButton};
@@ -43,14 +44,6 @@ impl CommentTarget {
             },
         }
     }
-
-    /// The annotation target existing comments are matched against.
-    fn as_target(&self) -> AnnotationTarget {
-        match self {
-            CommentTarget::Spot(p) => AnnotationTarget::Part(p.clone()),
-            CommentTarget::Target(t) => t.clone(),
-        }
-    }
 }
 
 #[derive(Resource, Default)]
@@ -63,6 +56,8 @@ pub(crate) struct CommentBox {
     pub(crate) flash: Option<(String, f64)>,
     /// Submit / cancel requested by a button (handled with the session).
     action: Option<Action>,
+    /// The right pane's spot for the box (it is rebuilt with the pane).
+    host: Option<Entity>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -84,6 +79,15 @@ impl CommentBox {
         self.dirty = true;
     }
 
+    /// The right pane rebuilt (or went away): the box moves with it.
+    pub(crate) fn set_host(&mut self, host: Option<Entity>) {
+        if self.host != host {
+            self.host = host;
+            self.root = None; // despawned with the old pane content
+            self.dirty = self.target.is_some();
+        }
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.target.is_some()
     }
@@ -94,7 +98,7 @@ impl CommentBox {
 }
 
 #[derive(Component)]
-struct DeleteComment(u32);
+pub(crate) struct DeleteComment(pub(crate) u32);
 
 fn on_submit(_: On<Activate>, mut cb: ResMut<CommentBox>) {
     cb.action = Some(Action::Submit);
@@ -104,7 +108,7 @@ fn on_cancel(_: On<Activate>, mut cb: ResMut<CommentBox>) {
     cb.action = Some(Action::Cancel);
 }
 
-fn on_delete(
+pub(crate) fn on_delete(
     activate: On<Activate>,
     ids: Query<&DeleteComment>,
     mut modeler: ResMut<Modeler>,
@@ -140,8 +144,14 @@ pub(crate) fn comment_box(
     >,
     assets: Res<AssetServer>,
     mut commands: Commands,
+    mut wb: ResMut<Workbench>,
 ) {
-    typing.open = cb.is_open();
+    typing.open = cb.is_open() || wb.doc_popup;
+    // The box lives in the right pane: open the comments list when nothing
+    // else would show the pane.
+    if cb.is_open() && !wb.right_open() {
+        wb.show_comments = true;
+    }
     // Focus the input as soon as it exists.
     if let Some(e) = new_inputs.iter().next() {
         focus.set(e, FocusCause::Auto);
@@ -210,53 +220,68 @@ pub(crate) fn comment_box(
         return;
     }
     cb.dirty = false;
-    if let Some(r) = cb.root.take() {
-        commands.entity(r).despawn();
+    if let Some(r) = cb.root.take()
+        && let Ok(mut e) = commands.get_entity(r)
+    {
+        e.despawn();
     }
     focus.clear();
     let Some(target) = cb.target.clone() else {
         return;
     };
-    cb.root = Some(spawn_box(
-        &mut commands,
-        &assets,
-        &target,
-        &modeler.session.model.annotations,
-    ));
+    let root = spawn_box(&mut commands, &assets, &target, cb.host);
+    cb.root = Some(root);
 }
 
 fn spawn_box(
     commands: &mut Commands,
     assets: &AssetServer,
     target: &CommentTarget,
-    annotations: &[modeler::Annotation],
+    host: Option<Entity>,
 ) -> Entity {
-    let root = commands
-        .spawn((
-            Name::new("comment box"),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(48.0),
-                right: Val::Px(12.0),
-                width: Val::Px(380.0),
-                flex_direction: FlexDirection::Column,
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            ThemeBackgroundColor(tokens::PANE_BODY_BG),
-            ThemeBorderColor(tokens::PANE_HEADER_BORDER),
-            BoxShadow::new(
+    let node = match host {
+        Some(_) => Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+        None => Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(TOP_H + 8.0),
+            right: Val::Px(12.0),
+            width: Val::Px(380.0),
+            flex_direction: FlexDirection::Column,
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+    };
+    let mut root = commands.spawn((
+        Name::new("comment box"),
+        node,
+        ThemeBackgroundColor(tokens::PANE_BODY_BG),
+        ThemeBorderColor(tokens::PANE_HEADER_BORDER),
+        GlobalZIndex(10),
+    ));
+    match host {
+        Some(h) => {
+            root.insert(ChildOf(h));
+        }
+        None => {
+            root.insert(BoxShadow::new(
                 Color::BLACK.with_alpha(0.5),
                 Val::Px(0.0),
                 Val::Px(4.0),
                 Val::Px(0.0),
                 Val::Px(16.0),
-            ),
-            GlobalZIndex(10),
-        ))
-        .id();
+            ));
+        }
+    }
+    let root = root.id();
     // Header: what this is on, and a close button.
     let header = commands
         .spawn((
@@ -300,50 +325,6 @@ fn spawn_box(
             ChildOf(root),
         ))
         .id();
-    // Comments already on this target.
-    let on = target.as_target();
-    let existing: Vec<&modeler::Annotation> = annotations.iter().filter(|a| a.is_on(&on)).collect();
-    if !existing.is_empty() {
-        for a in existing {
-            let row = commands
-                .spawn((
-                    Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(6.0),
-                        ..default()
-                    },
-                    ChildOf(body),
-                ))
-                .id();
-            commands.spawn((
-                Text::new(format!("#{}", a.id)),
-                ui_text(assets, 12.0, true),
-                TextColor(Color::srgb(1.0, 0.82, 0.25)),
-                ChildOf(row),
-            ));
-            commands.spawn((
-                Text::new(a.text.clone()),
-                ui_text(assets, 12.0, false),
-                ui_color(false),
-                Node {
-                    flex_grow: 1.0,
-                    flex_shrink: 1.0,
-                    ..default()
-                },
-                ChildOf(row),
-            ));
-            commands
-                .spawn_scene(bsn! {
-                    @FeathersToolButton {
-                        @variant: ButtonVariant::Plain,
-                        @caption: bsn! { @icon(icons::X) }
-                    }
-                })
-                .insert((DeleteComment(a.id), ChildOf(row)))
-                .observe(on_delete);
-        }
-    }
     // The input.
     commands
         .spawn_scene(bsn! {

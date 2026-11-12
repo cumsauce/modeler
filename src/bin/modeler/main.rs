@@ -290,8 +290,11 @@ fn main() -> AppExit {
             draw_game_gizmos.run_if(windowed),
             update_mode.run_if(windowed),
             orbit_camera.run_if(windowed).run_if(grid_off),
-            pin_on_click.run_if(windowed).run_if(grid_off),
-            spawn_pin_markers.run_if(windowed),
+            (click_in_view, spawn_pin_markers, sync_pins)
+                .chain()
+                .after(rebuild_scene)
+                .run_if(windowed)
+                .run_if(grid_off),
             comment_box.run_if(windowed),
             update_typing_hud.run_if(windowed),
             highlight_selected.run_if(windowed),

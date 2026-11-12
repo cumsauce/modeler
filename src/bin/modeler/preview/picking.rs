@@ -29,9 +29,12 @@ pub(crate) fn pin_radius(model: &Model) -> f32 {
         .unwrap_or(0.05)
 }
 
-/// A click on a part pins a spot: a small bright sphere with the annotation id it
-/// would get, and a `PendingPin` on the session for the next comment to fill in.
-pub(crate) fn pin_on_click(
+/// The 3D view's mouse: hovering a part lights it (`Workbench.hover`), a
+/// click selects it (empty space deselects), and while comments are open a
+/// click pins that spot instead: a small bright sphere with the annotation
+/// id it would get, and a `PendingPin` for the comment box to fill in.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_in_view(
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
@@ -42,42 +45,61 @@ pub(crate) fn pin_on_click(
     mut commands: Commands,
     mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
-    wb: Res<Workbench>,
+    mut wb: ResMut<Workbench>,
     mut comment: ResMut<CommentBox>,
     view: Res<View3d>,
+    mut last: Local<Option<Vec2>>,
 ) {
-    if wb.ui_hover {
+    let cursor = windows.single().ok().and_then(|w| {
+        w.cursor_position()
+            .filter(|c| view.rect.contains(*c))
+            .map(|c| (c, (c - view.rect.min) * w.scale_factor()))
+    });
+    let clicked = mouse.just_released(MouseButton::Left) && drag.moved <= 6.0;
+    let Some((at, cursor)) = cursor.filter(|_| !wb.ui_hover && drag.button.is_none() || clicked)
+    else {
+        if wb.hover.is_some() {
+            wb.hover = None;
+        }
+        *last = None;
+        return;
+    };
+    // Hover only re-casts when the cursor moved (or something was clicked).
+    if !clicked && *last == Some(at) {
         return;
     }
-    // Pins land on a click (press + release with barely any movement), never on
-    // the end of a left-drag orbit.
-    if !mouse.just_released(MouseButton::Left) || drag.moved > 6.0 {
-        return;
-    }
+    *last = Some(at);
     let Ok((camera, cam_transform)) = cameras.single() else {
         return;
     };
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    // The cursor is window-relative; the 3D view is an image in the area the
-    // panes leave, rendered at physical resolution.
-    if !view.rect.contains(cursor) {
-        return;
-    }
-    let cursor = (cursor - view.rect.min) * window.scale_factor();
     let Ok(ray) = camera.viewport_to_world(cam_transform, cursor) else {
         return;
     };
     let filter = |e| parts.contains(e);
     let settings = MeshRayCastSettings::default().with_filter(&filter);
-    let Some((hit_entity, hit)) = ray_cast.cast_ray(ray, &settings).first() else {
+    let hit = ray_cast
+        .cast_ray(ray, &settings)
+        .first()
+        .and_then(|(e, hit)| {
+            parts
+                .get(*e)
+                .ok()
+                .map(|(_, n)| (n.to_string(), hit.clone()))
+        });
+    let name = hit.as_ref().map(|(n, _)| n.clone());
+    if wb.hover != name {
+        wb.hover = name.clone();
+    }
+    if !clicked || wb.ui_hover {
         return;
-    };
-    let Ok((_, name)) = parts.get(*hit_entity) else {
+    }
+    if !wb.show_comments {
+        if wb.selected != name {
+            wb.selected = name;
+        }
+        return;
+    }
+    let Some((name, hit)) = hit else {
         return;
     };
     // One pin at a time: replace any pin that is still waiting for its comment.
@@ -90,13 +112,56 @@ pub(crate) fn pin_on_click(
     // Deferred: MeshRayCast already borrows Assets<Mesh>, so the pin mesh is
     // spawned by the following system.
     spawn.point = Some((hit.point, id));
-    comment.request_spot(name.to_string());
+    comment.request_spot(name.clone());
     modeler.session.pending_pin = Some(PendingPin {
-        part: name.to_string(),
+        part: name,
         face: hit.triangle_index.map(|i| i as u32),
         vertex: None,
         position: hit.point.to_array(),
     });
+}
+
+/// While comments are open, every comment on a part shows as a numbered
+/// pin where it was left (rebuilt after each model change, which clears
+/// the scene's pins); closed, only an uncommitted pin stays.
+pub(crate) fn sync_pins(
+    modeler: Res<Modeler>,
+    wb: Res<Workbench>,
+    pins: Query<(Entity, Option<&PinCommitted>), With<AnnotationPin>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut shown: Local<Option<(u64, usize, String)>>,
+) {
+    let model = &modeler.session.model;
+    let want = wb
+        .show_comments
+        .then(|| (model.version, model.annotations.len(), model.name.clone()));
+    let have = pins.iter().any(|(_, c)| c.is_some());
+    if *shown == want && (have || want.is_none() || model.annotations.is_empty()) {
+        return;
+    }
+    *shown = want.clone();
+    for (e, committed) in &pins {
+        if committed.is_some() {
+            commands.entity(e).despawn();
+        }
+    }
+    if want.is_none() {
+        return;
+    }
+    let radius = pin_radius(model);
+    for a in model.annotations.iter().filter(|a| a.material.is_none()) {
+        let pin = spawn_pin(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            radius,
+            a.id,
+            Vec3::from_array(a.position),
+        );
+        commands.entity(pin).insert(PinCommitted);
+    }
 }
 
 /// Spawns pin markers requested by [`pin_on_click`].
