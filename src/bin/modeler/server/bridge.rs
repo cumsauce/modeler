@@ -47,6 +47,7 @@ pub(crate) static WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
 pub(crate) struct CmdSender(pub(crate) mpsc::Sender<Cmd>);
 
 impl CmdSender {
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn send(&self, cmd: Cmd) -> Result<(), mpsc::error::SendError<Cmd>> {
         let r = self.0.send(cmd).await;
         if let Some(w) = WAKE.get() {
