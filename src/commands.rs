@@ -184,6 +184,13 @@ pub struct VerifySpec {
     /// pinched to nothing, walls too thin to print or cast.
     #[serde(default)]
     pub thickness: Option<f32>,
+    /// Smooth-bound parts have every vertex weighted (sums 1, <= 4 bones).
+    #[serde(default)]
+    pub weights: Option<bool>,
+    /// Checks across a clip's samples: loop seam, edge stretch, `floor`,
+    /// `collisions` (`{"clip": "walk", "floor": 0.005, "collisions": true}`).
+    #[serde(default)]
+    pub animation: Option<crate::anim::check::AnimationSpec>,
 }
 
 /// `grounded: true` or `"strict"`.
@@ -2377,6 +2384,8 @@ impl Session {
             && spec.collisions.is_none()
             && spec.self_intersections.is_none()
             && spec.thickness.is_none()
+            && spec.weights.is_none()
+            && spec.animation.is_none()
             && spec.materials.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
@@ -2385,6 +2394,14 @@ impl Session {
         };
         if let Some(parts) = &spec.parts {
             record("parts", self.expect_parts(parts).map_err(|e| e.to_string()));
+        }
+        if spec.weights == Some(true) {
+            record("weights", crate::anim::check::weights(view));
+        }
+        if let Some(a) = &spec.animation {
+            for (name, pass, detail) in crate::anim::check::animation(&self.model, a, &scope) {
+                record(&name, if pass { Ok(detail) } else { Err(detail) });
+            }
         }
         if let Some(w) = &spec.includes {
             record(
@@ -3514,6 +3531,9 @@ impl Session {
         }
         if !self.model.ops.is_empty() {
             s += &(graph::describe(&self.model.ops) + "\n");
+        }
+        if let Some(rig) = crate::anim::check::summary(&self.model) {
+            s += &(rig + "\n");
         }
         for p in &self.model.parts {
             s += &format!(

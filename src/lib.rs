@@ -60,6 +60,7 @@ pub fn compact_names(names: &[String]) -> Vec<String> {
     out
 }
 
+pub mod anim;
 pub mod blob;
 pub mod catalog;
 pub mod commands;
@@ -179,6 +180,10 @@ pub struct Part {
     /// closed solid, and checks that need one skip it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cards: bool,
+    /// How a `bind` attached this part to a skeleton (rigid bone or smooth
+    /// weights). Derived after the graph; never saved.
+    #[serde(skip)]
+    pub rig: Option<std::sync::Arc<crate::anim::Binding>>,
 }
 
 fn one() -> f32 {
@@ -1191,6 +1196,26 @@ pub enum Op {
         data: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach: Option<String>,
+    },
+    /// A skeleton: bones with world-aligned rest frames (see `crate::anim`).
+    /// Writes no part.
+    Skeleton {
+        name: String,
+        #[serde(flatten)]
+        def: crate::anim::SkeletonDef,
+    },
+    /// Binds parts to a skeleton, rigidly to one bone or with smooth
+    /// weights. Applied after moves; writes no part.
+    Bind {
+        name: String,
+        #[serde(flatten)]
+        def: crate::anim::BindDef,
+    },
+    /// An animation clip: keyframed or wave tracks per bone.
+    Clip {
+        name: String,
+        #[serde(flatten)]
+        def: crate::anim::ClipDef,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {

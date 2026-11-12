@@ -1094,6 +1094,10 @@ Style::default()
             dims,
             lighting,
             diff,
+            clip,
+            time,
+            times,
+            bone,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if views.is_empty() || views.len() > 9 {
@@ -1102,17 +1106,55 @@ Style::default()
                 None,
             ));
         }
-        let (ids, curvature) = match style.as_deref() {
-            None | Some("shaded") => (false, false),
-            Some("ids") => (true, false),
-            Some("curvature") => (false, true),
+        let (ids, curvature, bones, weights) = match style.as_deref() {
+            None | Some("shaded") => (false, false, false, false),
+            Some("ids") => (true, false, false, false),
+            Some("curvature") => (false, true, false, false),
+            Some("bones") => (false, false, true, false),
+            Some("weights") => (false, false, false, true),
             Some(other) => {
                 return Err(ErrorData::invalid_params(
-                    format!("style must be \"shaded\", \"ids\" or \"curvature\", got `{other}`"),
+                    format!(
+                        "style must be \"shaded\", \"ids\", \"curvature\", \"bones\" or \"weights\", got `{other}`"
+                    ),
                     None,
                 ));
             }
         };
+        if weights && bone.is_none() {
+            return Err(ErrorData::invalid_params(
+                "style \"weights\" needs `bone` (the bone whose weights to paint)",
+                None,
+            ));
+        }
+        if time.is_some() && times.is_some() {
+            return Err(ErrorData::invalid_params(
+                "give time or times, not both",
+                None,
+            ));
+        }
+        let pose_times: Vec<Option<f32>> = match (&times, time) {
+            (Some(ts), _) if ts.is_empty() => {
+                return Err(ErrorData::invalid_params(
+                    "times: list at least one time",
+                    None,
+                ));
+            }
+            (Some(ts), _) => ts.iter().map(|t| Some(*t)).collect(),
+            (None, Some(t)) => vec![Some(t)],
+            (None, None) if clip.is_some() => vec![Some(0.0)],
+            (None, None) => vec![None],
+        };
+        if views.len() * pose_times.len() > 9 {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{} views x {} times is more than 9 images: drop views or times",
+                    views.len(),
+                    pose_times.len()
+                ),
+                None,
+            ));
+        }
         let scene_lit = match lighting.as_deref() {
             None | Some("studio") => false,
             Some("scene") => true,
@@ -1124,6 +1166,9 @@ Style::default()
             }
         };
         let shot_style = ShotStyle {
+            pose: None,
+            bones,
+            weights: if weights { bone.clone() } else { None },
             ids,
             curvature,
             dims,
@@ -1145,6 +1190,11 @@ Style::default()
                 }),
             });
         }
+        // views x times: every view at each time.
+        let parsed: Vec<(AgentView, Option<f32>)> = pose_times
+            .iter()
+            .flat_map(|t| parsed.iter().map(move |v| (*v, *t)))
+            .collect();
         let n = parsed.len() as u32;
         let grid = grid.unwrap_or(n > 1);
         let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
@@ -1167,27 +1217,25 @@ Style::default()
         }
         let style_key = format!(
             "{}{}",
-            if ids {
-                "ids"
-            } else if curvature {
-                "curvature"
-            } else {
-                "shaded"
-            },
+            style.as_deref().unwrap_or("shaded"),
             if dims { "+dims" } else { "" }
         );
         let mut shots = Vec::with_capacity(parsed.len());
-        for view in &parsed {
+        for (view, t) in &parsed {
+            let mut st = shot_style.clone();
+            st.pose = t.map(|t| (clip.clone(), t));
             let (png, _) = self
-                .agent_render(*view, width, height, focus.clone(), shot_style)
+                .agent_render(*view, width, height, focus.clone(), st)
                 .await?;
-            let key = format!("{view}|{width}x{height}|{focus:?}|{style_key}");
+            let tl = t.map(|t| format!(" t={t}")).unwrap_or_default();
+            let key =
+                format!("{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}");
             let prev = self
                 .last_shots
                 .lock()
                 .ok()
                 .and_then(|mut m| m.insert(key, png.clone()));
-            let label = view.to_string();
+            let label = format!("{view}{tl}");
             if !diff {
                 shots.push((png, label));
                 continue;
@@ -1276,20 +1324,43 @@ Style::default()
             section,
             mass,
             thickness,
+            pose,
         }): Parameters<InspectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if measure.is_none() && section.is_none() && mass.is_none() && thickness.is_none() {
+        if measure.is_none()
+            && section.is_none()
+            && mass.is_none()
+            && thickness.is_none()
+            && pose.is_none()
+        {
             return Err(ErrorData::invalid_params(
-                "give measure, section, mass and/or thickness, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
+                "give measure, section, mass, thickness and/or pose, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
                 None,
             ));
         }
         let (png_tx, png_rx) = std::sync::mpsc::channel();
         let result = self
             .run_json(move |s| {
-                let model = &s.model;
                 let mut text = Vec::new();
                 let mut json = serde_json::Map::new();
+                let posed;
+                let model = match &pose {
+                    Some(p) => {
+                        let (t, j) = modeler::anim::check::pose_report(
+                            &s.model,
+                            p.clip.as_deref(),
+                            p.time,
+                            p.bones.as_deref(),
+                        )
+                        .map_err(|e| (e, None))?;
+                        text.push(t);
+                        json.insert("pose".into(), j);
+                        posed = modeler::anim::check::posed(&s.model, p.clip.as_deref(), p.time)
+                            .map_err(|e| (e, None))?;
+                        &posed
+                    }
+                    None => &s.model,
+                };
                 if let Some(pairs) = measure {
                     let mut rows = Vec::new();
                     for pair in &pairs {

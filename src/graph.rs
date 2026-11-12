@@ -106,7 +106,13 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
         let op = &ops[i];
         if matches!(
             op,
-            Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. }
+            Op::Move { .. }
+                | Op::Light { .. }
+                | Op::Collider { .. }
+                | Op::Marker { .. }
+                | Op::Skeleton { .. }
+                | Op::Bind { .. }
+                | Op::Clip { .. }
         ) {
             continue;
         }
@@ -242,6 +248,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             )?;
         }
     }
+    crate::anim::apply_binds(ops, &mut named)?;
     attach_occluders(&mut named);
     Ok(named.into_iter().map(|(_, part)| part).collect())
 }
@@ -599,7 +606,13 @@ fn eval_order(ops: &[Op]) -> Result<Vec<usize>, ModelerError> {
 fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
     match op {
         // Applied after the graph, in `evaluate_with`.
-        Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. } => {}
+        Op::Move { .. }
+        | Op::Light { .. }
+        | Op::Collider { .. }
+        | Op::Marker { .. }
+        | Op::Skeleton { .. }
+        | Op::Bind { .. }
+        | Op::Clip { .. } => {}
         Op::Primitive {
             name,
             kind,
@@ -1264,7 +1277,10 @@ pub fn output(op: &Op) -> &str {
         Op::Move { name, .. }
         | Op::Light { name, .. }
         | Op::Collider { name, .. }
-        | Op::Marker { name, .. } => name,
+        | Op::Marker { name, .. }
+        | Op::Skeleton { name, .. }
+        | Op::Bind { name, .. }
+        | Op::Clip { name, .. } => name,
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
         | Op::Revolve { name, .. }
@@ -1304,7 +1320,13 @@ pub fn output(op: &Op) -> &str {
 pub fn outputs(op: &Op) -> Vec<String> {
     match op {
         // Writes no part of its own: it re-places finished parts.
-        Op::Move { .. } | Op::Light { .. } | Op::Collider { .. } | Op::Marker { .. } => Vec::new(),
+        Op::Move { .. }
+        | Op::Light { .. }
+        | Op::Collider { .. }
+        | Op::Marker { .. }
+        | Op::Skeleton { .. }
+        | Op::Bind { .. }
+        | Op::Clip { .. } => Vec::new(),
         Op::RadialArray {
             name,
             count,
@@ -1360,6 +1382,9 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Light { .. } => "light",
         Op::Collider { .. } => "collider",
         Op::Marker { .. } => "marker",
+        Op::Skeleton { .. } => "skeleton",
+        Op::Bind { .. } => "bind",
+        Op::Clip { .. } => "clip",
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
         Op::Revolve { .. } => "revolve",
@@ -1400,6 +1425,9 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Light { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
+        | Op::Skeleton { .. }
+        | Op::Bind { .. }
+        | Op::Clip { .. }
         | Op::Primitive { frame: None, .. }
         | Op::Extrude { .. }
         | Op::Revolve { .. }
@@ -1481,6 +1509,37 @@ pub fn describe(ops: &[Op]) -> String {
     let mut lines = vec![format!("ops ({})", ops.len())];
     for (i, op) in ops.iter().enumerate() {
         lines.push(match op {
+            Op::Skeleton { name, def } => format!(
+                "#{i} skeleton `{name}` bones={}{}",
+                def.bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(","),
+                def.mirror.as_ref().map(|m| format!(" mirror={m}")).unwrap_or_default()
+            ),
+            Op::Bind { name, def } => format!(
+                "#{i} bind `{name}` skeleton=`{}` parts={:?} {}{}",
+                def.skeleton,
+                def.parts,
+                def.mode,
+                def.bone.as_ref().map(|b| format!(" bone=`{b}`")).unwrap_or_default()
+            ),
+            Op::Clip { name, def } => format!(
+                "#{i} clip `{name}` skeleton=`{}` {}s{} tracks={}{}",
+                def.skeleton,
+                def.duration,
+                if def.looping { " loop" } else { "" },
+                def.tracks.keys().cloned().collect::<Vec<_>>().join(","),
+                if def.mirror.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " mirror={}",
+                        def.mirror
+                            .iter()
+                            .map(|(k, m)| format!("{k}<-{}@{}", m.from, m.phase))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            ),
             Op::Collider {
                 name,
                 parts,

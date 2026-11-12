@@ -30,8 +30,14 @@ pub(crate) struct PendingAgentShots(
 /// How an agent shot is drawn: `ids` swaps every part for a flat, unlit,
 /// distinct colour (index = position among visible parts, legend drawn in);
 /// `dims` overlays the framed bounds' dimensions and a scale bar.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ShotStyle {
+    /// Draw the model posed at this time of a clip (None = the only clip).
+    pub(crate) pose: Option<(Option<String>, f32)>,
+    /// Overlay the skeleton (parts drawn see-through).
+    pub(crate) bones: bool,
+    /// Paint parts by this bone's skin weight (red 1, blue 0).
+    pub(crate) weights: Option<String>,
     pub(crate) ids: bool,
     /// Parts painted by mean curvature (white flat, red convex, blue
     /// concave), lit, on the stand-in layer like `ids`.
@@ -381,6 +387,62 @@ pub(crate) fn process_agent_shot(
         },
         None => model.bounds(),
     };
+    // A pose (or a skeleton overlay): the parts posed on the CPU, and the
+    // skeleton's segments to draw.
+    let rig_shot = style.pose.is_some() || style.bones || style.weights.is_some();
+    let mut posed_parts: Option<Vec<Arc<modeler::Part>>> = None;
+    let mut bone_segs: Vec<(Vec3, Vec3, f32)> = Vec::new();
+    let mut bounds = bounds;
+    if rig_shot {
+        let rig = match &style.pose {
+            Some((clip, t)) => {
+                modeler::anim::clip(model, clip.as_deref()).map(|(c, s)| (Some((c, *t)), s))
+            }
+            None => modeler::anim::skeletons(model).and_then(|v| {
+                v.into_iter()
+                    .next()
+                    .map(|s| (None, s))
+                    .ok_or_else(|| "the model has no skeleton".into())
+            }),
+        };
+        let (clip, skel) = match rig {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = reply.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let pose = clip
+            .as_ref()
+            .map(|(c, t)| c.sample(&skel, *t))
+            .unwrap_or_else(|| skel.rest());
+        bone_segs = skel
+            .posed_segments(&pose)
+            .into_iter()
+            .zip(&skel.bones)
+            .map(|((h, t), b)| (h, t, b.radius))
+            .collect();
+        if let Some((c, t)) = &clip {
+            posed_parts = Some(modeler::anim::posed_parts(model, c, &skel, *t));
+            // Frame the whole clip's reach, so a filmstrip keeps one framing.
+            if focus.is_none()
+                && let Some((mut lo, mut hi)) = bounds
+            {
+                for k in 0..16 {
+                    let tt = c.duration * k as f32 / 16.0;
+                    for ((h, tl), b) in modeler::anim::posed_segments_at(c, &skel, tt)
+                        .into_iter()
+                        .zip(&skel.bones)
+                    {
+                        let r = Vec3::splat(b.radius);
+                        lo = lo.min(h - r).min(tl - r);
+                        hi = hi.max(h + r).max(tl + r);
+                    }
+                }
+                bounds = Some((lo, hi));
+            }
+        }
+    }
     let (eye, target, up, new_projection) = agent_view_projection(view, bounds, aspect);
     // Pixels per metre for orthographic shots (dimension overlays).
     let ppm = match &new_projection {
@@ -426,17 +488,33 @@ pub(crate) fn process_agent_shot(
     // Part-ID stand-ins on their own layer; the camera looks only at it.
     let mut legend: Vec<(String, [u8; 4])> = Vec::new();
     let mut stand_ins: Vec<Entity> = Vec::new();
-    if style.ids || style.curvature {
-        let drawable = model
-            .parts
+    if style.ids || style.curvature || rig_shot {
+        let source = posed_parts.as_ref().unwrap_or(&model.parts);
+        let drawable = source
             .iter()
             .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
         let drawable: Vec<_> = drawable.collect();
         modeler::material::pbr::prebake(drawable.iter().map(|p| &***p));
+        let weight_bone = style.weights.as_ref().map(|b| {
+            modeler::anim::skeletons(model)
+                .ok()
+                .and_then(|v| v.iter().find_map(|s| s.bone(b)))
+        });
+        if let Some(None) = weight_bone {
+            let _ = reply.send(Err(format!(
+                "weights: no bone `{}` in any skeleton",
+                style.weights.clone().unwrap_or_default()
+            )));
+            return;
+        }
         let mut colored: Vec<Option<Mesh>> = Vec::new();
         for (i, part) in drawable.into_iter().enumerate() {
-            if style.curvature {
+            if let Some(Some(bone)) = weight_bone {
+                colored.push(Some(weights_mesh(part, bone)));
+            } else if style.curvature {
                 colored.push(Some(curvature_mesh(part)));
+            } else if !style.ids {
+                colored.push(None);
             } else {
                 legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
                 colored.push(None);
@@ -450,6 +528,14 @@ pub(crate) fn process_agent_shot(
             );
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
+        }
+        if let Some(b) = &style.weights {
+            legend.push((format!("weight of `{b}` = 1"), [235, 40, 30, 255]));
+            legend.push(("0.5".into(), [240, 220, 60, 255]));
+            legend.push((
+                "0 (or another skeleton / unbound)".into(),
+                [30, 70, 200, 255],
+            ));
         }
         if style.curvature {
             legend.push((
@@ -472,6 +558,19 @@ pub(crate) fn process_agent_shot(
                     .insert((Mesh3d(meshes.add(mesh)), MeshMaterial3d(m)));
                 continue;
             }
+            if !style.ids {
+                if style.bones {
+                    // See-through, so the skeleton inside reads.
+                    let m = materials.add(StandardMaterial {
+                        base_color: Color::srgba(0.9, 0.9, 0.95, 0.35),
+                        alpha_mode: AlphaMode::Blend,
+                        perceptual_roughness: 0.8,
+                        ..default()
+                    });
+                    commands.entity(*e).insert(MeshMaterial3d(m));
+                }
+                continue;
+            }
             let [r, g, b] = modeler::raster::id_color(k);
             let m = materials.add(StandardMaterial {
                 base_color: Color::srgb(r, g, b),
@@ -479,6 +578,41 @@ pub(crate) fn process_agent_shot(
                 ..default()
             });
             commands.entity(*e).insert(MeshMaterial3d(m));
+        }
+        if style.bones {
+            let bone_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.55, 0.1),
+                unlit: true,
+                ..default()
+            });
+            let joint_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.95, 0.4),
+                unlit: true,
+                ..default()
+            });
+            for (h, t, r) in &bone_segs {
+                let e = commands
+                    .spawn((
+                        Mesh3d(meshes.add(bone_mesh(*h, *t, *r))),
+                        MeshMaterial3d(bone_mat.clone()),
+                        Transform::IDENTITY,
+                        RenderLayers::layer(ID_LAYER),
+                    ))
+                    .id();
+                stand_ins.push(e);
+                let len = (*t - *h).length().max(1e-3);
+                let j = commands
+                    .spawn((
+                        Mesh3d(meshes.add(Sphere::new((len * 0.08).max(0.004)))),
+                        MeshMaterial3d(joint_mat.clone()),
+                        Transform::from_translation(*h),
+                        RenderLayers::layer(ID_LAYER),
+                    ))
+                    .id();
+                stand_ins.push(j);
+            }
+            legend.push(("bone (head -> tail)".into(), [255, 140, 26, 255]));
+            legend.push(("joint (bone head)".into(), [255, 242, 102, 255]));
         }
         commands
             .entity(camera_entity)
@@ -513,7 +647,7 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
-    let ids = style.ids || style.curvature;
+    let ids = style.ids || style.curvature || rig_shot;
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands
@@ -698,5 +832,89 @@ fn curvature_mesh(part: &modeler::Part) -> Mesh {
     } else {
         mesh.compute_normals();
     }
+    mesh
+}
+
+/// A part painted by one bone's skin weight: red 1, yellow 0.5, blue 0.
+fn weights_mesh(part: &modeler::Part, bone: usize) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let w = |i: usize| -> f32 {
+        let Some(b) = &part.rig else { return 0.0 };
+        if let Some(rb) = b.bone {
+            return if rb == bone { 1.0 } else { 0.0 };
+        }
+        match (b.joints.get(i), b.weights.get(i)) {
+            (Some(j), Some(w)) => (0..4)
+                .filter(|&k| j[k] as usize == bone)
+                .map(|k| w[k])
+                .sum(),
+            _ => 0.0,
+        }
+    };
+    let colors: Vec<[f32; 4]> = (0..part.verts.len())
+        .map(|i| {
+            let x = w(i).clamp(0.0, 1.0);
+            let lerp = |a: [f32; 3], b: [f32; 3], u: f32| {
+                [
+                    a[0] + (b[0] - a[0]) * u,
+                    a[1] + (b[1] - a[1]) * u,
+                    a[2] + (b[2] - a[2]) * u,
+                ]
+            };
+            let (blue, yellow, red) = ([0.12, 0.27, 0.78], [0.94, 0.86, 0.24], [0.92, 0.16, 0.12]);
+            let c = if x < 0.5 {
+                lerp(blue, yellow, x * 2.0)
+            } else {
+                lerp(yellow, red, (x - 0.5) * 2.0)
+            };
+            // Vertex colours are linear.
+            let lin = |v: f32| v.powf(2.2);
+            [lin(c[0]), lin(c[1]), lin(c[2]), 1.0]
+        })
+        .collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(part.indices.clone()));
+    if part.normals.len() == part.verts.len() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+    } else {
+        mesh.compute_normals();
+    }
+    mesh
+}
+
+/// A bone as a slim double pyramid from head to tail (world space).
+fn bone_mesh(head: Vec3, tail: Vec3, radius: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let d = tail - head;
+    let len = d.length().max(1e-4);
+    let dir = d / len;
+    let side = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let u = dir.cross(side).normalize();
+    let v = dir.cross(u);
+    let w = (len * 0.1).min(radius.max(len * 0.04));
+    let mid = head + dir * (len * 0.2);
+    let ring = [mid + u * w, mid + v * w, mid - u * w, mid - v * w];
+    let mut pos: Vec<[f32; 3]> = vec![head.to_array(), tail.to_array()];
+    pos.extend(ring.iter().map(|p| p.to_array()));
+    let mut idx = Vec::new();
+    for k in 0..4u32 {
+        let (a, b) = (2 + k, 2 + (k + 1) % 4);
+        idx.extend([0, b, a, 1, a, b]);
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+    .with_inserted_indices(Indices::U32(idx));
+    mesh.duplicate_vertices();
+    mesh.compute_flat_normals();
     mesh
 }

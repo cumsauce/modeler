@@ -462,7 +462,7 @@ fn is_cutter(ops: &[Op], part: &str) -> bool {
 /// `scene_summary`. These encode the ordering and overlap traps that are
 /// easy to hit and expensive to spot in a render.
 pub fn lints(model: &Model) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = crate::anim::check::lints(model);
     // Boolean volume sanity: a difference must shrink its input, a union
     // must not fall below its larger input, and a union that exactly sums
     // its inputs had no overlap at all.

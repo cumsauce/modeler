@@ -2159,6 +2159,261 @@ pub struct MarkerSpec {
     attach: Option<String>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoneSpec {
+    /// The parent bone (none = a root).
+    #[serde(default)]
+    parent: Option<String>,
+    /// The pivot: [x, y, z], or an anchor on a part's box ("leg_l:top").
+    head: crate::anim::PointRef,
+    /// The far end (default: the children's heads, else the parent
+    /// direction continued). Sets the length and the weight envelope.
+    #[serde(default)]
+    tail: Option<crate::anim::PointRef>,
+    /// Envelope radius in meters for smooth weights (default a fifth of
+    /// the length): about the limb's thickness.
+    #[serde(default)]
+    radius: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkeletonSpec {
+    name: String,
+    /// Bones by name. Rest frames are world-aligned: a clip's rotation
+    /// `{"x": 25}` pitches the bone about world x from rest.
+    bones: std::collections::BTreeMap<String, BoneSpec>,
+    /// "x": every `*_l` bone gets a `*_r` twin mirrored across x = 0.
+    #[serde(default)]
+    mirror: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoxSpec {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaintSpec {
+    bone: String,
+    /// A world box: every vertex inside starts fully on `bone`.
+    region: BoxSpec,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindSpec {
+    name: String,
+    skeleton: String,
+    /// Parts to bind (`*` globs).
+    parts: Vec<String>,
+    /// Rigid: the bone the parts ride (a door on its hinge bone).
+    #[serde(default)]
+    bone: Option<String>,
+    /// rigid (default with `bone`) or smooth (default without: per-vertex
+    /// weights from the nearest bone envelopes, blended over the mesh).
+    #[serde(default)]
+    mode: Option<String>,
+    /// Smooth: meters over which weights blend across a joint (default the
+    /// median bone radius).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// Smooth: force regions onto a bone before blending.
+    #[serde(default)]
+    paint: Vec<PaintSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClipMirrorSpec {
+    /// The bone whose track is copied (mirrored across x = 0).
+    from: String,
+    /// Time shift as a share of the clip (0.5 = half a cycle later).
+    #[serde(default)]
+    phase: f32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClipSpec {
+    name: String,
+    skeleton: String,
+    /// Seconds.
+    duration: f32,
+    /// Loops (default true): t wraps, and smooth keys pass through the seam.
+    #[serde(default, rename = "loop")]
+    looping: Option<bool>,
+    /// Default key interpolation: smooth (Catmull-Rom, default), linear, step.
+    #[serde(default)]
+    interp: Option<String>,
+    /// Per bone: {"rotate" | "translate" | "scale": channel}. A channel is
+    /// keys `[[t, value], ...]` (rotate values in any rotation form, offsets
+    /// from rest; translate [x, y, z] meters; scale [x, y, z] or a number),
+    /// `{"keys": [...], "interp": "linear"}`, or a generated
+    /// `{"wave": {"axis": "x" | [x, y, z], "amount" (degrees for rotate,
+    /// meters for translate), "period" (s, default the duration), "phase"}}`.
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
+    #[serde(default)]
+    tracks: std::collections::BTreeMap<String, Value>,
+    /// Per bone: a mirrored, phase-shifted copy of another bone's track
+    /// (`{"leg_r": {"from": "leg_l", "phase": 0.5}}`).
+    #[serde(default)]
+    mirror: std::collections::BTreeMap<String, ClipMirrorSpec>,
+}
+
+fn axis_of(ctx: &str, v: &Value) -> Result<[f32; 3], String> {
+    match v {
+        Value::String(s) => match s.as_str() {
+            "x" => Ok([1.0, 0.0, 0.0]),
+            "y" => Ok([0.0, 1.0, 0.0]),
+            "z" => Ok([0.0, 0.0, 1.0]),
+            other => Err(format!("{ctx}: axis `{other}`: use x, y, z or [x, y, z]")),
+        },
+        other => {
+            let a: [f32; 3] = de(ctx, other)?;
+            if crate::Vec3::from(a).length() < 1e-9 {
+                return Err(format!("{ctx}: axis is zero"));
+            }
+            Ok(a)
+        }
+    }
+}
+
+fn interp_of(ctx: &str, s: &str) -> Result<crate::anim::Interp, String> {
+    use crate::anim::Interp;
+    match s {
+        "smooth" | "catmull_rom" | "cubic" => Ok(Interp::Smooth),
+        "linear" => Ok(Interp::Linear),
+        "step" => Ok(Interp::Step),
+        other => Err(format!(
+            "{ctx}: interp `{other}`: use smooth, linear or step"
+        )),
+    }
+}
+
+/// One clip channel: keys or a wave.
+fn channel(
+    ctx: &str,
+    kind: &str,
+    v: &Value,
+    duration: f32,
+    default: crate::anim::Interp,
+) -> Result<crate::anim::Channel, String> {
+    use crate::anim::Channel;
+    let (keys_v, interp) = match v {
+        Value::Array(_) => (v.clone(), default),
+        Value::Object(o) if o.contains_key("wave") => {
+            if o.len() > 1 {
+                return Err(format!("{ctx}: a wave channel has only \"wave\""));
+            }
+            let Some(Value::Object(w)) = o.get("wave") else {
+                return Err(format!("{ctx}: wave: expected an object"));
+            };
+            for k in w.keys() {
+                if !matches!(
+                    k.as_str(),
+                    "axis" | "amount" | "degrees" | "period" | "phase"
+                ) {
+                    return Err(format!(
+                        "{ctx}: wave: unknown field `{k}` (axis, amount / degrees, period, phase)"
+                    ));
+                }
+            }
+            let axis = axis_of(ctx, w.get("axis").ok_or(format!("{ctx}: wave needs axis"))?)?;
+            let amount = w
+                .get("amount")
+                .or_else(|| w.get("degrees"))
+                .and_then(Value::as_f64)
+                .ok_or(format!(
+                    "{ctx}: wave needs amount (degrees for rotate, meters for translate)"
+                ))? as f32;
+            let period = w
+                .get("period")
+                .and_then(Value::as_f64)
+                .map(|p| p as f32)
+                .unwrap_or(duration);
+            if period.is_nan() || period <= 0.0 {
+                return Err(format!("{ctx}: wave period must be positive"));
+            }
+            let phase = w.get("phase").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            return Ok(Channel::Wave {
+                axis,
+                amount,
+                period,
+                phase,
+            });
+        }
+        Value::Object(o) => {
+            for k in o.keys() {
+                if !matches!(k.as_str(), "keys" | "interp") {
+                    return Err(format!(
+                        "{ctx}: unknown field `{k}` (keys, interp, or wave)"
+                    ));
+                }
+            }
+            let interp = match o.get("interp").and_then(Value::as_str) {
+                Some(s) => interp_of(ctx, s)?,
+                None => default,
+            };
+            (
+                o.get("keys").cloned().ok_or(format!("{ctx}: needs keys"))?,
+                interp,
+            )
+        }
+        other => {
+            return Err(format!(
+                "{ctx}: expected keys [[t, value], ...], {{keys, interp}} or {{wave}}, got {}",
+                describe_json(other)
+            ));
+        }
+    };
+    let Value::Array(items) = keys_v else {
+        return Err(format!("{ctx}: keys must be an array of [t, value]"));
+    };
+    let mut keys: Vec<(f32, [f32; 4])> = Vec::new();
+    for (k, item) in items.iter().enumerate() {
+        let kctx = format!("{ctx}: key #{k}");
+        let Some([t, val]) = item
+            .as_array()
+            .map(Vec::as_slice)
+            .and_then(|a| <&[Value; 2]>::try_from(a).ok())
+        else {
+            return Err(format!("{kctx}: expected [t, value]"));
+        };
+        let t = t.as_f64().ok_or(format!("{kctx}: time must be a number"))? as f32;
+        if t.is_nan() || t < -1e-6 || t > duration + 1e-4 {
+            return Err(format!("{kctx}: time {t} is outside 0..{duration}"));
+        }
+        let v = match kind {
+            "rotate" => {
+                let r: RotationSpec = de(&kctx, val)?;
+                r.quat().map_err(|e| format!("{kctx}: {e}"))?
+            }
+            "scale" if val.is_number() => {
+                let f = val.as_f64().unwrap_or(1.0) as f32;
+                [f, f, f, 0.0]
+            }
+            _ => {
+                let a: [f32; 3] = de(&kctx, val)?;
+                [a[0], a[1], a[2], 0.0]
+            }
+        };
+        keys.push((t, v));
+    }
+    if keys.is_empty() {
+        return Err(format!("{ctx}: needs at least one key"));
+    }
+    keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if keys.windows(2).any(|w| (w[1].0 - w[0].0).abs() < 1e-6) {
+        return Err(format!("{ctx}: two keys at the same time"));
+    }
+    Ok(Channel::Keys { keys, interp })
+}
+
 /// One `apply_ops` item, tagged by "type". Only used for the published JSON
 /// schema; parsing goes item by item through [`parse_ops`] so errors name the
 /// item and the field.
@@ -2192,6 +2447,9 @@ pub enum OpSpec {
     Light(LightSpec),
     Collider(ColliderSpec),
     Marker(MarkerSpec),
+    Skeleton(SkeletonSpec),
+    Bind(BindSpec),
+    Clip(ClipSpec),
     Place(PlaceSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
@@ -2212,6 +2470,9 @@ pub const OP_TYPES: &[&str] = &[
     "light",
     "collider",
     "marker",
+    "skeleton",
+    "bind",
+    "clip",
     "primitive",
     "extrude",
     "revolve",
@@ -3010,6 +3271,146 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 sensor: s.sensor,
             })
         }
+        "skeleton" => {
+            let s: SkeletonSpec = de(&ctx, &body)?;
+            if s.bones.is_empty() {
+                return Err(format!("{ctx}: bones: needs at least one bone"));
+            }
+            if let Some(m) = &s.mirror
+                && m != "x"
+            {
+                return Err(format!("{ctx}: mirror `{m}`: only \"x\" is supported"));
+            }
+            let mut bones = Vec::new();
+            for (n, b) in s.bones {
+                if b.radius.is_some_and(|r| r.is_nan() || r <= 0.0) {
+                    return Err(format!("{ctx}: bones.{n}.radius must be positive"));
+                }
+                if let crate::anim::PointRef::Anchor(a) = &b.head
+                    && !a.contains(':')
+                {
+                    return Err(format!(
+                        "{ctx}: bones.{n}.head `{a}`: an anchor names a part and words, like \"leg_l:top\""
+                    ));
+                }
+                bones.push(crate::anim::BoneDef {
+                    name: n,
+                    parent: b.parent,
+                    head: b.head,
+                    tail: b.tail,
+                    radius: b.radius,
+                });
+            }
+            BatchItem::Op(Op::Skeleton {
+                name: s.name,
+                def: crate::anim::SkeletonDef {
+                    bones,
+                    mirror: s.mirror,
+                },
+            })
+        }
+        "bind" => {
+            let s: BindSpec = de(&ctx, &body)?;
+            let mode = s
+                .mode
+                .unwrap_or_else(|| if s.bone.is_some() { "rigid" } else { "smooth" }.into());
+            match mode.as_str() {
+                "rigid" if s.bone.is_none() => {
+                    return Err(format!(
+                        "{ctx}: rigid needs `bone` (the bone the parts ride)"
+                    ));
+                }
+                "smooth" if s.bone.is_some() => {
+                    return Err(format!(
+                        "{ctx}: smooth picks bones itself: drop `bone` (or use mode rigid)"
+                    ));
+                }
+                "rigid" | "smooth" => {}
+                other => return Err(format!("{ctx}: mode `{other}`: use rigid or smooth")),
+            }
+            if s.parts.is_empty() {
+                return Err(format!("{ctx}: parts: list at least one part"));
+            }
+            BatchItem::Op(Op::Bind {
+                name: s.name,
+                def: crate::anim::BindDef {
+                    skeleton: s.skeleton,
+                    parts: s.parts,
+                    bone: s.bone,
+                    mode,
+                    blend: s.blend,
+                    paint: s
+                        .paint
+                        .into_iter()
+                        .map(|p| crate::anim::Paint {
+                            bone: p.bone,
+                            min: p.region.min,
+                            max: p.region.max,
+                        })
+                        .collect(),
+                },
+            })
+        }
+        "clip" => {
+            let s: ClipSpec = de(&ctx, &body)?;
+            if s.duration.is_nan() || s.duration <= 0.0 {
+                return Err(format!("{ctx}: duration must be positive (seconds)"));
+            }
+            let default = match &s.interp {
+                Some(i) => interp_of(&ctx, i)?,
+                None => crate::anim::Interp::Smooth,
+            };
+            let mut tracks = std::collections::BTreeMap::new();
+            for (bone, v) in &s.tracks {
+                let Value::Object(o) = v else {
+                    return Err(format!(
+                        "{ctx}: tracks.{bone}: expected {{rotate / translate / scale: channel}}"
+                    ));
+                };
+                let mut t = crate::anim::TrackDef::default();
+                for (k, c) in o {
+                    let cctx = format!("{ctx}: tracks.{bone}.{k}");
+                    let ch = match k.as_str() {
+                        "rotate" | "translate" | "scale" => {
+                            channel(&cctx, k, c, s.duration, default)?
+                        }
+                        other => {
+                            return Err(format!(
+                                "{ctx}: tracks.{bone}: unknown channel `{other}` (rotate, translate, scale)"
+                            ));
+                        }
+                    };
+                    match k.as_str() {
+                        "rotate" => t.rotate = Some(ch),
+                        "translate" => t.translate = Some(ch),
+                        _ => t.scale = Some(ch),
+                    }
+                }
+                tracks.insert(bone.clone(), t);
+            }
+            BatchItem::Op(Op::Clip {
+                name: s.name,
+                def: crate::anim::ClipDef {
+                    skeleton: s.skeleton,
+                    duration: s.duration,
+                    looping: s.looping.unwrap_or(true),
+                    tracks,
+                    mirror: s
+                        .mirror
+                        .into_iter()
+                        .map(|(k, m)| {
+                            (
+                                k,
+                                crate::anim::MirrorDef {
+                                    from: m.from,
+                                    phase: m.phase,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            })
+        }
         "marker" => {
             let s: MarkerSpec = de(&ctx, &body)?;
             if s.kind.trim().is_empty() {
@@ -3405,6 +3806,15 @@ pub fn example(ty: &str) -> Option<Value> {
         "collider" => {
             json!({"type": "collider", "name": "walls_solid", "parts": ["wall*", "floor"], "shape": "box"})
         }
+        "skeleton" => json!({"type": "skeleton", "name": "rig", "mirror": "x", "bones": {
+            "hip": {"head": [0, 0.5, 0], "tail": [0, 0.6, 0], "radius": 0.08},
+            "leg_l": {"parent": "hip", "head": [0.1, 0.5, 0], "tail": [0.1, 0.05, 0], "radius": 0.04}}}),
+        "bind" => json!({"type": "bind", "name": "body_skin", "skeleton": "rig", "parts": ["body"],
+            "mode": "smooth", "blend": 0.04}),
+        "clip" => json!({"type": "clip", "name": "walk", "skeleton": "rig", "duration": 1.0,
+            "tracks": {"leg_l": {"rotate": [[0, {"x": 25}], [0.5, {"x": -25}], [1, {"x": 25}]]},
+                       "hip": {"translate": {"wave": {"axis": "y", "amount": 0.02, "period": 0.5}}}},
+            "mirror": {"leg_r": {"from": "leg_l", "phase": 0.5}}}),
         "marker" => json!({"type": "marker", "name": "spawn_1", "kind": "spawn",
             "translation": [0, 0, 2], "yaw": 180, "data": {"team": 1}}),
         "light" => json!({"type": "light", "name": "lamp_bulb", "kind": "point",
@@ -3471,6 +3881,9 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "light" => schemars::schema_for!(LightSpec),
         "collider" => schemars::schema_for!(ColliderSpec),
         "marker" => schemars::schema_for!(MarkerSpec),
+        "skeleton" => schemars::schema_for!(SkeletonSpec),
+        "bind" => schemars::schema_for!(BindSpec),
+        "clip" => schemars::schema_for!(ClipSpec),
         "place" => schemars::schema_for!(PlaceSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),

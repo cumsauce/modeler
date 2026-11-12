@@ -47,6 +47,21 @@ pub(crate) struct InspectArgs {
     /// and whether its surface passes through itself.
     #[serde(default)]
     pub(crate) thickness: Option<ThicknessArg>,
+    /// A clip pose: {"clip"?: "walk", "time": 0.25, "bones"?: [...]}. Lists
+    /// bone world heads, tails and rotations, and the other checks of this
+    /// call (measure, section, mass, thickness) run on the posed model.
+    #[serde(default)]
+    pub(crate) pose: Option<PoseArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PoseArg {
+    #[serde(default)]
+    pub(crate) clip: Option<String>,
+    pub(crate) time: f32,
+    #[serde(default)]
+    pub(crate) bones: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema, Default)]
@@ -352,7 +367,9 @@ pub(crate) struct AgentViewsArgs {
     /// "shaded" (default), "ids" (every part a flat distinct colour with a
     /// legend, to tell which shape is which part) or "curvature" (mean
     /// curvature heat map: red convex, white flat, blue concave; lumps,
-    /// pinches and creases on organic surfaces stand out).
+    /// pinches and creases on organic surfaces stand out), "bones" (the
+    /// skeleton over see-through parts) or "weights" (one `bone`'s skin
+    /// weights: red 1, blue 0).
     #[serde(default)]
     pub(crate) style: Option<String>,
     /// Overlay the framed box's width/height and a scale bar (true scale in
@@ -369,6 +386,20 @@ pub(crate) struct AgentViewsArgs {
     /// with the changed share.
     #[serde(default)]
     pub(crate) diff: bool,
+    /// Render posed by this clip (default: the only one) at `time` / `times`.
+    #[serde(default)]
+    pub(crate) clip: Option<String>,
+    /// Seconds into the clip.
+    #[serde(default)]
+    pub(crate) time: Option<f32>,
+    /// A filmstrip: every view at each of these times (views x times <= 9),
+    /// labelled, with one framing for the whole clip. The way to judge
+    /// motion: [0, 0.25, 0.5, 0.75] of a 1 s walk.
+    #[serde(default)]
+    pub(crate) times: Option<Vec<f32>>,
+    /// With style "weights": the bone whose skin weights are painted.
+    #[serde(default)]
+    pub(crate) bone: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
