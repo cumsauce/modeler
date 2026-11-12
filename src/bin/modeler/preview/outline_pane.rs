@@ -25,7 +25,7 @@ pub(crate) struct OutlinePane {
     pub(crate) selected: Option<String>,
     pub(crate) selected_parts: Vec<String>,
     /// The model version, selection and open documents the list was built for.
-    shown: Option<(u64, u64, String)>,
+    shown: Option<(u64, u64, u64)>,
     /// Document rows already opened once by default (the active document
     /// starts expanded; after that the human's choice sticks).
     auto_opened: HashSet<String>,
@@ -114,11 +114,17 @@ pub(crate) fn update_outline_pane(
 
     let session = &modeler.session;
     let model = &session.model;
-    let want = (
-        model.version,
-        pane.generation,
-        session.doc_names().join("\n"),
-    );
+    // The open documents, hashed (no strings built per frame).
+    let docs = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        model.name.hash(&mut h);
+        for m in &session.others {
+            m.name.hash(&mut h);
+        }
+        h.finish()
+    };
+    let want = (model.version, pane.generation, docs);
     if pane.shown.as_ref() == Some(&want) {
         return;
     }

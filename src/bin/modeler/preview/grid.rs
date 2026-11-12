@@ -161,6 +161,68 @@ pub(crate) struct GridTileClose(String);
 #[derive(Component)]
 pub(crate) struct GridTileCamera;
 
+/// How often the app loop runs. While the grid is up nothing animates
+/// (tiles render only on change): ~30 fps. Otherwise full rate while
+/// anything moves (input, the camera, a model change, playback, agent
+/// shots) and for two seconds after, so TAA and SSR settle; then the loop
+/// idles at 4 fps. Input and server calls wake it at once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_mode(
+    grid: Res<Grid>,
+    orbit: Res<crate::preview::camera::Orbit>,
+    playback: Res<crate::preview::playback::Playback>,
+    modeler: Res<Modeler>,
+    shots: Res<crate::preview::agent_rig::PendingAgentShots>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    motion: Res<bevy::input::mouse::AccumulatedMouseMotion>,
+    scroll: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    mut last: Local<(Option<Instant>, Option<(u64, [u32; 6])>)>,
+    winit: Option<ResMut<bevy::winit::WinitSettings>>,
+) {
+    let Some(mut w) = winit else {
+        return;
+    };
+    let stamp = (
+        modeler.session.model.version,
+        [
+            orbit.yaw,
+            orbit.pitch,
+            orbit.dist,
+            orbit.target.x,
+            orbit.target.y,
+            orbit.target.z,
+        ]
+        .map(f32::to_bits),
+    );
+    let active = last.1 != Some(stamp)
+        || !orbit.user
+        || playback.playing
+        || !shots.0.is_empty()
+        || keys.get_pressed().next().is_some()
+        || mouse.get_pressed().next().is_some()
+        || motion.delta != Vec2::ZERO
+        || scroll.delta != Vec2::ZERO;
+    last.1 = Some(stamp);
+    if active {
+        last.0 = Some(Instant::now());
+    }
+    let busy = last
+        .0
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
+    let want = if grid.on {
+        bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(33))
+    } else if busy {
+        bevy::winit::UpdateMode::Continuous
+    } else {
+        bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(250))
+    };
+    if w.focused_mode != want {
+        w.focused_mode = want;
+        w.unfocused_mode = want;
+    }
+}
+
 pub(crate) fn grid_off(grid: Res<Grid>) -> bool {
     !grid.on
 }
@@ -222,21 +284,7 @@ pub(crate) fn update_grid(
     mut label_tick: Local<Option<Instant>>,
     recency: Res<Recency>,
     mut more: Local<Option<Entity>>,
-    winit: Option<ResMut<bevy::winit::WinitSettings>>,
 ) {
-    // While the grid is up nothing animates (tiles render only on change),
-    // so the app loop drops to ~30 fps; input still wakes it at once.
-    if let Some(mut w) = winit {
-        let want = if grid.on {
-            bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(33))
-        } else {
-            bevy::winit::UpdateMode::Continuous
-        };
-        if w.focused_mode != want {
-            w.focused_mode = want;
-            w.unfocused_mode = want;
-        }
-    }
     let Ok((mut main, env)) = main_cam.single_mut() else {
         return;
     };
