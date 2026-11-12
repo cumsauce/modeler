@@ -95,7 +95,7 @@ fn near_points(a: &Part, b_tris: &[[Vec3; 3]], tol: f32) -> Vec<Vec3> {
 /// A part plus its solid (when it is a closed mesh), built once per check.
 pub struct Body<'a> {
     pub part: &'a Part,
-    solid: Option<Manifold>,
+    solid: Option<std::sync::Arc<Manifold>>,
     tris: Vec<[Vec3; 3]>,
     /// World bounds, from the triangles (once, not per pair).
     bounds: (Vec3, Vec3),
@@ -108,8 +108,10 @@ impl<'a> Body<'a> {
         let tris = world_tris(part);
         // An empty part's bounds (MAX..MIN) are near nothing, as before.
         let bounds = part.bounds();
-        let solid = crate::csg::part_to_manifold(part).ok();
-        let volume = solid.as_ref().map_or(0.0, |m| m.volume().abs());
+        let (solid, volume) = match part_solid(part) {
+            Some((m, v)) => (Some(m), v),
+            None => (None, 0.0),
+        };
         Self {
             part,
             solid,
@@ -600,21 +602,28 @@ pub fn floating(model: &Model) -> Vec<String> {
 
 /// [`floating`] ignoring the contacts `skip(a, b)` names.
 fn floating_skipping(model: &Model, skip: &dyn Fn(&str, &str) -> bool) -> Vec<String> {
-    let bodies: Vec<Body> = visible(model).map(Body::new).collect();
+    // Pairs come from [`Contacts`]: culled by bounds, tested in parallel.
+    let c = Contacts::new(model);
+    let bodies = &c.bodies;
     let ground = ground_level(model);
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); bodies.len()];
+    for &(i, j, _, _) in &c.pairs {
+        if skip(&bodies[i].part.name, &bodies[j].part.name) {
+            continue;
+        }
+        adj[i].push(j);
+        adj[j].push(i);
+    }
     // Grounded = connected to the ground through a chain of contacts, so two
     // parts touching only each other in mid-air still float.
     let mut reached: Vec<bool> = bodies
         .iter()
-        .map(|b| b.part.bounds().0.y <= ground + ground_tolerance(b.part))
+        .map(|b| b.bounds.0.y <= ground + ground_tolerance(b.part))
         .collect();
     let mut frontier: Vec<usize> = (0..bodies.len()).filter(|&i| reached[i]).collect();
     while let Some(i) = frontier.pop() {
-        for j in 0..bodies.len() {
-            if !reached[j]
-                && !skip(&bodies[i].part.name, &bodies[j].part.name)
-                && contact(&bodies[i], &bodies[j]).is_some()
-            {
+        for &j in &adj[i] {
+            if !reached[j] {
                 reached[j] = true;
                 frontier.push(j);
             }
@@ -1049,7 +1058,10 @@ type BvhKey = (usize, usize, usize, [u32; 10], u64);
 static BVHS: std::sync::Mutex<Option<std::collections::HashMap<BvhKey, std::sync::Arc<Bvh>>>> =
     std::sync::Mutex::new(None);
 
-fn part_bvh(p: &Part) -> std::sync::Arc<Bvh> {
+/// A key for a part's world-space geometry: its buffers' identity and
+/// lengths, its transform, and a fingerprint of sampled content (a freed
+/// mesh can come back at the same address).
+fn mesh_key(p: &Part) -> BvhKey {
     let mut tf = [0u32; 10];
     for (i, v) in p
         .translation
@@ -1060,26 +1072,57 @@ fn part_bvh(p: &Part) -> std::sync::Arc<Bvh> {
     {
         tf[i] = v.to_bits();
     }
-    // Freed meshes can come back at the same address: fingerprint a sample
-    // of the content too.
     let sample = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let (nv, ni) = (p.verts.len(), p.indices.len());
-        for k in 0..64 {
-            let v = p.verts[k * nv / 64];
-            v.map(f32::to_bits).hash(&mut h);
-            p.indices[k * ni / 64].hash(&mut h);
+        if nv > 0 && ni > 0 {
+            for k in 0..64 {
+                let v = p.verts[k * nv / 64];
+                v.map(f32::to_bits).hash(&mut h);
+                p.indices[k * ni / 64].hash(&mut h);
+            }
         }
         h.finish()
     };
-    let key = (
+    (
         p.verts.as_ptr() as usize,
         p.verts.len(),
         p.indices.len(),
         tf,
         sample,
-    );
+    )
+}
+
+type Solid = Option<(std::sync::Arc<Manifold>, f64)>;
+static SOLIDS: std::sync::Mutex<Option<std::collections::HashMap<BvhKey, Solid>>> =
+    std::sync::Mutex::new(None);
+
+/// A part's Manifold solid and volume, cached across verify calls (a big
+/// terrain took most of a map's verify to convert each time).
+fn part_solid(p: &Part) -> Solid {
+    let key = mesh_key(p);
+    if let Ok(g) = SOLIDS.lock()
+        && let Some(s) = g.as_ref().and_then(|m| m.get(&key))
+    {
+        return s.clone();
+    }
+    let solid = crate::csg::part_to_manifold(p).ok().map(|m| {
+        let v = m.volume().abs();
+        (std::sync::Arc::new(m), v)
+    });
+    if let Ok(mut g) = SOLIDS.lock() {
+        let m = g.get_or_insert_with(Default::default);
+        if m.len() >= 2048 {
+            m.clear();
+        }
+        m.insert(key, solid.clone());
+    }
+    solid
+}
+
+fn part_bvh(p: &Part) -> std::sync::Arc<Bvh> {
+    let key = mesh_key(p);
     if let Ok(g) = BVHS.lock()
         && let Some(b) = g.as_ref().and_then(|m| m.get(&key))
     {

@@ -124,6 +124,10 @@ fn a_map_stays_fast() {
     let t0 = Instant::now();
     let _ = s.verify_checks(&spec);
     budget("verify grounded on the map", t0.elapsed(), 3000);
+    // Solids are cached across calls: an agent verifies after every edit.
+    let t0 = Instant::now();
+    let _ = s.verify_checks(&spec);
+    budget("verify grounded again", t0.elapsed(), 150);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
