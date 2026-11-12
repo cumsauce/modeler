@@ -292,7 +292,7 @@ fn main() -> AppExit {
             // The grid covers the window's own view: rebuild it only when
             // it shows (parallel agents switch the active document per call).
             track_recency.run_if(windowed),
-            rebuild_scene.run_if(windowed).run_if(grid_off),
+            rebuild_scene.run_if(windowed).run_if(scene_wanted),
             (playback_keys, play_animation)
                 .chain()
                 .after(rebuild_scene)
@@ -372,7 +372,10 @@ fn main() -> AppExit {
                 Update,
                 (toggle_grid_key, update_grid.after(apply_layout)).run_if(windowed),
             )
-            .add_systems(Update, (process_agent_shot.run_if(windowed),));
+            .add_systems(
+                Update,
+                (process_agent_shot.run_if(windowed).after(rebuild_scene),),
+            );
     }
     // Catch a main-thread panic so the exit line and lock cleanup still run.
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.run()));

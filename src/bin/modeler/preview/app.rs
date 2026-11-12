@@ -252,6 +252,7 @@ pub(crate) fn rebuild_scene(
         return;
     }
     built.version = Some(version);
+    pbr_cache.tick();
     for e in existing.iter().chain(&pins).chain(&lights) {
         commands.entity(e).despawn();
     }
@@ -259,18 +260,18 @@ pub(crate) fn rebuild_scene(
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
     // Bake every part's material at once (in parallel) before spawning.
+    let is_drawn = drawn(&modeler.session.model);
     modeler::material::pbr::prebake(
         modeler
             .session
             .model
             .parts
             .iter()
-            .filter(|p| !p.verts.is_empty() && drawn(&modeler.session.model, p))
+            .filter(|p| !p.verts.is_empty() && is_drawn(p))
             .map(|p| &**p),
     );
     for part in &modeler.session.model.parts {
-        if part.verts.is_empty() || part.indices.is_empty() || !drawn(&modeler.session.model, part)
-        {
+        if part.verts.is_empty() || part.indices.is_empty() || !is_drawn(part) {
             continue;
         }
         commands.spawn((
@@ -315,11 +316,6 @@ pub(crate) fn rebuild_scene(
         built.framed = Some(name);
     }
 }
-
-/// Preview materials of procedurally textured parts, by bake key, so a
-/// scene rebuild (every model change) reuses the GPU textures.
-#[derive(Resource, Default)]
-pub(crate) struct PbrCache(std::collections::HashMap<u64, Handle<StandardMaterial>>);
 
 /// Uploads one RGBA8 texture with a box-filtered mip chain and a repeating,
 /// anisotropic sampler.
@@ -386,7 +382,9 @@ fn pbr_material(
         }
         h.finish()
     };
-    if let Some(h) = cache.0.get(&key) {
+    let generation = cache.generation;
+    if let Some((h, used)) = cache.pbr.get_mut(&key) {
+        *used = generation;
         return Some(h.clone());
     }
     let ch = match modeler::material::pbr::bake_part(part) {
@@ -453,12 +451,79 @@ fn pbr_material(
     if let Some(v) = x.ior {
         m.ior = v;
     }
-    if cache.0.len() > 256 {
-        cache.0.clear();
-    }
+
     let h = materials.add(m);
-    cache.0.insert(key, h.clone());
+    cache.pbr.insert(key, (h.clone(), generation));
     Some(h)
+}
+
+/// GPU meshes and flat materials shared between rebuilds, prefab
+/// instances, scatter copies, grid tiles and agent views: a rebuild uploads
+/// only geometry it hasn't seen (keyed by content), and parts with the same
+/// flat look share one material so Bevy can batch them.
+#[derive(Resource, Default)]
+pub(crate) struct PbrCache {
+    pbr: std::collections::HashMap<u64, (Handle<StandardMaterial>, u64)>,
+    /// (verts ptr, lengths, sampled content) -> content hash, so unchanged
+    /// parts aren't rehashed every rebuild.
+    fingerprints: std::collections::HashMap<(usize, usize, usize, u64), u64>,
+    meshes: std::collections::HashMap<(u64, bool), (Handle<Mesh>, u64)>,
+    flat: std::collections::HashMap<[u32; 6], Handle<StandardMaterial>>,
+    generation: u64,
+}
+
+impl PbrCache {
+    /// Called once per rebuild: drops meshes no rebuild used for a while.
+    pub(crate) fn tick(&mut self) {
+        self.generation += 1;
+        let g = self.generation;
+        self.meshes.retain(|_, (_, used)| g - *used < 32);
+        // Textures are dear to re-bake: keep up to 256, the least recently
+        // used go first.
+        if self.pbr.len() > 256 {
+            let mut ages: Vec<u64> = self.pbr.values().map(|(_, u)| *u).collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() - 256];
+            self.pbr.retain(|_, (_, u)| *u >= cut);
+        }
+        if self.fingerprints.len() > 8192 {
+            self.fingerprints.clear();
+        }
+        if self.flat.len() > 4096 {
+            self.flat.clear();
+        }
+    }
+}
+
+fn mesh_hash(part: &Part, cache: &mut PbrCache) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let (nv, ni) = (part.verts.len(), part.indices.len());
+    let sample = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for k in 0..32 {
+            part.verts[k * nv / 32].map(f32::to_bits).hash(&mut h);
+            part.indices[k * ni / 32].hash(&mut h);
+        }
+        h.finish()
+    };
+    let fp = (part.verts.as_ptr() as usize, nv, ni, sample);
+    if let Some(h) = cache.fingerprints.get(&fp) {
+        return *h;
+    }
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    for v in &part.verts {
+        v.map(f32::to_bits).hash(&mut b);
+    }
+    for v in &part.normals {
+        v.map(f32::to_bits).hash(&mut b);
+    }
+    for v in &part.uvs {
+        v.map(f32::to_bits).hash(&mut b);
+    }
+    part.indices.hash(&mut b);
+    let h = b.finish();
+    cache.fingerprints.insert(fp, h);
+    h
 }
 
 pub(crate) fn part_bundle(
@@ -468,45 +533,67 @@ pub(crate) fn part_bundle(
     images: &mut Assets<Image>,
     cache: &mut PbrCache,
 ) -> impl Bundle {
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
-    .with_inserted_indices(Indices::U32(part.indices.clone()));
-    if !part.normals.is_empty() {
-        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
-    }
-    if !part.uvs.is_empty() {
-        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs.clone());
-    }
     let textured = pbr_material(part, materials, images, cache);
-    if textured.is_some()
-        && !part.normals.is_empty()
-        && !part.uvs.is_empty()
-        && let Err(e) = mesh.generate_tangents()
-    {
-        eprintln!("tangents for `{}`: {e}", part.name);
-    }
+    let tangents = textured.is_some() && !part.normals.is_empty() && !part.uvs.is_empty();
+    // Rigged parts are re-posed in place by playback: they keep their own
+    // mesh with its data on the CPU side.
+    let shared = part.rig.is_none();
+    let key = shared.then(|| (mesh_hash(part, cache), tangents));
+    let generation = cache.generation;
+    let cached = key.and_then(|k| cache.meshes.get_mut(&k)).map(|(h, used)| {
+        *used = generation;
+        h.clone()
+    });
+    let mesh = cached.unwrap_or_else(|| {
+        // Main-world data stays: picking ray-casts these meshes.
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+        .with_inserted_indices(Indices::U32(part.indices.clone()));
+        if !part.normals.is_empty() {
+            mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+        }
+        if !part.uvs.is_empty() {
+            mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs.clone());
+        }
+        if tangents && let Err(e) = mesh.generate_tangents() {
+            eprintln!("tangents for `{}`: {e}", part.name);
+        }
+        let h = meshes.add(mesh);
+        if let Some(k) = key {
+            cache.meshes.insert(k, (h.clone(), generation));
+        }
+        h
+    });
     let material = textured.unwrap_or_else(|| {
         let [r, g, b, a] = part.material.base_color;
-        materials.add(StandardMaterial {
-            base_color: Color::srgba(r, g, b, a),
-            perceptual_roughness: part.material.roughness,
-            metallic: part.material.metalness,
-            // A colour with alpha (glass, holograms) blends; Bevy renders
-            // blended materials forward, over the deferred opaque pass.
-            alpha_mode: if a < 0.999 {
-                AlphaMode::Blend
-            } else {
-                AlphaMode::Opaque
-            },
-            ..default()
-        })
+        let fkey = [r, g, b, a, part.material.roughness, part.material.metalness].map(f32::to_bits);
+        cache
+            .flat
+            .entry(fkey)
+            .or_insert_with(|| {
+                materials.add(StandardMaterial {
+                    base_color: Color::srgba(r, g, b, a),
+                    perceptual_roughness: part.material.roughness,
+                    metallic: part.material.metalness,
+                    // A colour with alpha (glass, holograms) blends; Bevy
+                    // renders blended materials forward, over the deferred
+                    // opaque pass.
+                    alpha_mode: if a < 0.999 {
+                        AlphaMode::Blend
+                    } else {
+                        AlphaMode::Opaque
+                    },
+                    ..default()
+                })
+            })
+            .clone()
     });
     (
         Name::new(part.name.clone()),
-        Mesh3d(meshes.add(mesh)),
+        Mesh3d(mesh),
         MeshMaterial3d(material),
         Transform {
             translation: Vec3::from_array(part.translation),
@@ -783,12 +870,16 @@ pub(crate) fn draw_game_gizmos(
 /// a hidden terrain too. A map hides its ground so the export leaves it to
 /// the game (which builds it from the heights file), but without it the
 /// window showed only marker gizmos over empty space.
-pub(crate) fn drawn(model: &modeler::Model, part: &modeler::Part) -> bool {
-    part.visible
-        || model
-            .ops
-            .iter()
-            .any(|o| matches!(o, modeler::Op::Terrain { name, .. } if *name == part.name))
+pub(crate) fn drawn(model: &modeler::Model) -> impl Fn(&modeler::Part) -> bool + '_ {
+    let terrains: std::collections::HashSet<&str> = model
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            modeler::Op::Terrain { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    move |p| p.visible || terrains.contains(p.name.as_str())
 }
 
 /// The models markers name in `preview` (what game code builds there), each

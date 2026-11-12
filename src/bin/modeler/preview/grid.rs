@@ -165,6 +165,15 @@ pub(crate) fn grid_off(grid: Res<Grid>) -> bool {
     !grid.on
 }
 
+/// The window's scene is rebuilt when it shows, and while agent shots are
+/// waiting (they render it from their own camera, grid or not).
+pub(crate) fn scene_wanted(
+    grid: Res<Grid>,
+    shots: Res<crate::preview::agent_rig::PendingAgentShots>,
+) -> bool {
+    !grid.on || !shots.0.is_empty()
+}
+
 pub(crate) fn toggle_grid_key(
     keys: Res<ButtonInput<KeyCode>>,
     typing: Res<PinTyping>,
@@ -534,6 +543,7 @@ pub(crate) fn update_grid(
             for e in tile.parts.drain(..) {
                 commands.entity(e).despawn();
             }
+            pbr_cache.tick();
             // An inactive document restored from the autosave may hold
             // only its ops: derive its parts on a copy.
             let derived;
@@ -545,15 +555,12 @@ pub(crate) fn update_grid(
             } else {
                 model
             };
+            let drawn = crate::preview::app::drawn(model);
             let visible: Vec<&modeler::Part> = model
                 .parts
                 .iter()
                 .map(|p| &**p)
-                .filter(|p| {
-                    !p.verts.is_empty()
-                        && !p.indices.is_empty()
-                        && crate::preview::app::drawn(model, p)
-                })
+                .filter(|p| !p.verts.is_empty() && !p.indices.is_empty() && drawn(p))
                 .collect();
             modeler::material::pbr::prebake(visible.iter().copied());
             tile.parts_n = visible.len();
