@@ -1457,7 +1457,7 @@ Esc deselects, C toggles comments, G All documents.
   its comments with "Add a comment", or, with nothing selected, every
   comment numbered like its pin (click selects the part, × deletes). The
   comment box (`comments.rs`) opens inside it (Enter commits, Esc cancels);
-  right-clicking a left-pane row or a material node comments on that.
+  right-clicking a left-pane row or a material node comments on that. A right-click on a part in the 3D view pins a comment on that spot any time (comments open or not); the box opens at the top of the pane, wraps long text, and keeps its draft when the pane rebuilds. The app icon is `icons/app-icon.png` (drawn from `icons/app-icon.svg`; `preview/app_icon.rs` sets the Dock icon on macOS, the window icon elsewhere).
   The comments chip ends the 3D view's HUD row.
 - **All documents** tiles are cheap by design: each is its own camera on
   its own render layer rendering into its own image, active only for a few

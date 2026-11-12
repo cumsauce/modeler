@@ -367,6 +367,7 @@ fn main() -> AppExit {
             .add_plugins((
                 workbench_plugin,
                 crate::preview::ds::ds_plugin,
+                crate::preview::app_icon::app_icon_plugin,
                 top_bar_plugin,
                 doc_popup_plugin,
                 right_pane_plugin,

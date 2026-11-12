@@ -179,9 +179,12 @@ pub(crate) fn comment_box(
         }
     }
     if cb.is_open() {
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
         if keys.just_pressed(KeyCode::Escape) {
             cb.action = Some(Action::Cancel);
-        } else if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
+        } else if !shift
+            && (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter))
+        {
             cb.action = Some(Action::Submit);
         }
     }
@@ -429,7 +432,25 @@ pub(crate) fn tag_input(
 ) {
     for (e, parent) in &new {
         if hosts.contains(parent.parent()) {
-            commands.entity(e).insert(CommentInput);
+            // Long comments wrap onto more lines instead of scrolling
+            // sideways out of sight.
+            commands.entity(e).insert((
+                CommentInput,
+                TextLayout::linebreak(LineBreak::WordBoundary),
+                Node {
+                    flex_grow: 1.0,
+                    width: Val::Percent(100.0),
+                    ..default()
+                },
+            ));
+            commands.entity(parent.parent()).insert(Node {
+                min_height: Val::Px(52.0),
+                width: Val::Percent(100.0),
+                align_items: AlignItems::FlexStart,
+                padding: UiRect::all(Val::Px(6.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            });
         }
     }
 }

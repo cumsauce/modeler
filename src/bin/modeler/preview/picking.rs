@@ -56,6 +56,10 @@ pub(crate) fn click_in_view(
             .map(|c| (c, (c - view.rect.min) * w.scale_factor()))
     });
     let clicked = mouse.just_released(MouseButton::Left) && drag.moved <= 6.0;
+    // A right-click (not a right-drag look) pins a comment on that spot,
+    // whether or not comments are open.
+    let right = mouse.just_released(MouseButton::Right) && drag.moved <= 6.0;
+    let clicked = clicked || right;
     let Some((at, cursor)) = cursor.filter(|_| !wb.ui_hover && drag.button.is_none() || clicked)
     else {
         if wb.hover.is_some() {
@@ -93,7 +97,7 @@ pub(crate) fn click_in_view(
     if !clicked || wb.ui_hover {
         return;
     }
-    if !wb.show_comments {
+    if !wb.show_comments && !right {
         if wb.selected != name {
             wb.selected = name;
         }

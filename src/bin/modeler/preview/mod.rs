@@ -38,4 +38,5 @@ mod minimap;
 pub(crate) use minimap::*;
 mod shading;
 pub(crate) use shading::*;
+pub(crate) mod app_icon;
 pub(crate) mod ds;

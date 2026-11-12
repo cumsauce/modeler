@@ -141,6 +141,11 @@ fn update_right_pane(
         .collect();
     if let Some(sel) = &wb.selected {
         b.header(&mut commands, sel, PaneButton::Deselect);
+        // An open comment box goes first, where the eye is.
+        if cb.is_open() {
+            let host = b.host(&mut commands);
+            cb.set_host(Some(host));
+        }
         let rows = properties(model, sel);
         let list = b.section(&mut commands);
         for (k, v) in rows {
@@ -165,9 +170,9 @@ fn update_right_pane(
         for a in &mine {
             b.comment(&mut commands, list, a);
         }
-        let host = b.host(&mut commands);
-        cb.set_host(Some(host));
         if !cb.is_open() {
+            let host = b.host(&mut commands);
+            cb.set_host(Some(host));
             b.button(&mut commands, host, "Add a comment", PaneButton::AddComment);
         }
     } else {
@@ -176,6 +181,10 @@ fn update_right_pane(
             &format!("Comments · {}", notes.len()),
             PaneButton::CloseComments,
         );
+        if cb.is_open() {
+            let host = b.host(&mut commands);
+            cb.set_host(Some(host));
+        }
         let list = b.section(&mut commands);
         if notes.is_empty() {
             b.hint(&mut commands, list, "No comments yet.");
@@ -183,13 +192,13 @@ fn update_right_pane(
         for a in &notes {
             b.comment(&mut commands, list, a);
         }
-        let host = b.host(&mut commands);
-        cb.set_host(Some(host));
         if !cb.is_open() {
+            let host = b.host(&mut commands);
+            cb.set_host(Some(host));
             b.hint(
                 &mut commands,
                 host,
-                "Click the model to place a pin and comment on that spot.",
+                "Click the model (or right-click it any time) to pin a comment on that spot.",
             );
         }
     }

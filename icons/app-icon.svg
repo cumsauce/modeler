@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262b36"/><stop offset="1" stop-color="#12141a"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b9d6ff"/><stop offset="1" stop-color="#8bb9ff"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6aa6ff"/><stop offset="1" stop-color="#3f7fe0"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f62b8"/><stop offset="1" stop-color="#1d4185"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- ground grid -->
+  <g stroke="#6aa6ff" stroke-opacity="0.16" stroke-width="4" fill="none">
+    <path d="M 232 690 L 512 852 L 792 690"/>
+    <path d="M 302 650 L 512 772"/><path d="M 722 650 L 512 772"/>
+  </g>
+  <!-- cube -->
+  <path d="M512 250 L742 383 L512 516 L282 383 Z" fill="url(#top)"/>
+  <path d="M282 383 L512 516 L512 782 L282 649 Z" fill="url(#left)"/>
+  <path d="M742 383 L512 516 L512 782 L742 649 Z" fill="url(#right)"/>
+  <!-- edges -->
+  <g stroke="#e8f1ff" stroke-width="7" stroke-linejoin="round" fill="none" stroke-opacity="0.9">
+    <path d="M512 250 L742 383 L742 649 L512 782 L282 649 L282 383 Z"/>
+    <path d="M282 383 L512 516 L742 383 M512 516 L512 782"/>
+  </g>
+  <!-- vertices -->
+  <g fill="#ffffff" stroke="#1d4185" stroke-width="6">
+    <circle cx="512" cy="250" r="17"/><circle cx="742" cy="383" r="17"/><circle cx="282" cy="383" r="17"/>
+    <circle cx="512" cy="516" r="17"/><circle cx="742" cy="649" r="17"/><circle cx="282" cy="649" r="17"/>
+    <circle cx="512" cy="782" r="17"/>
+  </g>
+  <!-- selected vertex -->
+  <circle cx="742" cy="383" r="30" fill="none" stroke="#ffd37a" stroke-width="7"/>
+</svg>
