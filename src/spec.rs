@@ -799,6 +799,225 @@ pub struct HullSpec {
     inputs: Vec<String>,
 }
 
+/// One scatter input: a part (or `*` pattern: every matching visible part
+/// moves as one set, e.g. a prefab instance `"tree1.*"`), or a list of parts
+/// moved as one set (`["oak", "oak_leaves"]`).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ScatterEntry {
+    One(String),
+    Set(Vec<String>),
+}
+
+/// A part, or a list of entries (one is picked at random per copy).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ScatterInput {
+    One(String),
+    Many(Vec<ScatterEntry>),
+}
+
+/// A number (fixed) or [min, max].
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RangeArg {
+    One(f32),
+    Two([f32; 2]),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegionSpec {
+    /// [x, z] corner.
+    min: [f32; 2],
+    /// [x, z] corner.
+    max: [f32; 2],
+}
+
+/// Copies of parts strewn over another part's surface (rocks on terrain,
+/// grass tufts, mushrooms on a log, rivets on a hull, a forest): outputs
+/// name_0..name_{n-1}, each standing with its base on the surface. Hide the
+/// source parts.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScatterSpec {
+    name: String,
+    /// What to strew: "rock", or ["rock_a", "rock_b"] (one picked per copy),
+    /// or sets moved as one body: [["oak", "oak_leaves"], "tree1.*"]. An
+    /// lsystem's leaves come along with its wood ("oak" = ["oak", "oak_leaves"]).
+    input: ScatterInput,
+    /// The part whose surface they land on.
+    on: String,
+    /// Number of copies (fewer when spacing, slope or region leave no room).
+    #[serde(default)]
+    count: Option<u32>,
+    /// Copies per square meter of eligible surface, instead of count.
+    #[serde(default)]
+    density: Option<f32>,
+    /// Cap with density (default 2000, at most 10000).
+    #[serde(default)]
+    max: Option<u32>,
+    /// Same seed = same layout (default 1).
+    #[serde(default)]
+    seed: Option<u64>,
+    /// Uniform scale: a number or a random [min, max] range (default 1).
+    #[serde(default)]
+    scale: Option<RangeArg>,
+    /// "random_y" (default: spin about up), "random" (any orientation:
+    /// tumbled rocks) or "none".
+    #[serde(default)]
+    rotate: Option<String>,
+    /// 0 (default) = stay upright (trees), 1 = stand along the surface
+    /// normal (mushrooms on a log, rivets on a hull); between leans partly.
+    #[serde(default)]
+    align: Option<f32>,
+    /// Minimum distance between copies, meters. Default: 0.8 x the widest
+    /// copy's footprint (no overlaps); 0 allows clumps.
+    #[serde(default)]
+    min_spacing: Option<f32>,
+    /// Steepest surface used, degrees from level (e.g. 30: no trees on cliffs).
+    #[serde(default)]
+    max_slope: Option<f32>,
+    /// Extra depth pushed into the surface, meters (default 0; copies
+    /// already sink until their base is at or below the surface).
+    #[serde(default)]
+    sink: Option<f32>,
+    /// Only points with x, z inside {"min": [x, z], "max": [x, z]}.
+    #[serde(default)]
+    region: Option<RegionSpec>,
+    /// "up" (default: faces pointing up) or "all" (sides and undersides too,
+    /// with align 1: mushrooms round a log).
+    #[serde(default)]
+    faces: Option<String>,
+    /// Relative odds per input entry (default equal).
+    #[serde(default)]
+    weights: Option<Vec<f32>>,
+}
+
+impl ScatterSpec {
+    fn into_op(self, ctx: &str) -> Result<Op, String> {
+        let input: Vec<Vec<String>> = match self.input {
+            ScatterInput::One(s) => vec![vec![s]],
+            ScatterInput::Many(v) => v
+                .into_iter()
+                .map(|e| match e {
+                    ScatterEntry::One(s) => vec![s],
+                    ScatterEntry::Set(v) => v,
+                })
+                .collect(),
+        };
+        if input.is_empty() || input.iter().any(Vec::is_empty) {
+            return Err(format!(
+                "{ctx}: input: name at least one part in every entry"
+            ));
+        }
+        if input.iter().flatten().any(|n| n == &self.on) {
+            return Err(format!("{ctx}: input: `{}` is also `on`", self.on));
+        }
+        let mut def = crate::scatter::ScatterDef::default();
+        match (self.count, self.density) {
+            (Some(_), Some(_)) => {
+                return Err(format!("{ctx}: give count or density, not both"));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "{ctx}: count: say how many (count: 40) or how dense (density: 0.5 per m²)"
+                ));
+            }
+            (Some(c), None) => {
+                if c > crate::scatter::MAX_COPIES {
+                    return Err(format!(
+                        "{ctx}: count: at most {} copies",
+                        crate::scatter::MAX_COPIES
+                    ));
+                }
+                def.count = Some(c);
+            }
+            (None, Some(d)) => {
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(format!("{ctx}: density: must be > 0 per square meter"));
+                }
+                def.density = Some(d);
+            }
+        }
+        if let Some(m) = self.max {
+            def.max = m.min(crate::scatter::MAX_COPIES);
+        }
+        if let Some(seed) = self.seed {
+            def.seed = seed;
+        }
+        if let Some(r) = self.scale {
+            def.scale = match r {
+                RangeArg::One(x) => [x, x],
+                RangeArg::Two(v) => v,
+            };
+            if def.scale.iter().any(|x| !(x.is_finite() && *x > 0.0)) {
+                return Err(format!("{ctx}: scale: must be > 0"));
+            }
+        }
+        if let Some(r) = self.rotate {
+            if !matches!(r.as_str(), "random_y" | "random" | "none") {
+                return Err(format!(
+                    "{ctx}: rotate: `{r}` (one of random_y, random, none)"
+                ));
+            }
+            def.rotate = r;
+        }
+        if let Some(a) = self.align {
+            if !(0.0..=1.0).contains(&a) {
+                return Err(format!("{ctx}: align: 0 (upright) .. 1 (along the normal)"));
+            }
+            def.align = a;
+        }
+        if let Some(m) = self.min_spacing {
+            if !(m.is_finite() && m >= 0.0) {
+                return Err(format!("{ctx}: min_spacing: must be >= 0 meters"));
+            }
+            def.min_spacing = Some(m);
+        }
+        if let Some(m) = self.max_slope {
+            if !(0.0..=180.0).contains(&m) {
+                return Err(format!("{ctx}: max_slope: degrees 0..180"));
+            }
+            def.max_slope = Some(m);
+        }
+        if let Some(x) = self.sink {
+            def.sink = x;
+        }
+        if let Some(r) = self.region {
+            def.region = Some([
+                [r.min[0].min(r.max[0]), r.min[1].min(r.max[1])],
+                [r.min[0].max(r.max[0]), r.min[1].max(r.max[1])],
+            ]);
+        }
+        if let Some(f) = self.faces {
+            if !matches!(f.as_str(), "up" | "all") {
+                return Err(format!("{ctx}: faces: `{f}` (up or all)"));
+            }
+            def.faces = f;
+        }
+        if let Some(w) = self.weights {
+            if w.len() != input.len() {
+                return Err(format!(
+                    "{ctx}: weights: {} given for {} input entries",
+                    w.len(),
+                    input.len()
+                ));
+            }
+            if w.iter().any(|x| !(x.is_finite() && *x >= 0.0)) || w.iter().sum::<f32>() <= 0.0 {
+                return Err(format!("{ctx}: weights: >= 0 and not all 0"));
+            }
+            def.weights = w;
+        }
+        Ok(Op::Scatter {
+            name: self.name,
+            input,
+            on: self.on,
+            def: Box::new(def),
+        })
+    }
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoundSpec {
@@ -1191,6 +1410,7 @@ pub enum OpSpec {
     Sweep(SweepSpec),
     Lsystem(LSystemSpec),
     Hull(HullSpec),
+    Scatter(ScatterSpec),
     Round(RoundSpec),
     Shell(ShellSpec),
     Transform(TransformSpec),
@@ -1225,6 +1445,7 @@ pub const OP_TYPES: &[&str] = &[
     "sweep",
     "lsystem",
     "hull",
+    "scatter",
     "round",
     "shell",
     "transform",
@@ -1624,6 +1845,10 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 inputs: s.inputs,
             })
         }
+        "scatter" => {
+            let s: ScatterSpec = de(&ctx, &body)?;
+            BatchItem::Op(s.into_op(&ctx)?)
+        }
         "round" => {
             let s: RoundSpec = de(&ctx, &body)?;
             if !["fillet", "chamfer", "smooth"].contains(&s.mode.as_str()) {
@@ -2015,6 +2240,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "hull" => {
             json!({"type": "hull", "name": "pill", "inputs": ["ball_a", "ball_b"]})
         }
+        "scatter" => {
+            json!({"type": "scatter", "name": "rocks", "input": ["rock_a", "rock_b"], "on": "ground", "count": 40, "seed": 2, "scale": [0.6, 1.4], "rotate": "random", "align": 0.5, "max_slope": 35})
+        }
         "round" => {
             json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})
         }
@@ -2105,6 +2333,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "sweep" => schemars::schema_for!(SweepSpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "hull" => schemars::schema_for!(HullSpec),
+        "scatter" => schemars::schema_for!(ScatterSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),

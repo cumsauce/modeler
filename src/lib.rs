@@ -79,6 +79,7 @@ pub mod outline;
 pub mod params;
 pub mod primitives;
 pub mod raster;
+pub mod scatter;
 pub mod simplify;
 pub mod spec;
 pub mod style;
@@ -848,6 +849,16 @@ pub enum Op {
         name: String,
         #[serde(flatten)]
         def: Box<crate::lsystem::LSystem>,
+    },
+    /// Copies of parts (each set moved as one body) strewn over `on`'s
+    /// surface: outputs `name_0..`.
+    Scatter {
+        name: String,
+        /// Sets of parts, one picked per copy (globs already resolved).
+        input: Vec<Vec<String>>,
+        on: String,
+        #[serde(flatten)]
+        def: Box<crate::scatter::ScatterDef>,
     },
     /// Convex hull of several parts.
     Hull { name: String, inputs: Vec<String> },

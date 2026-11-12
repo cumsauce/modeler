@@ -619,6 +619,23 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 upsert(named, &format!("{name}_leaves"), l);
             }
         }
+        Op::Scatter {
+            name,
+            input,
+            on,
+            def,
+        } => {
+            let sets: Vec<Vec<Arc<Part>>> = input
+                .iter()
+                .map(|set| set.iter().map(|n| lookup_shared(named, n)).collect())
+                .collect::<Result<_, _>>()?;
+            let on_part = lookup_shared(named, on)?;
+            let copies = crate::scatter::build(name, &sets, &on_part, def)
+                .map_err(|e| format!("scatter `{name}`: {e}"))?;
+            for (n, p) in copies {
+                upsert(named, &n, p);
+            }
+        }
         Op::Hull { name, inputs } => {
             let parts: Vec<Arc<Part>> = inputs
                 .iter()
@@ -1036,6 +1053,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Sweep { name, .. }
         | Op::Hull { name, .. }
         | Op::LSystem { name, .. }
+        | Op::Scatter { name, .. }
         | Op::Round { name, .. }
         | Op::Shell { name, .. }
         | Op::Transform { name, .. }
@@ -1068,6 +1086,9 @@ pub fn outputs(op: &Op) -> Vec<String> {
         }
         Op::LinearArray { name, count, .. } => (1..*count).map(|i| format!("{name}_{i}")).collect(),
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
+        Op::Scatter {
+            name, input, def, ..
+        } => crate::scatter::output_names(name, input, def),
         Op::LSystem { name, def } => {
             let mut v = vec![name.clone()];
             if def.has_leaves() {
@@ -1094,6 +1115,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Sweep { .. } => "sweep",
         Op::Hull { .. } => "hull",
         Op::LSystem { .. } => "lsystem",
+        Op::Scatter { .. } => "scatter",
         Op::Round { .. } => "round",
         Op::Shell { .. } => "shell",
         Op::Transform { .. } => "transform",
@@ -1136,6 +1158,11 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         }
         Op::Round { input, .. } => vec![input],
         Op::Shell { input, .. } => vec![input],
+        Op::Scatter { input, on, .. } => {
+            let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
+            v.push(on);
+            v
+        }
         Op::Primitive {
             frame: Some(frame), ..
         } => vec![frame_part(frame)],
@@ -1322,6 +1349,25 @@ pub fn describe(ops: &[Op]) -> String {
                 "#{i} sweep `{name}` profile={profile:?} path={path:?} closed={closed} round={round}"
             ),
             Op::Hull { name, inputs } => format!("#{i} hull `{name}` of {inputs:?}"),
+            Op::Scatter {
+                name,
+                input,
+                on,
+                def,
+            } => format!(
+                "#{i} scatter `{name}` of {input:?} on `{on}` count={:?} density={:?} seed={} scale={:?} rotate={} align={} min_spacing={:?} max_slope={:?} sink={} faces={} region={:?}",
+                def.count,
+                def.density,
+                def.seed,
+                def.scale,
+                def.rotate,
+                def.align,
+                def.min_spacing,
+                def.max_slope,
+                def.sink,
+                def.faces,
+                def.region
+            ),
             Op::LSystem { name, def } => format!(
                 "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
                 def.axiom,

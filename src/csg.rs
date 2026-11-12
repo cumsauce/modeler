@@ -39,17 +39,15 @@ pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
         projected = p;
         &projected
     };
+    // In f64: a small part far from the origin (a scattered rock at x = 10)
+    // would otherwise round its vertices to f32 steps coarser than the weld
+    // grid below, splitting poles and seams.
+    let (rot, scale, t) = (rot.as_dquat(), scale.as_dvec3(), t.as_dvec3());
     let mut props = Vec::with_capacity(src.verts.len() * N_PROPS);
     for (i, v) in src.verts.iter().enumerate() {
-        let p = rot * (Vec3::from(*v) * scale) + t;
+        let p = rot * (Vec3::from(*v).as_dvec3() * scale) + t;
         let uv = src.uvs.get(i).copied().unwrap_or([0.0; 2]);
-        props.extend([
-            p.x as f64,
-            p.y as f64,
-            p.z as f64,
-            uv[0] as f64,
-            uv[1] as f64,
-        ]);
+        props.extend([p.x, p.y, p.z, uv[0] as f64, uv[1] as f64]);
     }
     let count = src.verts.len();
     let tris: Vec<usize> = if src.indices.is_empty() {
@@ -87,8 +85,58 @@ pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
     let mut first: std::collections::HashMap<[i64; 3], usize> = Default::default();
     let mut rep = vec![0usize; count];
     let (mut merge_from, mut merge_to) = (Vec::new(), Vec::new());
+    // A seam pair can straddle a cell boundary (a rotated copy puts its
+    // vertices anywhere): a vertex near a boundary also looks for a partner
+    // in the neighbouring cell, within half a cell on every axis.
+    let near_partner =
+        |i: usize, k: [i64; 3], first: &std::collections::HashMap<[i64; 3], usize>| {
+            let x = [0, 1, 2].map(|a| props[i * N_PROPS + a] * inv);
+            let step = [0, 1, 2].map(|a| {
+                let f = x[a] - k[a] as f64;
+                if f > 0.25 {
+                    1
+                } else if f < -0.25 {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if step == [0; 3] {
+                return None;
+            }
+            for mask in 1..8u8 {
+                let mut c = k;
+                let mut valid = true;
+                for a in 0..3 {
+                    if mask & (1 << a) != 0 {
+                        if step[a] == 0 {
+                            valid = false;
+                            break;
+                        }
+                        c[a] += step[a];
+                    }
+                }
+                if !valid {
+                    continue;
+                }
+                if let Some(&j) = first.get(&c)
+                    && (0..3).all(|a| (props[j * N_PROPS + a] * inv - x[a]).abs() <= 0.5)
+                {
+                    return Some(j);
+                }
+            }
+            None
+        };
     for (i, r) in rep.iter_mut().enumerate() {
-        let f = *first.entry(key(i)).or_insert(i);
+        let k = key(i);
+        let f = match first.get(&k) {
+            Some(&f) => f,
+            None => {
+                let f = near_partner(i, k, &first).unwrap_or(i);
+                first.insert(k, f);
+                f
+            }
+        };
         *r = f;
         if f != i {
             merge_from.push(i as u64);

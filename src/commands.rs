@@ -480,7 +480,7 @@ fn order_producers<T>(items: Vec<(BatchItem, T)>) -> Vec<(BatchItem, T)> {
                 .filter(|&j| {
                     produces(&items[j].0)
                         .iter()
-                        .any(|o| ins.contains(&o.as_str()))
+                        .any(|o| ins.iter().any(|p| crate::name_matches(p, o)))
                 })
                 .collect()
         })
@@ -1138,6 +1138,7 @@ impl Session {
                 if let Some(c) = raw.get("count").and_then(|v| v.as_u64()) {
                     match ty {
                         "linear_array" => names.extend((1..c).map(|i| format!("{n}_{i}"))),
+                        "scatter" => names.extend((0..c).map(|i| format!("{n}_{i}"))),
                         "radial_array" => {
                             let first =
                                 raw.get("include_source").and_then(|v| v.as_bool()) != Some(false);
@@ -1246,6 +1247,10 @@ impl Session {
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
                 self.resolve_pbr(&mut item)
                     .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
+                if let BatchItem::Op(op) = &mut item {
+                    self.resolve_scatter(op)
+                        .map_err(|e| format!("re-deriving `{name}`: {e}"))?;
+                }
                 stale.push((item, Some(raw.clone())));
             }
         }
@@ -1289,6 +1294,89 @@ impl Session {
 
     /// Replaces the model's style (or patches it with `patch`) and re-derives
     /// every templated op whose resolved form changed, as one history step.
+    /// Resolves a scatter's input entries against the live model: a `*`
+    /// pattern becomes the set of visible parts it matches (a prefab
+    /// instance), and a lone lsystem name brings its leaves along.
+    pub fn resolve_scatter(&self, op: &mut Op) -> Result<(), ModelerError> {
+        let Op::Scatter {
+            name, input, on, ..
+        } = op
+        else {
+            return Ok(());
+        };
+        let mine = format!("{name}_");
+        let mut out = Vec::with_capacity(input.len());
+        for set in input.iter() {
+            let mut resolved: Vec<String> = Vec::new();
+            for entry in set {
+                if entry.contains('*') {
+                    let hits: Vec<String> = self
+                        .model
+                        .parts
+                        .iter()
+                        .filter(|p| {
+                            p.visible
+                                && crate::name_matches(entry, &p.name)
+                                && !p.name.starts_with(&mine)
+                                && p.name != *on
+                        })
+                        .map(|p| p.name.clone())
+                        .collect();
+                    if hits.is_empty() {
+                        return Err(
+                            format!("scatter `{name}`: `{entry}` matches no visible part").into(),
+                        );
+                    }
+                    resolved.extend(hits);
+                } else {
+                    resolved.push(entry.clone());
+                }
+            }
+            if set.len() == 1 && !set[0].contains('*') {
+                let leafy = self.model.ops.iter().any(|o| {
+                    matches!(o, Op::LSystem { name: n, def } if *n == set[0] && def.has_leaves())
+                });
+                let leaves = format!("{}_leaves", set[0]);
+                if leafy && self.model.parts.iter().any(|p| p.name == leaves) {
+                    resolved.push(leaves);
+                }
+            }
+            resolved.dedup();
+            out.push(resolved);
+        }
+        *input = out;
+        Ok(())
+    }
+
+    /// For a scatter with an exact count: its name and that count.
+    fn scatter_note_for(&self, op: &Op) -> Option<(String, Option<u32>)> {
+        match op {
+            Op::Scatter { name, def, .. } => Some((name.clone(), def.count)),
+            _ => None,
+        }
+    }
+
+    /// The scatter result line: how many copies landed (and why fewer).
+    fn scatter_note(&self, name: &str, want: Option<u32>) -> String {
+        let have: std::collections::HashSet<&str> =
+            self.model.parts.iter().map(|p| p.name.as_str()).collect();
+        let mut n = 0;
+        while have.contains(format!("{name}_{n}").as_str()) {
+            n += 1;
+        }
+        let range = match n {
+            0 => "none".to_string(),
+            1 => format!("{name}_0"),
+            _ => format!("{name}_0..{}", n - 1),
+        };
+        match want {
+            Some(w) if n < w as usize => format!(
+                "scatter `{name}`: placed {n} of {w} ({range}); min_spacing, max_slope or region left no room for more (lower min_spacing or widen the surface)"
+            ),
+            _ => format!("scatter `{name}`: placed {n} ({range}); hide the source part(s)"),
+        }
+    }
+
     /// Refreshes a prefab op from its source (an open document first, else
     /// the catalog file): the visible part list, the digest, and the style it
     /// is re-derived with. Returns whether anything changed.
@@ -1513,7 +1601,9 @@ impl Session {
                 .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
             self.resolve_pbr(&mut item)
                 .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
-            if let BatchItem::Op(op) = item {
+            if let BatchItem::Op(mut op) = item {
+                self.resolve_scatter(&mut op)
+                    .map_err(|e| format!("re-styling `{key}`: {e}\n(style unchanged)"))?;
                 changed.push(op);
             }
         }
@@ -1609,11 +1699,17 @@ impl Session {
                 }) if name == input && !self.derived_by_ops(&name) => self
                     .transform_part(&name, translation, rotation, scale)
                     .map_err(fail)?,
-                BatchItem::Op(op) => {
+                BatchItem::Op(mut op) => {
+                    self.resolve_scatter(&mut op)
+                        .map_err(|e| format!("batch item #{i} failed: {e}"))?;
                     let label = Self::op_label(&op);
+                    let note = self.scatter_note_for(&op);
                     self.apply_op(op, &label)
                         .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
-                    format!("{label} ok")
+                    match note {
+                        Some((name, want)) => self.scatter_note(&name, want),
+                        None => format!("{label} ok"),
+                    }
                 }
                 BatchItem::Delete { name } => {
                     if self.model.ops.iter().any(|o| graph::output(o) == name) {
