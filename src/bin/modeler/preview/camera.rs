@@ -60,11 +60,9 @@ pub(crate) fn orbit_camera(
     mut orbit: ResMut<Orbit>,
     mut drag: ResMut<CameraDrag>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
-    panel: Res<StylePane>,
-    mat_pane: Res<MatPane>,
-    outline: Res<OutlinePane>,
+    wb: Res<Workbench>,
 ) {
-    let scroll_y = if panel.hover || mat_pane.hover || outline.hover {
+    let scroll_y = if wb.ui_hover {
         0.0
     } else {
         scroll_lines(&scroll)
@@ -89,7 +87,7 @@ pub(crate) fn orbit_camera(
         .into_iter()
         .find(|b| mouse.pressed(*b))
         // A drag that starts over the node panel belongs to the panel.
-        .filter(|_| drag.button.is_some() || !(panel.hover || mat_pane.hover || outline.hover));
+        .filter(|_| drag.button.is_some() || !wb.ui_hover);
     if let Some(button) = dragging {
         if let Some(cursor) = window.cursor_position() {
             if drag.button != Some(button) {

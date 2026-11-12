@@ -257,21 +257,11 @@ fn main() -> AppExit {
     .insert_resource(AgentRig::default())
     .insert_resource(Orbit::default())
     .init_resource::<CameraDrag>()
-    .insert_resource(StylePane::open(
-        std::env::var("MODELER_STYLE").is_ok_and(|v| v == "1"),
-    ))
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
-    // The style and material panes start closed unless set to 1; O, S, M
-    // and G (the grid of open documents) toggle them.
-    .insert_resource(MatPane::open(
-        std::env::var("MODELER_MATERIALS").is_ok_and(|v| v == "1"),
-    ))
-    // The outliner is the document list (grouped by project): open by
-    // default in the window, MODELER_OUTLINE=0 starts without.
-    .insert_resource(OutlinePane::open(
-        !offscreen && std::env::var("MODELER_OUTLINE").map_or(true, |v| v != "0"),
-    ))
+    // The material graph shows in Material mode; the left pane in a document.
+    .insert_resource(MatPane::open(false))
+    .insert_resource(OutlinePane::open(!offscreen))
     // The grid is the default view in the window (not offscreen, where
     // `screenshot` renders the window camera); MODELER_GRID=0 starts without.
     .insert_resource(Grid::open(
@@ -304,9 +294,7 @@ fn main() -> AppExit {
             spawn_pin_markers.run_if(windowed),
             comment_box.run_if(windowed),
             update_typing_hud.run_if(windowed),
-            update_style_pane.run_if(windowed),
             highlight_selected.run_if(windowed),
-            apply_layout.run_if(windowed),
             update_material_pane.run_if(windowed),
             update_outline_pane.run_if(windowed),
         ),
@@ -364,11 +352,18 @@ fn main() -> AppExit {
             .insert_resource(bevy::feathers::theme::UiTheme(
                 bevy::feathers::dark_theme::create_dark_theme(),
             ))
-            .add_systems(
-                Startup,
-                (setup_toolbar, setup_outline_pane, setup_style_pane),
-            )
-            .add_systems(Update, (sync_toolbar, focus_on_new_agent))
+            .add_systems(Startup, setup_outline_pane)
+            .add_systems(Update, focus_on_new_agent)
+            // The workbench and its panes (each file registers its own systems).
+            .add_plugins((
+                workbench_plugin,
+                top_bar_plugin,
+                doc_popup_plugin,
+                right_pane_plugin,
+                timeline_plugin,
+                minimap_plugin,
+                shading_plugin,
+            ))
             .add_systems(
                 Update,
                 (toggle_grid_key, update_grid.after(apply_layout)).run_if(windowed),

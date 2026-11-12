@@ -1,4 +1,4 @@
-//! The outliner (O): the open documents and the prefab library, then the
+//! The left pane (for now the outliner): the open documents and the prefab library, then the
 //! active document as a hierarchy. Prefab instances and array runs fold
 //! into expandable groups, hidden parts sink into a dimmed group (the tree
 //! is `modeler::outline`). Click a row to select it (its parts pulse in 3D;
@@ -78,14 +78,13 @@ pub(crate) fn update_outline_pane(
     typing: Res<PinTyping>,
     modeler: Res<Modeler>,
     mut pane: ResMut<OutlinePane>,
+    wb: Res<Workbench>,
     mut hud: Query<(&mut Visibility, &ComputedNode), With<OutlineHud>>,
     mut list: Query<(Entity, &mut ScrollPosition), With<OutlineList>>,
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
-    if keys.just_pressed(KeyCode::KeyO) && !typing.open {
-        pane.visible = !pane.visible;
-    }
+    let _ = (&keys, &typing);
     let shown = pane.visible;
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
@@ -101,7 +100,8 @@ pub(crate) fn update_outline_pane(
     }
     let size = computed.size() * computed.inverse_scale_factor();
     let cursor = windows.single().ok().and_then(|w| w.cursor_position());
-    pane.hover = cursor.is_some_and(|c| c.x < size.x && c.y < size.y);
+    let _ = size;
+    pane.hover = cursor.is_some_and(|c| wb.rects.left.contains(c));
     let Ok((list_e, mut pos)) = list.single_mut() else {
         return;
     };
@@ -394,12 +394,13 @@ pub(crate) fn setup_outline_pane(mut commands: Commands, assets: Res<AssetServer
         .spawn((
             Name::new("outliner"),
             OutlineHud,
+            InSlot(PaneSlot::Left),
             Visibility::Hidden,
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(0.0),
                 left: Val::Px(0.0),
-                width: Val::Percent(PANE_FRACTION * 100.0),
+                width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
                 overflow: Overflow::clip(),
                 ..default()

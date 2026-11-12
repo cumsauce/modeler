@@ -1,0 +1,764 @@
+<title>Modeler Workbench</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: top bar (Grid of all documents | one document + its mode). In a document: left = what's in it,
+   centre = the mode's main surface (3D, or the node graph in Material), right = properties / comments tabs. */
+:root {
+  color-scheme: dark;
+  --bg: #15171c; --panel: #1c1f26; --raise: #252932; --line: #2e333e;
+  --fg: #e3e6ec; --dim: #8a91a0; --faint: #5b6270;
+  --accent: #6fa8ff; --accent-soft: rgba(111,168,255,.14);
+  --ok: #5fc48a; --warn: #e2b24f; --bad: #ec6d6d;
+  --a1: #c792ea; --a2: #f6a04d; --a3: #4fd1c5;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--sans); overflow: hidden;
+  padding-left: max(0px, env(safe-area-inset-left, 0px)); padding-right: max(0px, env(safe-area-inset-right, 0px)); }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.app { display: grid; height: 100%; grid-template-rows: 48px 1fr; position: relative; }
+
+/* top bar */
+.top { display: flex; align-items: center; gap: 10px; padding: 0 10px; border-bottom: 1px solid var(--line); background: var(--panel); min-width: 0; }
+.where { display: flex; align-items: stretch; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 2px; min-width: 0; }
+.where > button { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 6px; color: var(--dim); white-space: nowrap; min-width: 0; }
+.where > button[aria-pressed="true"] { background: var(--raise); color: var(--fg); }
+.where .count { font: 11px var(--mono); background: var(--raise); border-radius: 99px; padding: 0 6px; color: var(--dim); }
+.where > button[aria-pressed="true"] .count { background: var(--bg); }
+.docname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.docproj { color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
+.modes { display: flex; gap: 2px; margin-left: 4px; }
+.modes button { padding: 6px 12px; border-radius: 6px; color: var(--dim); display: flex; gap: 6px; align-items: center; }
+.modes button:hover:not(:disabled) { color: var(--fg); }
+.modes button[aria-pressed="true"] { color: var(--fg); background: var(--raise); }
+.modes button:disabled { opacity: .3; cursor: default; }
+.modes[hidden] { display: none !important; }
+.spacer { flex: 1; }
+.agents { display: flex; align-items: center; gap: 4px; }
+.agent { display: flex; align-items: center; gap: 6px; padding: 3px 8px 3px 6px; border-radius: 99px; background: var(--raise); font-size: 12px; color: var(--dim); }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+.dot.live { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.iconbtn { padding: 5px 9px; border-radius: 6px; color: var(--dim); border: 1px solid var(--line); }
+.iconbtn:hover { color: var(--fg); background: var(--raise); }
+
+/* document switcher */
+.docpop { position: absolute; top: 44px; left: 10px; width: 380px; max-width: calc(100vw - 20px); max-height: min(520px, 70vh); display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.5); z-index: 30; }
+.docpop[hidden] { display: none !important; }
+.docpop input { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; margin: 8px; padding: 7px 9px; color: var(--fg); font: inherit; }
+.docpop .list { overflow: auto; padding: 0 6px 8px; }
+.docpop .grp { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); padding: 8px 8px 4px; display: flex; justify-content: space-between; }
+.docrow { display: grid; grid-template-columns: 16px 1fr auto; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.docrow:hover, .docrow.on { background: var(--raise); }
+.docrow .sub { color: var(--faint); font-size: 11px; }
+.docrow .r { color: var(--faint); font-size: 11px; text-align: right; white-space: nowrap; }
+
+/* workspace */
+.work { display: grid; grid-template-columns: 250px 1fr 290px; grid-template-rows: 1fr auto; min-height: 0; }
+.left, .right { background: var(--panel); min-height: 0; overflow: auto; }
+.left { border-right: 1px solid var(--line); grid-row: 1 / 3; }
+.right { border-left: 1px solid var(--line); grid-row: 1 / 3; grid-column: 3; display: flex; flex-direction: column; }
+.paneh { position: sticky; top: 0; background: var(--panel); z-index: 1; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 6px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+.tree { padding: 0 6px 12px; }
+.row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 5px; cursor: pointer; white-space: nowrap; min-width: 0; color: var(--fg); }
+.row:hover { background: var(--raise); }
+.row.sel { background: var(--accent-soft); }
+.row .name { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.row .meta { color: var(--faint); font-size: 11px; }
+.row svg.i { color: var(--dim); }
+.row .eye { color: var(--dim); display: grid; place-items: center; }
+.row .eye.off { color: var(--faint); opacity: .5; }
+.row.off .name { color: var(--faint); }
+.row.child { padding-left: 28px; }
+.swatch { width: 14px; height: 14px; border-radius: 4px; flex: none; }
+.badge { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; background: var(--raise); color: var(--dim); }
+
+/* viewport */
+.view { position: relative; min-height: 0; background: radial-gradient(ellipse at 50% 35%, #232731 0%, #16181d 70%); overflow: hidden; }
+.view canvas#gl { display: block; width: 100%; height: 100%; }
+.hud { position: absolute; display: flex; gap: 6px; align-items: center; }
+.hud.tl { top: 10px; left: 10px; } .hud.tr { top: 10px; right: 10px; } .hud.br { bottom: 10px; right: 10px; }
+.chip { background: rgba(21,23,28,.82); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; color: var(--dim); font-size: 12px; backdrop-filter: blur(6px); display: inline-flex; align-items: center; gap: 6px; }
+.chip.small { font-size: 11px; padding: 2px 7px; border-radius: 99px; }
+.chip b { color: var(--fg); font-weight: 500; }
+.seg { display: flex; background: rgba(21,23,28,.82); border: 1px solid var(--line); border-radius: 6px; padding: 2px; }
+.seg button { padding: 3px 9px; border-radius: 4px; color: var(--dim); font-size: 12px; }
+.seg button[aria-pressed="true"] { background: var(--raise); color: var(--fg); }
+.menu { position: relative; }
+.menu .pop { position: absolute; right: 0; top: calc(100% + 4px); width: 250px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px; box-shadow: 0 12px 30px rgba(0,0,0,.45); z-index: 6; }
+.menu .pop[hidden] { display: none !important; }
+.menu .opt { display: grid; grid-template-columns: 16px 1fr; gap: 2px 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; width: 100%; text-align: left; }
+.menu .opt:hover { background: var(--raise); }
+.menu .opt .d { grid-column: 2; color: var(--faint); font-size: 11.5px; }
+.pin { position: absolute; transform: translate(-50%, -100%); }
+.pin span { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 11px 11px 11px 2px; background: var(--warn); color: #1b1600; font: 600 11px var(--sans); transform: rotate(-45deg); }
+.pin span i { transform: rotate(45deg); font-style: normal; }
+.toast { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 4; }
+.minimap { width: 150px; height: 150px; border-radius: 8px; border: 1px solid var(--line); background: rgba(21,23,28,.85); overflow: hidden; cursor: pointer; }
+.minimap canvas { width: 100%; height: 100%; display: block; }
+
+/* material: graph is the main surface */
+.graphhost { position: absolute; inset: 0; overflow: auto; background-color: #181a20; background-image: radial-gradient(#2a2f3a 1px, transparent 1px); background-size: 18px 18px; }
+.graphhost[hidden] { display: none !important; }
+.graph { position: relative; width: 820px; height: 420px; margin: 24px; }
+.graph svg.wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.gnode { position: absolute; width: 150px; display: grid; grid-template-columns: 28px 1fr; gap: 0 8px; align-items: center; padding: 5px; background: var(--raise); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.gnode.sel { border-color: var(--accent); }
+.gnode canvas { width: 28px; height: 28px; border-radius: 4px; grid-row: 1 / 3; }
+.gnode .n { font-size: 12px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gnode .t { font: 10.5px var(--mono); color: var(--faint); line-height: 1.2; }
+.prev { padding: 12px; border-bottom: 1px solid var(--line); }
+.prev .ball { width: 100%; aspect-ratio: 1; max-width: 100%; display: block; border-radius: 8px; background: #181a20; }
+.prev .chans { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+.prev .chans canvas { width: 100%; aspect-ratio: 1; border-radius: 4px; display: block; }
+.prev .chans span { font-size: 10.5px; color: var(--faint); display: block; text-align: center; margin-top: 2px; }
+
+/* animate dock */
+.dock { grid-column: 2; border-top: 1px solid var(--line); background: var(--panel); min-width: 0; }
+.dock[hidden] { display: none !important; }
+.dockh { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+.dockb { height: 186px; overflow: auto; position: relative; }
+.tl { display: grid; grid-template-columns: 130px 1fr; font-size: 12px; min-width: 640px; position: relative; }
+.tl .lbl { padding: 4px 12px; color: var(--dim); border-bottom: 1px solid var(--line); height: 26px; white-space: nowrap; }
+.tl .lane { position: relative; border-bottom: 1px solid var(--line); height: 26px; }
+.key { position: absolute; top: 8px; width: 9px; height: 9px; background: var(--fg); transform: rotate(45deg); margin-left: -4px; }
+.key.mir { background: none; border: 1.5px solid var(--dim); }
+.ruler { position: relative; height: 22px; border-bottom: 1px solid var(--line); cursor: ew-resize; }
+.ruler span { position: absolute; top: 4px; font: 10px var(--mono); color: var(--faint); transform: translateX(-50%); }
+.playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); pointer-events: none; }
+.playbtn { padding: 2px 10px; border-radius: 5px; background: var(--raise); color: var(--fg); }
+
+/* right pane tabs */
+.tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 2; }
+.tabs button { padding: 6px 10px; color: var(--dim); border-bottom: 2px solid transparent; display: flex; gap: 6px; align-items: center; }
+.tabs button[aria-selected="true"] { color: var(--fg); border-color: var(--accent); }
+.sect { padding: 6px 12px 14px; }
+.kv { display: grid; grid-template-columns: 90px 1fr; gap: 5px 8px; font-size: 12px; margin: 0; }
+.kv dt { color: var(--dim); } .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.cmt { display: grid; grid-template-columns: 22px 1fr; gap: 0 10px; padding: 10px 4px; border-bottom: 1px solid var(--line); cursor: pointer; font-size: 12.5px; }
+.cmt:hover { background: rgba(255,255,255,.02); }
+.cmt .num { width: 20px; height: 20px; border-radius: 50%; background: var(--warn); color: #1b1600; font: 600 11px var(--sans); display: grid; place-items: center; }
+.cmt .hd { display: flex; gap: 6px; align-items: baseline; margin-bottom: 2px; }
+.cmt .hd b { font-weight: 500; } .cmt .hd span { color: var(--faint); font-size: 11px; }
+.cmt .reply { margin-top: 8px; padding-left: 10px; border-left: 2px solid var(--line); color: var(--dim); }
+.cmt .reply .hd b { color: var(--fg); }
+.work.noright { grid-template-columns: 250px 1fr; }
+.work.noright .right { display: none; }
+.where kbd, .modes kbd { font: 10px var(--mono); color: var(--faint); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+.ovbar { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; position: sticky; top: -14px; background: var(--bg); padding: 4px 0 8px; z-index: 2; }
+.ovbar input { flex: 1; max-width: 320px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; color: var(--fg); font: inherit; }
+.ovbar button { padding: 5px 10px; border-radius: 6px; color: var(--dim); border: 1px solid var(--line); }
+.ovbar button[aria-pressed="true"] { color: var(--fg); background: var(--raise); }
+.ovsec { grid-column: 1 / -1; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); padding-top: 6px; }
+.compose { display: flex; gap: 6px; margin-top: 8px; }
+.compose input { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: var(--fg); font: inherit; }
+.primary { background: var(--accent); color: #08162b; padding: 6px 10px; border-radius: 6px; font-weight: 600; }
+.primary:disabled { opacity: .4; }
+.hint { color: var(--faint); font-size: 12px; }
+
+/* grid of all documents */
+.overview { position: absolute; top: 48px; left: 0; right: 0; bottom: 0; background: var(--bg); display: grid; grid-template-columns: 1fr 280px; z-index: 5; }
+.overview[hidden] { display: none !important; }
+.ovgrid { padding: 14px; overflow: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; align-content: start; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; }
+.tile:hover { border-color: var(--faint); }
+.tile .thumb { aspect-ratio: 16/10; max-width: 100%; position: relative; background: radial-gradient(ellipse at 50% 40%, #262b35, #17191e); }
+.tile .thumb canvas { width: 100%; height: 100%; display: block; }
+.tile .info { padding: 8px 10px; display: flex; gap: 8px; align-items: center; }
+.tile .info .n { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile .x { position: absolute; top: 6px; right: 6px; width: 26px; height: 26px; border-radius: 6px; background: rgba(21,23,28,.85); color: var(--dim); display: grid; place-items: center; opacity: 0; }
+.tile:hover .x, .tile .x:focus-visible { opacity: 1; }
+.tile .x:hover { color: var(--fg); }
+.tile .confirm { position: absolute; inset: auto 6px 6px 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 8px; font-size: 12px; display: flex; gap: 6px; align-items: center; }
+.tile .working { position: absolute; left: 8px; top: 8px; }
+.ovside { border-left: 1px solid var(--line); background: var(--panel); overflow: auto; }
+.feed { font-size: 12px; }
+.feed .ev { display: grid; grid-template-columns: 8px 1fr auto; gap: 8px; align-items: baseline; padding: 5px 0; cursor: pointer; }
+.feed .ev time { color: var(--faint); font-family: var(--mono); font-size: 11px; }
+.feed .ev .what { color: var(--dim); } .feed .ev .what b { color: var(--fg); font-weight: 500; }
+
+/* concept notes */
+.notes { position: fixed; left: 12px; bottom: 12px; width: 300px; z-index: 15; background: #fff7dd; color: #2b2410; border-radius: 10px; padding: 10px 12px 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45); font-size: 12.5px; }
+.notes h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; display: flex; justify-content: space-between; }
+.notes h3 button { color: #6b5a22; }
+.notes ul { margin: 0; padding-left: 16px; }
+.notes li { margin: 3px 0; }
+.notes.min ul { display: none; }
+
+@media (max-width: 900px) {
+  .work { grid-template-columns: 1fr; grid-template-rows: 46vh auto auto auto; overflow: auto; }
+  .left, .right, .dock { grid-column: 1; grid-row: auto; border: 0; border-top: 1px solid var(--line); }
+  .view { grid-row: 1; }
+  .docproj, .agents .agent span, .where .lbl { display: none; }
+  body { overflow: auto; }
+  .overview { grid-template-columns: 1fr; overflow: auto; }
+  .notes { width: calc(100vw - 24px); }
+}
+@media (prefers-reduced-motion: reduce) { .dot.live { animation: none; } }
+</style>
+
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4"/></symbol>
+  <symbol id="i-cube" viewBox="0 0 16 16"><path d="M8 1.8l5.5 3v6.4L8 14.2l-5.5-3V4.8z"/><path d="M2.5 4.8L8 7.8l5.5-3M8 7.8v6.4"/></symbol>
+  <symbol id="i-house" viewBox="0 0 16 16"><path d="M2.5 7.5L8 3l5.5 4.5V13h-11z"/><path d="M6.5 13v-3h3v3"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 16 16"><path d="M8 14s4.5-4.2 4.5-7.5a4.5 4.5 0 10-9 0C3.5 9.8 8 14 8 14z"/><circle cx="8" cy="6.5" r="1.5"/></symbol>
+  <symbol id="i-mount" viewBox="0 0 16 16"><path d="M1.5 13l4.5-7 3 4.5 2-3 3.5 5.5z"/></symbol>
+  <symbol id="i-zone" viewBox="0 0 16 16"><rect x="2.5" y="3.5" width="11" height="9" rx="1" stroke-dasharray="2 1.6"/></symbol>
+  <symbol id="i-route" viewBox="0 0 16 16"><circle cx="3.5" cy="12.5" r="1.5"/><circle cx="12.5" cy="3.5" r="1.5"/><path d="M5 12.5h3.5a2 2 0 000-4h-1a2 2 0 010-4H11"/></symbol>
+  <symbol id="i-block" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="1"/><path d="M3 8h10M8 3v10"/></symbol>
+  <symbol id="i-part" viewBox="0 0 16 16"><path d="M3 11.5l5 2.5 5-2.5v-7L8 2 3 4.5z"/></symbol>
+  <symbol id="i-hide" viewBox="0 0 16 16"><path d="M2 8s2.2-4 6-4 6 4 6 4-2.2 4-6 4-6-4-6-4z"/><path d="M3 13L13 3"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></symbol>
+  <symbol id="i-bone" viewBox="0 0 16 16"><circle cx="3.5" cy="12.5" r="1.6"/><circle cx="12.5" cy="3.5" r="1.6"/><path d="M4.7 11.3l6.6-6.6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7-4.5z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-view" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5a5.5 5.5 0 010 11z" fill="currentColor"/></symbol>
+</svg>
+
+<div class="app">
+  <header class="top">
+    <div class="where" role="group" aria-label="View">
+      <button id="gridbtn" aria-pressed="false" title="Every open document side by side, newest first"><svg class="i"><use href="#i-grid"/></svg><span class="lbl">All documents</span><span class="count" id="doccount">6</span></button>
+      <button id="docbtn" aria-pressed="true" title="Switch document"><span class="docproj" id="cproj">friendSLOP/crates/game /</span><span class="docname" id="cdoc">commune-map</span><svg class="i"><use href="#i-chev"/></svg></button>
+    </div>
+    <nav class="modes" id="modes" aria-label="Mode">
+      <button data-mode="model">Model <kbd>1</kbd></button>
+      <button data-mode="material">Material <kbd>2</kbd></button>
+      <button data-mode="animate">Animate <kbd>3</kbd></button>
+      <button data-mode="map">Map <kbd>4</kbd></button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="agents" id="agents"></div>
+  </header>
+  <div class="docpop" id="docpop" hidden><input id="docq" placeholder="Find a document" autocomplete="off"><div class="list" id="doclist"></div></div>
+
+  <div class="work" id="work">
+    <aside class="left" id="left"></aside>
+    <main class="view" id="view">
+      <canvas id="gl"></canvas>
+      <div class="graphhost" id="graphhost" hidden></div>
+      <div id="pins"></div>
+      <div class="hud tl" id="hudtl"></div>
+      <div class="hud tr" id="hudtr"></div>
+      <div class="hud br" id="hudbr"></div>
+      <div class="toast" id="toast" hidden></div>
+    </main>
+    <section class="dock" id="dock"><div class="dockh" id="dockh"></div><div class="dockb" id="dockb"></div></section>
+    <aside class="right" id="right"></aside>
+  </div>
+
+  <div class="overview" id="overview" hidden>
+    <div class="ovgrid" id="ovgrid"></div>
+    <aside class="ovside">
+      <div class="paneh">What agents are doing</div>
+      <div class="sect feed" id="feedAll"></div>
+    </aside>
+  </div>
+</div>
+
+<div class="notes" id="notes">
+  <h3>Concept notes · v3 <button id="notesmin">hide</button></h3>
+  <ul id="notelist"></ul>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- example data (from the real friendSLOP / shared libraries) ----------
+const AGENTS = {
+  look: { name: 'look', color: 'var(--a1)', live: true },
+  'pid:34601': { name: 'pid:34601', color: 'var(--a2)', live: true },
+  'pid:70917': { name: 'pid:70917', color: 'var(--a3)', live: false },
+};
+const DOCS = [
+  { id: 'commune-map', project: 'friendSLOP/crates/game', kind: 'map', modes: ['model','material','map'], parts: 124, by: 'pid:34601', ago: 'just now', working: true, saved: true },
+  { id: 'pt-crow', project: 'friendSLOP/crates/game', kind: 'creature', modes: ['model','material','animate'], parts: 6, by: 'look', ago: '1 min', working: true, saved: false },
+  { id: 'zn-windmill', project: 'friendSLOP/crates/game', kind: 'prop', modes: ['model','material','animate'], parts: 9, by: 'pid:70917', ago: '12 min', saved: true },
+  { id: 'fu-table', project: 'friendSLOP/crates/game', kind: 'prop', modes: ['model','material'], parts: 14, by: 'pid:70917', ago: '40 min', saved: true },
+  { id: 'mug', project: 'shared library', kind: 'prop', modes: ['model','material'], parts: 3, by: 'look', ago: '25 min', saved: true },
+  { id: 'pine-tree', project: 'shared library', kind: 'plant', modes: ['model','material','animate'], parts: 4, by: 'pid:70917', ago: '1 h', saved: true },
+  ...['sp-wendys', 'sp-parliament', 'zn-castle-arch', 'zn-quarry-crane', 'fu-picnic-crates', 'fu-lectern', 'pt-frog', 'pt-goose'].map((id, i) => ({ id, project: 'friendSLOP/crates/game', kind: id.startsWith('pt') ? 'creature' : 'prop', modes: ['model','material'], parts: 5 + i * 3, by: i % 2 ? 'pid:70917' : 'look', ago: `${2 + i} h`, saved: true })),
+  ...['oak-tree', 'rock-set', 'lamp'].map((id, i) => ({ id, project: 'shared library', kind: 'prop', modes: ['model','material'], parts: 3 + i, by: 'pid:70917', ago: `${1 + i} d`, saved: true })),
+];
+const LIBRARY = { 'friendSLOP/crates/game': 210, 'shared library': 40 };
+const FEED = [
+  ['pid:34601', 'apply_ops', '<b>commune-map</b> · marker preview on 6 spots', '0:04', 'commune-map'],
+  ['look', 'apply_ops', '<b>pt-crow</b> · clip <b>hop</b>, 4 keys', '0:21', 'pt-crow'],
+  ['look', 'verify', '<b>pt-crow</b> · animation: floor, collisions pass', '0:30', 'pt-crow'],
+  ['pid:34601', 'save_prefab', '<b>commune-map</b> saved', '1:12', 'commune-map'],
+  ['look', 'material_ops', '<b>pt-knit-crow</b> · 3 nodes changed', '2:40', 'pt-crow'],
+  ['pid:70917', 'export_model', '<b>zn-windmill</b> → models/scenery/windmill.gltf', '12:05', 'zn-windmill'],
+];
+const NOTES = {
+  grid: [
+    'The grid scrolls, grouped by project, with a filter box and All / Agent working / Unsaved. 17 documents here to show it.',
+    'Tiles: × closes, unsaved work asks inside the tile. The feed on the right shows what agents are doing.',
+  ],
+  model: [
+    '<b>1 2 3 4</b> switch modes again. <b>C</b> or the pin chip at the top right opens comments.',
+    'Click anything in the view to select it: hover lights it up, a click selects, Esc or × deselects.',
+    'The right pane only appears with a selection (its properties and its comments) or with comments open. Otherwise the view gets the room.',
+  ],
+  material: [
+    'The node graph fills the centre. The right pane shows the preview (sphere and channels), then the node.',
+    'Click a node to preview its output.',
+  ],
+  animate: [
+    'The timeline dock has one lane per bone, with mirrored tracks hollow. Space plays; drag the ruler to scrub.',
+  ],
+  map: [
+    'The left list is "Instances and markers", the modeler\'s own words: prefab items and marker items. Icons tell prefab, game-built and marker apart.',
+    'Contour terrain. Fly by default (F toggles); the minimap is click-to-jump.',
+  ],
+};
+
+// ---------- state ----------
+const S = { doc: 'commune-map', mode: 'map', view: 'doc', sel: null, hover: null, showComments: false, ovq: '', ovfilter: 'all', shading: 'lit', cam: 'fly', layers: { terrain: true, prefabs: true, previews: true, spots: true, zones: true, waypoints: false, blocks: false }, t: 0.35, playing: false, matNode: 'base', clip: 'hop' };
+const $ = (s, r = document) => r.querySelector(s);
+const el = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstElementChild; };
+const ic = (id) => `<svg class="i"><use href="#i-${id}"/></svg>`;
+const doc = () => DOCS.find(d => d.id === S.doc);
+
+// ---------- 3D ----------
+const canvas = $('#gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.shadowMap.enabled = true;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 2000);
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x3a3328, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(30, 60, 20); sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left: -60, right: 60, top: 60, bottom: -60, far: 200 });
+scene.add(sun);
+let world = new THREE.Group(); scene.add(world);
+const orbit = { yaw: 0.8, pitch: 0.45, dist: 6, target: new THREE.Vector3(0, 0.5, 0) };
+const fly = { pos: new THREE.Vector3(-30, 22, 55), yaw: 0.55, pitch: -0.35 };
+const pickables = [];
+const MAP = {};
+
+const M = (c, r = 0.7, m = 0) => new THREE.MeshStandardMaterial({ color: c, roughness: r, metalness: m });
+function box(w, h, d, c, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), M(c)); m.position.set(x, y + h / 2, z); m.castShadow = m.receiveShadow = true; return m; }
+function cyl(r1, r2, h, c, x = 0, y = 0, z = 0, seg = 24) { const m = new THREE.Mesh(new THREE.CylinderGeometry(r1, r2, h, seg), M(c)); m.position.set(x, y + h / 2, z); m.castShadow = m.receiveShadow = true; return m; }
+function noise(x, z) { return Math.sin(x * 0.07) * Math.cos(z * 0.06) * 1.6 + Math.sin(x * 0.021 + z * 0.03) * 1.2 + Math.sin(z * 0.15 + x * 0.05) * 0.3; }
+function groundY(x, z) { const flat = Math.max(0, 1 - Math.hypot(x, z) / 28); return noise(x, z) * (1 - flat) + 0.4 * flat; }
+
+// Terrain: a flat tint with contour lines from world height (0.5 m minor, 2.5 m major).
+function contourMaterial() {
+  const m = new THREE.MeshStandardMaterial({ color: 0x5d7a55, roughness: 1 });
+  m.onBeforeCompile = sh => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying float vH;').replace('#include <begin_vertex>', '#include <begin_vertex>\nvH = (modelMatrix * vec4(position,1.0)).y;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vH;\nfloat iso(float h, float step, float w){ float f = abs(fract(h/step + 0.5) - 0.5) * step; float aa = fwidth(h) * w; return 1.0 - smoothstep(0.0, aa, f); }')
+      .replace('#include <color_fragment>', '#include <color_fragment>\nfloat minor = iso(vH, 0.5, 1.0); float major = iso(vH, 2.5, 1.8);\nvec3 tint = mix(vec3(0.24,0.33,0.22), vec3(0.42,0.5,0.36), clamp(vH/4.0 + 0.4, 0.0, 1.0));\ndiffuseColor.rgb = mix(tint, vec3(0.86,0.92,0.78), max(minor*0.35, major*0.75));');
+  };
+  m.extensions = { derivatives: true };
+  return m;
+}
+
+const MAPDEF = {
+  previews: [
+    { name: 'warehouse', at: [14, 41], build: g => { g.add(box(20, 6, 13, 0x4a3328)); const roof = box(20.6, 1.6, 13.6, 0x7b7f86); roof.position.y = 6.8; g.add(roof); g.add(box(4, 3.4, 0.2, 0x2b2d31, 0, 0, 6.55)); } },
+    { name: 'wendys', at: [30, 9], build: g => { g.add(box(6, 3, 5, 0xe9e1cc)); const r = box(6.6, 0.8, 5.6, 0xd9473d); r.position.y = 3.2; g.add(r); } },
+    { name: 'parliament', at: [-12, -10], build: g => { for (let i = 0; i < 5; i++) g.add(box(0.8, 2 + (i % 3), 0.8, 0x6e6a63, -4 + i * 2, 0, (i % 2) * 2)); g.add(box(9, 0.6, 5, 0x5b5852, 0, 0, 1)); } },
+    { name: 'tower', at: [72, 16], build: g => { g.add(cyl(2.2, 2.6, 14, 0xd8d0c0)); const c = new THREE.Mesh(new THREE.ConeGeometry(3, 4, 24), M(0xc85a43)); c.position.y = 16; c.castShadow = true; g.add(c); } },
+  ],
+  prefabs: [
+    { name: 'windmill_tower', at: [-8, -31], build: g => { g.add(cyl(2.3, 2.8, 10, 0xece4d4)); const c = new THREE.Mesh(new THREE.ConeGeometry(3, 3, 24), M(0xb85440)); c.position.y = 11.5; g.add(c); const s = new THREE.Group(); for (let i = 0; i < 4; i++) { const b = box(0.6, 7, 0.15, 0x7a5a3a); b.position.y = 3.5; const p = new THREE.Group(); p.add(b); p.rotation.z = i * Math.PI / 2; s.add(p); } s.position.set(0, 9, 2.9); g.add(s); MAP.sails = s; } },
+    { name: 'castle_arch', at: [-34, 58], build: g => { g.add(box(1.8, 8, 1.6, 0x8d8a83, 0, 0, -2)); g.add(box(1.8, 8, 1.6, 0x8d8a83, 0, 0, 2)); g.add(box(1.8, 1.6, 6, 0x8d8a83, 0, 6.4, 0)); } },
+    { name: 'woodcutter_hut', at: [-28, -62], build: g => { g.add(box(5, 2.6, 4, 0x6b4a2e)); const r = box(5.6, 1.2, 4.6, 0x3e3a35); r.position.y = 2.6; g.add(r); } },
+    { name: 'picnic_table', at: [6, 20], build: g => { g.add(box(1.8, 0.75, 0.9, 0x9a6b42)); g.add(box(0.4, 0.45, 0.4, 0x9a6b42, -1.3)); g.add(box(0.4, 0.45, 0.4, 0x9a6b42, 1.3)); g.add(cyl(0.35, 0.35, 0.9, 0x7a5232, 2.2, 0, 1.2)); } },
+    { name: 'quarry_crane', at: [-46, 62], build: g => { g.add(box(0.35, 7, 0.35, 0x6d4c33, 0, 0, -1)); g.add(box(0.35, 7, 0.35, 0x6d4c33, 0, 0, 1)); g.add(box(5, 0.3, 0.3, 0x6d4c33, 2, 6.5, 0)); } },
+  ],
+  plots: [[40, -11, 7, 6], [50, -13, 8, 7], [58, -13, 6, 6], [42, 13, 8, 7], [52, 12, 6, 5], [60, 13, 7, 6]],
+  zones: [['district_commune', 0, 0, 54, 54, 0x6fa8ff], ['district_village', 58, 0, 49, 74, 0xf6a04d], ['district_ruins', -59, 59, 58, 58, 0xc792ea], ['district_valley', -62, 0, 53, 60, 0x4fd1c5], ['district_forest', 0, -62, 176, 53, 0x5fc48a]],
+  spots: [['bonfire', -8.5, -1.5], ['arena', 0, -12], ['lectern', -4.5, 13], ['pond', 13, 9], ['market', 57, 0], ['officer', 15.5, -3.5], ['lake', -44, 20], ['hill', -62, -6], ['maze', -66, 44]],
+};
+
+function tag(g, name, layer) { g.name = name; g.userData.layer = layer; g.traverse(m => { if (m.isMesh) { m.name = name; pickables.push(m); } }); world.add(g); }
+function buildMap() {
+  const N = 140, size = 220;
+  const geo = new THREE.PlaneGeometry(size, size, N, N); geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setY(i, groundY(p.getX(i), p.getZ(i)));
+  geo.computeVertexNormals();
+  const ground = new THREE.Mesh(geo, contourMaterial()); ground.receiveShadow = true;
+  const gg = new THREE.Group(); gg.add(ground); tag(gg, 'ground', 'terrain');
+  const place = (list, layer) => list.forEach(o => { const g = new THREE.Group(); o.build(g); g.position.set(o.at[0], groundY(o.at[0], o.at[1]), o.at[1]); g.traverse(m => { if (m.isMesh) m.castShadow = true; }); tag(g, o.name, layer); });
+  place(MAPDEF.prefabs, 'prefabs'); place(MAPDEF.previews, 'previews');
+  MAPDEF.plots.forEach(([x, z, w, d], i) => {
+    const g = new THREE.Group();
+    const pad = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshBasicMaterial({ color: 0xf6a04d, transparent: true, opacity: 0.22, depthWrite: false }));
+    pad.rotation.x = -Math.PI / 2; pad.position.y = 0.08; g.add(pad);
+    const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(w, d)), new THREE.LineBasicMaterial({ color: 0xf6a04d }));
+    e.rotation.x = -Math.PI / 2; e.position.y = 0.09; g.add(e);
+    g.position.set(x, groundY(x, z), z); tag(g, 'plot_' + (i + 1), 'zones');
+  });
+  MAPDEF.zones.forEach(([name, x, z, w, d, c]) => {
+    const g = new THREE.Group();
+    const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(w, d)), new THREE.LineDashedMaterial({ color: c, dashSize: 2, gapSize: 1.4, transparent: true, opacity: 0.7 }));
+    e.rotation.x = -Math.PI / 2; e.computeLineDistances(); g.add(e); g.position.set(x, 3.2, z); g.name = name; g.userData.layer = 'zones'; world.add(g);
+  });
+  MAPDEF.spots.forEach(([name, x, z]) => {
+    const g = new THREE.Group();
+    const stem = cyl(0.06, 0.06, 2.2, 0xff5fd2); const head = new THREE.Mesh(new THREE.SphereGeometry(0.35, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff5fd2 })); head.position.y = 2.4;
+    g.add(stem, head); g.position.set(x, groundY(x, z), z); tag(g, name, 'spots');
+  });
+}
+
+function buildCrow() {
+  const mk = (geo, c, r, name) => { const m = new THREE.Mesh(geo, M(c, r)); m.name = name; m.castShadow = true; pickables.push(m); return m; };
+  const body = mk(new THREE.SphereGeometry(0.12, 32, 20), 0x2a2a33, 0.9, 'body'); body.scale.set(1, 0.9, 1.35); body.position.y = 0.2;
+  const head = mk(new THREE.SphereGeometry(0.08, 28, 18), 0x2a2a33, 0.9, 'head'); head.position.set(0, 0.33, 0.13);
+  const beak = mk(new THREE.ConeGeometry(0.03, 0.09, 16), 0xe0a43a, 0.4, 'beak'); beak.rotation.x = Math.PI / 2; beak.position.set(0, 0.32, 0.23);
+  const e1 = mk(new THREE.SphereGeometry(0.018, 12, 8), 0xffffff, 0.2, 'eyes'); e1.position.set(0.045, 0.35, 0.19);
+  const e2 = mk(new THREE.SphereGeometry(0.018, 12, 8), 0xffffff, 0.2, 'eyes'); e2.position.set(-0.045, 0.35, 0.19);
+  const wing = s => { const w = mk(new THREE.SphereGeometry(0.1, 20, 12), 0x23232b, 0.9, 'wings'); w.scale.set(0.25, 0.7, 1.2); w.position.set(0.11 * s, 0.22, -0.01); return w; };
+  const legs = new THREE.Group(); [-1, 1].forEach(s => { const l = cyl(0.008, 0.008, 0.1, 0xe0a43a, 0.04 * s, 0, 0.01); l.name = 'legs'; pickables.push(l); legs.add(l); });
+  const top = new THREE.Group(); top.add(body, head, beak, e1, e2, wing(1), wing(-1));
+  const rig = new THREE.Group(); rig.add(top, legs); rig.userData = { top, head }; world.add(rig); MAP.crow = rig;
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(1.2, 48), new THREE.MeshStandardMaterial({ color: 0x2a2e37, roughness: 1 })); floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; world.add(floor);
+  const bones = new THREE.Group(); const lm = new THREE.LineBasicMaterial({ color: 0x6fa8ff, depthTest: false });
+  const seg = (a, b) => { bones.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...a), new THREE.Vector3(...b)]), lm)); [a, b].forEach(q => { const j = new THREE.Mesh(new THREE.SphereGeometry(0.012, 8, 6), new THREE.MeshBasicMaterial({ color: 0x6fa8ff, depthTest: false })); j.position.set(...q); bones.add(j); }); };
+  seg([0, 0.1, 0], [0, 0.22, 0.02]); seg([0, 0.22, 0.02], [0, 0.33, 0.13]); seg([0, 0.22, 0], [0.13, 0.24, -0.04]); seg([0, 0.22, 0], [-0.13, 0.24, -0.04]); seg([0, 0.22, -0.08], [0, 0.2, -0.22]);
+  bones.renderOrder = 10; bones.visible = false; top.add(bones); MAP.bones = bones;
+}
+
+function buildMug() {
+  const mk = (geo, mat, name) => { const m = new THREE.Mesh(geo, mat); m.name = name; m.castShadow = true; pickables.push(m); world.add(m); return m; };
+  const cup = mk(new THREE.CylinderGeometry(0.045, 0.04, 0.1, 48, 1, true), new THREE.MeshStandardMaterial({ color: 0x3a6fb5, roughness: 0.35, side: THREE.DoubleSide }), 'cup'); cup.position.y = 0.05;
+  const coffee = mk(new THREE.CircleGeometry(0.042, 48), M(0x5a2e14, 0.15), 'coffee'); coffee.rotation.x = -Math.PI / 2; coffee.position.y = 0.085;
+  const handle = mk(new THREE.TorusGeometry(0.026, 0.008, 12, 32), M(0x3a6fb5, 0.35), 'handle_trim'); handle.position.set(0.05, 0.05, 0);
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(0.4, 48), new THREE.MeshStandardMaterial({ color: 0x2a2e37, roughness: 1 })); floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; world.add(floor);
+}
+
+function rebuild() {
+  scene.remove(world); world = new THREE.Group(); scene.add(world); pickables.length = 0; MAP.sails = MAP.crow = MAP.bones = null;
+  if (S.doc === 'commune-map') { buildMap(); Object.assign(orbit, { target: new THREE.Vector3(14, 3, 30), dist: 38, yaw: 1.2, pitch: 0.5 }); scene.fog = new THREE.Fog(0x16181d, 120, 260); }
+  else if (S.doc === 'pt-crow') { buildCrow(); Object.assign(orbit, { target: new THREE.Vector3(0, 0.2, 0), dist: 1.1, yaw: 0.9, pitch: 0.3 }); scene.fog = null; }
+  else { buildMug(); Object.assign(orbit, { target: new THREE.Vector3(0, 0.05, 0), dist: 0.38, yaw: 0.8, pitch: 0.45 }); scene.fog = null; }
+  applyLayers(); applyShading();
+}
+function applyLayers() { world.children.forEach(o => { const l = o.userData.layer; if (l) o.visible = !!S.layers[l]; }); }
+const PART_COLORS = [0x6fa8ff, 0xf6a04d, 0x5fc48a, 0xc792ea, 0xe2b24f, 0x4fd1c5, 0xec6d6d];
+function applyShading() {
+  setTimeout(applySelection);
+  const names = [...new Set(pickables.map(m => m.name))];
+  pickables.forEach(m => {
+    if (m.userData.orig === undefined) m.userData.orig = m.material;
+    if (S.shading === 'parts') m.material = new THREE.MeshBasicMaterial({ color: PART_COLORS[names.indexOf(m.name) % PART_COLORS.length], side: m.userData.orig.side });
+    else if (S.shading === 'clay') m.material = new THREE.MeshStandardMaterial({ color: 0xc9c3b8, roughness: 0.8, side: m.userData.orig.side });
+    else m.material = m.userData.orig;
+  });
+}
+
+function applySelection() {
+  pickables.forEach(m => { if (!m.material.emissive) return; const on = m.name === S.sel, hv = m.name === S.hover && m.name !== 'ground';
+    m.material.emissive.setHex(on ? 0x24477a : hv ? 0x152a48 : 0); });
+}
+function resize() { const r = canvas.parentElement.getBoundingClientRect(); renderer.setSize(r.width, r.height, false); camera.aspect = r.width / Math.max(1, r.height); camera.updateProjectionMatrix(); }
+new ResizeObserver(resize).observe($('#view'));
+
+// camera input
+const keys = new Set(); let drag = null;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointerdown', e => { drag = { b: e.button, x: e.clientX, y: e.clientY, moved: 0 }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', e => {
+  if (!drag) { const h = hitAt(e); const n = h ? h.object.name : null; if (n !== S.hover) { S.hover = n; canvas.style.cursor = n && n !== 'ground' ? 'pointer' : ''; applySelection(); } return; } const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
+  const flying = S.mode === 'map' && S.cam === 'fly';
+  if (flying && (drag.b === 0 || drag.b === 2)) { fly.yaw += dx * 0.004; fly.pitch = Math.max(-1.5, Math.min(1.5, fly.pitch - dy * 0.004)); }
+  else if (drag.b === 0) { orbit.yaw += dx * 0.01; orbit.pitch = Math.max(-1.45, Math.min(1.45, orbit.pitch + dy * 0.01)); }
+  else panBy(dx, dy);
+});
+canvas.addEventListener('pointerup', e => { if (drag && drag.moved < 4 && drag.b === 0) pick(e); drag = null; });
+canvas.addEventListener('wheel', e => { e.preventDefault(); if (S.mode === 'map' && S.cam === 'fly') fly.pos.addScaledVector(flyDir(), -e.deltaY * 0.05); else orbit.dist = Math.max(0.05, orbit.dist * Math.exp(e.deltaY * 0.0012)); }, { passive: false });
+function panBy(dx, dy) { const s = orbit.dist * 0.0015; const r = new THREE.Vector3(Math.sin(orbit.yaw), 0, -Math.cos(orbit.yaw)); orbit.target.addScaledVector(r, -dx * s); orbit.target.y += dy * s; }
+const flyDir = () => new THREE.Vector3(Math.sin(fly.yaw) * Math.cos(fly.pitch), Math.sin(fly.pitch), -Math.cos(fly.yaw) * Math.cos(fly.pitch));
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') { if (e.key === 'Escape') closePops(); return; }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openDocs(); return; }
+  if (e.key === 'Escape') { closePops(); if (S.sel) { S.sel = null; S.pin = null; applySelection(); renderLeft(); renderRight(); } }
+  keys.add(e.code);
+  const flying = S.mode === 'map' && S.cam === 'fly';
+  if (flying && ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE'].includes(e.code)) return;
+  const dm = { Digit1: 'model', Digit2: 'material', Digit3: 'animate', Digit4: 'map' }[e.code];
+  if (dm && S.view === 'doc' && doc().modes.includes(dm)) { setMode(dm); return; }
+  if (e.code === 'KeyC' && S.view === 'doc') { S.showComments = !S.showComments; S.pin = null; renderRight(); renderHud(); return; }
+  if (e.code === 'Space' && S.mode === 'animate') { e.preventDefault(); S.playing = !S.playing; renderDock(); }
+  if (e.code === 'KeyF' && S.mode === 'map') { S.cam = S.cam === 'fly' ? 'orbit' : 'fly'; renderHud(); }
+});
+addEventListener('keyup', e => keys.delete(e.code));
+
+const ray = new THREE.Raycaster();
+function hitAt(e) {
+  const r = canvas.getBoundingClientRect(); const p = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(p, camera);
+  return ray.intersectObjects(pickables.filter(m => { let o = m; while (o) { if (!o.visible) return false; o = o.parent; } return true; }), false)[0];
+}
+function pick(e) {
+  const hit = hitAt(e);
+  S.sel = hit ? hit.object.name : null; S.pin = hit && S.showComments ? hit.point.clone() : null;
+  applySelection(); renderLeft(); renderRight();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (S.mode === 'map' && S.cam === 'fly' && S.doc === 'commune-map') {
+    const f = flyDir(); const rt = new THREE.Vector3(Math.cos(fly.yaw), 0, Math.sin(fly.yaw)); const v = new THREE.Vector3();
+    if (keys.has('KeyW')) v.add(f); if (keys.has('KeyS')) v.sub(f); if (keys.has('KeyD')) v.add(rt); if (keys.has('KeyA')) v.sub(rt); if (keys.has('KeyE')) v.y += 1; if (keys.has('KeyQ')) v.y -= 1;
+    if (v.lengthSq()) fly.pos.addScaledVector(v.normalize(), (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 60 : 15) * dt);
+    camera.position.copy(fly.pos); camera.lookAt(fly.pos.clone().add(f));
+  } else {
+    const d = new THREE.Vector3(Math.cos(orbit.yaw) * Math.cos(orbit.pitch), Math.sin(orbit.pitch), Math.sin(orbit.yaw) * Math.cos(orbit.pitch));
+    camera.position.copy(orbit.target).addScaledVector(d, orbit.dist); camera.lookAt(orbit.target);
+  }
+  camera.near = S.doc === 'commune-map' ? 0.3 : 0.005; camera.updateProjectionMatrix();
+  if (MAP.sails) MAP.sails.rotation.z += dt * 0.6;
+  if (MAP.crow) {
+    if (S.mode === 'animate' && S.playing) { S.t = (S.t + dt / 0.8) % 1; const ph = $('#playhead'); if (ph) ph.style.left = `calc(130px + (100% - 130px) * ${S.t})`; }
+    const t = S.mode === 'animate' ? S.t : (now / 1000 / 2.4) % 1; const hop = Math.max(0, Math.sin(t * Math.PI * 2));
+    MAP.crow.position.y = hop * 0.06; MAP.crow.userData.top.rotation.x = -Math.sin(t * Math.PI * 2) * 0.15; MAP.crow.userData.head.position.z = 0.13 + Math.sin(t * Math.PI * 4) * 0.01;
+    MAP.bones.visible = S.mode === 'animate';
+  }
+  if (S.mode !== 'material') { renderer.render(scene, camera); drawPins(); if (S.mode === 'map') drawMinimap(); }
+  requestAnimationFrame(frame);
+}
+
+// ---------- pins (only while Comments is open) ----------
+const PINS = { 'commune-map': [{ n: 1, at: [14, 8, 41], part: 'warehouse', who: 'you', text: 'Warehouse door should face the road, not the pond.' }, { n: 2, at: [50, 1, -13], part: 'plot_2', who: 'you', text: 'Plot 2 overlaps the street edge.' }], 'pt-crow': [{ n: 1, at: [0, 0.34, 0.2], part: 'beak', who: 'you', text: 'Beak is too long, maybe 70%?' }], mug: [{ n: 1, at: [0.075, 0.06, 0], part: 'handle_trim', who: 'you', text: 'Handle looks thin from the side.' }] };
+const REPLIES = { 'commune-map': { 1: ['pid:34601', 'Turned the marker yaw to 180°; the preview follows.'] } };
+function drawPins() {
+  const host = $('#pins'); let h = '';
+  if (S.showComments && S.mode !== 'material') {
+    const list = (PINS[S.doc] || []).slice(); if (S.pin) list.push({ n: '+', at: S.pin.toArray() });
+    const r = canvas.getBoundingClientRect();
+    for (const p of list) { const v = new THREE.Vector3(...p.at).project(camera); if (v.z > 1 || Math.abs(v.x) > 1.05 || Math.abs(v.y) > 1.05) continue; h += `<div class="pin" style="left:${(v.x + 1) / 2 * r.width}px;top:${(1 - v.y) / 2 * r.height}px"><span><i>${p.n}</i></span></div>`; }
+  }
+  if (host.innerHTML !== h) host.innerHTML = h;
+}
+
+// ---------- minimap ----------
+let mini;
+function drawMinimap() {
+  const c = $('#mini'); if (!c) return; const g = c.getContext('2d'); const W = c.width = c.clientWidth * 2, H = c.height = c.clientHeight * 2; const s = W / 220;
+  if (!mini) { mini = document.createElement('canvas'); mini.width = mini.height = 110; const mg = mini.getContext('2d'); for (let y = 0; y < 110; y++) for (let x = 0; x < 110; x++) { const h = groundY(x * 2 - 110, y * 2 - 110); const line = Math.abs(((h / 0.5) % 1 + 1) % 1 - 0.5) < 0.12; mg.fillStyle = line ? '#a9b69a' : `hsl(105,16%,${24 + h * 3}%)`; mg.fillRect(x, y, 1, 1); } }
+  g.drawImage(mini, 0, 0, W, H);
+  const P = (x, z) => [(x + 110) * s, (z + 110) * s];
+  g.strokeStyle = '#f6a04d'; g.lineWidth = 2; MAPDEF.plots.forEach(([x, z, w, d]) => { const [a, b] = P(x - w / 2, z - d / 2); g.strokeRect(a, b, w * s, d * s); });
+  g.fillStyle = '#e3e6ec'; [...MAPDEF.prefabs, ...MAPDEF.previews].forEach(o => { const [a, b] = P(...o.at); g.fillRect(a - 3, b - 3, 6, 6); });
+  g.fillStyle = '#ff5fd2'; MAPDEF.spots.forEach(([, x, z]) => { const [a, b] = P(x, z); g.beginPath(); g.arc(a, b, 3, 0, 7); g.fill(); });
+  const cp = camera.position; const [a, b] = P(cp.x, cp.z); const f = new THREE.Vector3(); camera.getWorldDirection(f);
+  g.fillStyle = '#6fa8ff'; g.beginPath(); g.arc(a, b, 5, 0, 7); g.fill(); g.strokeStyle = '#6fa8ff'; g.lineWidth = 3; g.beginPath(); g.moveTo(a, b); g.lineTo(a + f.x * 26, b + f.z * 26); g.stroke();
+}
+
+// ---------- UI ----------
+function setDoc(id) {
+  S.doc = id; S.sel = null; S.pin = null; S.view = 'doc'; const d = doc(); if (!d.modes.includes(S.mode)) S.mode = d.kind === 'map' ? 'map' : d.modes[0];
+  closePops(); rebuild(); renderAll();
+}
+function setMode(m) { S.mode = m; S.view = 'doc'; renderAll(); }
+
+function renderTop() {
+  const d = doc(); const grid = S.view === 'grid';
+  $('#cproj').textContent = d.project + ' /'; $('#cdoc').textContent = d.id; $('#doccount').textContent = DOCS.length;
+  $('#gridbtn').setAttribute('aria-pressed', grid); $('#docbtn').setAttribute('aria-pressed', !grid);
+  $('#modes').hidden = grid;
+  document.querySelectorAll('#modes button').forEach(b => { const m = b.dataset.mode; b.disabled = !d.modes.includes(m); b.setAttribute('aria-pressed', S.mode === m); b.title = b.disabled ? `${d.id} has no ${m === 'animate' ? 'skeleton' : m === 'map' ? 'terrain or markers' : m}` : ''; });
+  $('#agents').innerHTML = Object.values(AGENTS).map(a => `<div class="agent" title="${a.live ? 'working now' : 'idle'}"><i class="dot ${a.live ? 'live' : ''}" style="background:${a.color}"></i><span>${a.name}</span></div>`).join('');
+}
+
+// document switcher: searchable, grouped by project, scales to many documents
+function openDocs() { const p = $('#docpop'); p.hidden = false; $('#docq').value = ''; drawDocs(); $('#docq').focus(); }
+function closePops() { $('#docpop').hidden = true; const v = $('#viewpop'); if (v) v.hidden = true; }
+function drawDocs() {
+  const q = $('#docq').value.toLowerCase(); let h = '';
+  for (const proj of [...new Set(DOCS.map(d => d.project))]) {
+    const ds = DOCS.filter(d => d.project === proj && d.id.includes(q)); if (!ds.length) continue;
+    h += `<div class="grp"><span>${proj}</span><span>${ds.length} open</span></div>` + ds.map(d => `<div class="docrow ${d.id === S.doc ? 'on' : ''}" data-open="${d.id}">${d.working ? `<i class="dot live" style="background:${AGENTS[d.by].color}"></i>` : `<i class="dot" style="background:var(--line)"></i>`}<div><div>${d.id}</div><div class="sub">${d.modes.join(' · ')}</div></div><div class="r">${d.by}<br>${d.ago}${d.saved ? '' : ' · <span style="color:var(--warn)">unsaved</span>'}</div></div>`).join('');
+    h += `<div class="docrow" data-lib="${proj}"><svg class="i"><use href="#i-cube"/></svg><div class="sub">Open from library…</div><div class="r">${LIBRARY[proj]} prefabs</div></div>`;
+  }
+  $('#doclist').innerHTML = h || '<div class="hint" style="padding:8px">No open document matches. Press Enter to open it from the library.</div>';
+}
+$('#docq').addEventListener('input', drawDocs);
+$('#doclist').onclick = e => { const r = e.target.closest('[data-open]'); if (r) setDoc(r.dataset.open); else if (e.target.closest('[data-lib]')) toast('Library browser: same list, every saved prefab'); };
+document.addEventListener('pointerdown', e => { if (!e.target.closest('#docpop, #docbtn')) $('#docpop').hidden = true; if (!e.target.closest('.menu')) { const v = $('#viewpop'); if (v) v.hidden = true; } });
+
+function row(name, o = {}) {
+  const sel = S.sel === (o.sel ?? name) ? ' sel' : '';
+  const eye = o.layer ? `<button class="eye ${o.on ? '' : 'off'}" data-layer="${o.layer}" aria-label="${o.on ? 'Hide' : 'Show'} ${name}">${ic(o.on ? 'eye' : 'hide')}</button>` : '';
+  const lead = o.sw ? `<i class="swatch" style="background:${o.sw}"></i>` : o.icon ? ic(o.icon) : '';
+  return `<div class="row${sel} ${o.cls || ''} ${o.layer && !o.on ? 'off' : ''}" data-sel="${o.sel ?? name}">${lead}<span class="name">${name}</span><span class="meta">${o.meta || ''}</span>${eye}</div>`;
+}
+function renderLeft() {
+  let h = '';
+  if (S.mode === 'map') {
+    const L = [['terrain', 'Terrain', 'mount', 1], ['prefabs', 'Prefab instances', 'cube', MAPDEF.prefabs.length], ['previews', 'Built by the game', 'house', MAPDEF.previews.length], ['spots', 'Spots', 'pin', MAPDEF.spots.length], ['zones', 'Zones and plots', 'zone', MAPDEF.zones.length + 6], ['waypoints', 'Waypoints', 'route', 21], ['blocks', 'Collision blocks', 'block', 18]];
+    h += `<div class="paneh">Layers</div><div class="tree">` + L.map(([k, n, i, c]) => row(n, { icon: i, meta: c, layer: k, on: S.layers[k], sel: '' })).join('') + `</div>`;
+    h += `<div class="paneh">Instances and markers</div><div class="tree">` + [...MAPDEF.prefabs.map(p => [p.name, 'cube']), ...MAPDEF.previews.map(p => [p.name, 'house']), ...MAPDEF.spots.map(s => [s[0], 'pin'])].map(([n, i]) => row(n, { icon: i })).join('') + `</div>`;
+  } else if (S.mode === 'material') {
+    const mats = S.doc === 'commune-map' ? [['contour-ground', '#5d7a55', 'ground'], ['zn-timber', '#6d4c33', '14 parts'], ['zn-stonework', '#8d8a83', '8 parts'], ['fu-wood', '#9a6b42', '19 parts']] : S.doc === 'pt-crow' ? [['pt-knit-crow', '#2a2a33', 'body, head, wings'], ['pt-beak', '#e0a43a', 'beak, legs'], ['pt-eye-white', '#e8e8e8', 'eyes']] : [['glazed-blue', '#3a6fb5', 'cup, handle'], ['coffee', '#5a2e14', 'coffee']];
+    h += `<div class="paneh">Materials in this document</div><div class="tree">` + mats.map(([n, c, m], i) => row(n, { sw: c, meta: m, cls: i === 0 ? 'sel' : '', sel: 'mat:' + n })).join('') + `</div>`;
+    h += `<div class="paneh">Library</div><div class="tree">` + [['stone', '#7d7a74'], ['bark', '#5a4130'], ['leaf', '#4f7a3a'], ['sp-soil', '#6b5038'], ['fa-knit', '#d8d2c4']].map(([n, c]) => row(n, { sw: c, meta: 'tile', sel: 'lib:' + n })).join('') + '</div>';
+  } else if (S.mode === 'animate') {
+    h += `<div class="paneh">Clips</div><div class="tree">` + [['hop', '0.8 s'], ['idle', '2.0 s'], ['wind', 'sway']].map(([n, m]) => row(n, { icon: 'play', meta: m, sel: 'clip:' + n, cls: S.clip === n ? 'sel' : '' })).join('') + `</div>`;
+    h += `<div class="paneh">Skeleton</div><div class="tree">` + [['root', ''], ['spine', 'child'], ['neck', 'child'], ['head', 'child'], ['wing_l', 'child'], ['wing_r', 'child'], ['tail', 'child']].map(([n, c]) => row(n, { icon: 'bone', cls: c, meta: n === 'wing_r' ? 'mirror' : '' })).join('') + '</div>';
+  } else {
+    const parts = S.doc === 'commune-map' ? [['ground', 'mount'], ['picnic_table', 'cube', 14], ['picnic_crates', 'cube', 28], ['woodcutter_hut', 'cube', 7], ['castle_arch', 'cube', 8], ['quarry_crane', 'cube', 22], ['windmill_tower', 'cube', 5]] : S.doc === 'pt-crow' ? [['body', 'part'], ['head', 'part'], ['beak', 'part'], ['eyes', 'part'], ['wings', 'part'], ['legs', 'part']] : [['cup', 'part'], ['coffee', 'part'], ['handle_trim', 'part']];
+    h += `<div class="paneh">Parts <span class="badge">${doc().parts}</span></div><div class="tree">` + parts.map(([n, i, c]) => row(n, { icon: i, sel: n, meta: c ? `prefab · ${c}` : '' })).join('') + row('Hidden parts', { icon: 'hide', meta: '2', sel: '', cls: 'off' }) + '</div>';
+  }
+  $('#left').innerHTML = h;
+}
+
+const GN = [
+  { id: 'nb', type: 'noise', f: 'fbm · size 0.5 m · 4 octaves', x: 0, y: 30, hue: null, freq: 0.06 },
+  { id: 'nf', type: 'noise', f: 'fbm · size 0.06 m', x: 0, y: 150, hue: null, freq: 0.35 },
+  { id: 'base', type: 'ramp', f: '#3f7a35 → #8fbf5c', x: 200, y: 30, hue: 105, freq: 0.06 },
+  { id: 'blades', type: 'dir_blur', f: 'angle 90° · 0.03 m', x: 200, y: 150, hue: null, freq: 0.5 },
+  { id: 'col', type: 'blend', f: 'multiply · 0.4', x: 400, y: 80, hue: 100, freq: 0.2 },
+  { id: 'h', type: 'remap', f: '0..1 → 0..4 mm', x: 400, y: 210, hue: null, freq: 0.3 },
+  { id: 'out', type: 'output', f: 'base_color · roughness 0.92 · height', x: 610, y: 130, hue: 100, freq: 0.15 },
+];
+const GE = [['nb', 'base'], ['nf', 'blades'], ['base', 'col'], ['blades', 'col'], ['blades', 'h'], ['col', 'out'], ['h', 'out']];
+const node = id => GN.find(n => n.id === id);
+function paint(c, n, w, h) { const g = c.getContext('2d'); c.width = w; c.height = h; const im = g.createImageData(w, h); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = 0.5 + 0.3 * Math.sin(x * n.freq * 6 + Math.sin(y * 0.13) * 2) * Math.cos(y * n.freq * 4) + 0.15 * Math.sin((x + y) * 0.05); const i = (y * w + x) * 4; const l = Math.max(0, Math.min(1, v)); if (n.hue != null) { const c2 = hsl(n.hue, 0.38, 0.22 + l * 0.35); im.data[i] = c2[0]; im.data[i + 1] = c2[1]; im.data[i + 2] = c2[2]; } else { im.data[i] = im.data[i + 1] = im.data[i + 2] = l * 230; } im.data[i + 3] = 255; } g.putImageData(im, 0, 0); }
+function hsl(h, s, l) { const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), f = n => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1)); return [f(0) * 255, f(8) * 255, f(4) * 255]; }
+function sphere(c, n) {
+  const W = 240; c.width = c.height = W; const g = c.getContext('2d'); const im = g.createImageData(W, W); const L = [-0.5, -0.6, 0.62];
+  for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) { const nx = (x - W / 2) / (W * 0.42), ny = (y - W / 2) / (W * 0.42), r2 = nx * nx + ny * ny; const i = (y * W + x) * 4; if (r2 > 1) { im.data[i] = 24; im.data[i + 1] = 26; im.data[i + 2] = 32; im.data[i + 3] = 255; continue; } const nz = Math.sqrt(1 - r2); const d = Math.max(0, nx * L[0] + ny * L[1] + nz * L[2]) * 0.85 + 0.18; const u = Math.atan2(nx, nz) * 40, v = ny * 60; const t = 0.5 + 0.3 * Math.sin(u * n.freq * 2 + Math.sin(v * 0.2) * 2) * Math.cos(v * n.freq * 1.5); const base = n.hue != null ? hsl(n.hue, 0.38, 0.2 + t * 0.35) : [t * 220, t * 220, t * 220]; const spec = Math.pow(Math.max(0, nx * -0.3 + ny * -0.4 + nz * 0.86), 40) * 60; for (let k = 0; k < 3; k++) im.data[i + k] = Math.min(255, base[k] * d + spec); im.data[i + 3] = 255; }
+  g.putImageData(im, 0, 0);
+}
+function renderGraph() {
+  const host = $('#graphhost');
+  let svg = '<svg class="wires">'; GE.forEach(([a, b]) => { const A = node(a), B = node(b); const ax = A.x + 150, ay = A.y + 20, bx = B.x, by = B.y + 20; svg += `<path d="M${ax} ${ay} C ${ax + 40} ${ay}, ${bx - 40} ${by}, ${bx} ${by}" stroke="${S.matNode === a ? '#6fa8ff' : '#4a5160'}" stroke-width="1.5" fill="none"/>`; }); svg += '</svg>';
+  host.innerHTML = `<div class="graph">${svg}${GN.map(n => `<div class="gnode ${S.matNode === n.id ? 'sel' : ''}" data-node="${n.id}" style="left:${n.x}px;top:${n.y}px" title="${n.f}"><canvas data-thumb="${n.id}"></canvas><div class="n">${n.id}</div><div class="t">${n.type}</div></div>`).join('')}</div>`;
+  host.querySelectorAll('canvas[data-thumb]').forEach(c => paint(c, node(c.dataset.thumb), 56, 56));
+}
+
+function renderRight() {
+  const d = doc(); const R = $('#right'); let h = '';
+  if (S.mode === 'material') {
+    const n = node(S.matNode); const mat = S.doc === 'pt-crow' ? 'pt-knit-crow' : S.doc === 'commune-map' ? 'contour-ground' : 'glazed-blue';
+    h += `<div class="paneh">Preview · ${S.matNode === 'out' ? mat : 'node ' + S.matNode}</div><div class="prev"><canvas class="ball" id="ball"></canvas><div class="chans">${['color', 'rough', 'normal', 'height'].map(c => `<div><canvas data-ch="${c}"></canvas><span>${c}</span></div>`).join('')}</div></div>`;
+    h += `<div class="paneh">Node</div><div class="sect"><dl class="kv"><dt>name</dt><dd>${n.id}</dd><dt>type</dt><dd>${n.type}</dd><dt>fields</dt><dd>${n.f}</dd><dt>used on</dt><dd>${S.doc === 'pt-crow' ? 'body, head, wings' : 'ground'}</dd></dl></div>`;
+    R.innerHTML = h; sphere($('#ball'), n); R.querySelectorAll('[data-ch]').forEach((c, i) => paint(c, { ...n, hue: i ? null : n.hue, freq: n.freq * (1 + i * 0.4) }, 48, 48));
+    return;
+  }
+  const cm = PINS[S.doc] || [];
+  const show = !!S.sel || S.showComments;
+  $('#work').classList.toggle('noright', !show);
+  if (!show) { R.innerHTML = ''; return; }
+  const cmtRow = p => { const r = (REPLIES[S.doc] || {})[p.n]; return `<div class="cmt" data-pin="${p.n}"><span class="num">${p.n}</span><div><div class="hd"><b>${p.part}</b><span>you · 3 min</span></div>${p.text}${r ? `<div class="reply"><div class="hd"><i class="dot" style="background:${AGENTS[r[0]].color}"></i><b>${r[0]}</b><span>1 min</span></div>${r[1]}</div>` : ''}</div></div>`; };
+  const compose = S.pin ? `<form class="compose" id="compose"><input id="cin" placeholder="Comment on ${S.sel}…"><button class="primary">Pin</button></form>` : '';
+  if (S.sel) {
+    const sel = S.sel;
+    h += `<div class="paneh"><span>${sel}</span><button data-close aria-label="Deselect">${ic('x')}</button></div><div class="sect">`;
+    if (S.doc === 'commune-map') { const pv = MAPDEF.previews.some(p => p.name === sel); h += `<dl class="kv"><dt>kind</dt><dd>${pv ? 'marker, built by the game' : sel === 'ground' ? 'terrain' : sel.startsWith('plot') ? 'plot (zone marker)' : MAPDEF.spots.some(s => s[0] === sel) ? 'marker' : 'prefab instance'}</dd><dt>components</dt><dd>${sel === 'warehouse' ? 'Feature {height 7.5}, Spot' : sel.startsWith('plot') ? 'Plot' : sel === 'ground' ? 'none' : 'Spot'}</dd>${pv ? `<dt>preview</dt><dd>sp-${sel}-…</dd>` : ''}</dl>`; }
+    else h += `<dl class="kv"><dt>material</dt><dd>${sel === 'beak' || sel === 'legs' ? 'pt-beak' : sel === 'eyes' ? 'pt-eye-white' : 'pt-knit-crow'}</dd><dt>made by</dt><dd>sdf crow_body</dd><dt>triangles</dt><dd>4,812</dd></dl>`;
+    const mine = cm.filter(p => p.part === sel);
+    h += `</div><div class="paneh"><span>Comments on ${sel}</span><button class="badge" data-allc>all ${cm.length}</button></div><div class="sect">${mine.map(cmtRow).join('')}${compose || `<button class="iconbtn" data-addc style="margin-top:8px">Add a comment</button>`}</div>`;
+  } else {
+    h += `<div class="paneh"><span>Comments · ${cm.length}</span><button data-closec aria-label="Close comments">${ic('x')}</button></div><div class="sect">${cm.length ? cm.map(cmtRow).join('') : '<p class="hint">No comments yet.</p>'}${compose || '<p class="hint" style="margin-top:10px">Click the model to place a pin.</p>'}</div>`;
+  }
+  R.innerHTML = h;
+  const f = $('#compose'); if (f) f.onsubmit = e => { e.preventDefault(); const v = $('#cin').value.trim(); if (!v) return; (PINS[S.doc] ||= []).push({ n: PINS[S.doc].length + 1, at: S.pin.toArray(), part: S.sel, who: 'you', text: v }); S.pin = null; toast(`Pinned on ${S.sel}; agents read it with list_annotations`); renderRight(); };
+}
+const feedRow = ([a, tool, what, t, d]) => `<div class="ev" data-open="${d}"><i class="dot" style="background:${AGENTS[a].color}"></i><span class="what"><span class="mono">${tool}</span> ${what}</span><time>${t}</time></div>`;
+
+function renderDock() {
+  const D = $('#dock'), H = $('#dockh'), B = $('#dockb');
+  if (S.mode !== 'animate') { D.hidden = true; return; } D.hidden = false;
+  const lanes = [['root · move', [0, 0.25, 0.5, 0.75, 1]], ['spine · turn', [0, 0.5, 1]], ['head · turn', [0, 0.25, 0.5, 0.75]], ['wing_l · turn', [0, 0.3, 0.6]], ['wing_r · turn', [0.5, 0.8, 0.1], true], ['tail · spring', []]];
+  H.innerHTML = `<button class="playbtn" id="play">${S.playing ? 'Pause' : 'Play'}</button><span>clip <b style="color:var(--fg)">${S.clip}</b> · 0.8 s · loops</span><span class="spacer"></span><span>Space plays · drag the ruler to scrub</span>`;
+  B.innerHTML = `<div class="tl"><div class="lbl"></div><div class="ruler" id="ruler">${[0, .1, .2, .3, .4, .5, .6, .7, .8].map((t, i) => `<span style="left:${i / 8 * 100}%">${t.toFixed(1)}</span>`).join('')}</div>${lanes.map(([n, ks, mir]) => `<div class="lbl">${n}</div><div class="lane">${ks.map(k => `<i class="key ${mir ? 'mir' : ''}" style="left:${k * 100}%"></i>`).join('')}${n.includes('spring') ? '<span style="position:absolute;left:8px;top:5px;color:var(--faint);font-size:11px">simulated, follows hop</span>' : ''}</div>`).join('')}<div class="playhead" id="playhead" style="left:calc(130px + (100% - 130px) * ${S.t})"></div></div>`;
+  $('#play').onclick = () => { S.playing = !S.playing; renderDock(); };
+  const ruler = $('#ruler'); const scrub = e => { const r = ruler.getBoundingClientRect(); S.t = Math.max(0, Math.min(0.999, (e.clientX - r.left) / r.width)); S.playing = false; $('#playhead').style.left = `calc(130px + (100% - 130px) * ${S.t})`; };
+  ruler.onpointerdown = e => { scrub(e); ruler.setPointerCapture(e.pointerId); ruler.onpointermove = scrub; }; ruler.onpointerup = () => ruler.onpointermove = null;
+}
+
+const SHADES = [['lit', 'Lit', 'Materials and lights as they will look'], ['clay', 'Clay', 'One neutral grey: judge the shape alone'], ['parts', 'By part', 'Each part a flat colour, to tell parts apart']];
+function renderHud() {
+  const d = doc(); const material = S.mode === 'material';
+  $('#gl').style.visibility = material ? 'hidden' : 'visible'; $('#graphhost').hidden = !material; if (material) renderGraph();
+  $('#hudtl').innerHTML = d.working && !material ? `<span class="chip small"><i class="dot live" style="background:${AGENTS[d.by].color}"></i>${d.by} editing</span>` : '';
+  if (material) { $('#hudtr').innerHTML = ''; $('#hudbr').innerHTML = ''; return; }
+  const cur = SHADES.find(s => s[0] === S.shading);
+  const view = `<div class="menu"><button class="chip" id="viewbtn">${ic('view')}<b>${cur[1]}</b>${ic('chev')}</button><div class="pop" id="viewpop" hidden>${SHADES.map(([k, n, ds]) => `<button class="opt" data-shade="${k}"><span>${S.shading === k ? '✓' : ''}</span><span>${n}</span><span class="d">${ds}</span></button>`).join('')}${S.mode === 'animate' ? '' : ''}</div></div>`;
+  const nc = (PINS[S.doc] || []).length;
+  const cbtn = `<button class="chip" id="cbtn" title="Comments (C)" style="${S.showComments ? 'color:var(--fg);border-color:var(--warn)' : ''}">${ic('pin')}<b>${nc}</b></button>`;
+  $('#hudtr').innerHTML = cbtn + (S.mode === 'map' ? `<div class="seg"><button data-cam="fly" aria-pressed="${S.cam === 'fly'}" title="Drag to look, WASD to move (F)">Fly</button><button data-cam="orbit" aria-pressed="${S.cam === 'orbit'}" title="Drag to turn around a point (F)">Orbit</button></div>` : '') + view;
+  $('#hudbr').innerHTML = S.mode === 'map' ? `<div class="minimap" title="Click to jump there"><canvas id="mini"></canvas></div>` : '';
+  $('#cbtn').onclick = () => { S.showComments = !S.showComments; S.pin = null; renderRight(); renderHud(); };
+  $('#viewbtn').onclick = () => { $('#viewpop').hidden = !$('#viewpop').hidden; };
+  $('#viewpop').onclick = e => { const o = e.target.closest('[data-shade]'); if (!o) return; S.shading = o.dataset.shade; applyShading(); renderHud(); };
+  $('#hudtr').querySelectorAll('[data-cam]').forEach(b => b.onclick = () => { S.cam = b.dataset.cam; if (S.cam === 'orbit') { orbit.target.copy(camera.position).addScaledVector(flyDir(), 30); orbit.target.y = 2; orbit.dist = 34; } renderHud(); });
+  const m = $('#mini'); if (m) m.onclick = e => { const r = m.getBoundingClientRect(); const x = (e.clientX - r.left) / r.width * 220 - 110, z = (e.clientY - r.top) / r.height * 220 - 110; fly.pos.set(x, groundY(x, z) + 14, z + 22); fly.pitch = -0.5; fly.yaw = 0; S.cam = 'fly'; renderHud(); };
+}
+
+function renderOverview() {
+  $('#overview').hidden = S.view !== 'grid'; if (S.view !== 'grid') return;
+  const q = S.ovq.toLowerCase();
+  const ds = DOCS.filter(d => d.id.includes(q) && (S.ovfilter === 'all' || (S.ovfilter === 'working' ? d.working : !d.saved)));
+  const tile = d => `<div class="tile" data-doc="${d.id}" tabindex="0"><div class="thumb"><canvas data-tthumb="${d.id}"></canvas>${d.working ? `<span class="chip small working"><i class="dot live" style="background:${AGENTS[d.by].color}"></i>${d.by} editing</span>` : ''}<button class="x" data-close="${d.id}" aria-label="Close ${d.id}">${ic('x')}</button></div><div class="info"><span class="n">${d.id}</span><span class="badge">${d.kind}</span></div><div class="info" style="padding-top:0;color:var(--faint);font-size:12px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.project}</span><span>${d.by} · ${d.ago}${d.saved ? '' : ' · <span style="color:var(--warn)">unsaved</span>'}</span></div></div>`;
+  const bar = `<div class="ovbar"><input id="ovq" placeholder="Filter ${DOCS.length} documents" value="${S.ovq}">${[['all', 'All'], ['working', 'Agent working'], ['unsaved', 'Unsaved']].map(([k, n]) => `<button data-ovf="${k}" aria-pressed="${S.ovfilter === k}">${n}</button>`).join('')}</div>`;
+  $('#ovgrid').innerHTML = bar + [...new Set(ds.map(d => d.project))].map(p => `<div class="ovsec">${p} · ${ds.filter(d => d.project === p).length}</div>` + ds.filter(d => d.project === p).map(tile).join('')).join('');
+  const qi = $('#ovq'); qi.oninput = () => { S.ovq = qi.value; renderOverview(); const n = $('#ovq'); n.focus(); n.setSelectionRange(n.value.length, n.value.length); };
+  $('#feedAll').innerHTML = FEED.map(feedRow).join('');
+  document.querySelectorAll('[data-tthumb]').forEach(c => thumb(c, c.dataset.tthumb));
+}
+function thumb(c, id) {
+  const g = c.getContext('2d'); const W = c.width = 320, H = c.height = 200; g.fillStyle = '#1d2027'; g.fillRect(0, 0, W, H);
+  if (id === 'commune-map') { g.fillStyle = '#4c6646'; g.beginPath(); g.moveTo(0, 110); g.lineTo(W, 80); g.lineTo(W, H); g.lineTo(0, H); g.fill(); g.strokeStyle = 'rgba(220,235,200,.35)'; for (let k = 0; k < 7; k++) { g.beginPath(); for (let x = 0; x <= W; x += 8) g.lineTo(x, 118 - x * 0.1 + k * 13 + Math.sin(x * 0.04 + k) * 5); g.stroke(); } g.fillStyle = '#4a3328'; g.fillRect(150, 70, 60, 34); g.fillStyle = '#e9e1cc'; g.fillRect(230, 90, 22, 14); g.strokeStyle = '#f6a04d'; [60, 90, 120].forEach(x => g.strokeRect(x, 150, 22, 14)); }
+  else if (id === 'pine-tree') { g.fillStyle = '#664226'; g.fillRect(154, 150, 12, 26); g.fillStyle = '#2b8038'; [[160, 40, 40], [160, 75, 55], [160, 110, 70]].forEach(([x, y, w]) => { g.beginPath(); g.moveTo(x, y); g.lineTo(x - w, y + 50); g.lineTo(x + w, y + 50); g.fill(); }); }
+  else if (id === 'zn-windmill') { g.fillStyle = '#ece4d4'; g.fillRect(140, 70, 40, 100); g.fillStyle = '#b85440'; g.beginPath(); g.moveTo(130, 72); g.lineTo(160, 40); g.lineTo(190, 72); g.fill(); g.strokeStyle = '#7a5a3a'; g.lineWidth = 5; g.beginPath(); g.moveTo(110, 40); g.lineTo(210, 120); g.moveTo(210, 40); g.lineTo(110, 120); g.stroke(); }
+  else if (id === 'pt-crow') { g.fillStyle = '#2a2a33'; g.beginPath(); g.ellipse(160, 115, 45, 38, 0, 0, 7); g.fill(); g.beginPath(); g.arc(190, 78, 25, 0, 7); g.fill(); g.fillStyle = '#e0a43a'; g.beginPath(); g.moveTo(210, 74); g.lineTo(238, 80); g.lineTo(210, 86); g.fill(); }
+  else if (id === 'fu-table') { g.fillStyle = '#9a6b42'; g.fillRect(90, 80, 140, 16); g.fillRect(100, 96, 10, 60); g.fillRect(210, 96, 10, 60); g.fillStyle = '#e88a2e'; g.beginPath(); g.arc(150, 72, 9, 0, 7); g.arc(170, 72, 9, 0, 7); g.fill(); }
+  else { g.fillStyle = '#3a6fb5'; g.fillRect(130, 70, 60, 80); g.strokeStyle = '#3a6fb5'; g.lineWidth = 8; g.beginPath(); g.arc(196, 110, 18, -1.4, 1.4); g.stroke(); }
+}
+
+function toast(t) { const e = $('#toast'); e.innerHTML = `<span class="chip"><b>${t}</b></span>`; e.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => e.hidden = true, 2600); }
+function renderNotes() { $('#notelist').innerHTML = NOTES[S.view === 'grid' ? 'grid' : S.mode].map(n => `<li>${n}</li>`).join(''); }
+function renderAll() { renderTop(); renderOverview(); renderLeft(); renderRight(); renderDock(); renderHud(); renderNotes(); requestAnimationFrame(resize); }
+
+// wiring
+$('#gridbtn').onclick = () => { S.view = 'grid'; closePops(); renderAll(); };
+$('#docbtn').onclick = () => { if (S.view === 'grid') { S.view = 'doc'; renderAll(); } else if ($('#docpop').hidden) openDocs(); else closePops(); };
+$('#modes').onclick = e => { const b = e.target.closest('button'); if (b && !b.disabled) setMode(b.dataset.mode); };
+$('#left').onclick = e => {
+  const eye = e.target.closest('[data-layer]'); if (eye) { const k = eye.dataset.layer; S.layers[k] = !S.layers[k]; applyLayers(); renderLeft(); return; }
+  const r = e.target.closest('[data-sel]'); if (!r || !r.dataset.sel) return; const v = r.dataset.sel;
+  if (v.startsWith('clip:')) { S.clip = v.slice(5); renderLeft(); renderDock(); return; }
+  if (v.startsWith('mat:') || v.startsWith('lib:')) { toast(`Showing ${v.slice(4)}'s graph`); return; }
+  S.sel = v; S.pin = null;
+  if (S.mode === 'map') { const o = [...MAPDEF.prefabs, ...MAPDEF.previews].find(p => p.name === v); const sp = MAPDEF.spots.find(s => s[0] === v); const at = o ? o.at : sp ? [sp[1], sp[2]] : null; if (at) { fly.pos.set(at[0] + 14, groundY(...at) + 12, at[1] + 18); const dir = new THREE.Vector3(at[0], groundY(...at) + 2, at[1]).sub(fly.pos).normalize(); fly.yaw = Math.atan2(dir.x, -dir.z); fly.pitch = Math.asin(dir.y); S.cam = 'fly'; renderHud(); } }
+  renderLeft(); renderRight();
+};
+$('#right').onclick = e => {
+  if (e.target.closest('[data-close]')) { S.sel = null; S.pin = null; applySelection(); renderLeft(); renderRight(); return; }
+  if (e.target.closest('[data-closec]')) { S.showComments = false; S.pin = null; renderRight(); renderHud(); return; }
+  if (e.target.closest('[data-allc]')) { S.sel = null; S.showComments = true; applySelection(); renderLeft(); renderRight(); renderHud(); return; }
+  if (e.target.closest('[data-addc]')) { S.showComments = true; toast('Click the spot on the model'); renderHud(); return; }
+  const c = e.target.closest('[data-pin]'); if (c) { const p = PINS[S.doc].find(p => p.n == c.dataset.pin); S.sel = p.part; if (S.mode === 'map') { fly.pos.set(p.at[0] + 12, p.at[1] + 10, p.at[2] + 16); const dir = new THREE.Vector3(...p.at).sub(fly.pos).normalize(); fly.yaw = Math.atan2(dir.x, -dir.z); fly.pitch = Math.asin(dir.y); } applySelection(); renderLeft(); renderRight(); } };
+$('#graphhost').onclick = e => { const n = e.target.closest('[data-node]'); if (n) { S.matNode = n.dataset.node; renderGraph(); renderRight(); } };
+$('#ovgrid').onclick = e => {
+  const f = e.target.closest('[data-ovf]'); if (f) { S.ovfilter = f.dataset.ovf; renderOverview(); return; }
+  const x = e.target.closest('[data-close]');
+  if (x) { e.stopPropagation(); const d = DOCS.find(d => d.id === x.dataset.close); const tile = x.closest('.tile');
+    if (d.saved) { DOCS.splice(DOCS.indexOf(d), 1); renderAll(); toast(`Closed ${d.id}`); }
+    else if (!tile.querySelector('.confirm')) tile.querySelector('.thumb').append(el(`<div class="confirm"><span style="flex:1">${d.id} has unsaved work.</span><button class="iconbtn" data-keep>Keep</button><button class="primary" data-really="${d.id}">Close</button></div>`));
+    return; }
+  if (e.target.closest('[data-keep]')) { e.target.closest('.confirm').remove(); return; }
+  const r = e.target.closest('[data-really]'); if (r) { const d = DOCS.find(d => d.id === r.dataset.really); DOCS.splice(DOCS.indexOf(d), 1); if (S.doc === d.id) S.doc = DOCS[0].id; renderAll(); toast(`Closed ${d.id}; its autosave was dropped`); return; }
+  const t = e.target.closest('[data-doc]'); if (t) setDoc(t.dataset.doc);
+};
+$('#feedAll').onclick = e => { const r = e.target.closest('[data-open]'); if (r && DOCS.some(d => d.id === r.dataset.open)) setDoc(r.dataset.open); };
+$('#notesmin').onclick = () => { const n = $('#notes'); n.classList.toggle('min'); $('#notesmin').textContent = n.classList.contains('min') ? 'show' : 'hide'; };
+
+rebuild(); renderAll(); resize(); requestAnimationFrame(frame);
+</script>

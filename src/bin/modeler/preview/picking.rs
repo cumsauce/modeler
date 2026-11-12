@@ -42,13 +42,11 @@ pub(crate) fn pin_on_click(
     mut commands: Commands,
     mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
-    panel: Res<StylePane>,
-    mat_pane: Res<MatPane>,
-    outline: Res<OutlinePane>,
+    wb: Res<Workbench>,
     mut comment: ResMut<CommentBox>,
     view: Res<View3d>,
 ) {
-    if panel.hover || mat_pane.hover || outline.hover {
+    if wb.ui_hover {
         return;
     }
     // Pins land on a click (press + release with barely any movement), never on

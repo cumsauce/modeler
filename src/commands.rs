@@ -294,6 +294,32 @@ pub struct Session {
     pub focus_requested: bool,
 }
 
+impl Session {
+    /// Every client (agent) this server has seen, with its active document.
+    pub fn clients(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.clients
+            .iter()
+            .map(|(c, v)| (c.as_str(), v.doc.as_str()))
+    }
+
+    /// When a call last worked in document `doc` (None: not this run).
+    pub fn last_touched(&self, doc: &str) -> Option<std::time::Instant> {
+        self.touched.get(doc).copied()
+    }
+
+    /// Whether document `name` (open, active or not) matches its catalog file.
+    pub fn is_saved_doc(&self, name: &str) -> bool {
+        let model = if self.model.name == name {
+            Some(&self.model)
+        } else {
+            self.others.iter().find(|m| m.name == name)
+        };
+        model.is_some_and(|m| {
+            self.saved_state.get(name) == Some(&(m.history.nodes.len(), m.history.current))
+        })
+    }
+}
+
 /// "the shared library" or "project `name`" for messages.
 pub fn project_label(p: Option<&std::path::Path>) -> String {
     match p {

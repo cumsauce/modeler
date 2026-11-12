@@ -103,6 +103,7 @@ pub(crate) fn update_material_pane(
     typing: Res<PinTyping>,
     modeler: Res<Modeler>,
     mut pane: ResMut<MatPane>,
+    (wb, grid): (Res<Workbench>, Res<Grid>),
     mut hud: Query<(&mut Visibility, &ComputedNode), With<MatHud>>,
     canvas: Query<Entity, With<MatCanvas>>,
     mut title: Query<&mut Text, With<MatTitle>>,
@@ -112,9 +113,8 @@ pub(crate) fn update_material_pane(
     mut commands: Commands,
     (assets, mut comment): (Res<AssetServer>, ResMut<CommentBox>),
 ) {
-    if keys.just_pressed(KeyCode::KeyM) && !typing.open {
-        pane.visible = !pane.visible;
-    }
+    let _ = (&keys, &typing);
+    pane.visible = wb.mode == Mode::Material && !grid.on;
     let Ok((mut vis, computed)) = hud.single_mut() else {
         return;
     };
@@ -138,13 +138,12 @@ pub(crate) fn update_material_pane(
         pane.laid_out = size.round().as_uvec2();
         pane.shown = None;
     }
-    // The strip sits along the window's bottom: pane-local cursor.
-    let win_h = windows.single().map_or(size.y, |w| w.height());
+    // The graph fills the centre slot: pane-local cursor.
     let cursor = windows
         .single()
         .ok()
         .and_then(|w| w.cursor_position())
-        .map(|c| c - Vec2::new(0.0, win_h - size.y));
+        .map(|c| c - wb.rects.centre.min);
     pane.hover = cursor.is_some_and(|c| c.x >= 0.0 && c.y >= 0.0 && c.x < size.x && c.y < size.y);
 
     // Left: the lit preview; right of it: the node graph.
@@ -367,13 +366,15 @@ pub(crate) fn setup_material_pane(mut commands: Commands, assets: Res<AssetServe
         .spawn((
             Name::new("material pane"),
             MatHud,
+            InSlot(PaneSlot::Centre),
+            BlocksCamera,
             Visibility::Hidden,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(0.0),
+                top: Val::Px(0.0),
                 left: Val::Px(0.0),
                 width: Val::Percent(100.0),
-                height: Val::Percent(STRIP_FRACTION * 100.0),
+                height: Val::Percent(100.0),
                 overflow: Overflow::clip(),
                 ..default()
             },
