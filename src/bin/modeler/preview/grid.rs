@@ -39,6 +39,9 @@ const LABEL_H: f32 = 22.0;
 pub(crate) struct Grid {
     pub(crate) on: bool,
     tiles: Vec<Tile>,
+    /// An unsaved document whose close button was clicked once: the
+    /// second click closes it (its work is lost unless saved).
+    confirm_close: Option<String>,
 }
 
 /// Every open document, most recently changed first, and the grid's steady
@@ -120,6 +123,7 @@ impl Grid {
         Grid {
             on,
             tiles: Vec::new(),
+            confirm_close: None,
         }
     }
 }
@@ -130,6 +134,7 @@ struct Tile {
     camera: Entity,
     node: Entity,
     label: Entity,
+    close: Entity,
     image: Handle<Image>,
     size: UVec2,
     /// (version, history length) the parts were spawned from.
@@ -148,6 +153,10 @@ struct Tile {
 /// Marks a tile's image node (clicking it switches to `0`).
 #[derive(Component)]
 pub(crate) struct GridTileNode(String);
+
+/// A tile's close button (closes document `0`).
+#[derive(Component)]
+pub(crate) struct GridTileClose(String);
 
 #[derive(Component)]
 pub(crate) struct GridTileCamera;
@@ -259,6 +268,7 @@ pub(crate) fn update_grid(
         return;
     };
     let sf = windows.single().map(|w| w.scale_factor()).unwrap_or(1.0);
+    let win_w = windows.single().map(|w| w.width()).unwrap_or(0.0);
     let s = &mut modeler.session;
     let names: Vec<String> = recency.slots.clone();
     let total = recency.order.len();
@@ -440,12 +450,30 @@ pub(crate) fn update_grid(
                         GlobalZIndex(1),
                     ))
                     .id();
+                let close = commands
+                    .spawn((
+                        Name::new(format!("grid close {name}")),
+                        GridTileClose(name.clone()),
+                        Text::new("\u{d7}"),
+                        ui_text(&assets, 15.0, false),
+                        ui_color(false),
+                        TextLayout::no_wrap(),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            padding: UiRect::horizontal(Val::Px(4.0)),
+                            ..default()
+                        },
+                        GlobalZIndex(2),
+                    ))
+                    .observe(on_tile_close)
+                    .id();
                 grid.tiles.push(Tile {
                     doc: name.clone(),
                     layer,
                     camera,
                     node,
                     label,
+                    close,
                     image,
                     size,
                     built: None,
@@ -459,6 +487,7 @@ pub(crate) fn update_grid(
                 grid.tiles.len() - 1
             }
         };
+        let confirming = grid.confirm_close.as_deref() == Some(name.as_str());
         let tile = &mut grid.tiles[idx];
         if tile.built.is_none()
             && let Some(t) = recency.changed.get(name)
@@ -584,6 +613,23 @@ pub(crate) fn update_grid(
                 }
             }
         }
+        if let Ok((mut text, mut node)) = texts.get_mut(tile.close) {
+            let t = if confirming {
+                "close unsaved? \u{d7}"
+            } else {
+                "\u{d7}"
+            };
+            if text.0 != t {
+                text.0 = t.into();
+            }
+            let want = (
+                Val::Px(top + 1.0),
+                Val::Px((win_w - (left + cw)).max(0.0) + 2.0),
+            );
+            if (node.top, node.right) != want {
+                (node.top, node.right) = want;
+            }
+        }
         // Render only while settling.
         if let Ok((mut cam, mut tf, _)) = tile_cams.get_mut(tile.camera) {
             if *tf != tile.view {
@@ -600,7 +646,11 @@ pub(crate) fn update_grid(
 }
 
 fn despawn_tile(commands: &mut Commands, t: &Tile) {
-    for e in t.parts.iter().chain([&t.camera, &t.node, &t.label]) {
+    for e in t
+        .parts
+        .iter()
+        .chain([&t.camera, &t.node, &t.label, &t.close])
+    {
         commands.entity(*e).despawn();
     }
 }
@@ -622,4 +672,38 @@ fn on_tile_click(
         }
     }
     grid.on = false;
+}
+
+/// The close button: closes a saved document at once, an unsaved one on a
+/// second click (closing drops its autosave).
+fn on_tile_close(
+    mut click: On<PointerClick>,
+    buttons: Query<&GridTileClose>,
+    mut modeler: ResMut<Modeler>,
+    mut grid: ResMut<Grid>,
+) {
+    click.propagate(false);
+    let Ok(b) = buttons.get(click.entity) else {
+        return;
+    };
+    let s = &mut modeler.session;
+    let Some(m) = std::iter::once(&s.model)
+        .chain(s.others.iter())
+        .find(|m| m.name == b.0)
+    else {
+        return;
+    };
+    let saved = m.ops.is_empty() && m.parts.is_empty()
+        || modeler::catalog::with_project(m.project.clone(), || {
+            modeler::catalog::matches_prefab_file(m)
+        });
+    if !saved && grid.confirm_close.as_deref() != Some(b.0.as_str()) {
+        grid.confirm_close = Some(b.0.clone());
+        return;
+    }
+    grid.confirm_close = None;
+    match s.scene("close", Some(&b.0)) {
+        Ok(_) => s.mark_autosave(true, true, false),
+        Err(e) => eprintln!("closing document: {e}"),
+    }
 }

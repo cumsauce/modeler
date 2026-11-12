@@ -1428,7 +1428,7 @@ and material panes closed (`MODELER_OUTLINE=0` / `MODELER_STYLE=1` /
   agents switch the active document on nearly every call). Each tile is labelled with the document,
   its visible part count, the agent that made its latest step (`by
   <client>`) and when it last changed; "(active)" marks the active one.
-  Click a tile to switch to that document and leave the grid. Cheap by
+  Click a tile to switch to that document and leave the grid; its × closes the document (an unsaved one asks "close unsaved?" first: closing drops its autosave). Cheap by
   design: each tile is its own camera on its own render layer rendering
   into its own image, active only for a few frames after its document
   changes (or the tile resizes), so an idle grid renders no 3D at all; the
