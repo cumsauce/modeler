@@ -331,8 +331,9 @@ mod tests {
                 },
             ],
             mirror: None,
+            ..Default::default()
         };
-        build("s", &def, &[]).unwrap_or_else(|e| panic!("{e}"))
+        build("s", &def, &[], &[]).unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn bind() -> BindDef {
@@ -405,8 +406,9 @@ mod tests {
                 },
             ],
             mirror: None,
+            ..Default::default()
         };
-        let s = build("s", &def, &[]).unwrap_or_else(|e| panic!("{e}"));
+        let s = build("s", &def, &[], &[]).unwrap_or_else(|e| panic!("{e}"));
         let mut d = bind();
         d.blend = Some(1.0);
         let b = smooth_weights(&p, &s, &d, "t").unwrap_or_else(|e| panic!("{e}"));

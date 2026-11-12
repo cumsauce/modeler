@@ -637,3 +637,46 @@ fn skins_and_clips_export() {
         assert!((angle - 60.0).abs() < 0.5, "{angle}");
     }
 }
+
+#[test]
+fn sway_tree_exports_runtime_settings() {
+    let mut s = modeler::commands::Session::default();
+    let items = serde_json::json!([
+        {"type": "lsystem", "name": "oak", "preset": "tree", "seed": 4, "iterations": 4},
+        {"type": "material", "name": "oak", "color": "#6a4a30", "flat": true},
+        {"type": "material", "name": "oak_leaves", "color": "#4a7a30", "flat": true},
+        {"type": "skeleton", "name": "oak_rig", "from": "oak", "max_depth": 2},
+        {"type": "bind", "name": "oak_bind", "skeleton": "oak_rig", "parts": ["oak", "oak_leaves"], "mode": "auto"},
+        {"type": "sway", "name": "wind", "skeleton": "oak_rig", "strength": 0.8, "duration": 2, "fps": 15}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    let dir = temp_dir("sway");
+    let path = dir.join("oak.gltf");
+    let opts = modeler::export_opt::Options::parse(&serde_json::json!("game")).unwrap();
+    let report = modeler::gltf::export_gltf_with(&s.model, &path, &opts).unwrap();
+    assert!(report.contains("rig: 1 skeleton"), "{report}");
+    let (doc, _, _) = gltf::import(&path).expect("imports");
+    let root = doc
+        .nodes()
+        .find(|n| n.name() == Some("oak_rig"))
+        .expect("skeleton root node");
+    let extras: serde_json::Value =
+        serde_json::from_str(root.extras().as_ref().expect("extras").get()).unwrap();
+    let rig: modeler_anim::SwayRig = serde_json::from_value(extras["sway"].clone()).unwrap();
+    assert_eq!(rig.clip.as_deref(), Some("wind"));
+    assert!(rig.period.is_none(), "the runtime runs unlooped");
+    assert!(
+        matches!(rig.kind, modeler_anim::SwayKind::Wind(ref w) if (w.strength - 0.8).abs() < 1e-6)
+    );
+    let skin = doc.skins().next().expect("a skin");
+    assert_eq!(skin.joints().count(), rig.bones.len());
+    // The baked clip animates the bones' rotations at 15 fps.
+    let anim = doc.animations().next().expect("the wind clip");
+    assert_eq!(anim.name(), Some("wind"));
+    let ch = anim.channels().next().expect("a channel");
+    assert_eq!(ch.sampler().input().count(), 31);
+    // Both parts are skinned: wood and leaf cards.
+    let skinned = doc.nodes().filter(|n| n.skin().is_some()).count();
+    assert_eq!(skinned, 2);
+}

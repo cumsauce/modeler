@@ -113,6 +113,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 | Op::Skeleton { .. }
                 | Op::Bind { .. }
                 | Op::Clip { .. }
+                | Op::Sway { .. }
         ) {
             continue;
         }
@@ -612,7 +613,8 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         | Op::Marker { .. }
         | Op::Skeleton { .. }
         | Op::Bind { .. }
-        | Op::Clip { .. } => {}
+        | Op::Clip { .. }
+        | Op::Sway { .. } => {}
         Op::Primitive {
             name,
             kind,
@@ -1280,7 +1282,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Marker { name, .. }
         | Op::Skeleton { name, .. }
         | Op::Bind { name, .. }
-        | Op::Clip { name, .. } => name,
+        | Op::Clip { name, .. }
+        | Op::Sway { name, .. } => name,
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
         | Op::Revolve { name, .. }
@@ -1326,7 +1329,8 @@ pub fn outputs(op: &Op) -> Vec<String> {
         | Op::Marker { .. }
         | Op::Skeleton { .. }
         | Op::Bind { .. }
-        | Op::Clip { .. } => Vec::new(),
+        | Op::Clip { .. }
+        | Op::Sway { .. } => Vec::new(),
         Op::RadialArray {
             name,
             count,
@@ -1385,6 +1389,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Skeleton { .. } => "skeleton",
         Op::Bind { .. } => "bind",
         Op::Clip { .. } => "clip",
+        Op::Sway { .. } => "sway",
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
         Op::Revolve { .. } => "revolve",
@@ -1428,6 +1433,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
+        | Op::Sway { .. }
         | Op::Primitive { frame: None, .. }
         | Op::Extrude { .. }
         | Op::Revolve { .. }
@@ -1510,8 +1516,19 @@ pub fn describe(ops: &[Op]) -> String {
     for (i, op) in ops.iter().enumerate() {
         lines.push(match op {
             Op::Skeleton { name, def } => format!(
-                "#{i} skeleton `{name}` bones={}{}",
-                def.bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(","),
+                "#{i} skeleton `{name}`{}{}{}",
+                def.from
+                    .as_ref()
+                    .map(|f| format!(" from=`{f}`"))
+                    .unwrap_or_default(),
+                if def.bones.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " bones={}",
+                        def.bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(",")
+                    )
+                },
                 def.mirror.as_ref().map(|m| format!(" mirror={m}")).unwrap_or_default()
             ),
             Op::Bind { name, def } => format!(
@@ -1520,6 +1537,26 @@ pub fn describe(ops: &[Op]) -> String {
                 def.parts,
                 def.mode,
                 def.bone.as_ref().map(|b| format!(" bone=`{b}`")).unwrap_or_default()
+            ),
+            Op::Sway { name, def } => format!(
+                "#{i} sway `{name}` skeleton=`{}` {}{}{}",
+                def.skeleton,
+                match &def.motion {
+                    modeler_anim::SwayKind::Wind(w) => format!(
+                        "wind strength={} gust={} flutter={} dir={:?}",
+                        w.strength, w.gust, w.flutter, w.direction
+                    ),
+                    modeler_anim::SwayKind::Spring(s) => format!(
+                        "spring stiffness={} damping={} gravity={}",
+                        s.stiffness, s.damping, s.gravity
+                    ),
+                },
+                def.over.as_ref().map(|o| format!(" over=`{o}`")).unwrap_or_default(),
+                if def.bones.is_empty() {
+                    String::new()
+                } else {
+                    format!(" bones={:?}", def.bones)
+                }
             ),
             Op::Clip { name, def } => format!(
                 "#{i} clip `{name}` skeleton=`{}` {}s{} tracks={}{}",

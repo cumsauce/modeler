@@ -184,6 +184,10 @@ pub struct Part {
     /// weights). Derived after the graph; never saved.
     #[serde(skip)]
     pub rig: Option<std::sync::Arc<crate::anim::Binding>>,
+    /// The branch structure an `lsystem` grew this part from (wood or
+    /// leaves), for auto-rigs. Derived by the op; never saved.
+    #[serde(skip)]
+    pub branches: Option<std::sync::Arc<crate::lsystem::Branches>>,
 }
 
 fn one() -> f32 {
@@ -1216,6 +1220,12 @@ pub enum Op {
         name: String,
         #[serde(flatten)]
         def: crate::anim::ClipDef,
+    },
+    /// Dynamic motion (wind or springs) baked into a clip of this name.
+    Sway {
+        name: String,
+        #[serde(flatten)]
+        def: crate::anim::SwayDef,
     },
     /// CSG combine two earlier parts (`union`/`difference`/`intersection`).
     Boolean {

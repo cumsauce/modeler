@@ -12,8 +12,12 @@
 //! pitches the bone about world x from the rest pose, with no roll to think
 //! about. Clip tracks are offsets from rest, composed down the tree.
 
+pub mod auto;
 pub mod check;
 pub mod skin;
+pub mod sway;
+
+pub use sway::SwayDef;
 
 use std::collections::BTreeMap;
 
@@ -52,6 +56,15 @@ pub struct SkeletonDef {
     /// x = 0 (parents `*_l` map to `*_r` too).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<String>,
+    /// Auto-rig from this op (an lsystem or a skin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bone_length: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bones: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -156,6 +169,8 @@ pub struct Bone {
 pub struct Skeleton {
     pub name: String,
     pub bones: Vec<Bone>,
+    /// Exact weights when the skeleton was grown `from` an lsystem.
+    pub auto: Option<std::sync::Arc<auto::AutoMap>>,
 }
 
 /// Local offsets from rest per bone: translation, rotation, scale.
@@ -251,15 +266,46 @@ pub fn mirror_name(n: &str) -> Option<String> {
         .or_else(|| n.strip_suffix(".l").map(|b| format!("{b}.r")))
 }
 
-/// Builds a skeleton from its item, resolving anchors on `parts`.
+/// Builds a skeleton from its item, resolving anchors on `parts` (and a
+/// `from` auto-rig on `parts` / `ops`).
 pub fn build(
     name: &str,
     def: &SkeletonDef,
     parts: &[(String, std::sync::Arc<Part>)],
+    ops: &[Op],
 ) -> Result<Skeleton, String> {
     let ctx = format!("skeleton `{name}`");
     // name -> (parent, head, tail?, radius?)
-    let mut raw: Vec<(String, Option<String>, Vec3, Option<Vec3>, Option<f32>)> = Vec::new();
+    let mut raw: Vec<auto::RawBone> = Vec::new();
+    let mut mirror = def.mirror.clone();
+    // lsystem rigs: per chain point, (generated bone index, weight) pairs.
+    let mut lsys: Option<(String, Vec<Vec<[(usize, f32); 2]>>)> = None;
+    if let Some(from) = &def.from {
+        let skin = ops.iter().find_map(|o| match o {
+            Op::Skin { name: n, def } if n == from => Some(def),
+            _ => None,
+        });
+        if let Some(sd) = skin {
+            let (bones, mirrored) =
+                auto::from_skin(from, sd).map_err(|e| format!("{ctx}: from {e}"))?;
+            raw.extend(bones);
+            if mirrored {
+                mirror = Some("x".into());
+            }
+        } else {
+            let part = parts.iter().find(|(n, _)| n == from).map(|(_, p)| p);
+            let Some(br) = part.and_then(|p| p.branches.as_ref().map(|b| (p, b))) else {
+                return Err(format!(
+                    "{ctx}: from `{from}`: not an lsystem's wood part or a skin op (auto-rigs grow from those)"
+                ));
+            };
+            let (bones, point) = auto::from_lsystem(from, def, br.0, br.1)
+                .map_err(|e| format!("{ctx}: from {e}"))?;
+            raw.extend(bones);
+            lsys = Some((from.clone(), point));
+        }
+    }
+    let generated: Vec<String> = raw.iter().map(|r| r.0.clone()).collect();
     for b in &def.bones {
         let head =
             point(&b.head, parts).map_err(|e| format!("{ctx}: bone `{}`: head {e}", b.name))?;
@@ -271,7 +317,7 @@ pub fn build(
             .map_err(|e| format!("{ctx}: bone `{}`: tail {e}", b.name))?;
         raw.push((b.name.clone(), b.parent.clone(), head, tail, b.radius));
     }
-    match def.mirror.as_deref() {
+    match mirror.as_deref() {
         None => {}
         Some("x") => {
             let flip = |v: Vec3| Vec3::new(-v.x, v.y, v.z);
@@ -379,9 +425,31 @@ pub fn build(
     if bones.len() > u16::MAX as usize {
         return Err(format!("{ctx}: too many bones"));
     }
+    let auto = match lsys {
+        None => None,
+        Some((from, point)) => {
+            let idx: Vec<u16> = generated
+                .iter()
+                .map(|n| bones.iter().position(|b| &b.name == n).unwrap_or(0) as u16)
+                .collect();
+            let map = |b: usize| idx.get(b).copied().unwrap_or(0);
+            Some(std::sync::Arc::new(auto::AutoMap {
+                from,
+                point: point
+                    .into_iter()
+                    .map(|c| {
+                        c.into_iter()
+                            .map(|[(a, wa), (b, wb)]| [(map(a), wa), (map(b), wb)])
+                            .collect()
+                    })
+                    .collect(),
+            }))
+        }
+    };
     Ok(Skeleton {
         name: name.to_string(),
         bones,
+        auto,
     })
 }
 
@@ -394,12 +462,21 @@ pub struct Clip {
     pub looping: bool,
     /// (bone index, track, mirrored?, time shift)
     pub tracks: Vec<(usize, TrackDef, bool, f32)>,
+    /// The clip this one layers over (a sway's `over`).
+    pub base: Option<Box<Clip>>,
+    /// Dynamic motion on top (a `sway`).
+    pub layer: Option<std::sync::Arc<sway::Layer>>,
+    /// Export samples per second (default 30).
+    pub fps: Option<f32>,
 }
 
 impl Clip {
     /// The pose at time `t` (wrapped when looping, clamped otherwise).
     pub fn sample(&self, skel: &Skeleton, t: f32) -> Pose {
-        let mut pose = skel.rest();
+        let mut pose = match &self.base {
+            Some(b) => b.sample(skel, t),
+            None => skel.rest(),
+        };
         for (bone, track, mirrored, shift) in &self.tracks {
             let tt = self.wrap(t + shift);
             let d = self.duration;
@@ -427,7 +504,78 @@ impl Clip {
                 *slot = (tr, r, s);
             }
         }
+        if let Some(l) = &self.layer {
+            sway::apply(l, self.duration, self.wrap(t), &mut pose);
+        }
         pose
+    }
+
+    /// Which channels of which bones move: (bone, translate, rotate, scale).
+    pub fn channels(&self, skel: &Skeleton) -> Vec<(usize, bool, bool, bool)> {
+        let mut out: Vec<(usize, bool, bool, bool)> = match &self.base {
+            Some(b) => b.channels(skel),
+            None => Vec::new(),
+        };
+        let mut add =
+            |bone: usize, t: bool, r: bool, s: bool| match out.iter_mut().find(|c| c.0 == bone) {
+                Some(c) => {
+                    c.1 |= t;
+                    c.2 |= r;
+                    c.3 |= s;
+                }
+                None => out.push((bone, t, r, s)),
+            };
+        for (bone, track, _, _) in &self.tracks {
+            add(
+                *bone,
+                track.translate.is_some(),
+                track.rotate.is_some(),
+                track.scale.is_some(),
+            );
+        }
+        match self.layer.as_deref() {
+            Some(sway::Layer::Wind(rig)) => {
+                for (i, b) in rig.bones.iter().enumerate() {
+                    if b.weight > 0.0 {
+                        add(i, false, true, false);
+                    }
+                }
+            }
+            Some(sway::Layer::Spring(_)) => {
+                for i in 0..skel.bones.len() {
+                    add(i, false, true, false);
+                }
+            }
+            None => {}
+        }
+        out.sort_by_key(|c| c.0);
+        out
+    }
+
+    /// Key times of keyed channels (base included), wrapped into the clip.
+    pub fn key_times(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        if let Some(b) = &self.base {
+            let reps = (self.duration / b.duration).round().max(1.0) as usize;
+            for t in b.key_times() {
+                for k in 0..reps {
+                    out.push(t + k as f32 * b.duration);
+                }
+            }
+        }
+        for (_, track, _, shift) in &self.tracks {
+            for ch in [&track.rotate, &track.translate, &track.scale]
+                .into_iter()
+                .flatten()
+            {
+                if let Channel::Keys { keys, .. } = ch {
+                    for (t, _) in keys {
+                        out.push(self.wrap(t - shift));
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn wrap(&self, t: f32) -> f32 {
@@ -629,6 +777,9 @@ pub fn build_clip(name: &str, def: &ClipDef, skel: &Skeleton) -> Result<Clip, St
         duration: def.duration,
         looping: def.looping,
         tracks,
+        base: None,
+        layer: None,
+        fps: None,
     })
 }
 
@@ -664,7 +815,7 @@ pub fn skeletons(model: &Model) -> Result<Vec<Skeleton>, ModelerError> {
     let mut out = Vec::new();
     for op in &model.ops {
         if let Op::Skeleton { name, def } = op {
-            out.push(build(name, def, &named)?);
+            out.push(build(name, def, &named, &model.ops)?);
         }
     }
     Ok(out)
@@ -673,15 +824,51 @@ pub fn skeletons(model: &Model) -> Result<Vec<Skeleton>, ModelerError> {
 /// Every clip of the model with its skeleton.
 pub fn clips(model: &Model) -> Result<Vec<(Clip, Skeleton)>, ModelerError> {
     let skels = skeletons(model)?;
-    let mut out = Vec::new();
-    for op in &model.ops {
+    Ok(build_all(&model.ops, &skels)?)
+}
+
+/// Keyed clips first, then sways (which may layer over a keyed clip), in
+/// op order within each.
+fn build_all(ops: &[Op], skels: &[Skeleton]) -> Result<Vec<(Clip, Skeleton)>, String> {
+    let mut out: Vec<(Clip, Skeleton)> = Vec::new();
+    for op in ops {
         if let Op::Clip { name, def } = op {
             let Some(s) = skels.iter().find(|s| s.name == def.skeleton) else {
-                return Err(format!("clip `{name}`: no skeleton `{}`", def.skeleton).into());
+                return Err(format!("clip `{name}`: no skeleton `{}`", def.skeleton));
             };
             out.push((build_clip(name, def, s)?, s.clone()));
         }
     }
+    let mut sways = Vec::new();
+    for op in ops {
+        if let Op::Sway { name, def } = op {
+            let Some(s) = skels.iter().find(|s| s.name == def.skeleton) else {
+                return Err(format!("sway `{name}`: no skeleton `{}`", def.skeleton));
+            };
+            if out.iter().any(|(c, _)| &c.name == name) {
+                return Err(format!(
+                    "sway `{name}`: a clip is already named `{name}`: rename one"
+                ));
+            }
+            let base = match &def.over {
+                None => None,
+                Some(o) => {
+                    let Some((c, _)) = out.iter().find(|(c, _)| &c.name == o) else {
+                        return Err(format!("sway `{name}`: over `{o}`: no such clip"));
+                    };
+                    if c.skeleton != s.name {
+                        return Err(format!(
+                            "sway `{name}`: over `{o}` animates skeleton `{}`, not `{}`",
+                            c.skeleton, s.name
+                        ));
+                    }
+                    Some(c.clone())
+                }
+            };
+            sways.push((sway::build(name, def, s, base)?, s.clone()));
+        }
+    }
+    out.extend(sways);
     Ok(out)
 }
 
@@ -744,27 +931,22 @@ pub fn apply_binds(
     ops: &[Op],
     named: &mut [(String, std::sync::Arc<Part>)],
 ) -> Result<(), ModelerError> {
-    if !ops
-        .iter()
-        .any(|o| matches!(o, Op::Bind { .. } | Op::Skeleton { .. } | Op::Clip { .. }))
-    {
+    if !ops.iter().any(|o| {
+        matches!(
+            o,
+            Op::Bind { .. } | Op::Skeleton { .. } | Op::Clip { .. } | Op::Sway { .. }
+        )
+    }) {
         return Ok(());
     }
     let mut skels: Vec<Skeleton> = Vec::new();
     for op in ops {
         if let Op::Skeleton { name, def } = op {
-            skels.push(build(name, def, named)?);
+            skels.push(build(name, def, named, ops)?);
         }
     }
     // Clips are checked here so a bad track fails (and rolls back) the batch.
-    for op in ops {
-        if let Op::Clip { name, def } = op {
-            let Some(s) = skels.iter().find(|s| s.name == def.skeleton) else {
-                return Err(format!("clip `{name}`: no skeleton `{}`", def.skeleton).into());
-            };
-            build_clip(name, def, s)?;
-        }
-    }
+    build_all(ops, &skels)?;
     for op in ops {
         let Op::Bind { name, def } = op else { continue };
         let ctx = format!("bind `{name}`");
@@ -798,6 +980,7 @@ pub fn apply_binds(
                         weights: Vec::new(),
                     }
                 }
+                "auto" if exact_fits(skel, part, n) => exact(skel, part, name),
                 _ => skin::smooth_weights(part, skel, def, name)
                     .map_err(|e| format!("{ctx}: {e}"))?,
             };
@@ -808,6 +991,49 @@ pub fn apply_binds(
         }
     }
     Ok(())
+}
+
+/// Whether `part` (named `n`) is the wood or leaves of the lsystem `skel`
+/// was grown from, with its branch record intact.
+fn exact_fits(skel: &Skeleton, part: &Part, n: &str) -> bool {
+    let (Some(map), Some(br)) = (&skel.auto, &part.branches) else {
+        return false;
+    };
+    (n == map.from || n.strip_suffix("_leaves") == Some(map.from.as_str()))
+        && br.vert_point.len() == part.verts.len()
+        && br.chains.len() == map.point.len()
+}
+
+/// Exact weights from the branch record: each vertex rides the bones of
+/// the chain point it hangs on.
+fn exact(skel: &Skeleton, part: &Part, bind: &str) -> Binding {
+    let mut joints = Vec::with_capacity(part.verts.len());
+    let mut weights = Vec::with_capacity(part.verts.len());
+    let map = skel.auto.as_deref();
+    for &(c, p) in part
+        .branches
+        .as_ref()
+        .map_or(&[][..], |b| &b.vert_point[..])
+    {
+        let w = map
+            .and_then(|m| m.point.get(c as usize)?.get(p as usize))
+            .copied()
+            .unwrap_or([(0, 1.0), (0, 0.0)]);
+        if w[1].1 > 0.0 && w[1].0 != w[0].0 {
+            joints.push([w[0].0, w[1].0, 0, 0]);
+            weights.push([w[0].1, w[1].1, 0.0, 0.0]);
+        } else {
+            joints.push([w[0].0, 0, 0, 0]);
+            weights.push([1.0, 0.0, 0.0, 0.0]);
+        }
+    }
+    Binding {
+        skeleton: skel.name.clone(),
+        bind: bind.to_string(),
+        bone: None,
+        joints,
+        weights,
+    }
 }
 
 #[cfg(test)]
@@ -832,9 +1058,9 @@ mod tests {
                     radius: None,
                 },
             ],
-            mirror: None,
+            ..Default::default()
         };
-        build("arm", &def, &[]).unwrap_or_else(|e| panic!("{e}"))
+        build("arm", &def, &[], &[]).unwrap_or_else(|e| panic!("{e}"))
     }
 
     #[test]
@@ -931,8 +1157,9 @@ mod tests {
                 },
             ],
             mirror: Some("x".into()),
+            ..Default::default()
         };
-        let s = build("r", &def, &[]).unwrap_or_else(|e| panic!("{e}"));
+        let s = build("r", &def, &[], &[]).unwrap_or_else(|e| panic!("{e}"));
         let r = s.bone("leg_r").unwrap_or_else(|| panic!("no leg_r"));
         assert!((s.bones[r].head.x + 0.2).abs() < 1e-6);
         assert_eq!(s.bones[r].parent, s.bone("hip"));
@@ -1000,5 +1227,135 @@ mod tests {
                 .angle_between(Quat::from_rotation_x(40f32.to_radians()))
                 < 1e-3
         );
+    }
+
+    fn session(items: serde_json::Value) -> crate::commands::Session {
+        let mut s = crate::commands::Session::default();
+        let serde_json::Value::Array(items) = items else {
+            panic!()
+        };
+        s.apply_values(None, items)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s
+    }
+
+    #[test]
+    fn lsystem_auto_rig_and_wind() {
+        let s = session(serde_json::json!([
+            {"type": "lsystem", "name": "oak", "preset": "tree", "seed": 2},
+            {"type": "skeleton", "name": "oak_rig", "from": "oak"},
+            {"type": "bind", "name": "oak_bind", "skeleton": "oak_rig", "parts": ["oak", "oak_leaves"], "mode": "auto"},
+            {"type": "sway", "name": "wind", "skeleton": "oak_rig", "strength": 1.0, "duration": 4}
+        ]));
+        let (clip, skel) = clip(&s.model, Some("wind")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            skel.bones.len() > 4 && skel.bones.len() <= 128,
+            "{}",
+            skel.bones.len()
+        );
+        assert!(skel.auto.is_some());
+        for name in ["oak", "oak_leaves"] {
+            let p = s
+                .model
+                .parts
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("no {name}"));
+            let b = p.rig.as_ref().unwrap_or_else(|| panic!("{name} unbound"));
+            assert_eq!(b.weights.len(), p.verts.len(), "{name}");
+            for w in &b.weights {
+                assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{w:?}");
+            }
+        }
+        // Loops, and moves the crown more than the base.
+        let a = clip.sample(&skel, 0.0);
+        let b = clip.sample(&skel, 4.0 - 1e-4);
+        for (x, y) in a.iter().zip(&b) {
+            assert!(x.1.angle_between(y.1) < 2e-3);
+        }
+        let rest = posed_parts(&s.model, &clip, &skel, 0.0);
+        let later = posed_parts(&s.model, &clip, &skel, 1.3);
+        let wood = |v: &[std::sync::Arc<Part>]| {
+            v.iter()
+                .find(|p| p.name == "oak")
+                .cloned()
+                .unwrap_or_else(|| panic!("no oak"))
+        };
+        let (r, l) = (wood(&rest), wood(&later));
+        let mut top = 0.0f32;
+        let mut bottom = 0.0f32;
+        for (p, q) in r.verts.iter().zip(&l.verts) {
+            let d = Vec3::from(*p).distance(Vec3::from(*q));
+            if p[1] > 3.0 {
+                top = top.max(d);
+            } else if p[1] < 0.5 {
+                bottom = bottom.max(d);
+            }
+        }
+        assert!(
+            top > 0.01 && top > bottom * 3.0,
+            "top {top} bottom {bottom}"
+        );
+    }
+
+    #[test]
+    fn spring_tail_lags_a_walk_and_loops() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "body", "kind": "box", "size": [0.3, 0.2, 0.5], "translation": [0, 0.5, 0]},
+            {"type": "skeleton", "name": "rig", "bones": {
+                "body": {"head": [0, 0.5, 0], "tail": [0, 0.5, -0.25]},
+                "tail_0": {"parent": "body", "head": [0, 0.5, -0.25], "tail": [0, 0.5, -0.45]},
+                "tail_1": {"parent": "tail_0", "head": [0, 0.5, -0.45], "tail": [0, 0.5, -0.65]}}},
+            {"type": "bind", "name": "b", "skeleton": "rig", "parts": ["body"], "bone": "body"},
+            {"type": "clip", "name": "trot", "skeleton": "rig", "duration": 1.0,
+             "tracks": {"body": {"translate": {"wave": {"axis": "x", "amount": 0.1}}}}},
+            {"type": "sway", "name": "tail_spring", "skeleton": "rig", "kind": "spring", "over": "trot",
+             "bones": ["tail*"], "stiffness": 60, "damping": 4}
+        ]));
+        let (clip, skel) = clip(&s.model, Some("tail_spring")).unwrap_or_else(|e| panic!("{e}"));
+        let t1 = skel.bone("tail_1").unwrap_or(0);
+        let swing = (0..20)
+            .map(|k| {
+                clip.sample(&skel, k as f32 * 0.05)[t1]
+                    .1
+                    .angle_between(Quat::IDENTITY)
+            })
+            .fold(0.0f32, f32::max);
+        assert!(swing > 0.02, "the tail swings ({swing})");
+        // The body keeps its trot.
+        assert!((clip.sample(&skel, 0.25)[0].0.x - 0.1).abs() < 1e-3);
+        let a = clip.sample(&skel, 0.0);
+        let b = clip.sample(&skel, 1.0 - 1e-4);
+        assert!(a[t1].1.angle_between(b[t1].1) < 5e-3, "seam");
+        // A duration that isn't whole cycles of the driver fails.
+        let mut s = s;
+        let bad = serde_json::json!([{"type": "sway", "name": "tail_spring", "skeleton": "rig",
+            "kind": "spring", "over": "trot", "duration": 1.5}]);
+        let serde_json::Value::Array(bad) = bad else {
+            panic!()
+        };
+        let Err(e) = s.apply_values(None, bad) else {
+            panic!("applied")
+        };
+        assert!(e.to_string().contains("whole number"), "{e}");
+    }
+
+    #[test]
+    fn skin_auto_rig_mirrors() {
+        let s = session(serde_json::json!([
+            {"type": "skin", "name": "critter", "mirror": "x",
+             "joints": {"body": [0, 0.3, 0, 0.12]},
+             "chains": [["body", [0.15, 0.15, 0.05, 0.04], [0.2, 0.02, 0.08, 0.03]], ["body", [0, 0.5, 0.1, 0.08]]]},
+            {"type": "skeleton", "name": "rig", "from": "critter"},
+            {"type": "bind", "name": "b", "skeleton": "rig", "parts": ["critter"], "mode": "auto"}
+        ]));
+        let skel = skeletons(&s.model).unwrap_or_else(|e| panic!("{e}"));
+        let names: Vec<&str> = skel[0].bones.iter().map(|b| b.name.as_str()).collect();
+        for n in ["body", "c0_1_l", "c0_1_r", "c0_2_r", "c1_1"] {
+            assert!(names.contains(&n), "{n} in {names:?}");
+        }
+        let r = skel[0].bone("c0_1_r").unwrap_or(0);
+        assert_eq!(skel[0].bones[r].parent, skel[0].bone("body"));
+        assert!(skel[0].bones[r].head.x < -0.1);
     }
 }

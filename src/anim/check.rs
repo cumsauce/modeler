@@ -35,6 +35,17 @@ pub fn summary(model: &Model) -> Option<String> {
                     if def.looping { " loop" } else { "" },
                     def.tracks.len() + def.mirror.len()
                 )),
+                Op::Sway { name, def } if def.skeleton == s.name => Some(format!(
+                    "`{name}` {} sway{}",
+                    match def.motion {
+                        modeler_anim::SwayKind::Wind(_) => "wind",
+                        modeler_anim::SwayKind::Spring(_) => "spring",
+                    },
+                    def.over
+                        .as_ref()
+                        .map(|o| format!(" over `{o}`"))
+                        .unwrap_or_default()
+                )),
                 _ => None,
             })
             .collect();

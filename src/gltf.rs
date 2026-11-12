@@ -1044,8 +1044,16 @@ fn rig_nodes(
             children.insert(*r);
         }
         let root = nodes.len();
-        nodes
-            .push(json!({"name": skel.name, "children": roots, "extras": {"skeleton": skel.name}}));
+        let mut extras = json!({"skeleton": skel.name});
+        // The live simulation's settings, for the runtime plugin.
+        if let Some((name, def)) = model.ops.iter().find_map(|o| match o {
+            crate::Op::Sway { name, def } if def.skeleton == skel.name => Some((name, def)),
+            _ => None,
+        }) {
+            let rig = crate::anim::sway::rig_of(skel, def, None, name);
+            extras["sway"] = serde_json::to_value(&rig).unwrap_or(Value::Null);
+        }
+        nodes.push(json!({"name": skel.name, "children": roots, "extras": extras}));
         // Rigid parts ride their joint: local = inverse(joint rest) * part.
         for &pi in &users {
             let Some(rig) = &exported[pi].rig else {
@@ -1096,22 +1104,11 @@ fn rig_nodes(
         }
         // Clips of this skeleton.
         for (clip, _) in clips.iter().filter(|(c, _)| c.skeleton == skel.name) {
-            let fps = 30.0f32;
+            let fps = clip.fps.unwrap_or(30.0);
             let mut times: Vec<f32> = (0..=((clip.duration * fps).ceil() as usize))
                 .map(|i| (i as f32 / fps).min(clip.duration))
                 .collect();
-            for (_, track, _, shift) in &clip.tracks {
-                for ch in [&track.rotate, &track.translate, &track.scale]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let crate::anim::Channel::Keys { keys, .. } = ch {
-                        for (t, _) in keys {
-                            times.push(clip.wrap(t - shift));
-                        }
-                    }
-                }
-            }
+            times.extend(clip.key_times());
             times.sort_by(f32::total_cmp);
             times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
             let poses: Vec<crate::anim::Pose> = times
@@ -1133,16 +1130,7 @@ fn rig_nodes(
             }));
             let input = b.accessors.len() - 1;
             let (mut samplers, mut channels) = (Vec::new(), Vec::new());
-            let mut animated: Vec<(usize, bool, bool, bool)> = Vec::new();
-            for (bone, track, _, _) in &clip.tracks {
-                animated.push((
-                    *bone,
-                    track.translate.is_some(),
-                    track.rotate.is_some(),
-                    track.scale.is_some(),
-                ));
-            }
-            for (bone, tr, rot, sc) in animated {
+            for (bone, tr, rot, sc) in clip.channels(skel) {
                 let rest = match skel.bones[bone].parent {
                     Some(p) => skel.bones[bone].head - skel.bones[p].head,
                     None => skel.bones[bone].head,

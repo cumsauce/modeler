@@ -2183,10 +2183,28 @@ pub struct SkeletonSpec {
     name: String,
     /// Bones by name. Rest frames are world-aligned: a clip's rotation
     /// `{"x": 25}` pitches the bone about world x from rest.
+    #[serde(default)]
     bones: std::collections::BTreeMap<String, BoneSpec>,
     /// "x": every `*_l` bone gets a `*_r` twin mirrored across x = 0.
     #[serde(default)]
     mirror: Option<String>,
+    /// Auto-rig from an op instead of listing bones: an `lsystem` (bones
+    /// along its branches: `trunk_0..`, `branch7_0..`) or a `skin` (a bone
+    /// per chain point, named joints keep their names, mirrored skins get
+    /// `_l` / `_r` twins). Extra `bones` may hang off the generated ones.
+    #[serde(default)]
+    from: Option<String>,
+    /// lsystem: meters per bone along a branch (default 0.5).
+    #[serde(default)]
+    bone_length: Option<f32>,
+    /// lsystem: deepest branch level that gets bones (0 = trunk only,
+    /// default 3); finer twigs ride the bone they grow from.
+    #[serde(default)]
+    max_depth: Option<u32>,
+    /// lsystem: bone budget (default 128, at most 256 for Bevy's GPU
+    /// skinning); the thickest branches get bones first.
+    #[serde(default)]
+    max_bones: Option<u32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2215,7 +2233,9 @@ pub struct BindSpec {
     #[serde(default)]
     bone: Option<String>,
     /// rigid (default with `bone`) or smooth (default without: per-vertex
-    /// weights from the nearest bone envelopes, blended over the mesh).
+    /// weights from the nearest bone envelopes, blended over the mesh), or
+    /// auto (for a skeleton `from` an lsystem: exact weights along the
+    /// branches, each leaf rigid on its twig's bone; otherwise smooth).
     #[serde(default)]
     mode: Option<String>,
     /// Smooth: meters over which weights blend across a joint (default the
@@ -2225,6 +2245,59 @@ pub struct BindSpec {
     /// Smooth: force regions onto a bone before blending.
     #[serde(default)]
     paint: Vec<PaintSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SwaySpec {
+    name: String,
+    skeleton: String,
+    /// wind (default: trees, grass, cloth-like sway as a function of time)
+    /// or spring (secondary motion: tails, ears, antennae, hanging signs
+    /// lagging behind `over` and pushed by wind / gravity).
+    #[serde(default)]
+    kind: Option<String>,
+    /// A clip this motion layers over (a spring tail over `walk`; wind over
+    /// an idle). Its duration becomes the default `duration`.
+    #[serde(default)]
+    over: Option<String>,
+    /// Bones that sway (`*` globs, default all); the others only follow.
+    #[serde(default)]
+    bones: Vec<String>,
+    /// Seconds of the baked loop (default 4, or the `over` clip's;
+    /// with `over` it must be a whole number of its cycles).
+    #[serde(default)]
+    duration: Option<f32>,
+    /// Export samples per second (default 30).
+    #[serde(default)]
+    fps: Option<f32>,
+    /// Wind: where it blows to (horizontal part, default [1, 0, 0]).
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
+    /// Wind: 0.5 a breeze (default for wind), 1 strong, 2 a gale. A spring
+    /// gets wind only when this is given.
+    #[serde(default)]
+    strength: Option<f32>,
+    /// Wind: how much gusts vary the strength, 0..1 (default 0.3).
+    #[serde(default)]
+    gust: Option<f32>,
+    /// Wind: fast jitter of the thinnest bones and tips, 0..1 (default 0.5).
+    #[serde(default)]
+    flutter: Option<f32>,
+    /// Wind: speed factor (default 1).
+    #[serde(default)]
+    frequency: Option<f32>,
+    #[serde(default)]
+    seed: Option<u32>,
+    /// Spring: pull toward the animated pose (default 80; higher = stiffer).
+    #[serde(default)]
+    stiffness: Option<f32>,
+    /// Spring: damping (default 8; 2 * sqrt(stiffness) = no bounce).
+    #[serde(default)]
+    damping: Option<f32>,
+    /// Spring: share of gravity pulling tips down (default 0).
+    #[serde(default)]
+    gravity: Option<f32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2450,6 +2523,7 @@ pub enum OpSpec {
     Skeleton(SkeletonSpec),
     Bind(BindSpec),
     Clip(ClipSpec),
+    Sway(SwaySpec),
     Place(PlaceSpec),
     Boolean(BooleanSpec),
     RadialArray(RadialArraySpec),
@@ -2473,6 +2547,7 @@ pub const OP_TYPES: &[&str] = &[
     "skeleton",
     "bind",
     "clip",
+    "sway",
     "primitive",
     "extrude",
     "revolve",
@@ -3273,8 +3348,16 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         }
         "skeleton" => {
             let s: SkeletonSpec = de(&ctx, &body)?;
-            if s.bones.is_empty() {
-                return Err(format!("{ctx}: bones: needs at least one bone"));
+            if s.bones.is_empty() && s.from.is_none() {
+                return Err(format!(
+                    "{ctx}: bones: needs at least one bone (or `from`: an lsystem or skin op to rig)"
+                ));
+            }
+            if s.bone_length.is_some_and(|v| v.is_nan() || v <= 0.0) {
+                return Err(format!("{ctx}: bone_length must be positive (meters)"));
+            }
+            if s.max_bones.is_some_and(|v| v == 0 || v > 256) {
+                return Err(format!("{ctx}: max_bones must be 1..256"));
             }
             if let Some(m) = &s.mirror
                 && m != "x"
@@ -3306,6 +3389,10 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 def: crate::anim::SkeletonDef {
                     bones,
                     mirror: s.mirror,
+                    from: s.from,
+                    bone_length: s.bone_length,
+                    max_depth: s.max_depth,
+                    max_bones: s.max_bones,
                 },
             })
         }
@@ -3325,8 +3412,13 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                         "{ctx}: smooth picks bones itself: drop `bone` (or use mode rigid)"
                     ));
                 }
-                "rigid" | "smooth" => {}
-                other => return Err(format!("{ctx}: mode `{other}`: use rigid or smooth")),
+                "auto" if s.bone.is_some() => {
+                    return Err(format!("{ctx}: auto picks bones itself: drop `bone`"));
+                }
+                "rigid" | "smooth" | "auto" => {}
+                other => {
+                    return Err(format!("{ctx}: mode `{other}`: use rigid, smooth or auto"));
+                }
             }
             if s.parts.is_empty() {
                 return Err(format!("{ctx}: parts: list at least one part"));
@@ -3408,6 +3500,76 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                             )
                         })
                         .collect(),
+                },
+            })
+        }
+        "sway" => {
+            let s: SwaySpec = de(&ctx, &body)?;
+            let kind = s.kind.as_deref().unwrap_or("wind");
+            for (field, v) in [
+                ("duration", s.duration),
+                ("fps", s.fps),
+                ("frequency", s.frequency),
+                ("stiffness", s.stiffness),
+            ] {
+                if v.is_some_and(|v| v.is_nan() || v <= 0.0) {
+                    return Err(format!("{ctx}: {field} must be positive"));
+                }
+            }
+            for (field, v) in [
+                ("strength", s.strength),
+                ("gust", s.gust),
+                ("flutter", s.flutter),
+                ("damping", s.damping),
+            ] {
+                if v.is_some_and(|v| v.is_nan() || v < 0.0) {
+                    return Err(format!("{ctx}: {field} must be 0 or more"));
+                }
+            }
+            let d = modeler_anim::Wind::default();
+            let wind = modeler_anim::Wind {
+                direction: s.direction.unwrap_or(d.direction),
+                strength: s.strength.unwrap_or(d.strength),
+                gust: s.gust.unwrap_or(d.gust),
+                flutter: s.flutter.unwrap_or(d.flutter),
+                frequency: s.frequency.unwrap_or(d.frequency),
+                seed: s.seed.unwrap_or(d.seed),
+            };
+            let sk = match kind {
+                "wind" => {
+                    if s.stiffness.is_some() || s.damping.is_some() || s.gravity.is_some() {
+                        return Err(format!(
+                            "{ctx}: stiffness / damping / gravity are for kind spring"
+                        ));
+                    }
+                    modeler_anim::SwayKind::Wind(wind)
+                }
+                "spring" => {
+                    let d = modeler_anim::Spring::default();
+                    if s.flutter.is_some() {
+                        return Err(format!("{ctx}: flutter is for kind wind"));
+                    }
+                    modeler_anim::SwayKind::Spring(modeler_anim::Spring {
+                        stiffness: s.stiffness.unwrap_or(d.stiffness),
+                        damping: s.damping.unwrap_or(d.damping),
+                        gravity: s.gravity.unwrap_or(d.gravity),
+                        wind: s.strength.is_some().then_some(modeler_anim::Wind {
+                            flutter: 0.0,
+                            ..wind
+                        }),
+                    })
+                }
+                other => return Err(format!("{ctx}: kind `{other}`: use wind or spring")),
+            };
+            BatchItem::Op(Op::Sway {
+                name: s.name,
+                def: crate::anim::SwayDef {
+                    skeleton: s.skeleton,
+                    over: s.over,
+                    bones: s.bones,
+                    duration: s.duration,
+                    fps: s.fps,
+                    motion: sk,
                 },
             })
         }
@@ -3815,6 +3977,8 @@ pub fn example(ty: &str) -> Option<Value> {
             "tracks": {"leg_l": {"rotate": [[0, {"x": 25}], [0.5, {"x": -25}], [1, {"x": 25}]]},
                        "hip": {"translate": {"wave": {"axis": "y", "amount": 0.02, "period": 0.5}}}},
             "mirror": {"leg_r": {"from": "leg_l", "phase": 0.5}}}),
+        "sway" => json!({"type": "sway", "name": "wind", "skeleton": "oak_rig", "kind": "wind",
+            "direction": [1, 0, 0.3], "strength": 0.6, "gust": 0.4, "flutter": 0.5, "duration": 4}),
         "marker" => json!({"type": "marker", "name": "spawn_1", "kind": "spawn",
             "translation": [0, 0, 2], "yaw": 180, "data": {"team": 1}}),
         "light" => json!({"type": "light", "name": "lamp_bulb", "kind": "point",
@@ -3884,6 +4048,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "skeleton" => schemars::schema_for!(SkeletonSpec),
         "bind" => schemars::schema_for!(BindSpec),
         "clip" => schemars::schema_for!(ClipSpec),
+        "sway" => schemars::schema_for!(SwaySpec),
         "place" => schemars::schema_for!(PlaceSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),
         "radial_array" => schemars::schema_for!(RadialArraySpec),

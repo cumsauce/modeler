@@ -345,11 +345,34 @@ struct Turtle {
     radius: f32,
     length: f32,
     chain: Option<usize>,
+    /// Where a branch started here attaches: (chain, point index).
+    attach: Option<(usize, usize)>,
 }
 
 /// A branch: points along it with radii.
 struct Chain {
     pts: Vec<(Vec3, f32)>,
+    parent: Option<(usize, usize)>,
+}
+
+/// One branch of a grown structure, in the part's local space: what an
+/// auto-rig (`skeleton` `from`) puts bones along.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BranchChain {
+    /// The (chain, point) it grows from; `None` for a root.
+    pub parent: Option<(u32, u32)>,
+    pub pts: Vec<(Vec3, f32)>,
+    /// Ancestors: 0 for the trunk.
+    pub depth: u32,
+}
+
+/// The branch structure of an lsystem's wood and leaves parts: the chains,
+/// and for every vertex of the part the chain point it hangs on. Derived;
+/// never saved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Branches {
+    pub chains: std::sync::Arc<Vec<BranchChain>>,
+    pub vert_point: Vec<(u32, u32)>,
 }
 
 pub struct Drawn {
@@ -375,10 +398,11 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
         radius: ls.radius,
         length: ls.length,
         chain: None,
+        attach: None,
     };
     let mut stack: Vec<Turtle> = Vec::new();
     let mut chains: Vec<Chain> = Vec::new();
-    let mut leaves: Vec<(Vec3, Quat, f32)> = Vec::new();
+    let mut leaves: Vec<(Vec3, Quat, f32, (u32, u32))> = Vec::new();
     let mut segments = 0usize;
     // Turtle axes in its own frame: heading +y, left -x, up +z.
     let (h, l, u) = (Vec3::Y, Vec3::NEG_X, Vec3::Z);
@@ -405,6 +429,7 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
                     None => {
                         chains.push(Chain {
                             pts: vec![(t.pos, t.radius)],
+                            parent: t.attach,
                         });
                         chains.len() - 1
                     }
@@ -440,6 +465,9 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
             },
             '[' => {
                 stack.push(t);
+                if let Some(c) = t.chain {
+                    t.attach = Some((c, chains[c].pts.len() - 1));
+                }
                 t.chain = None;
                 t.radius *= ls.radius_scale;
                 t.length *= ls.length_scale;
@@ -455,17 +483,58 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
             }
             'L' => {
                 let roll = Quat::from_axis_angle(h, rng.s() * std::f32::consts::PI);
-                leaves.push((t.pos, (t.rot * roll).normalize(), arg.unwrap_or(1.0)));
+                let at = t
+                    .chain
+                    .map(|c| (c, chains[c].pts.len() - 1))
+                    .or(t.attach)
+                    .map_or((u32::MAX, 0), |(c, p)| (c as u32, p as u32));
+                leaves.push((t.pos, (t.rot * roll).normalize(), arg.unwrap_or(1.0), at));
             }
             _ => {}
         }
     }
     let mut wood = Part::new(name);
-    for ch in &chains {
+    let mut vert_point: Vec<(u32, u32)> = Vec::new();
+    for (ci, ch) in chains.iter().enumerate() {
         if ch.pts.len() >= 2 {
+            let base = wood.verts.len();
             tube(&mut wood, &ch.pts, ls.sides as usize);
+            let ring = ls.sides as usize + 1;
+            let n = ch.pts.len();
+            for v in 0..wood.verts.len() - base {
+                let pt = if v < n * ring {
+                    v / ring
+                } else if v < n * ring + 1 + ls.sides as usize {
+                    0
+                } else {
+                    n - 1
+                };
+                vert_point.push((ci as u32, pt as u32));
+            }
         }
     }
+    let mut depth: Vec<u32> = Vec::with_capacity(chains.len());
+    for ch in &chains {
+        let d = ch
+            .parent
+            .map_or(0, |(p, _)| depth.get(p).map_or(0, |d| d + 1));
+        depth.push(d);
+    }
+    let structure = std::sync::Arc::new(
+        chains
+            .iter()
+            .zip(&depth)
+            .map(|(c, d)| BranchChain {
+                parent: c.parent.map(|(a, b)| (a as u32, b as u32)),
+                pts: c.pts.clone(),
+                depth: *d,
+            })
+            .collect::<Vec<_>>(),
+    );
+    wood.branches = Some(std::sync::Arc::new(Branches {
+        chains: structure.clone(),
+        vert_point,
+    }));
     if wood.indices.is_empty() {
         return Err(format!(
             "the system draws nothing: {} modules but no `F` segments (check the rules)",
@@ -482,14 +551,21 @@ pub fn build(name: &str, ls: &LSystem) -> Result<Drawn, String> {
     let leaf_count = leaves.len();
     let leaves = ls.has_leaves().then(|| {
         let mut lp = Part::new(format!("{name}_leaves"));
-        for (pos, rot, k) in &leaves {
+        let mut vp: Vec<(u32, u32)> = Vec::new();
+        for (pos, rot, k, at) in &leaves {
             let size = [ls.leaf_size[0] * k, ls.leaf_size[1] * k];
+            let before = lp.verts.len();
             if ls.leaf.mode == "card" {
                 card(&mut lp, *pos, *rot, size, &ls.leaf);
             } else {
                 blade(&mut lp, *pos, *rot, size, &ls.leaf);
             }
+            vp.extend(std::iter::repeat_n(*at, lp.verts.len() - before));
         }
+        lp.branches = Some(std::sync::Arc::new(Branches {
+            chains: structure.clone(),
+            vert_point: vp,
+        }));
         lp.cards = ls.leaf.mode == "card";
         place(&mut lp);
         // No `L` was reached: keep the name (materials may point at it) but

@@ -51,7 +51,7 @@ fn clip_names(model: &modeler::Model) -> Vec<String> {
         .ops
         .iter()
         .filter_map(|o| match o {
-            modeler::Op::Clip { name, .. } => Some(name.clone()),
+            modeler::Op::Clip { name, .. } | modeler::Op::Sway { name, .. } => Some(name.clone()),
             _ => None,
         })
         .collect()

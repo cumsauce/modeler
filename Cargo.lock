@@ -3878,6 +3878,7 @@ dependencies = [
  "ktx2",
  "libc",
  "manifold-csg",
+ "modeler_anim",
  "png",
  "rayon",
  "rmcp",
@@ -3890,6 +3891,24 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ttf-parser",
+]
+
+[[package]]
+name = "modeler_anim"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "modeler_bevy"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "modeler_anim",
+ "serde_json",
 ]
 
 [[package]]

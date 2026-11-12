@@ -143,6 +143,10 @@ type, so there is no need to memorise field names.
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
+| `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
+| `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
+| `clip` | name, skeleton, duration, tracks {bone: {rotate / translate / scale: keys or wave}}, [mirror {bone: {from, phase}}], [loop true], [interp smooth] |
+| `sway` | name, skeleton, [kind wind / spring], [over clip], [bones], [duration 4], [fps 30], wind: [direction], [strength], [gust], [flutter], [frequency], [seed]; spring: [stiffness], [damping], [gravity] |
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
 | `repeat` | var, count or values, items (a loop, expanded before anything else) |
 
@@ -913,6 +917,133 @@ lights only (studio off, faint environment) to judge how the level is lit.
 
   Markers the same way: read `extras.marker` and spawn your own
   components at the node's `Transform`.
+
+**Skeletons and animation:** Rig a model after its shape and materials are done: shape, then materials,
+then the rig. Rig items are `apply_ops` items like any other (upserts,
+params, atomic, undoable). They run after the graph, as `move` does, so the
+geometry recipe stays as it is. One pose evaluator serves every consumer:
+agent views, verify, inspect, export and the window.
+
+- **Bone frames are world-aligned at rest.** A bone has a `head` (its pivot),
+  a `tail` and a parent. Every rest rotation is the identity, so a clip
+  rotation `{"x": 25}` means "pitch 25 degrees about world x from rest", with
+  no bone roll to think about. Clip tracks are offsets from rest, composed
+  down the tree.
+- **`skeleton`**:
+  ```json
+  {"type": "skeleton", "name": "rig", "mirror": "x", "bones": {
+    "hip": {"head": [0, 0.9, 0], "tail": [0, 1.0, 0]},
+    "thigh_l": {"parent": "hip", "head": "leg_l:top", "tail": "leg_l:bottom", "radius": 0.06}}}
+  ```
+  - Heads and tails are points or part anchors, so bones follow the geometry
+    when params change.
+  - `mirror: "x"` makes a `_r` twin of every `_l` bone.
+  - `radius` is the envelope for smooth weights (default a fifth of the
+    bone's length): about the limb's thickness.
+- **Auto-rigs (`from`)**: instead of listing bones, `from` names an op.
+  - **An `lsystem`**: bones run along its branches (`trunk_0..`,
+    `branch7_0..`), one every `bone_length` meters (0.5), down to `max_depth`
+    branch levels (3), within `max_bones` (128, at most 256), thickest
+    branches first. Finer twigs ride the bone they grow from.
+  - **A `skin` op**: one bone per chain point. Named joints keep their names
+    and other points are `c{chain}_{point}`. The radii come from the chain,
+    and a skin with `mirror: "x"` gets `_l` / `_r` bones.
+  - Extra `bones` may hang off the generated ones.
+- **`bind`** attaches parts to a skeleton:
+  - `bone: "forearm_l"` binds rigidly: a door on its hinge, a robot arm.
+  - `mode: "smooth"` gives per-vertex weights from the bone envelopes,
+    diffused over the mesh: two legs side by side don't bleed into each
+    other. `blend` is the meters weights blend across a joint, and `paint:
+    [{bone, region: {min, max}}]` forces a region onto one bone.
+  - `mode: "auto"` on an lsystem rig gives exact weights along the branches,
+    and every leaf card rides its twig's bone rigidly. Bind both:
+    `"parts": ["oak", "oak_leaves"]`. On any other rig, `auto` is `smooth`.
+- **`clip`**: keyframed motion.
+  ```json
+  {"type": "clip", "name": "walk", "skeleton": "rig", "duration": 1.0,
+   "tracks": {"thigh_l": {"rotate": [[0, {"x": 25}], [0.5, {"x": -25}], [1, {"x": 25}]]},
+              "hip": {"translate": {"wave": {"axis": "y", "amount": 0.03, "period": 0.5}}}},
+   "mirror": {"thigh_r": {"from": "thigh_l", "phase": 0.5}}}
+  ```
+  - Keys are `[t, value]`: rotations in any rotation form, translate in
+    meters, scale as a factor.
+  - Interpolation is `smooth` (Catmull-Rom; the default), `linear` or `step`.
+  - `wave` generates a periodic channel.
+  - `mirror` + `phase` copies a track to the other side, mirrored and half a
+    cycle later, so a walk is half-authored.
+  - `loop` defaults to true.
+- **`sway`**: dynamic motion, baked into a clip of its own name. Every tool
+  that plays clips plays it.
+  - `kind: "wind"` (the default):
+    `{"type": "sway", "name": "wind", "skeleton": "oak_rig", "direction":
+    [1, 0, 0.3], "strength": 0.6, "gust": 0.4, "flutter": 0.5,
+    "duration": 4}`.
+    - Thick bones bend slowly and a little, thin ones faster and further,
+      and the tips flutter.
+    - `strength` is 0.5 for a breeze, 1 for a strong wind, 2 for a gale.
+    - Every frequency snaps to whole cycles of `duration`, so the loop is
+      seamless.
+  - `kind: "spring"` is secondary motion: tails, ears, antennae, a hanging
+    sign.
+    - Each bone's tip lags behind where `over` (a looping clip) puts it, on
+      a damped spring (`stiffness` 80, `damping` 8; `2 * sqrt(stiffness)`
+      is no bounce).
+    - `gravity` droops it, and a `strength` adds wind.
+    - It bakes three loops of `over` and keeps the last, so it loops.
+  - `bones: ["tail*"]` limits which bones sway; the rest only follow.
+  - `duration` defaults to 4 s, or to the `over` clip's duration. With
+    `over` it must be a whole number of that clip's cycles.
+  - `fps` sets the export rate (30).
+- **Seeing motion**: `agent_views` with `clip` and `times: [0, 0.25, 0.5,
+  0.75]` renders a **filmstrip**: each view at each time, tiled with labels.
+  This is how to judge a walk. `time` gives a single moment.
+  - `style: "bones"` overlays the skeleton.
+  - `style: "weights"` with `bone` shows a heat map of that bone's weights.
+- **Checking motion**: `verify`.
+  - `weights: true`: every vertex of a smooth part is weighted, the weights
+    sum to 1, and there are at most 4 bones per vertex.
+  - `animation: {clip, samples: 16, collisions, floor, loop, stretch}` runs
+    at each sample time and fails naming the time and bones:
+    - `loop`: the pose at 0 matches the pose at the end;
+    - `floor`: nothing sinks below y = 0;
+    - `collisions`: a limb through the body;
+    - `stretch`: skinning tears or collapses a triangle.
+- **Inspecting a pose**: `inspect(pose: {clip, time, bones?})` gives bone
+  world positions, and `measure` / `section` / `mass` / `thickness` then run
+  on the posed model.
+- **The window**: `set_camera(play: {clip, time?, speed?, paused?})` plays a
+  clip. The human uses P (play/pause), `[` `]` (switch clip) and `,` `.`
+  (step).
+- **Export**:
+  - Each skeleton becomes a joint node tree under a root node named after
+    the skeleton, plus a glTF skin with inverse bind matrices.
+  - Smooth parts get `JOINTS_0` / `WEIGHTS_0`; rigid parts become children of
+    their joint.
+  - Clips become `animations`, sampled at `fps` plus the key times. Bevy
+    plays them with `AnimationPlayer`.
+  - A `sway` also writes its settings to `extras.sway` on the skeleton root,
+    for the runtime plugin.
+  - `instance`, `merge`, `cull_contacts` and `lods` leave rigged parts
+    alone.
+- **Runtime plugin (`crates/modeler_bevy`)**:
+  - `app.add_plugins(modeler_bevy::ModelerPlugin)` runs the same wind and
+    spring simulation live (`crates/modeler_anim`), after `AnimationPlayer`,
+    so a spring tail layers over a playing walk. Each instance gets its own
+    phase.
+  - The `Wind` resource steers every rig: `enabled`, `direction`,
+    `strength`, `gust`.
+  - Play the baked sway clip *or* keep the live sway (`Sway::live`), not
+    both.
+  - It also turns `extras.collider` into `ModelerCollider` and
+    `extras.marker` into `ModelerMarker`.
+  - `cargo run -p modeler_bevy --example viewer -- <assets dir>
+    <model.gltf>` looks at an export.
+- **Limits**:
+  - Scattered copies of a rigged tree don't get their own skeletons. Rig
+    the tree in its own document, export it, and place the copies in the
+    game, where the plugin sways each one with its own phase.
+  - A skin's `warps` and a `mirror` other than `"x"` are not followed by
+    auto-rigs.
 
 **Scenes (open documents):** `scene(action, name?)` keeps several models
 open at once, each with its own ops, history and style; every other tool

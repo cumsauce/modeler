@@ -1,0 +1,16 @@
+[package]
+name = "modeler_anim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The wind and spring simulation shared by the modeler (baked clips) and its Bevy plugin (live)"
+
+[dependencies]
+glam = "0.33"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints.clippy]
+unwrap_used = "deny"
