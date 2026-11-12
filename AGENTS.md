@@ -1160,10 +1160,12 @@ MCP config runs) starts empty and first moves the last autosave aside to
 `session.prev.json` (+ `.prev.history.jsonl`, `open_docs.prev.json`, the
 materials' `session.prev.json`), so its edits never overwrite it; a later
 `--restore` brings the kept one back when nothing newer was written.
-`mcp_driver.py` always passes `--restore`, so daemon restarts keep the work. The history tree goes to an append-only
-journal beside it (`session.history.jsonl`, one node per line): a save
-appends only the new nodes, and rewrites the file only after undo branches
-or pruning, so the autosave stays small however long the session runs. `save_prefab` only
+`mcp_driver.py` always passes `--restore`, so daemon restarts keep the work. Each open document's history tree goes to its
+own append-only journal (`session.history.<doc>.jsonl`, one node per line;
+`open_docs.json` holds the inactive documents without their nodes): a save
+appends only the new nodes, and rewrites a file only after undo branches
+or pruning, so the autosave stays small however long the session runs and
+however often agents switch documents. `save_prefab` only
 names and indexes it.
 
 ## Style tokens

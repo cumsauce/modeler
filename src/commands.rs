@@ -3083,7 +3083,7 @@ impl Session {
                     }
                 })
                 .collect();
-            if let Err(e) = crate::catalog::save_open_docs(&self.others) {
+            if let Err(e) = crate::catalog::save_open_docs(&mut self.others, &mut self.journal) {
                 eprintln!("open docs autosave failed: {e}");
             }
             for (m, p) in self.others.iter_mut().zip(taken) {

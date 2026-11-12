@@ -184,16 +184,28 @@ fn ensure_project_gitignore() {
     if std::env::var("FRIENDSLOP_DATA_DIR").is_ok_and(|d| !d.is_empty()) {
         return;
     }
-    // Prefab undo histories live in sidecars, per machine like autosaves:
-    // add the rule to a .gitignore written before them.
-    const HISTORY: &str = "*/*.history.json";
+    // Rules added after the first .gitignore was written: prefab undo
+    // histories (sidecars) and per-document session journals, per machine
+    // like the autosaves.
+    const LATER: [(&str, &str); 2] = [
+        ("*/*.history.json", "prefab undo histories (per machine)"),
+        (
+            "*/session*.jsonl",
+            "per-document session journals (per machine)",
+        ),
+    ];
     if let Ok(text) = fs::read_to_string(&ign) {
-        if !text.lines().any(|l| l.trim() == HISTORY) {
-            let sep = if text.ends_with('\n') { "" } else { "\n" };
-            let _ = fs::write(
-                &ign,
-                format!("{text}{sep}# prefab undo histories (per machine)\n{HISTORY}\n"),
-            );
+        let mut out = text.clone();
+        for (rule, why) in LATER {
+            if !text.lines().any(|l| l.trim() == rule) {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out += &format!("# {why}\n{rule}\n");
+            }
+        }
+        if out != text {
+            let _ = fs::write(&ign, out);
         }
         return;
     }
@@ -201,7 +213,7 @@ fn ensure_project_gitignore() {
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */*.history.json\n*/session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/feedback.jsonl\n*/daemon.log\n*/daemon.log.1\n\
+         */*.history.json\n*/session.json\n*/session*.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/feedback.jsonl\n*/daemon.log\n*/daemon.log.1\n\
          *.tmp\n*/*.tmp\n",
     );
 }
@@ -436,13 +448,10 @@ pub fn save_session_state(model: &Model) -> Result<(), ModelerError> {
 /// only the nodes recorded since (see [`save_session_journaled`]).
 #[derive(Debug, Default, Clone)]
 pub struct JournalState {
-    /// Nodes already in the journal file.
-    written: usize,
-    /// (parent, label, version) of the last written node, to tell that the
-    /// live history still extends the file (not pruned or swapped).
-    tail: Option<(Option<usize>, String, u64)>,
-    /// The file this state describes (the slot can change mid-session).
-    path: Option<PathBuf>,
+    /// Per journal file: nodes already in it, and (parent, label, version)
+    /// of the last one, to tell that the live history still extends the
+    /// file (not pruned or swapped).
+    files: std::collections::HashMap<PathBuf, (usize, Option<(Option<usize>, String, u64)>)>,
 }
 
 /// One history node as a journal line; children are rebuilt from parents.
@@ -457,8 +466,16 @@ struct JournalLine {
     author: Option<String>,
 }
 
-fn journal_path() -> Result<PathBuf, ModelerError> {
-    let name = autosave_file("session").replace(".json", ".history.jsonl");
+/// The history journal of the document named `doc` (each open document
+/// has its own, so switching documents appends instead of rewriting).
+fn journal_path_for(doc: &str) -> Result<PathBuf, ModelerError> {
+    let key = sanitize(doc);
+    let key = if key.is_empty() {
+        "untitled".to_string()
+    } else {
+        key
+    };
+    let name = autosave_file("session").replace(".json", &format!(".history.{key}.jsonl"));
     Ok(home_dir(Kind::Prefabs)?.join(name))
 }
 
@@ -479,19 +496,46 @@ pub fn save_session_journaled(
 ) -> Result<(), ModelerError> {
     ensure_project_gitignore();
     let path = session_state_path()?;
-    let jpath = journal_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| ModelerError::Io(format!("creating {}: {e}", parent.display())))?;
     }
+    append_journal(model, st)?;
+    // The model itself, its node list moved out (the journal has it).
+    let taken = std::mem::take(&mut model.history.nodes);
+    let text = serde_json::to_string(&slim(model).as_ref())
+        .map_err(|e| ModelerError::Parse(e.to_string()));
+    model.history.nodes = taken;
+    atomic_write(&path, text?.as_bytes())
+}
+
+/// Brings `model`'s journal up to date: appends the nodes recorded since
+/// the last write, or rewrites it when the history no longer extends it.
+/// A journal this process hasn't written yet (after a restart) is checked
+/// by its line count and last line, so it is appended to, not rewritten.
+fn append_journal(model: &Model, st: &mut JournalState) -> Result<(), ModelerError> {
+    let jpath = journal_path_for(&model.name)?;
     let nodes = &model.history.nodes;
-    let extends = st.path.as_ref() == Some(&jpath)
-        && st.written <= nodes.len()
-        && match (&st.tail, st.written) {
-            (None, 0) => jpath.exists() && fs::metadata(&jpath).is_ok_and(|m| m.len() == 0),
+    let known = match st.files.get(&jpath) {
+        Some(k) => Some(k.clone()),
+        None => fs::read_to_string(&jpath).ok().map(|t| {
+            let n = t.lines().count();
+            let tail = t
+                .lines()
+                .last()
+                .and_then(|l| serde_json::from_str::<JournalLine>(l).ok())
+                .map(|j| (j.parent, j.label, j.model.version));
+            (n, tail)
+        }),
+    };
+    let extends = match &known {
+        Some((w, tail)) if *w <= nodes.len() => match (tail, *w) {
+            (None, 0) => true,
             (Some(k), w) if w > 0 => node_key(&nodes[w - 1]) == *k,
             _ => false,
-        };
+        },
+        _ => false,
+    };
     let line = |n: &crate::Snapshot| {
         serde_json::to_string(&JournalLine {
             model: n.model.for_file(),
@@ -501,10 +545,11 @@ pub fn save_session_journaled(
         })
         .map_err(|e| ModelerError::Parse(e.to_string()))
     };
-    if extends {
-        if st.written < nodes.len() {
+    let written = known.as_ref().map_or(0, |k| k.0);
+    if extends && jpath.exists() {
+        if written < nodes.len() {
             let mut text = String::new();
-            for n in &nodes[st.written..] {
+            for n in &nodes[written..] {
                 text += &line(n)?;
                 text.push('\n');
             }
@@ -524,15 +569,30 @@ pub fn save_session_journaled(
         }
         atomic_write(&jpath, text.as_bytes())?;
     }
-    st.written = nodes.len();
-    st.tail = nodes.last().map(node_key);
-    st.path = Some(jpath);
-    // The model itself, its node list moved out (the journal has it).
-    let taken = std::mem::take(&mut model.history.nodes);
-    let text = serde_json::to_string(&slim(model).as_ref())
-        .map_err(|e| ModelerError::Parse(e.to_string()));
-    model.history.nodes = taken;
-    atomic_write(&path, text?.as_bytes())
+    st.files
+        .insert(jpath, (nodes.len(), nodes.last().map(node_key)));
+    Ok(())
+}
+
+/// The nodes of `doc`'s journal, else (files from before per-document
+/// journals) the shared one when it belonged to the session model.
+fn journal_nodes(doc: &str, legacy: bool) -> Option<Vec<crate::Snapshot>> {
+    if let Ok(p) = journal_path_for(doc)
+        && p.exists()
+    {
+        return read_journal(&p);
+    }
+    if !legacy {
+        return None;
+    }
+    let dir = home_dir(Kind::Prefabs).ok()?;
+    let slot = format!("session.{}.json", autosave_slot());
+    let jname = if autosave_owner().is_some() && dir.join(&slot).exists() {
+        slot.replace(".json", ".history.jsonl")
+    } else {
+        "session.history.jsonl".to_string()
+    };
+    read_journal(&dir.join(jname))
 }
 
 /// Reads the journal's nodes (children rebuilt from parents); a torn last
@@ -584,8 +644,10 @@ fn autosave_files() -> Vec<(PathBuf, PathBuf)> {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        let to = if let Some(stem) = n.strip_suffix(".history.jsonl") {
-            format!("{stem}.prev.history.jsonl")
+        let to = if let Some((stem, rest)) = n.split_once(".history.")
+            && n.ends_with(".jsonl")
+        {
+            format!("{stem}.prev.history.{rest}")
         } else {
             n.trim_end_matches(".json").to_string() + ".prev.json"
         };
@@ -595,8 +657,17 @@ fn autosave_files() -> Vec<(PathBuf, PathBuf)> {
     if let Ok(p) = session_state_path() {
         out.push(prev(p));
     }
-    if let Ok(p) = journal_path() {
-        out.push(prev(p));
+    // Every history journal: the per-document ones and the older shared one.
+    if let Ok(d) = home_dir(Kind::Prefabs) {
+        let stem = autosave_file("session").replace(".json", ".history.");
+        if let Ok(rd) = fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with(&stem) && n.ends_with(".jsonl") {
+                    out.push(prev(e.path()));
+                }
+            }
+        }
     }
     if let Ok(d) = home_dir(Kind::Prefabs) {
         out.push(prev(d.join(autosave_file("open_docs"))));
@@ -652,14 +723,28 @@ pub fn load_kind_state<T: serde::de::DeserializeOwned>(kind: Kind) -> Option<T> 
 }
 
 /// Autosaves the inactive open documents (`open_docs.json`), so a restart
-/// restores every open scene, not just the active one.
-pub fn save_open_docs(docs: &[Model]) -> Result<(), ModelerError> {
+/// restores every open scene, not just the active one. Their histories go
+/// to their own journals (appended, usually nothing new), so the file holds
+/// only what changes when documents switch.
+pub fn save_open_docs(docs: &mut [Model], st: &mut JournalState) -> Result<(), ModelerError> {
     let dir = home_dir(Kind::Prefabs)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
-    let slim: Vec<std::borrow::Cow<'_, Model>> = docs.iter().map(slim).collect();
-    let text = serde_json::to_string(&slim).map_err(|e| ModelerError::Parse(e.to_string()))?;
-    atomic_write(&dir.join(autosave_file("open_docs")), text.as_bytes())
+    for d in docs.iter() {
+        append_journal(d, st)?;
+    }
+    let taken: Vec<_> = docs
+        .iter_mut()
+        .map(|d| std::mem::take(&mut d.history.nodes))
+        .collect();
+    let text = {
+        let slim: Vec<std::borrow::Cow<'_, Model>> = docs.iter().map(|d| slim(d)).collect();
+        serde_json::to_string(&slim).map_err(|e| ModelerError::Parse(e.to_string()))
+    };
+    for (d, n) in docs.iter_mut().zip(taken) {
+        d.history.nodes = n;
+    }
+    atomic_write(&dir.join(autosave_file("open_docs")), text?.as_bytes())
 }
 
 /// The autosaved inactive documents (empty when missing or unreadable).
@@ -674,6 +759,16 @@ pub fn load_open_docs() -> Vec<Model> {
     docs.into_iter()
         .filter(|m| m.check_format().is_ok())
         .map(|mut m| {
+            if m.history.nodes.is_empty()
+                && let Some(nodes) = journal_nodes(&m.name, false)
+            {
+                m.history.current = m
+                    .history
+                    .current
+                    .filter(|&c| c < nodes.len())
+                    .or_else(|| nodes.len().checked_sub(1));
+                m.history.nodes = nodes;
+            }
             let _ = m.restore_parts();
             m
         })
@@ -829,17 +924,8 @@ pub fn load_session_state() -> Option<Model> {
         eprintln!("ignoring session autosave: {e}");
         return None;
     }
-    // The journal next to whichever session file was read (this server's
-    // slot, or the main one).
-    let dir = home_dir(Kind::Prefabs).ok()?;
-    let slot = format!("session.{}.json", autosave_slot());
-    let jname = if autosave_owner().is_some() && dir.join(&slot).exists() {
-        slot.replace(".json", ".history.jsonl")
-    } else {
-        "session.history.jsonl".to_string()
-    };
     if model.history.nodes.is_empty()
-        && let Some(nodes) = read_journal(&dir.join(jname))
+        && let Some(nodes) = journal_nodes(&model.name, true)
     {
         model.history.current = model
             .history
@@ -1588,6 +1674,54 @@ mod tests {
     }
 
     #[test]
+    fn open_docs_keep_their_history_in_their_own_journals() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("docjournal")) };
+        let mut s = crate::commands::Session::default();
+        let box_at = |x: i32| -> Vec<serde_json::Value> {
+            serde_json::from_str(&format!(
+                r#"[{{"type":"primitive","name":"b","kind":"box","size":0.1,"translation":[{x},0.05,0]}}]"#
+            ))
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        s.new_model("doc_a").unwrap_or_else(|e| panic!("{e}"));
+        for x in 0..3 {
+            s.apply_values(None, box_at(x))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        s.scene("open", Some("doc_b"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.apply_values(None, box_at(9))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let a_nodes = s
+            .others
+            .iter()
+            .find(|m| m.name == "doc_a")
+            .map(|m| m.history.nodes.len())
+            .unwrap_or_else(|| panic!("doc_a not open"));
+        s.mark_autosave(true, true, false);
+        s.flush_autosave(true);
+        let dir = home_dir(Kind::Prefabs).unwrap_or_else(|e| panic!("{e}"));
+        let raw = fs::read_to_string(dir.join("open_docs.json")).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        assert!(
+            v.as_array()
+                .is_some_and(|d| d.iter().all(|m| m["history"]["nodes"]
+                    .as_array()
+                    .is_none_or(|n| n.is_empty()))),
+            "open_docs.json carries no snapshots"
+        );
+        let back = load_open_docs();
+        let a = back
+            .iter()
+            .find(|m| m.name == "doc_a")
+            .unwrap_or_else(|| panic!("doc_a not restored"));
+        assert_eq!(a.history.nodes.len(), a_nodes);
+        assert_eq!(a.parts.len(), 1);
+    }
+
+    #[test]
     fn session_history_goes_to_an_append_only_journal() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: test-only, single-threaded; edition 2024 makes set_var unsafe.
@@ -1600,8 +1734,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
             s.apply_values(None, item).unwrap_or_else(|e| panic!("{e}"));
         };
+        let jpath = journal_path_for(&s.model.name).unwrap_or_else(|e| panic!("{e}"));
         let lines = || {
-            fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
+            fs::read_to_string(&jpath)
                 .unwrap_or_default()
                 .lines()
                 .count()
@@ -1621,14 +1756,12 @@ mod tests {
                 .is_none_or(|n| n.is_empty()),
             "session.json carries no snapshots"
         );
-        let before = fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
-            .unwrap_or_default();
+        let before = fs::read_to_string(&jpath).unwrap_or_default();
         for i in 3..5 {
             step(&mut s, i);
         }
         save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
-        let after = fs::read_to_string(journal_path().unwrap_or_else(|e| panic!("{e}")))
-            .unwrap_or_default();
+        let after = fs::read_to_string(&jpath).unwrap_or_default();
         assert_eq!(lines(), 5);
         assert!(after.starts_with(&before), "appended, not rewritten");
         let back = load_session_state().unwrap_or_else(|| panic!("no autosave"));
