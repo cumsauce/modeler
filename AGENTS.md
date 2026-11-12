@@ -1460,6 +1460,17 @@ preview sphere; Enter commits, Esc cancels. The UI uses Bevy Feathers
 button, and a toolbar at the 3D view's top right whose Outliner / Style /
 Material / Grid toggles match O, S, M and G.
 
+Material mode (`preview/material_pane.rs`): the graph fills the centre
+on a dotted background, one-row node cards (28 px thumbnail, name, type in
+mono) in columns by dependency level, curved edges; one `UiTransform` on a
+zero-size canvas holds pan + zoom (wheel zooms about the cursor,
+middle-drag pans, the view fits on a new material or pane size). Click
+selects a node, right-click comments on it (empty graph: the material).
+The right slot gets its own root: a lit sphere of the material (or the
+selected node's output), base colour / roughness / normal / height
+thumbnails from the bake, then the node's fields (or the material's
+domain, tile and params).
+
 ## Dev notes / gotchas
 
 - Agents driving the server over stdio (frozen MCP tool list) should run
