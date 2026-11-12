@@ -3,6 +3,8 @@
 A mesh modeling tool driven by an MCP server, with a live Bevy preview
 window. Built standalone out of the friendSLOP workspace; no game code.
 
+![The preview window: a map document in Model mode, a selected part's properties on the right](docs/workbench.png)
+
 ## Units
 
 **1 unit = 1 meter**, everywhere: op sizes and positions, bounds, the
