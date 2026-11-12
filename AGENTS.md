@@ -1406,59 +1406,39 @@ Auto-drift stops once the human steers; a new model re-frames the camera
 around true world bounds (bounds include part transforms), while edits to
 the same model keep a camera the human steered.
 
-Layout (`ui::apply_layout`; the 3D camera renders to an image the size of
-what is left (`View3d`), shown by a UI node, so `screenshot` never includes a
-pane and screen-space reflections line up: a camera viewport inside the
-window misplaced them). The outliner and the grid start open, the style
-and material panes closed (`MODELER_OUTLINE=0` / `MODELER_STYLE=1` /
-`MODELER_MATERIALS=1` change that at start; the keys toggle them):
+Layout (`preview/workbench.rs`, after `design/workbench-concept.html`):
+a top bar, then either **All documents** (the grid, on by default;
+`MODELER_GRID=0` starts without, never offscreen) or **one document in a
+mode**: Model, Material, Animate, Map (keys 1-4; a mode the document can't
+use is disabled, `mode_available`; a document opens in Map when it has
+terrain, else Model). `Workbench` holds the mode, selection, hover, open
+comments and shading; every pane spawns under a `PaneSlot` root (`InSlot`)
+that `apply_layout` sizes each frame: top bar 48 px, left 250, right 290
+(only with a selection, open comments, or in Material), the Animate dock
+210 under the centre, and the centre, where the 3D camera renders to an
+image of exactly that size (`View3d`), so `screenshot` never includes a
+pane and screen-space reflections line up. In Material the 3D camera is
+off and the graph fills the centre. `ui_hover` (cursor outside the centre
+or over a `BlocksCamera` node) keeps the camera and picking off the mouse.
+Keys stay off while a text field has focus or a comment is being typed.
+Esc deselects, C toggles comments, G All documents.
 
-- **O**, the outliner, the document list down the left column (40%,
-  `PANE_FRACTION`; there is no tab strip): files first
-  (`outline::build_files`): every open document, grouped by project when
-  more than one project has documents open (named after the git repo,
-  `friendSLOP/crates/game`), each saying who made its latest step; the
-  active one expanded into its part tree; click another to switch. Then a
-  `library` group of the active project's catalog prefabs not open (click
-  to open). Inside the document
-  the scene is a hierarchy (`src/outline.rs`): prefab instances and array
-  runs fold into expandable groups (an instance row says `prefab <name>`
-  and its `open` button opens the source), hidden parts (cutters, blanks,
-  sources) sink into one dimmed group, each row shows its material. Click a
-  row to select it (its parts pulse in 3D), click a selected group or its
-  chevron to open it, double-click to frame it; the wheel scrolls.
-- **S**, the style pane, under the outliner (`preview/style_pane.rs`): the
-  model's tokens, read-only: the brief, colour chips with hex, material
-  presets, numbers and defaults. It follows every `style` call.
-- **G**, the grid (`preview/grid.rs`), **on by default** in the window
-  (`MODELER_GRID=0` starts without; never offscreen): the 9 most recently
-  changed open documents side by side, so a human can watch several agents
-  build at once. Slots are steady: a shown document keeps its tile however
-  often it changes, one not shown takes the front slot when it changes and
-  the stalest tile drops off; a line says how many more are open. The
-  window's own scene is not rebuilt while the grid covers it (parallel
-  agents switch the active document on nearly every call). Each tile is labelled with the document,
-  its visible part count, the agent that made its latest step (`by
-  <client>`) and when it last changed; "(active)" marks the active one.
-  Click a tile to switch to that document and leave the grid; its × closes the document (an unsaved one asks "close unsaved?" first: closing drops its autosave). Cheap by
-  design: each tile is its own camera on its own render layer rendering
-  into its own image, active only for a few frames after its document
-  changes (or the tile resizes), so an idle grid renders no 3D at all; the
-  window camera (TAA + SSR) pauses while the grid is up, tile cameras skip
-  SSR / TAA / SSAO and shadows, and the app loop drops to ~30 fps. With the grid off the loop runs at full rate while anything moves (input, the camera, edits, playback, agent shots) and for 2 s after, then idles at 4 fps; server calls wake it at once. A
-  `screenshot` in the grid captures the window (tiles and labels).
-- **M**, the material strip along the bottom under both: the active
-  material's graph by dependency level with a live thumbnail per node, a lit
-  sphere and the channels; clicking a node shows its output large (click
-  again for the material).
-
-Comments use a Feathers popup (`preview/comments.rs`) listing the target's
-existing comments (each deletable): click a part in 3D, right-click an
-outliner row (a group comments on all its parts) or a material node / the
-preview sphere; Enter commits, Esc cancels. The UI uses Bevy Feathers
-(`preview/ui.rs`): the dark theme, Fira fonts, pane headers with a close
-button, and a toolbar at the 3D view's top right whose Outliner / Style /
-Material / Grid toggles match O, S, M and G.
+- **3D view**: hovering a part glows it, a click selects it (empty space
+  deselects); while comments are open a click pins that spot and opens the
+  comment box (`picking.rs`, the glow in `panel.rs`). Pins for existing
+  comments show while comments are open and come back after rebuilds.
+- **Right pane** (`right_pane.rs`): the selection's properties (what made
+  it, material, triangles, size; a marker's kind, preview, components) and
+  its comments with "Add a comment", or, with nothing selected, every
+  comment numbered like its pin (click selects the part, × deletes). The
+  comment box (`comments.rs`) opens inside it (Enter commits, Esc cancels);
+  right-clicking a left-pane row or a material node comments on that.
+  The comments chip ends the 3D view's HUD row.
+- **All documents** tiles are cheap by design: each is its own camera on
+  its own render layer rendering into its own image, active only for a few
+  frames after its document changes, so an idle grid renders no 3D; the
+  window camera pauses while it is up, and a `screenshot` then captures the
+  whole window (top bar, tiles, feed). Click a tile to open that document.
 
 Material mode (`preview/material_pane.rs`): the graph fills the centre
 on a dotted background, one-row node cards (28 px thumbnail, name, type in
