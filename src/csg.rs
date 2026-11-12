@@ -84,11 +84,42 @@ pub(crate) fn part_to_manifold(part: &Part) -> Result<Manifold, ModelerError> {
             (props[i * N_PROPS + 2] * inv).round() as i64,
         ]
     };
-    let mut first: std::collections::HashMap<[i64; 3], usize> = Default::default();
+    // Two copies of one vertex can straddle a cell border (a seam vertex at
+    // x = 0.08 off by one ulp), so look in the neighbouring cells too and
+    // weld anything within one cell size.
+    let tol2 = (1.0 / inv).powi(2);
+    let mut cells: std::collections::HashMap<[i64; 3], Vec<usize>> = Default::default();
     let mut rep = vec![0usize; count];
     let (mut merge_from, mut merge_to) = (Vec::new(), Vec::new());
     for (i, r) in rep.iter_mut().enumerate() {
-        let f = *first.entry(key(i)).or_insert(i);
+        let k = key(i);
+        let p = &props[i * N_PROPS..i * N_PROPS + 3];
+        let mut found = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(list) = cells.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) else {
+                        continue;
+                    };
+                    for &j in list {
+                        let q = &props[j * N_PROPS..j * N_PROPS + 3];
+                        let d2 =
+                            (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                        if d2 <= tol2 {
+                            found = Some(j);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        let f = match found {
+            Some(j) => j,
+            None => {
+                cells.entry(k).or_default().push(i);
+                i
+            }
+        };
         *r = f;
         if f != i {
             merge_from.push(i as u64);

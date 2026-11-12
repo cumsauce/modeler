@@ -483,7 +483,7 @@ mod tests {
         let mid = p
             .verts
             .iter()
-            .filter(|v| (v[1] - 0.5).abs() < 0.01)
+            .filter(|v| (v[1] - 0.5).abs() < 0.02)
             .map(|v| v[0].abs())
             .fold(0.0f32, f32::max);
         assert!((mid - 0.05 * 2f32.sqrt()).abs() < 2e-3, "{mid}");

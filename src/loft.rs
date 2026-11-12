@@ -398,7 +398,7 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
                 "section {k}: the profile needs at least 3 finite points"
             )));
         }
-        let rr = crate::csg::rounded_rings(&[s.profile.clone()], o.round);
+        let rr = crate::csg::rounded_rings(std::slice::from_ref(&s.profile), o.round);
         let [ring] = rr.as_slice() else {
             return Err(err(format!(
                 "section {k}: the profile must be one simple ring (round may have split it)"

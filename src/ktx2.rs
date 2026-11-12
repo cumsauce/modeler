@@ -104,7 +104,7 @@ pub fn encode(rgba: &[u8], w: usize, h: usize, kind: Kind) -> Result<Vec<u8>, St
     // GPUs (wgpu) refuse a block-compressed texture whose base size is not
     // a whole number of 4x4 blocks: stretch such an image to the next
     // multiple of 4 (uvs are normalised, so the mapping is unchanged).
-    let (rgba, w, h) = if w % 4 != 0 || h % 4 != 0 {
+    let (rgba, w, h) = if !w.is_multiple_of(4) || !h.is_multiple_of(4) {
         let (nw, nh) = (w.next_multiple_of(4), h.next_multiple_of(4));
         let mut out = vec![0u8; nw * nh * 4];
         for y in 0..nh {
