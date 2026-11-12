@@ -1471,6 +1471,8 @@ selected node's output), base colour / roughness / normal / height
 thumbnails from the bake, then the node's fields (or the material's
 domain, tile and params).
 
+- **Top bar** (`preview/top_bar.rs`): [All documents (N open)] [project / document ▾], the mode buttons 1-4 (unavailable ones dimmed with the `mode_available` reason as a tooltip), and one pill per agent (`Session::clients()`) with a green dot while its document changed in the last 4 s (`last_touched`). It is rebuilt only when a hash of what it shows changes. The document half or ⌘K / Ctrl+K opens the **document popup** (`preview/doc_popup.rs`): a search box, the open documents grouped by project (modes, last author, time ago, unsaved), and per project "Open from library…" listing matching catalog prefabs once something is typed. A click or Enter (the first row) switches or opens; Esc closes.
+
 ## Dev notes / gotchas
 
 - Agents driving the server over stdio (frozen MCP tool list) should run
