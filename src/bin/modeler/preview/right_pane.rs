@@ -447,7 +447,7 @@ impl Build<'_> {
                     border_radius: BorderRadius::all(Val::Px(10.0)),
                     ..default()
                 },
-                BackgroundColor(ds::WARN),
+                BackgroundColor(ds::ACCENT),
                 ChildOf(row),
             ))
             .id();

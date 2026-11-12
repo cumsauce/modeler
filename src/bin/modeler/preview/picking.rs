@@ -21,18 +21,9 @@ pub(crate) struct PendingPinSpawn {
     pub(crate) point: Option<(Vec3, u32)>,
 }
 
-/// Pin radius: about 2% of the model bounds diagonal, so it reads at any size.
-pub(crate) fn pin_radius(model: &Model) -> f32 {
-    model
-        .bounds()
-        .map(|(min, max)| ((max - min).length() * 0.02).max(0.02))
-        .unwrap_or(0.05)
-}
-
 /// The 3D view's mouse: hovering a part lights it (`Workbench.hover`), a
 /// click selects it (empty space deselects), and while comments are open a
-/// click pins that spot instead: a small bright sphere with the annotation
-/// id it would get, and a `PendingPin` for the comment box to fill in.
+/// click (or a right-click any time) pins that spot instead: a badge, and a `PendingPin` for the comment box to fill in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn click_in_view(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -133,8 +124,6 @@ pub(crate) fn sync_pins(
     wb: Res<Workbench>,
     pins: Query<(Entity, Option<&PinCommitted>), With<AnnotationPin>>,
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut shown: Local<Option<(u64, usize, String)>>,
 ) {
     let model = &modeler.session.model;
@@ -154,73 +143,147 @@ pub(crate) fn sync_pins(
     if want.is_none() {
         return;
     }
-    let radius = pin_radius(model);
     for a in model.annotations.iter().filter(|a| a.material.is_none()) {
-        let pin = spawn_pin(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            radius,
-            a.id,
-            Vec3::from_array(a.position),
-        );
+        let pin = spawn_pin(&mut commands, a.id, Vec3::from_array(a.position));
         commands.entity(pin).insert(PinCommitted);
     }
 }
 
 /// Spawns pin markers requested by [`pin_on_click`].
-pub(crate) fn spawn_pin_markers(
-    mut spawn: ResMut<PendingPinSpawn>,
-    modeler: Res<Modeler>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+pub(crate) fn spawn_pin_markers(mut spawn: ResMut<PendingPinSpawn>, mut commands: Commands) {
     let Some((point, id)) = spawn.point.take() else {
         return;
     };
-    let radius = pin_radius(&modeler.session.model);
-    spawn_pin(
-        &mut commands,
-        &mut meshes,
-        &mut materials,
-        radius,
-        id,
-        point,
-    );
+    spawn_pin(&mut commands, id, point);
 }
 
 /// Spawn a pin marker (sphere + number label) at `point`.
-pub(crate) fn spawn_pin(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
-    radius: f32,
-    id: u32,
-    point: Vec3,
-) -> Entity {
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.85, 0.1),
-        emissive: LinearRgba::rgb(1.0, 0.85, 0.1),
-        ..default()
-    });
-    let pin = commands
+pub(crate) fn spawn_pin(commands: &mut Commands, id: u32, point: Vec3) -> Entity {
+    // An anchor in the world; `pin_badges` draws it as a flat badge on screen.
+    commands
         .spawn((
             Name::new(format!("pin #{id}")),
             AnnotationPin,
-            Mesh3d(meshes.add(Sphere::new(radius))),
-            MeshMaterial3d(material),
+            PinId(id),
             Transform::from_translation(point),
         ))
-        .id();
-    commands.entity(pin).with_child((
-        Text2d::new(format!("{id}")),
-        TextFont {
-            font_size: FontSize::Px(24.0),
-            ..default()
-        },
-        TextColor(Color::WHITE),
-        Transform::from_xyz(0.0, radius * 3.0, 0.0),
-    ));
-    pin
+        .id()
+}
+
+/// The comment number a pin shows.
+#[derive(Component)]
+pub(crate) struct PinId(pub(crate) u32);
+
+/// The on-screen badge drawn for a pin.
+#[derive(Component)]
+pub(crate) struct PinBadge(Entity);
+
+/// Draws every pin as a numbered badge over the 3D view (a circle in the
+/// accent colour with a small tail pointing at the spot; a pin still waiting
+/// for its comment is a hollow ring), kept on its spot as the camera moves
+/// and hidden when the spot is behind the camera or outside the view.
+pub(crate) fn pin_badges(
+    pins: Query<(Entity, &GlobalTransform, &PinId, Has<PinCommitted>), With<AnnotationPin>>,
+    mut badges: Query<(Entity, &PinBadge, &mut Node, &mut Visibility)>,
+    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    view: Res<View3d>,
+    assets: Res<AssetServer>,
+    mut commands: Commands,
+) {
+    const D: f32 = 22.0;
+    let scale = windows.single().map(|w| w.scale_factor()).unwrap_or(1.0);
+    let cam = cameras.single().ok();
+    let mut have = std::collections::HashSet::new();
+    for (e, badge, mut node, mut vis) in &mut badges {
+        let Ok((_, at, _, _)) = pins.get(badge.0) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        have.insert(badge.0);
+        let spot = cam.and_then(|(c, ct)| c.world_to_viewport(ct, at.translation()).ok());
+        let spot = spot
+            .map(|p| view.rect.min + p / scale)
+            .filter(|p| view.rect.contains(*p));
+        match spot {
+            Some(p) => {
+                node.left = Val::Px(p.x - D / 2.0);
+                node.top = Val::Px(p.y - D - 6.0);
+                if *vis != Visibility::Inherited {
+                    *vis = Visibility::Inherited;
+                }
+            }
+            None => {
+                if *vis != Visibility::Hidden {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+    }
+    for (pin, _, id, committed) in &pins {
+        if have.contains(&pin) {
+            continue;
+        }
+        let (fill, ink) = if committed {
+            (ds::ACCENT, ds::ON_ACCENT)
+        } else {
+            (ds::BG.with_alpha(0.85), ds::ACCENT)
+        };
+        let badge = commands
+            .spawn((
+                Name::new("pin badge"),
+                PinBadge(pin),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Px(D),
+                    height: Val::Px(D),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(D / 2.0)),
+                    ..default()
+                },
+                BackgroundColor(fill),
+                BorderColor::all(if committed { ds::FG } else { ds::ACCENT }),
+                BoxShadow::new(
+                    Color::BLACK.with_alpha(0.45),
+                    Val::Px(0.0),
+                    Val::Px(2.0),
+                    Val::Px(0.0),
+                    Val::Px(6.0),
+                ),
+                Visibility::Hidden,
+                GlobalZIndex(5),
+                Pickable::IGNORE,
+            ))
+            .id();
+        commands.spawn((
+            ds::text_in(
+                &assets,
+                ds::Type::Small,
+                &if committed {
+                    id.0.to_string()
+                } else {
+                    "+".into()
+                },
+                ink,
+            ),
+            Pickable::IGNORE,
+            ChildOf(badge),
+        ));
+        // The tail: a short stem from the badge down to the spot.
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(D - 2.0),
+                left: Val::Px(D / 2.0 - 1.0),
+                width: Val::Px(2.0),
+                height: Val::Px(7.0),
+                ..default()
+            },
+            BackgroundColor(if committed { ds::FG } else { ds::ACCENT }),
+            Pickable::IGNORE,
+            ChildOf(badge),
+        ));
+    }
 }

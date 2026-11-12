@@ -148,11 +148,7 @@ pub(crate) fn comment_box(
     mut focus: ResMut<InputFocus>,
     mut inputs: Query<(Entity, &mut EditableText), With<CommentInput>>,
     new_inputs: Query<Entity, Added<CommentInput>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    uncommitted: Query<
-        (Entity, &MeshMaterial3d<StandardMaterial>),
-        (With<AnnotationPin>, Without<PinCommitted>),
-    >,
+    uncommitted: Query<Entity, (With<AnnotationPin>, Without<PinCommitted>)>,
     assets: Res<AssetServer>,
     mut commands: Commands,
     mut wb: ResMut<Workbench>,
@@ -193,7 +189,7 @@ pub(crate) fn comment_box(
         Some(Action::Cancel) => {
             if matches!(cb.target, Some(CommentTarget::Spot(_))) {
                 modeler.session.pending_pin = None;
-                for (e, _) in &uncommitted {
+                for e in &uncommitted {
                     commands.entity(e).despawn();
                 }
             }
@@ -223,12 +219,10 @@ pub(crate) fn comment_box(
                 match r {
                     Ok(msg) => {
                         if matches!(t, CommentTarget::Spot(_)) {
-                            for (e, m) in &uncommitted {
-                                commands.entity(e).insert(PinCommitted);
-                                if let Some(mut mat) = materials.get_mut(&m.0) {
-                                    mat.base_color = Color::srgb(0.2, 0.9, 0.3);
-                                    mat.emissive = LinearRgba::rgb(0.2, 0.9, 0.3);
-                                }
+                            // The committed pins come back from the model
+                            // (`sync_pins`), numbered.
+                            for e in &uncommitted {
+                                commands.entity(e).despawn();
                             }
                         }
                         modeler.session.mark_autosave(true, false, false);

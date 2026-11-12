@@ -298,7 +298,7 @@ fn main() -> AppExit {
             draw_game_gizmos.run_if(windowed),
             update_mode.run_if(windowed),
             orbit_camera.run_if(windowed).run_if(grid_off),
-            (click_in_view, spawn_pin_markers, sync_pins)
+            (click_in_view, spawn_pin_markers, sync_pins, pin_badges)
                 .chain()
                 .after(rebuild_scene)
                 .run_if(windowed)
