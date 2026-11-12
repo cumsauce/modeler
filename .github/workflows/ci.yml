@@ -52,6 +52,10 @@ jobs:
           cp target/release/modeler mcp_driver.py AGENTS.md README.md dist/modeler/
           tar -C dist -czf modeler-linux-x86_64.tar.gz modeler
           ldd target/release/modeler
+          # Runs in bare containers: nothing beyond libc / libstdc++.
+          if ldd target/release/modeler | grep -E "wayland|asound|udev|X11|xkbcommon"; then
+            echo "::error::the binary links a desktop library (above)"; exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -70,3 +74,30 @@ jobs:
             --title "latest (main @ ${GITHUB_SHA::7})" \
             --notes "Linux x86_64 build of main at ${GITHUB_SHA}. Run with --headless (no window, no GPU). Install in a workflow with: uses: ${GITHUB_REPOSITORY}@main" \
             --prerelease
+
+  # The binary in a bare container (what a cloud CI session looks like).
+  bare:
+    needs: linux
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: modeler-linux-x86_64
+      - run: |
+          tar -xzf modeler-linux-x86_64.tar.gz
+          ci/smoke.sh modeler/modeler
+
+  # The action, installed the way another repo would use it.
+  action:
+    needs: linux
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: modeler
+        uses: ./
+      - run: |
+          cat .mcp.json
+          ci/smoke.sh "${{ steps.modeler.outputs.bin }}"

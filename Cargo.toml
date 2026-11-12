@@ -36,6 +36,11 @@ texture-compressor = { version = "0.2", features = ["parallel"] }
 ruzstd = "0.8.3"
 ttf-parser = "0.25"
 
+# Load libwayland at runtime on Linux (Bevy links it otherwise), so the
+# headless binary starts in bare containers that don't have it.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["wayland-dlopen"] }
+
 [dev-dependencies]
 gltf = "1"
 ktx2 = "0.5"
