@@ -58,9 +58,13 @@ pub struct Deform {
     /// Target edge length, meters: the input is refined to this first.
     #[serde(default, skip_serializing_if = "none")]
     pub detail: Option<f32>,
+    /// Material: the procedural material whose height channel displaces
+    /// the surface (graph embedded when the item is applied).
+    #[serde(default, skip_serializing_if = "none")]
+    pub pbr: Option<crate::material::pbr::PbrRef>,
 }
 
-pub const MODES: &[&str] = &["displace", "bend", "twist", "taper"];
+pub const MODES: &[&str] = &["displace", "bend", "twist", "taper", "material"];
 
 /// "x" / "+y" / "-z" or a direction word (right, left, up, down, front,
 /// back) as (axis index, sign).
@@ -91,7 +95,7 @@ impl Deform {
     pub fn validate(&self) -> Result<(), String> {
         if !MODES.contains(&self.mode.as_str()) {
             return Err(format!(
-                "mode: must be displace, bend, twist or taper, got `{}`",
+                "mode: must be displace, bend, twist, taper or material, got `{}`",
                 self.mode
             ));
         }
@@ -141,6 +145,18 @@ impl Deform {
                 _ => {}
             }
         }
+        if (self.mode == "material") != self.pbr.is_some() {
+            return Err(if self.pbr.is_some() {
+                "pbr: only for mode material".into()
+            } else {
+                "pbr: mode material needs the material whose height displaces the surface".into()
+            });
+        }
+        if self.mode == "material"
+            && (self.noise.is_some() || self.octaves.is_some() || self.seed.is_some())
+        {
+            return Err("noise / octaves / seed: the material's own graph sets the pattern".into());
+        }
         match self.mode.as_str() {
             "bend" | "twist" if self.degrees.is_none() => {
                 Err(format!("degrees: {} needs an angle", self.mode))
@@ -172,6 +188,7 @@ impl Deform {
         f("seed", self.seed.map(|v| v.to_string()));
         f("noise", self.noise.clone());
         f("detail", self.detail.map(|v| v.to_string()));
+        f("pbr", self.pbr.as_ref().map(|r| r.material.clone()));
         s
     }
 }
@@ -204,6 +221,7 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
     let scale = def.scale.unwrap_or(0.45 * size.max_element());
     let detail = def.detail.unwrap_or(match def.mode.as_str() {
         "displace" => (scale / 8.0).min(size.max_element() / 32.0),
+        "material" => material_detail(def, size),
         _ => size[axis] / 32.0,
     });
 
@@ -245,6 +263,8 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
 
     match def.mode.as_str() {
         "displace" => displace(&mut verts, &indices, def, scale, size),
+        "material" => material_displace(&mut verts, &indices, def, size)
+            .map_err(|e| ModelerError::Invalid(format!("deform `{name}`: {e}")))?,
         mode => {
             let (lo, hi) = verts.iter().fold(
                 (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
@@ -304,7 +324,11 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
     }
     // Displaced surfaces are smooth at the detail scale: crease only real
     // ridges. Bent/twisted boxes keep their edges hard.
-    let crease = if def.mode == "displace" { 60.0 } else { 40.0 };
+    let crease = if matches!(def.mode.as_str(), "displace" | "material") {
+        60.0
+    } else {
+        40.0
+    };
     crate::uv::crease_normals(&mut out, crease);
     if out.uvs.len() != out.verts.len() {
         out.uvs.clear();
@@ -365,6 +389,236 @@ fn displace(verts: &mut [Vec3], indices: &[u32], def: &Deform, scale: f32, size:
         };
         *v += n * (h * amount);
     }
+}
+
+/// Default refinement for material displacement: two texels of the
+/// material's bake (tile domain), else 1/100 of the part.
+fn material_detail(def: &Deform, size: Vec3) -> f32 {
+    let fallback = size.max_element() / 100.0;
+    let Some(g) = def.pbr.as_ref().and_then(|r| r.graph().ok()) else {
+        return fallback;
+    };
+    if g.domain == "object" {
+        return fallback;
+    }
+    let scale = def.pbr.as_ref().map_or(1.0, |r| r.scale).max(1e-6);
+    (2.0 * g.tile * scale / g.resolution.max(16) as f32).max(size.max_element() / 400.0)
+}
+
+/// Welded, area-weighted vertex normals (coincident vertices share one),
+/// then smoothed over their neighbours a few rounds: on a faceted input
+/// (a 32-sided cylinder refined into small triangles) raw normals jump at
+/// the old facet edges, and relief pushed along them folds the surface.
+fn welded_normals(verts: &[Vec3], indices: &[u32], size: Vec3) -> Vec<Vec3> {
+    let inv = 1.0 / (size.max_element() * 1e-6).clamp(1e-7, 1e-5);
+    let mut ids: HashMap<[i64; 3], usize> = HashMap::new();
+    let of: Vec<usize> = verts
+        .iter()
+        .map(|v| {
+            let n = ids.len();
+            *ids.entry(key(*v, inv)).or_insert(n)
+        })
+        .collect();
+    let mut nrm = vec![Vec3::ZERO; ids.len()];
+    let mut nb: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+    for t in indices.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|i| verts[i as usize]);
+        let n = (b - a).cross(c - a);
+        let k = t.map(|i| of[i as usize]);
+        for x in 0..3 {
+            nrm[k[x]] += n;
+            nb[k[x]].push(k[(x + 1) % 3]);
+            nb[k[x]].push(k[(x + 2) % 3]);
+        }
+    }
+    let mut nrm: Vec<Vec3> = nrm.iter().map(|n| n.normalize_or_zero()).collect();
+    for l in &mut nb {
+        l.sort_unstable();
+        l.dedup();
+    }
+    for _ in 0..4 {
+        nrm = (0..nrm.len())
+            .map(|i| {
+                let s = nb[i].iter().map(|&j| nrm[j]).sum::<Vec3>();
+                (nrm[i] * 2.0 + s).normalize_or_zero()
+            })
+            .collect();
+    }
+    of.iter().map(|&i| nrm[i]).collect()
+}
+
+/// Moves each vertex along its normal by the material's height channel
+/// (meters, minus its mean so the surface stays where it was) times
+/// `amount` (default 1). Tile materials are baked once and sampled
+/// triplanar at real size (the same metric projection their colour uses);
+/// object materials are evaluated at each vertex.
+fn material_displace(
+    verts: &mut [Vec3],
+    indices: &[u32],
+    def: &Deform,
+    size: Vec3,
+) -> Result<(), String> {
+    use crate::material::eval::Samples;
+    use crate::material::node::Buf;
+    use std::sync::Arc;
+    let Some(r) = &def.pbr else {
+        return Err("pbr: missing".into());
+    };
+    let g = r.graph()?;
+    let amount = def.amount.unwrap_or(1.0);
+    let normals = welded_normals(verts, indices, size);
+    let h: Vec<f32> = if g.domain == "object" {
+        let uv: Vec<[f32; 2]> = verts
+            .iter()
+            .zip(&normals)
+            .map(|(p, n)| {
+                let a = n.abs();
+                let (axis, sign) = if a.x >= a.y && a.x >= a.z {
+                    (0u8, n.x.signum())
+                } else if a.y >= a.z {
+                    (1, n.y.signum())
+                } else {
+                    (2, n.z.signum())
+                };
+                crate::uv::metric_uv(axis, sign, *p)
+            })
+            .collect();
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        for v in verts.iter() {
+            std::hash::Hash::hash(&v.to_array().map(f32::to_bits), &mut hs);
+        }
+        let s = Samples {
+            w: verts.len(),
+            h: 1,
+            uv: Arc::new(Buf::V2(uv)),
+            pos: Arc::new(Buf::V3(verts.iter().map(|v| v.to_array()).collect())),
+            nrm: Arc::new(Buf::V3(normals.iter().map(|v| v.to_array()).collect())),
+            valid: None,
+            period: 0.0,
+            texel: size.max_element() / 200.0,
+            key: std::hash::Hasher::finish(&hs),
+            mesh: None,
+        };
+        let ch = crate::material::bake::bake(&g.nodes, &r.merged_params(), &s, true)
+            .map_err(|e| format!("material `{}`: {e}", r.material))?;
+        ch.height
+    } else {
+        let mut probe = Part::new("_height");
+        probe.material.pbr = Some(r.clone());
+        let ch = crate::material::pbr::bake_part(&probe)?
+            .ok_or_else(|| format!("material `{}` did not bake", r.material))?;
+        let (w, hh) = (ch.w, ch.h);
+        let period = (g.tile * r.scale.max(1e-6)).max(1e-6);
+        let sample = |uv: [f32; 2]| -> f32 {
+            let x = uv[0] / period * w as f32 - 0.5;
+            let y = uv[1] / period * hh as f32 - 0.5;
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let at = |i: f32, j: f32| {
+                let i = (i as i64).rem_euclid(w as i64) as usize;
+                let j = (j as i64).rem_euclid(hh as i64) as usize;
+                ch.height[j * w + i]
+            };
+            let a = at(x0, y0) + (at(x0 + 1.0, y0) - at(x0, y0)) * fx;
+            let b = at(x0, y0 + 1.0) + (at(x0 + 1.0, y0 + 1.0) - at(x0, y0 + 1.0)) * fx;
+            a + (b - a) * fy
+        };
+        verts
+            .iter()
+            .zip(&normals)
+            .map(|(p, n)| {
+                let wgt = (n.abs().powf(4.0)).max(Vec3::splat(1e-6));
+                let wgt = wgt / (wgt.x + wgt.y + wgt.z);
+                (0..3)
+                    .map(|axis| {
+                        let sign = if n[axis] < 0.0 { -1.0 } else { 1.0 };
+                        wgt[axis] * sample(crate::uv::metric_uv(axis as u8, sign, *p))
+                    })
+                    .sum()
+            })
+            .collect()
+    };
+    if h.is_empty() {
+        return Ok(());
+    }
+    let mean = h.iter().sum::<f32>() / h.len() as f32;
+    let reach = h.iter().map(|x| (x - mean).abs()).fold(0.0f32, f32::max) * amount.abs();
+    let fade = crease_fade(verts, indices, size, 3.0 * reach);
+    for (((v, n), x), f) in verts.iter_mut().zip(&normals).zip(&h).zip(&fade) {
+        *v += *n * ((x - mean) * amount * f);
+    }
+    Ok(())
+}
+
+/// 0 on sharp creases (where faces meet at more than about 30 degrees: a
+/// cylinder's rim, a box edge) rising smoothly to 1 at `radius` meters
+/// along the surface, so relief fades out instead of folding the edge.
+fn crease_fade(verts: &[Vec3], indices: &[u32], size: Vec3, radius: f32) -> Vec<f32> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    if radius <= 0.0 {
+        return vec![1.0; verts.len()];
+    }
+    let inv = 1.0 / (size.max_element() * 1e-6).clamp(1e-7, 1e-5);
+    let mut ids: HashMap<[i64; 3], usize> = HashMap::new();
+    let of: Vec<usize> = verts
+        .iter()
+        .map(|v| {
+            let n = ids.len();
+            *ids.entry(key(*v, inv)).or_insert(n)
+        })
+        .collect();
+    let n = ids.len();
+    let mut pos = vec![Vec3::ZERO; n];
+    for (v, &i) in verts.iter().zip(&of) {
+        pos[i] = *v;
+    }
+    // Per welded edge, the unit normals of its faces.
+    let mut edges: HashMap<(usize, usize), Vec<Vec3>> = HashMap::new();
+    for t in indices.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|i| of[i as usize]);
+        let fnrm = (pos[b] - pos[a]).cross(pos[c] - pos[a]).normalize_or_zero();
+        for (x, y) in [(a, b), (b, c), (c, a)] {
+            edges.entry((x.min(y), x.max(y))).or_default().push(fnrm);
+        }
+    }
+    let mut nb: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    let mut dist = vec![f32::MAX; n];
+    let mut heap = BinaryHeap::new();
+    let cos = 30f32.to_radians().cos();
+    for (&(a, b), ns) in &edges {
+        let l = pos[a].distance(pos[b]);
+        nb[a].push((b, l));
+        nb[b].push((a, l));
+        if ns.len() == 2 && ns[0].dot(ns[1]) < cos {
+            for v in [a, b] {
+                if dist[v] > 0.0 {
+                    dist[v] = 0.0;
+                    heap.push((Reverse(0u32), v));
+                }
+            }
+        }
+    }
+    // Dijkstra out to `radius` (distances as f32 bits order like floats).
+    while let Some((Reverse(db), v)) = heap.pop() {
+        let d = f32::from_bits(db);
+        if d > dist[v] || d > radius {
+            continue;
+        }
+        for &(w, l) in &nb[v] {
+            let nd = d + l;
+            if nd < dist[w] {
+                dist[w] = nd;
+                heap.push((Reverse(nd.to_bits()), w));
+            }
+        }
+    }
+    of.iter()
+        .map(|&i| {
+            let t = (dist[i] / radius).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        })
+        .collect()
 }
 
 /// Midpoint subdivision (1 -> 4) until no edge is longer than `detail`, for
@@ -566,5 +820,68 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.validate().is_err_and(|e| e.starts_with("mode")));
+    }
+
+    #[test]
+    fn a_material_height_becomes_relief() {
+        use serde_json::json;
+        let nodes = json!([
+            {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
+            {"type": "rect", "name": "brick", "coords": "g.local", "size": [0.24, 0.0525], "round": 0.004},
+            {"type": "mask", "name": "m", "sdf": "brick"},
+            {"type": "math", "name": "h", "op": "mul", "a": "m", "b": 0.01},
+            {"type": "output", "name": "out", "height": "h"}
+        ]);
+        let graph = crate::material::pbr::MatGraph {
+            domain: "tile".into(),
+            tile: 0.5,
+            resolution: 128,
+            nodes: nodes.as_array().cloned().unwrap_or_default(),
+            params: Default::default(),
+        };
+        let wall = crate::primitives::primitive(crate::PrimitiveKind::Box, [0.5, 0.5, 0.1], "wall")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let def = Deform {
+            mode: "material".into(),
+            pbr: Some(crate::material::PbrRef {
+                material: "bricks".into(),
+                params: Default::default(),
+                scale: 1.0,
+                graph: Some(std::sync::Arc::new(graph)),
+            }),
+            ..Deform::default()
+        };
+        let out = deform("w", &wall, &def).unwrap_or_else(|e| panic!("{e}"));
+        check_solid(&out);
+        // The front face (z = 0.05) now has bricks standing out and mortar
+        // sunk in: about 1 cm of relief.
+        let front: Vec<f32> = out
+            .verts
+            .iter()
+            .filter(|v| v[0].abs() < 0.2 && v[1].abs() < 0.2 && v[2] > 0.0)
+            .map(|v| v[2])
+            .collect();
+        let (lo, hi) = front
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), z| (a.min(*z), b.max(*z)));
+        assert!(hi - lo > 0.007 && hi - lo < 0.013, "relief {lo}..{hi}");
+        // Relief fades at a cylinder's rim instead of folding it.
+        let mut on_cyl = def.clone();
+        on_cyl.amount = Some(1.5);
+        let cyl =
+            crate::primitives::primitive(crate::PrimitiveKind::Cylinder, [0.15, 0.6, 0.0], "c")
+                .unwrap_or_else(|e| panic!("{e}"));
+        let trunk = deform("t", &cyl, &on_cyl).unwrap_or_else(|e| panic!("{e}"));
+        check_solid(&trunk);
+        let (n, at) = crate::organic::self_intersections(&trunk);
+        assert_eq!(n, 0, "{at:?}");
+        let e = Deform {
+            mode: "material".into(),
+            ..Deform::default()
+        }
+        .validate()
+        .err()
+        .unwrap_or_default();
+        assert!(e.contains("pbr: mode material needs"), "{e}");
     }
 }

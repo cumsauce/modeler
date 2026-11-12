@@ -103,7 +103,10 @@ type, so there is no need to memorise field names.
 | `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
 | `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights] |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
-| `deform` | name, input, mode (displace / bend / twist / taper), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail] |
+| `deform` | name, input, mode (displace / bend / twist / taper / material), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
+| `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution] (analytic distance-field modeling) |
+| `skin` | name, chains [[[x, y, z, r] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution] (a skeleton with radii as one smooth skin) |
+| `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
@@ -363,6 +366,20 @@ A visible part with only a flat colour (no `pbr`) is a warning in
     low end staying put. A horn is a cylinder tapered, then bent:
     `{"mode": "taper", "scale_end": 0.08}` into `{"mode": "bend", "degrees":
     120, "toward": "-z"}`; a curved blade bends a thin box.
+  - `material`: real relief from a procedural material's `height` output
+    (bark, scales, wrinkles, cobbles, bricks): `{"type": "deform", "name":
+    "trunk", "input": "trunk_raw", "mode": "material", "pbr": "bark"}`.
+    Each vertex moves along its (smoothed) normal by the height minus its
+    mean, times `amount` (default 1: the channel's own meters); `scale` and
+    `params` work as on a material item. Tile materials are baked once and
+    sampled triplanar at real size, the same metric projection their
+    colour uses, so giving the result the same `pbr` lines colour and relief
+    up; object materials are evaluated per vertex (neighbourhood nodes such
+    as blur see a strip there: build their height from noise / SDF nodes).
+    `detail` defaults to two texels of the bake. Relief fades out within a
+    few relief-depths of sharp creases (a cylinder's rim, a box edge) so
+    the edge doesn't fold. Editing the material with `material_ops`
+    re-derives the relief.
   Every number takes params (`"degrees": "$curl"`), and chains of deforms
   re-derive like any op.
 - **`scatter`** strews copies of parts over another part's surface: rocks
@@ -414,6 +431,67 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   over ~27M samples is refused with the size that fits. Hide the inputs.
   A blob of one input with a blend just remeshes it: use `round` for that.
   `{"type": "blob", "name": "shroom", "inputs": ["stem", "cap"], "blend": 0.03}`.
+- **`sdf`** models organic solids as signed distance fields: analytic
+  shapes combined by smooth booleans, warped as a field, meshed once
+  (Manifold's level set) into one closed solid. Cleaner and faster than
+  `blob` (no meshes to sample) and the way to build creatures, mushrooms,
+  bones, teeth, sculpted forms. `shapes` run in order, each joining the
+  field before it by its `op` (`union` default, `subtract`, `intersect`)
+  with smooth radius `blend` (per shape, else the item's, default a fifth of
+  the thinnest shape; 0 = sharp):
+  - `sphere` {radius, at}; `ellipsoid` {size: radii [x, y, z], at,
+    rotation}; `box` {size: full [x, y, z], round, at, rotation};
+    `capsule` {from, to, radius: r or [r_from, r_to]} (a rounded cone:
+    limbs, horns, fingers); `cylinder` {radius, height, round, at,
+    rotation}; `torus` {size: [ring, tube], at, rotation};
+  - `chain` {points: [[x, y, z, r], ...], smooth} (a tube whose radius
+    follows the points, a Catmull-Rom through them by default);
+  - `part` {part}: a closed solid of the model sampled as a field (this is
+    what `blob` does, mixable with analytic shapes);
+  - `group` {shapes}: combined on their own first, then joined as one (to
+    subtract a blended cluster).
+  `mirror: "x"` folds the field so you model only the +x side of a
+  symmetric creature (shapes crossing x = 0 should be symmetric
+  themselves; `"z"`, `"xz"` for four-fold). `warps` act on the whole field
+  in order, with the deform fields: `twist` / `bend` / `taper` warp space
+  over the field's box at that point of the list, `displace` adds noise to
+  the surface (amount, scale, octaves, seed, noise). `resolution` (voxel
+  meters) defaults to 1/120 of the size, finer for thin shapes, at most
+  about 12M samples; an explicit one may go to 27M. Evaluation is
+  bucketed, so hundreds of shapes stay fast. A critter:
+  `{"type": "sdf", "name": "critter", "mirror": "x", "blend": 0.03,
+  "shapes": [{"shape": "ellipsoid", "size": [0.12, 0.1, 0.16], "at": [0,
+  0.16, 0]}, {"shape": "sphere", "radius": 0.075, "at": [0, 0.27, 0.15]},
+  {"shape": "capsule", "from": [0.07, 0.12, 0.09], "to": [0.09, 0, 0.11],
+  "radius": [0.03, 0.022]}, {"shape": "sphere", "radius": 0.02, "at":
+  [0.035, 0.29, 0.215], "op": "subtract", "blend": 0.008}]}` (body, head,
+  legs, eye sockets on both sides).
+- **`skin`** wraps a skeleton in one smooth surface (like a skin modifier
+  or Z-spheres): tentacles, roots, worms, hands, simple characters.
+  `chains` are lists of points `[x, y, z, radius]` or names of `joints`
+  (`{"hip": [0, 0.5, 0, 0.08]}`); each chain is a smooth tube through its
+  points with the radius following them (`smooth: false` for straight
+  rounded cones), and chains melt together where they meet by `blend`
+  (default half the median radius). Same `mirror`, `warps` and
+  `resolution` as `sdf`. An octopus: `{"type": "skin", "name": "octo",
+  "mirror": "xz", "joints": {"body": [0, 0.25, 0, 0.12]}, "chains":
+  [["body", [0.14, 0.1, 0.05, 0.045], [0.3, 0.03, 0.12, 0.028], [0.42,
+  0.06, 0.26, 0.012]], ["body", [0, 0.45, -0.03, 0.11]]]}` (with `xz` one
+  arm makes four).
+- **`smooth`** fairs or rebuilds a mesh (model space; hide the input):
+  - `relax`: Taubin smoothing, `iterations` (10) rounds of `strength`
+    (0.5): evens out lumps, pinches and noise without the shrink of plain
+    Laplacian smoothing. Open borders stay put. Good after `deform`.
+  - `remesh`: a closed solid rebuilt with even triangles `edge` meters
+    long (default the input's mean edge), then relaxed along the surface.
+    Edges sharper than `edge` round off. Use it before `deform` or after
+    booleans that left slivers.
+  - `subdiv`: Catmull-Clark of a coarse cage, `levels` 1..5 (2): a box
+    becomes a smooth pebble, a few boxes a soft character. Coplanar
+    triangle pairs are merged back into quads first, and edges whose faces
+    meet at more than `crease` degrees stay sharp (`crease: 60` on a
+    cylinder cage keeps the rims, smooths the sides); open borders stay
+    sharp too.
 - **`split`** cuts a closed solid by a plane into `name_above` (the side
   `plane.normal` points to) and `name_below`, both closed with flat caps:
   broken pots, cutaway views, parts that open or animate apart.
@@ -499,7 +577,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, scope?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, self_intersections?, thickness?, scope?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `scope: ["bars_*", "basket"]` limits what the other checks report to
     those parts (`*` globs): grounded / supported / rests / bounds /
@@ -539,6 +617,12 @@ name: the producer first, then in-place material/visibility/transform edits).
     `pbr`). **Every model should pass `materials: true`**, and prefer
     `"pbr"` for anything that ships: put it in the build's `expect`.
     `save_prefab` warns about grey parts (and notes flat colours).
+  - `self_intersections: true`: no part's surface passes through itself
+    (a deform, warp or skin that folded it); fails with the crossing count
+    and a point.
+  - `thickness: 0.004`: every part is at least that many meters thick
+    everywhere (sampled straight through along the inward normal); fails
+    naming the part and where.
   - `collisions`: no part passes through another. `true`, or `{allow:
     [["c_leg*", "c_seat"]], max: 0.2}`. Fails any pair where more than
     `max` (default 20%) of the smaller part's volume is inside the other,
@@ -593,6 +677,10 @@ name: the producer first, then in-place material/visibility/transform edits).
     result says so). A 2x2 grid of 640x480 is ~1.6k tokens.
   - `style: "ids"`: each part a flat, unlit, distinct colour with a legend
     (and the colour order in the text), to tell which shape is which part.
+  - `style: "curvature"`: each part painted by mean curvature (white flat,
+    red convex, blue concave, saturated where the radius of curvature is a
+    sixteenth of the part or tighter): lumps, pinches, dents and creases on
+    organic surfaces stand out where shading hides them.
   - `dims: true`: the framed box's width and height and a scale bar, at true
     scale in orthographic views. Perspective views have no single scale:
     they state the model's box size ("not the view") and a scale bar valid
@@ -600,8 +688,12 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `diff: true`: compares with the previous render of the same view, size,
     focus and style: magenta where something now is, cyan where something
     was, the rest greyed, plus the changed share and pixel box.
-- `inspect(measure?, section?, mass?)`: numeric senses, any combination per
-  call.
+- `inspect(measure?, section?, mass?, thickness?)`: numeric senses, any
+  combination per call.
+  - `thickness: {parts?}`: per visible part, the thinnest point straight
+    through it along the inward normal (and where), the 5% and median
+    thickness, and whether its surface passes through itself: a limb
+    pinched to nothing, a wall too thin to print.
   - `measure: [["a", "b"], ["c"]]`: two parts are apart (closest-surface
     gap), touching, or overlapping (shared volume and penetration depth),
     plus per-axis box gaps and where an overlap is centred (so an intended joint, like a stay meeting a hub, tells apart from a collision); one name gives its height above the ground.

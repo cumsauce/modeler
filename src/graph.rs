@@ -766,6 +766,20 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::blob::blob(name, &refs, op, k, *resolution)?;
             upsert(named, name, part);
         }
+        Op::Sdf { name, def } => {
+            let look = |n: &str| lookup_shared(named, n);
+            let part = crate::sdf::build(name, def, &look)?;
+            upsert(named, name, part);
+        }
+        Op::Skin { name, def } => {
+            let part = crate::sdf::skin(name, def)?;
+            upsert(named, name, part);
+        }
+        Op::Smooth { name, input, def } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::smooth::smooth(name, &src, def)?;
+            upsert(named, name, part);
+        }
         Op::Split {
             name,
             input,
@@ -1198,6 +1212,9 @@ pub fn output(op: &Op) -> &str {
         | Op::PathArray { name, .. }
         | Op::Hull { name, .. }
         | Op::Blob { name, .. }
+        | Op::Sdf { name, .. }
+        | Op::Skin { name, .. }
+        | Op::Smooth { name, .. }
         | Op::Split { name, .. }
         | Op::LSystem { name, .. }
         | Op::Text { name, .. }
@@ -1289,6 +1306,9 @@ pub fn kind(op: &Op) -> &'static str {
         Op::PathArray { .. } => "path_array",
         Op::Hull { .. } => "hull",
         Op::Blob { .. } => "blob",
+        Op::Sdf { .. } => "sdf",
+        Op::Skin { .. } => "skin",
+        Op::Smooth { .. } => "smooth",
         Op::Split { .. } => "split",
         Op::LSystem { .. } => "lsystem",
         Op::Text { .. } => "text",
@@ -1341,6 +1361,9 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         }
         Op::Round { input, .. } => vec![input],
         Op::Deform { input, .. } => vec![input],
+        Op::Sdf { def, .. } => def.reads(),
+        Op::Skin { .. } => Vec::new(),
+        Op::Smooth { input, .. } => vec![input],
         Op::Shell { input, .. } | Op::Split { input, .. } => vec![input],
         Op::Scatter { input, on, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
@@ -1672,6 +1695,11 @@ pub fn describe(ops: &[Op]) -> String {
             ),
             Op::Deform { name, input, def } => {
                 format!("#{i} deform `{name}` <- `{input}` {}", def.summary())
+            }
+            Op::Sdf { name, def } => format!("#{i} sdf `{name}` {}", def.summary()),
+            Op::Skin { name, def } => format!("#{i} skin `{name}` {}", def.summary()),
+            Op::Smooth { name, input, def } => {
+                format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
             }
             Op::Shell {
                 name,

@@ -33,6 +33,9 @@ pub(crate) struct PendingAgentShots(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ShotStyle {
     pub(crate) ids: bool,
+    /// Parts painted by mean curvature (white flat, red convex, blue
+    /// concave), lit, on the stand-in layer like `ids`.
+    pub(crate) curvature: bool,
     pub(crate) dims: bool,
     /// Light with the model's own lights only (studio lights hidden).
     pub(crate) scene_lit: bool,
@@ -423,15 +426,21 @@ pub(crate) fn process_agent_shot(
     // Part-ID stand-ins on their own layer; the camera looks only at it.
     let mut legend: Vec<(String, [u8; 4])> = Vec::new();
     let mut stand_ins: Vec<Entity> = Vec::new();
-    if style.ids {
+    if style.ids || style.curvature {
         let drawable = model
             .parts
             .iter()
             .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
         let drawable: Vec<_> = drawable.collect();
         modeler::material::pbr::prebake(drawable.iter().map(|p| &***p));
+        let mut colored: Vec<Option<Mesh>> = Vec::new();
         for (i, part) in drawable.into_iter().enumerate() {
-            legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
+            if style.curvature {
+                colored.push(Some(curvature_mesh(part)));
+            } else {
+                legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
+                colored.push(None);
+            }
             let bundle = part_bundle(
                 part,
                 &mut meshes,
@@ -442,8 +451,27 @@ pub(crate) fn process_agent_shot(
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
         }
+        if style.curvature {
+            legend.push((
+                "convex (radius < 1/16 of the part)".into(),
+                [235, 40, 30, 255],
+            ));
+            legend.push(("flat".into(), [250, 250, 250, 255]));
+            legend.push(("concave (hollow, crease)".into(), [30, 110, 240, 255]));
+        }
         // Unlit: swap the materials the bundle made for flat ones.
         for (k, e) in stand_ins.iter().enumerate() {
+            if let Some(Some(mesh)) = colored.get_mut(k).map(Option::take) {
+                let m = materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    perceptual_roughness: 0.7,
+                    ..default()
+                });
+                commands
+                    .entity(*e)
+                    .insert((Mesh3d(meshes.add(mesh)), MeshMaterial3d(m)));
+                continue;
+            }
             let [r, g, b] = modeler::raster::id_color(k);
             let m = materials.add(StandardMaterial {
                 base_color: Color::srgb(r, g, b),
@@ -485,7 +513,7 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
-    let ids = style.ids;
+    let ids = style.ids || style.curvature;
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands
@@ -641,4 +669,34 @@ fn draw_legend(c: &mut Canvas, legend: &[(String, [u8; 4])]) {
     if legend.len() > max_rows {
         c.text(4, y, &format!("+{} MORE", legend.len() - max_rows), scale);
     }
+}
+
+/// A part's mesh with per-vertex curvature colours (its own transform still
+/// applies through the stand-in's bundle).
+fn curvature_mesh(part: &modeler::Part) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let k = modeler::organic::vertex_curvature(part);
+    let (lo, hi) = part.bounds();
+    let size = (hi - lo).max_element().max(1e-6);
+    let colors: Vec<[f32; 4]> = k
+        .iter()
+        .map(|&c| {
+            let [r, g, b] = modeler::organic::curvature_color(c, size);
+            [r, g, b, 1.0]
+        })
+        .collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(part.indices.clone()));
+    if part.normals.len() == part.verts.len() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+    } else {
+        mesh.compute_normals();
+    }
+    mesh
 }

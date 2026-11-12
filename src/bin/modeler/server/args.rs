@@ -42,6 +42,18 @@ pub(crate) struct InspectArgs {
     /// what tilt).
     #[serde(default)]
     pub(crate) mass: Option<MassArg>,
+    /// Organic checks per visible part: {"parts"?: [...]}. The thinnest
+    /// point straight through each part (where, plus the 5% and median),
+    /// and whether its surface passes through itself.
+    #[serde(default)]
+    pub(crate) thickness: Option<ThicknessArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThicknessArg {
+    #[serde(default)]
+    pub(crate) parts: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -336,8 +348,10 @@ pub(crate) struct AgentViewsArgs {
     /// there is more than one view; false returns one image per view.
     #[serde(default)]
     pub(crate) grid: Option<bool>,
-    /// "shaded" (default) or "ids": every part a flat distinct colour with a
-    /// legend, to tell which shape is which part.
+    /// "shaded" (default), "ids" (every part a flat distinct colour with a
+    /// legend, to tell which shape is which part) or "curvature" (mean
+    /// curvature heat map: red convex, white flat, blue concave; lumps,
+    /// pinches and creases on organic surfaces stand out).
     #[serde(default)]
     pub(crate) style: Option<String>,
     /// Overlay the framed box's width/height and a scale bar (true scale in

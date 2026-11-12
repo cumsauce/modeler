@@ -175,6 +175,15 @@ pub struct VerifySpec {
     /// (`*` patterns, either order). Shallow overlaps are joints.
     #[serde(default)]
     pub collisions: Option<CollisionSpec>,
+    /// No visible part's surface passes through itself (a deform, skin or
+    /// sdf warp that folded it): fails with the crossing count and where.
+    #[serde(default)]
+    pub self_intersections: Option<bool>,
+    /// Every visible part is at least this many meters thick everywhere
+    /// (measured straight through along the inward normal): catches limbs
+    /// pinched to nothing, walls too thin to print or cast.
+    #[serde(default)]
+    pub thickness: Option<f32>,
 }
 
 /// `grounded: true` or `"strict"`.
@@ -1085,8 +1094,13 @@ impl Session {
     /// Embeds the graph of a `material` item's `pbr` (from the working
     /// materials first, then the library), so the model is self-contained.
     fn resolve_pbr(&self, item: &mut BatchItem) -> Result<(), String> {
-        let BatchItem::Op(Op::Material { pbr: Some(r), .. }) = item else {
-            return Ok(());
+        let r = match item {
+            BatchItem::Op(Op::Material { pbr: Some(r), .. }) => r,
+            BatchItem::Op(Op::Deform { def, .. }) if def.pbr.is_some() => match &mut def.pbr {
+                Some(r) => r,
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
         };
         let doc = match self.materials.docs.get(&r.material) {
             Some(d) => d.clone(),
@@ -1135,7 +1149,12 @@ impl Session {
         let before = self.model_without_history();
         let mut n = 0;
         for op in &mut self.model.ops {
-            if let Op::Material { pbr: Some(r), .. } = op
+            let r = match op {
+                Op::Material { pbr: Some(r), .. } => Some(r),
+                Op::Deform { def, .. } => def.pbr.as_mut(),
+                _ => None,
+            };
+            if let Some(r) = r
                 && r.material == material
             {
                 r.graph = Some(graph.clone());
@@ -2356,6 +2375,8 @@ impl Session {
             && spec.supported.is_none()
             && spec.rests.is_none()
             && spec.collisions.is_none()
+            && spec.self_intersections.is_none()
+            && spec.thickness.is_none()
             && spec.materials.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
@@ -2439,6 +2460,75 @@ impl Session {
                 record("validate", Ok(v));
             } else {
                 record("validate", Err(v.replace('\n', "; ")));
+            }
+        }
+        if spec.self_intersections == Some(true) || spec.thickness.is_some() {
+            use rayon::prelude::*;
+            let parts: Vec<&crate::Part> = view
+                .parts
+                .iter()
+                .map(|p| p.as_ref())
+                .filter(|p| p.visible && !p.verts.is_empty())
+                .collect();
+            if spec.self_intersections == Some(true) {
+                let bad: Vec<String> = parts
+                    .par_iter()
+                    .filter_map(|p| {
+                        let (n, at) = crate::organic::self_intersections(p);
+                        (n > 0).then(|| {
+                            let a = at.first().copied().unwrap_or_default();
+                            format!(
+                                "`{}` ({n} crossing triangle pairs, e.g. at [{:.3}, {:.3}, {:.3}])",
+                                p.name, a.x, a.y, a.z
+                            )
+                        })
+                    })
+                    .collect();
+                record(
+                    "self_intersections",
+                    if bad.is_empty() {
+                        Ok(format!(
+                            "no part's surface passes through itself ({} checked)",
+                            parts.len()
+                        ))
+                    } else {
+                        Err(format!(
+                            "surfaces passing through themselves: {} (relax it, lower the deform/warp, or check with agent_views style \"curvature\")",
+                            bad.join(", ")
+                        ))
+                    },
+                );
+            }
+            if let Some(min) = spec.thickness {
+                let mut rows: Vec<(String, crate::organic::Thickness)> = parts
+                    .par_iter()
+                    .filter_map(|p| crate::organic::thickness(p, 4000).map(|t| (p.name.clone(), t)))
+                    .collect();
+                rows.sort_by(|a, b| a.1.min.total_cmp(&b.1.min));
+                let bad: Vec<String> = rows
+                    .iter()
+                    .filter(|(_, t)| t.min < min)
+                    .map(|(n, t)| {
+                        format!(
+                            "`{n}` {:.4} m at [{:.3}, {:.3}, {:.3}]",
+                            t.min, t.at.x, t.at.y, t.at.z
+                        )
+                    })
+                    .collect();
+                record(
+                    "thickness",
+                    if bad.is_empty() {
+                        Ok(match rows.first() {
+                            Some((n, t)) => format!(
+                                "every part is at least {min} m thick (thinnest `{n}` {:.4} m)",
+                                t.min
+                            ),
+                            None => "no solid parts to measure".into(),
+                        })
+                    } else {
+                        Err(format!("thinner than {min} m: {}", bad.join(", ")))
+                    },
+                );
             }
         }
         if spec.rebuild.unwrap_or(empty) {

@@ -78,12 +78,15 @@ pub mod light;
 pub mod loft;
 pub mod lsystem;
 pub mod material;
+pub mod organic;
 pub mod outline;
 pub mod params;
 pub mod primitives;
 pub mod raster;
 pub mod scatter;
+pub mod sdf;
 pub mod simplify;
+pub mod smooth;
 pub mod spec;
 pub mod style;
 pub mod terrain;
@@ -975,6 +978,27 @@ pub enum Op {
         input: String,
         #[serde(flatten)]
         def: Box<crate::deform::Deform>,
+    },
+    /// Analytic signed-distance shapes (spheres, ellipsoids, capsules,
+    /// boxes, chains, sampled parts) combined by smooth booleans, warped as
+    /// a field and meshed once: creatures, organic forms.
+    Sdf {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::sdf::SdfDef>,
+    },
+    /// A skeleton of point chains with radii meshed as one smooth skin.
+    Skin {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::sdf::SkinDef>,
+    },
+    /// Taubin relax, isotropic remesh or Catmull-Clark subdivision.
+    Smooth {
+        name: String,
+        input: String,
+        #[serde(flatten)]
+        def: Box<crate::smooth::Smooth>,
     },
     /// Inputs melted together as signed distance fields with a smooth
     /// minimum of radius `blend` (`op` subtract / intersect too), meshed at

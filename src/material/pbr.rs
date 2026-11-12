@@ -58,6 +58,14 @@ impl PbrRef {
         })
     }
 
+    /// The graph's params with this use's overrides.
+    pub fn merged_params(&self) -> Params {
+        match &self.graph {
+            Some(g) => self.params(g),
+            None => Params::default(),
+        }
+    }
+
     fn params(&self, g: &MatGraph) -> Params {
         let mut p = g.params.clone();
         p.extend(self.params.clone());

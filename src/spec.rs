@@ -1489,10 +1489,271 @@ pub struct DeformSpec {
     noise: Option<String>,
     /// Target edge length in meters: the input is refined to it first so
     /// the deform has vertices to move (a 12-triangle box can't bend).
-    /// Default: scale / 8 for displace, 1/32 of the axis length otherwise;
-    /// capped at about 250k triangles.
+    /// Default: scale / 8 for displace, 1/32 of the axis length otherwise
+    /// (material: two texels of the bake); capped at about 250k triangles.
     #[serde(default)]
     detail: Option<f32>,
+    /// material: the procedural material (material_ops / material_catalog
+    /// name) whose `height` output becomes real geometry: bark, scales,
+    /// wrinkles, cobbles. Give the result the same pbr material so colour
+    /// and relief line up. `amount` multiplies the height (default 1: the
+    /// height channel's own meters); `scale` is the pattern scale as on a
+    /// material item.
+    #[serde(default)]
+    pbr: Option<String>,
+    /// material: param overrides for this use of the pbr material.
+    #[serde(default)]
+    params: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+/// A number or a short list of numbers.
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
+#[serde(untagged)]
+pub enum NumOrList {
+    One(f32),
+    Many(Vec<f32>),
+}
+
+impl NumOrList {
+    fn list(self) -> Vec<f32> {
+        match self {
+            NumOrList::One(x) => vec![x],
+            NumOrList::Many(v) => v,
+        }
+    }
+}
+
+/// One shape of an `sdf` item.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SdfShapeSpec {
+    /// "sphere" {radius, at}, "ellipsoid" {size: radii [x, y, z], at,
+    /// rotation}, "box" {size: full [x, y, z], round, at, rotation},
+    /// "capsule" {from, to, radius: r or [r_from, r_to] (a rounded cone)},
+    /// "cylinder" {radius, height, round, at, rotation; along y},
+    /// "torus" {size: [ring, tube], at, rotation; flat in xz}, "chain"
+    /// {points: [[x, y, z, radius], ...], smooth (default true)}: a tube
+    /// through the points whose radius varies, "part" {part}: a closed
+    /// solid of the model sampled as a field, "group" {shapes}: combined on
+    /// their own first, then joined as one (subtract a blended group).
+    shape: String,
+    /// How it joins the shapes before it: "union" (default), "subtract",
+    /// "intersect".
+    #[serde(default)]
+    op: Option<String>,
+    /// Smooth radius of this join in meters (default: the item's blend; 0 =
+    /// a sharp seam).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// Centre (default the origin).
+    #[serde(default)]
+    at: Option<[f32; 3]>,
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
+    #[serde(default)]
+    radius: Option<NumOrList>,
+    #[serde(default)]
+    size: Option<NumOrList>,
+    #[serde(default)]
+    height: Option<f32>,
+    /// box / cylinder: edge rounding radius in meters.
+    #[serde(default)]
+    round: Option<f32>,
+    #[serde(default)]
+    from: Option<[f32; 3]>,
+    #[serde(default)]
+    to: Option<[f32; 3]>,
+    #[serde(default)]
+    points: Option<Vec<[f32; 4]>>,
+    #[serde(default)]
+    smooth: Option<bool>,
+    #[serde(default)]
+    part: Option<String>,
+    #[serde(default)]
+    shapes: Option<Vec<SdfShapeSpec>>,
+}
+
+impl SdfShapeSpec {
+    fn into_shape(self, at: &str) -> Result<crate::sdf::Shape, String> {
+        let rotation = match self.rotation {
+            Some(r) => Some(r.quat().map_err(|e| format!("{at}: rotation: {e}"))?),
+            None => None,
+        };
+        let shapes = match self.shapes {
+            Some(v) => Some(
+                v.into_iter()
+                    .enumerate()
+                    .map(|(i, c)| c.into_shape(&format!("{at}.shapes[{i}]")))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        Ok(crate::sdf::Shape {
+            shape: self.shape,
+            op: self.op,
+            blend: self.blend,
+            at: self.at,
+            rotation,
+            radius: self.radius.map(NumOrList::list),
+            size: self.size.map(NumOrList::list),
+            height: self.height,
+            round: self.round,
+            from: self.from,
+            to: self.to,
+            points: self.points,
+            smooth: self.smooth,
+            part: self.part,
+            shapes,
+        })
+    }
+}
+
+/// A field warp of an `sdf` / `skin` item (the `deform` fields).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WarpSpec {
+    /// "twist", "bend", "taper" (the space, over the field's box at that
+    /// point of the list) or "displace" (noise added to the surface).
+    mode: String,
+    #[serde(default)]
+    axis: Option<String>,
+    #[serde(default)]
+    degrees: Option<f32>,
+    #[serde(default)]
+    toward: Option<String>,
+    #[serde(default)]
+    scale_end: Option<ScaleEndArg>,
+    #[serde(default)]
+    power: Option<f32>,
+    #[serde(default)]
+    amount: Option<f32>,
+    #[serde(default)]
+    scale: Option<f32>,
+    #[serde(default)]
+    octaves: Option<u32>,
+    #[serde(default)]
+    seed: Option<u32>,
+    #[serde(default)]
+    noise: Option<String>,
+}
+
+impl WarpSpec {
+    fn into_deform(self) -> crate::deform::Deform {
+        crate::deform::Deform {
+            mode: self.mode,
+            axis: self.axis,
+            degrees: self.degrees,
+            toward: self.toward,
+            scale_end: self.scale_end.map(|v| match v {
+                ScaleEndArg::Both(x) => [x, x],
+                ScaleEndArg::Each(a) => a,
+            }),
+            power: self.power,
+            amount: self.amount,
+            scale: self.scale,
+            octaves: self.octaves,
+            seed: self.seed,
+            noise: self.noise,
+            detail: None,
+            pbr: None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SdfSpec {
+    name: String,
+    /// Shapes combined in order, each by its `op` (union / subtract /
+    /// intersect) with a smooth radius `blend`.
+    shapes: Vec<SdfShapeSpec>,
+    /// Default smooth radius of every join in meters (default: a fifth of
+    /// the thinnest shape).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// "x" (or "z", "xz"): the field is mirrored, so model one side (x >=
+    /// 0) of a symmetric creature. Shapes crossing the plane should be
+    /// symmetric themselves.
+    #[serde(default)]
+    mirror: Option<String>,
+    /// Warps of the whole field, in order: {"mode": "twist" | "bend" |
+    /// "taper" | "displace", ...} with the deform fields (axis, degrees,
+    /// toward, scale_end, power, amount, scale, octaves, seed, noise).
+    #[serde(default)]
+    warps: Option<Vec<WarpSpec>>,
+    /// Meshing voxel size in meters (default 1/120 of the size, finer for
+    /// thin shapes, about 12M samples at most; explicit up to 27M).
+    #[serde(default)]
+    resolution: Option<f32>,
+}
+
+/// A skin chain point: [x, y, z, radius] or a joint name.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ChainPtSpec {
+    Joint(String),
+    Point([f32; 4]),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkinSpec {
+    name: String,
+    /// Chains of points, each [x, y, z, radius] or a joint name: a tube
+    /// through them whose radius follows the points. Chains sharing a joint
+    /// melt together there (a limb into a body, fingers into a palm).
+    chains: Vec<Vec<ChainPtSpec>>,
+    /// Named points [x, y, z, radius] chains can share.
+    #[serde(default)]
+    joints: Option<std::collections::BTreeMap<String, [f32; 4]>>,
+    /// Smooth curves through the points (default true); false = straight
+    /// rounded cones between them.
+    #[serde(default)]
+    smooth: Option<bool>,
+    /// Smooth radius where chains meet, meters (default half the median
+    /// radius).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// "x" / "z" / "xz": mirror the skin (model one side).
+    #[serde(default)]
+    mirror: Option<String>,
+    /// Field warps, as on sdf.
+    #[serde(default)]
+    warps: Option<Vec<WarpSpec>>,
+    /// Meshing voxel size in meters (default from the size and the thinnest
+    /// radius).
+    #[serde(default)]
+    resolution: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SmoothSpec {
+    name: String,
+    /// The part to smooth (hide it). relax and subdiv take sheets too.
+    input: String,
+    /// "relax" (Taubin smoothing: evens out lumps and pinches without
+    /// shrinking), "remesh" (a closed solid rebuilt with even triangles of
+    /// `edge` meters; edges sharper than that round off) or "subdiv"
+    /// (Catmull-Clark of a coarse cage: a box becomes a smooth pebble,
+    /// creased where faces meet at more than `crease` degrees).
+    mode: String,
+    /// relax: rounds (default 10); remesh: tangential relax rounds (5).
+    #[serde(default)]
+    iterations: Option<u32>,
+    /// relax: step size, 0..1 (default 0.5).
+    #[serde(default)]
+    strength: Option<f32>,
+    /// remesh: target edge length in meters (default the input's mean).
+    #[serde(default)]
+    edge: Option<f32>,
+    /// subdiv: levels, 1..5 (default 2); each quadruples the faces.
+    #[serde(default)]
+    levels: Option<u32>,
+    /// subdiv: edges whose faces meet at more than this many degrees stay
+    /// sharp (default: none, everything rounds).
+    #[serde(default)]
+    crease: Option<f32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1878,6 +2139,9 @@ pub enum OpSpec {
     Scatter(ScatterSpec),
     Round(RoundSpec),
     Deform(DeformSpec),
+    Sdf(SdfSpec),
+    Skin(SkinSpec),
+    Smooth(SmoothSpec),
     Shell(ShellSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
@@ -1920,6 +2184,9 @@ pub const OP_TYPES: &[&str] = &[
     "scatter",
     "round",
     "deform",
+    "sdf",
+    "skin",
+    "smooth",
     "shell",
     "transform",
     "move",
@@ -2490,6 +2757,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         }
         "deform" => {
             let s: DeformSpec = de(&ctx, &body)?;
+            let is_material = s.mode == "material";
             let def = crate::deform::Deform {
                 mode: s.mode,
                 axis: s.axis,
@@ -2501,14 +2769,108 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 }),
                 power: s.power,
                 amount: s.amount,
-                scale: s.scale,
+                scale: if is_material { None } else { s.scale },
                 octaves: s.octaves,
                 seed: s.seed,
                 noise: s.noise,
                 detail: s.detail,
+                pbr: match (s.pbr, is_material) {
+                    (Some(m), true) => Some(crate::material::PbrRef {
+                        material: m,
+                        params: s.params.unwrap_or_default(),
+                        scale: s.scale.unwrap_or(1.0),
+                        graph: None,
+                    }),
+                    (Some(_), false) => {
+                        return Err(format!("{ctx}: pbr: only for mode \"material\""));
+                    }
+                    (None, _) if s.params.is_some() => {
+                        return Err(format!(
+                            "{ctx}: params: only with mode \"material\" and a pbr"
+                        ));
+                    }
+                    (None, _) => None,
+                },
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Deform {
+                name: s.name,
+                input: s.input,
+                def: Box::new(def),
+            })
+        }
+        "sdf" => {
+            let s: SdfSpec = de(&ctx, &body)?;
+            let shapes = s
+                .shapes
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| c.into_shape(&format!("shapes[{i}]")))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("{ctx}: {e}"))?;
+            let def = crate::sdf::SdfDef {
+                shapes,
+                blend: s.blend,
+                mirror: s.mirror,
+                warps: s
+                    .warps
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(WarpSpec::into_deform)
+                    .collect(),
+                resolution: s.resolution,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Sdf {
+                name: s.name,
+                def: Box::new(def),
+            })
+        }
+        "skin" => {
+            let s: SkinSpec = de(&ctx, &body)?;
+            let def = crate::sdf::SkinDef {
+                chains: s
+                    .chains
+                    .into_iter()
+                    .map(|c| {
+                        c.into_iter()
+                            .map(|p| match p {
+                                ChainPtSpec::Joint(n) => crate::sdf::ChainPt::Joint(n),
+                                ChainPtSpec::Point(q) => crate::sdf::ChainPt::Point(q),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                joints: s.joints.unwrap_or_default(),
+                smooth: s.smooth,
+                blend: s.blend,
+                mirror: s.mirror,
+                warps: s
+                    .warps
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(WarpSpec::into_deform)
+                    .collect(),
+                resolution: s.resolution,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Skin {
+                name: s.name,
+                def: Box::new(def),
+            })
+        }
+        "smooth" => {
+            let s: SmoothSpec = de(&ctx, &body)?;
+            let def = crate::smooth::Smooth {
+                mode: s.mode,
+                iterations: s.iterations,
+                strength: s.strength,
+                edge: s.edge,
+                levels: s.levels,
+                crease: s.crease,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Smooth {
                 name: s.name,
                 input: s.input,
                 def: Box::new(def),
@@ -2920,6 +3282,23 @@ pub fn example(ty: &str) -> Option<Value> {
         "deform" => {
             json!({"type": "deform", "name": "rock", "input": "rock_raw", "mode": "displace", "amount": 0.08, "scale": 0.4, "seed": 7})
         }
+        "sdf" => {
+            json!({"type": "sdf", "name": "critter", "mirror": "x", "blend": 0.03, "shapes": [
+                {"shape": "ellipsoid", "size": [0.12, 0.1, 0.16], "at": [0, 0.14, 0]},
+                {"shape": "sphere", "radius": 0.07, "at": [0, 0.24, 0.14]},
+                {"shape": "capsule", "from": [0.06, 0.1, 0.08], "to": [0.09, 0.0, 0.1], "radius": [0.03, 0.022]},
+                {"shape": "sphere", "radius": 0.02, "at": [0.03, 0.27, 0.2], "op": "subtract", "blend": 0.01}
+            ]})
+        }
+        "skin" => {
+            json!({"type": "skin", "name": "octo", "joints": {"body": [0, 0.25, 0, 0.12]}, "chains": [
+                ["body", [0.16, 0.12, 0, 0.04], [0.32, 0.03, 0.05, 0.025], [0.45, 0.02, 0.15, 0.01]],
+                ["body", [0, 0.42, 0, 0.1]]
+            ], "mirror": "x"})
+        }
+        "smooth" => {
+            json!({"type": "smooth", "name": "pebble", "input": "pebble_cage", "mode": "subdiv", "levels": 3})
+        }
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
         }
@@ -3016,6 +3395,9 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "scatter" => schemars::schema_for!(ScatterSpec),
         "round" => schemars::schema_for!(RoundSpec),
         "deform" => schemars::schema_for!(DeformSpec),
+        "sdf" => schemars::schema_for!(SdfSpec),
+        "skin" => schemars::schema_for!(SkinSpec),
+        "smooth" => schemars::schema_for!(SmoothSpec),
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),

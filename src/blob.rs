@@ -16,7 +16,7 @@ use rayon::prelude::*;
 const MAX_SAMPLES: f64 = 27e6;
 
 /// A signed distance grid (negative inside), clamped to +-`band`.
-struct Grid {
+pub(crate) struct Grid {
     lo: Vec3,
     res: f32,
     n: [usize; 3],
@@ -30,7 +30,7 @@ impl Grid {
     }
 
     /// Trilinear sample; outside the grid is "far outside" (+band).
-    fn sample(&self, p: Vec3) -> f32 {
+    pub(crate) fn sample(&self, p: Vec3) -> f32 {
         let g = (p - self.lo) / self.res;
         let max = |a: usize| (a - 1) as f32;
         if g.x < 0.0
@@ -115,7 +115,7 @@ fn tri_dist(p: Vec3, t: &[Vec3; 3]) -> f32 {
 
 /// Samples a closed part's signed distance on a grid of `res` spacing over
 /// its box grown by `band + res`.
-fn sdf_grid(part: &Part, res: f32, band: f32) -> Result<Grid, ModelerError> {
+pub(crate) fn sdf_grid(part: &Part, res: f32, band: f32) -> Result<Grid, ModelerError> {
     let tris = world_tris(part)?;
     let (blo, bhi) = part.bounds();
     let pad = Vec3::splat(band + 2.0 * res);

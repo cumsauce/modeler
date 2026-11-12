@@ -105,7 +105,7 @@ fn centripetal(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, u: f32) -> Vec3 {
 
 /// Catmull-Rom with explicit knots (Barry-Goldman pyramid), evaluated at
 /// `t` in [k1, k2]. Works on any vector type through `lerp`.
-fn barry_goldman<T>(p: [T; 4], k: [f32; 4], t: f32) -> T
+pub(crate) fn barry_goldman<T>(p: [T; 4], k: [f32; 4], t: f32) -> T
 where
     T: Copy + std::ops::Mul<f32, Output = T> + std::ops::Add<Output = T>,
 {
