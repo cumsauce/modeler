@@ -140,6 +140,7 @@ pub(crate) fn drain_commands(
     mut playback: ResMut<Playback>,
     // Window-only: absent headless, where `set_camera ui` says so.
     (mut wb, mut grid): (Option<ResMut<Workbench>>, Option<ResMut<Grid>>),
+    mut agent_cam: Local<AgentCam>,
 ) {
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
@@ -154,18 +155,32 @@ pub(crate) fn drain_commands(
             Cmd::Screenshot(reply) => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no screenshot".into()));
-                } else if offscreen.0 {
-                    // No window: render the window camera's view (the orbit
-                    // that set_camera and auto-framing steer) with the agent rig.
-                    agent_shots.0.push((
-                        AgentView::Custom(CustomCam {
+                } else if offscreen.0 || !wb.as_ref().is_some_and(|w| w.capture_window) {
+                    // Offscreen: the window camera's view (the orbit that
+                    // set_camera and auto-framing steer). Windowed: the
+                    // agents' own camera, so a screenshot never moves the
+                    // human's view or shows their document instead.
+                    let cam = if offscreen.0 {
+                        CustomCam {
                             yaw: 90.0 - orbit.yaw.to_degrees(),
                             pitch: orbit.pitch.to_degrees(),
                             dist: Some(orbit.dist),
                             target: Some(orbit.target.to_array()),
                             ortho: false,
                             fov: 45.0,
-                        }),
+                        }
+                    } else {
+                        CustomCam {
+                            yaw: agent_cam.yaw,
+                            pitch: agent_cam.pitch,
+                            dist: agent_cam.dist,
+                            target: None,
+                            ortho: false,
+                            fov: 45.0,
+                        }
+                    };
+                    agent_shots.0.push((
+                        AgentView::Custom(cam),
                         1280,
                         800,
                         None,
@@ -192,6 +207,27 @@ pub(crate) fn drain_commands(
                     let _ = reply.send(Err(
                         "headless: no camera to move; agent_views takes its own camera".into(),
                     ));
+                } else if !offscreen.0 {
+                    // A window: agents steer their own camera (what their
+                    // screenshots see), never the human's.
+                    if let Some(yaw) = yaw {
+                        agent_cam.yaw = yaw;
+                    }
+                    if let Some(pitch) = pitch {
+                        agent_cam.pitch = pitch.clamp(-89.0, 89.0);
+                    }
+                    if let Some(dist) = dist {
+                        agent_cam.dist = Some(dist.clamp(0.2, 200.0));
+                    }
+                    finish_set_camera(
+                        play,
+                        ui,
+                        reply,
+                        &modeler.session.model,
+                        &mut playback,
+                        wb.as_deref_mut(),
+                        grid.as_deref_mut(),
+                    );
                 } else {
                     // Same convention as agent custom cameras: yaw 0 = on +z looking -z.
                     if let Some(yaw) = yaw {
@@ -206,28 +242,15 @@ pub(crate) fn drain_commands(
                         orbit.dist = dist.clamp(0.2, 200.0);
                         orbit.user = true;
                     }
-                    let mut msg = match play {
-                        Some(r) => playback.request(&modeler.session.model, &r),
-                        None => Ok(String::new()),
-                    };
-                    if let (Some(u), Ok(m)) = (ui, &mut msg) {
-                        let applied = match (wb.as_deref_mut(), grid.as_deref_mut()) {
-                            (Some(wb), Some(grid)) => {
-                                apply_ui(&u, &modeler.session.model, wb, grid)
-                            }
-                            _ => Err("set_camera ui: no window (headless server)".to_string()),
-                        };
-                        match applied {
-                            Ok(said) => {
-                                if !m.is_empty() {
-                                    m.push('\n');
-                                }
-                                m.push_str(&said);
-                            }
-                            Err(e) => msg = Err(e),
-                        }
-                    }
-                    let _ = reply.send(msg.map(String::into_bytes));
+                    finish_set_camera(
+                        play,
+                        ui,
+                        reply,
+                        &modeler.session.model,
+                        &mut playback,
+                        wb.as_deref_mut(),
+                        grid.as_deref_mut(),
+                    );
                 }
             }
             Cmd::AgentShot {
@@ -250,6 +273,57 @@ pub(crate) fn drain_commands(
             }
         }
     }
+}
+
+/// The agents' camera in a window: what `set_camera` yaw / pitch / dist
+/// steer and `screenshot` renders, apart from the human's orbit.
+pub(crate) struct AgentCam {
+    yaw: f32,
+    pitch: f32,
+    /// None auto-fits the model.
+    dist: Option<f32>,
+}
+
+impl Default for AgentCam {
+    fn default() -> Self {
+        AgentCam {
+            yaw: 35.0,
+            pitch: 25.0,
+            dist: None,
+        }
+    }
+}
+
+/// The rest of `set_camera`: playback and the window UI, then the reply.
+fn finish_set_camera(
+    play: Option<super::playback::PlayRequest>,
+    ui: Option<crate::server::UiArg>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    model: &Model,
+    playback: &mut Playback,
+    wb: Option<&mut Workbench>,
+    grid: Option<&mut Grid>,
+) {
+    let mut msg = match play {
+        Some(r) => playback.request(model, &r),
+        None => Ok(String::new()),
+    };
+    if let (Some(u), Ok(m)) = (ui, &mut msg) {
+        let applied = match (wb, grid) {
+            (Some(wb), Some(grid)) => apply_ui(&u, model, wb, grid),
+            _ => Err("set_camera ui: no window (headless server)".to_string()),
+        };
+        match applied {
+            Ok(said) => {
+                if !m.is_empty() {
+                    m.push('\n');
+                }
+                m.push_str(&said);
+            }
+            Err(e) => msg = Err(e),
+        }
+    }
+    let _ = reply.send(msg.map(String::into_bytes));
 }
 
 /// `set_camera(ui: ...)`: the window's UI as the human would set it.
@@ -354,6 +428,9 @@ pub(crate) fn rebuild_scene(
     layers: Option<Res<LayerVisibility>>,
     mut built_layers: Local<Option<LayerVisibility>>,
 ) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     // Map mode's eye toggles (view only).
     let layers = layers.map(|l| *l).unwrap_or_default();
     let version = modeler.session.model.version;

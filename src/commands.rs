@@ -265,6 +265,12 @@ pub struct Session {
     /// `scene restore`, so a restart never brings back stale copies on its
     /// own.
     pub parked: Vec<Model>,
+    /// The document the human picked in the window (popup, grid, outliner).
+    /// Agent calls switch to their own documents and back to this one when
+    /// they end, so agents never change what the human is looking at.
+    /// `None` until the human picks one: the window then shows whatever the
+    /// last call worked on.
+    pub viewer_doc: Option<String>,
     /// Autosaves waiting to be written (see [`Session::flush_autosave`]).
     pub autosave_due: AutosaveDue,
     /// How much of the history the autosave journal already holds.
@@ -379,6 +385,7 @@ impl Default for Session {
             batch_labels: Vec::new(),
             others: Vec::new(),
             parked: Vec::new(),
+            viewer_doc: None,
             autosave_due: AutosaveDue::default(),
             journal: Default::default(),
             client: None,
@@ -1775,6 +1782,25 @@ impl Session {
     /// The active document is `self.model`; the rest wait in `others`, each
     /// with its own history, and are visible to prefab instances by name.
     pub fn scene(&mut self, action: &str, name: Option<&str>) -> CmdResult {
+        let r = self.scene_impl(action, name);
+        // The window (no client) picking a document: it stays on it.
+        if r.is_ok() && self.client.is_none() && matches!(action, "switch" | "open" | "restore") {
+            self.viewer_doc = Some(self.model.name.clone());
+        }
+        r
+    }
+
+    /// True while an agent's call has another document active than the one
+    /// the human is looking at: the window keeps showing what it showed.
+    pub fn viewer_away(&self) -> bool {
+        self.client.is_some()
+            && self
+                .viewer_doc
+                .as_ref()
+                .is_some_and(|v| *v != self.model.name)
+    }
+
+    fn scene_impl(&mut self, action: &str, name: Option<&str>) -> CmdResult {
         let need = || name.ok_or_else(|| format!("scene {action}: needs a name"));
         match action {
             "list" => {
@@ -1980,7 +2006,9 @@ impl Session {
         self.derive_if_bare();
         let me = client?;
         if !self.clients.contains_key(me) {
-            self.focus_requested = true;
+            // Raise the window for a new agent, unless the human is
+            // already working in it.
+            self.focus_requested = self.viewer_doc.is_none();
         }
         let mut notes = Vec::new();
         let active = self.model.name.clone();
@@ -2081,6 +2109,16 @@ impl Session {
                     seen_cursor: self.model.history.current,
                 },
             );
+            // Back to the human's document, quietly.
+            if let Some(v) = self.viewer_doc.clone()
+                && v != self.model.name
+            {
+                if self.others.iter().any(|m| m.name == v) {
+                    let _ = self.scene_impl("switch", Some(&v));
+                } else {
+                    self.viewer_doc = None;
+                }
+            }
         }
     }
 
@@ -4075,6 +4113,27 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         s
+    }
+
+    #[test]
+    fn an_agent_call_leaves_the_human_on_their_document() {
+        let mut s = Session::default();
+        s.scene("open", Some("agents_doc"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.scene("open", Some("humans_doc"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.viewer_doc.as_deref(), Some("humans_doc"));
+        s.begin_call(Some("agent"), Some("agents_doc"), None);
+        assert_eq!(s.model.name, "agents_doc");
+        assert!(s.viewer_away());
+        s.end_call();
+        assert_eq!(s.model.name, "humans_doc");
+        assert!(!s.viewer_away());
+        // The agent's next call is back on its own document.
+        s.begin_call(Some("agent"), None, None);
+        assert_eq!(s.model.name, "agents_doc");
+        s.end_call();
+        assert_eq!(s.model.name, "humans_doc");
     }
 
     #[test]

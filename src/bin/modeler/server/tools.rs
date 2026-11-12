@@ -761,11 +761,11 @@ Style::default()
         .await
     }
 
-    /// Grab the current preview render as a PNG image so you can see the model.
-    /// With no window (--offscreen) it renders the same camera (set_camera
-    /// and auto-framing steer it) offscreen; fails in --headless mode. When
-    /// the human has the grid view (G) up, it captures that window: every
-    /// open document's tile.
+    /// Render your document as a PNG (1280x800) from the agents' camera,
+    /// which set_camera yaw / pitch / dist steer; it auto-fits the model.
+    /// The human's own view in the window is never moved. With
+    /// `set_camera(ui: {capture: "window"})` it captures
+    /// the whole window instead. Fails in --headless mode.
     #[tool]
     async fn screenshot(&self) -> Result<CallToolResult, ErrorData> {
         self.grab_screenshot().await
@@ -1024,9 +1024,12 @@ Style::default()
         .await
     }
 
-    /// Move the window's orbit camera (yaw/pitch in degrees, distance from
-    /// the model center; each optional) and/or play a clip in the window
-    /// (`play`). Marks the camera user-steered (auto-drift stops).
+    /// Aim the agents' camera that `screenshot` renders (yaw/pitch in
+    /// degrees, distance from the model centre; each optional; the human's
+    /// view is left alone; with --offscreen it is the one camera), and/or
+    /// play a clip in the window (`play`). `ui` drives the human's window
+    /// for checking the UI itself: it changes what they see, so only use
+    /// it when the UI is the task.
     #[tool]
     async fn set_camera(
         &self,

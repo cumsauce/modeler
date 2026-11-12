@@ -114,6 +114,9 @@ fn sync_top_bar(
     icons_res: ResMut<ds::Icons>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     let Ok(root) = root.single() else {
         return;
     };

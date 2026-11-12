@@ -92,6 +92,9 @@ fn update_right_pane(
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     let Ok((root, mut vis, mut pos)) = root.single_mut() else {
         return;
     };

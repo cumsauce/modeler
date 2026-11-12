@@ -288,6 +288,9 @@ pub(crate) fn update_outline_pane(
     mut commands: Commands,
     (mut icons, mut images): (ResMut<ds::Icons>, ResMut<Assets<Image>>),
 ) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     let Ok(mut vis) = hud.single_mut() else {
         return;
     };

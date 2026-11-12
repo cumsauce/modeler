@@ -39,7 +39,7 @@ server's own home library). Documents remember their project
 (`Model.project`, autosave only), a document of the same name from another
 project is refused rather than taken over, and `new_model` starts a
 document beside another agent's (or another project's) instead of
-replacing it. A new agent's first call brings the window to the front.
+replacing it. A new agent's first call brings the window to the front (not once the human has picked a document).
 After `cargo build`, restart the
 server with `pkill -f target/debug/modeler` (the daemon respawns it on the
 next call) or stop everything with a `quit` call.
@@ -802,8 +802,14 @@ name: the producer first, then in-place material/visibility/transform edits).
     the ground plane y = 0 when the model is sunk up to 1 cm into it (so a
     part sunk a few mm doesn't hide the other contacts), otherwise from its
     lowest point (a table on a 6 mm rug stands on its feet).
-- `screenshot` (the human's view; aim with `set_camera(yaw, pitch, dist)`,
-  same yaw convention as agent cameras).
+- `screenshot` (your document from the agents' own camera, auto-fitted;
+  aim it with `set_camera(yaw, pitch, dist)`, same yaw convention as agent
+  cameras. Agents never move the human's view: the window stays on the
+  document the human picked (`Session.viewer_doc`; agent calls switch to
+  their own document and back at `end_call`, and the window skips
+  rebuilding while a call is away, `viewer_away`), and set_camera aims
+  only the agents' camera. With `--offscreen` there is no human and it is
+  the one orbit camera).
   Render tools time out after 15 s instead of hanging. **Always look at an
   image after building**: the data can be right while the render is wrong.
 - `set_camera(ui: {mode, select, comments, shading, popup, capture})` drives the

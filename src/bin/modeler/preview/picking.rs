@@ -126,6 +126,9 @@ pub(crate) fn sync_pins(
     mut commands: Commands,
     mut shown: Local<Option<(u64, usize, usize, String)>>,
 ) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     let model = &modeler.session.model;
     let want = wb.show_comments.then(|| {
         (

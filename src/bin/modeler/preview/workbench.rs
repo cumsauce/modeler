@@ -206,6 +206,9 @@ fn setup_slots(mut commands: Commands) {
 /// A new active document opens in its default mode; a mode it can't use
 /// falls back to Model. The selection belongs to the document it was made in.
 fn follow_document(modeler: Res<Modeler>, mut wb: ResMut<Workbench>) {
+    if modeler.session.viewer_away() {
+        return;
+    }
     let model = &modeler.session.model;
     if wb.mode_doc != model.name {
         wb.mode_doc = model.name.clone();
