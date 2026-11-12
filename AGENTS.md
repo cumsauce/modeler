@@ -159,7 +159,7 @@ type, so there is no need to memorise field names.
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
-| `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [components] |
+| `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [preview], [components] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
 | `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
@@ -890,7 +890,10 @@ lights only (studio off, faint environment) to judge how the level is lit.
 - `marker` items are named points for game code: spawns, waypoints, item
   spots, cameras, trigger zones (`size` = a box volume). `yaw` faces them
   (degrees about +y, 0 = +z), `data` carries any JSON (`{"team": 1}`),
-  `attach` makes them ride a part's moves.
+  `attach` makes them ride a part's moves. `preview: "sp-warehouse-exterior"` draws that catalog
+  prefab at the marker (standing on the ground, hidden terrain too, turned
+  by yaw) in the window, grid and agent views only, never exported: what
+  game code builds there, so a map isn't just outlines.
 - Both come along with prefab instances (`b1.grab`; the prefab's rules
   apply first, so the scene can override: `{"parts": ["b2.*"], "shape":
   "box"}`), follow moves, and draw as gizmos in the window and agent views

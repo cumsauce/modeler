@@ -572,6 +572,27 @@ pub(crate) fn update_grid(
                     .id();
                 tile.parts.push(e);
             }
+            for (at, parts) in crate::preview::app::marker_previews(model) {
+                let root = commands
+                    .spawn((at, Visibility::default(), RenderLayers::layer(tile.layer)))
+                    .id();
+                for part in &parts {
+                    let child = commands
+                        .spawn((
+                            part_bundle(
+                                part,
+                                &mut meshes,
+                                &mut materials,
+                                &mut images,
+                                &mut pbr_cache,
+                            ),
+                            RenderLayers::layer(tile.layer),
+                        ))
+                        .id();
+                    commands.entity(root).add_child(child);
+                }
+                tile.parts.push(root);
+            }
             // Frame a three-quarter view on the document's bounds.
             if let Some((lo, hi)) = model.bounds() {
                 let c = (lo + hi) * 0.5;

@@ -284,6 +284,23 @@ pub(crate) fn rebuild_scene(
             PreviewPart,
         ));
     }
+    for (at, parts) in marker_previews(&modeler.session.model) {
+        let root = commands
+            .spawn((at, Visibility::default(), PreviewPart))
+            .id();
+        for part in &parts {
+            let child = commands
+                .spawn(part_bundle(
+                    part,
+                    &mut meshes,
+                    &mut materials,
+                    &mut images,
+                    &mut pbr_cache,
+                ))
+                .id();
+            commands.entity(root).add_child(child);
+        }
+    }
     if let Some((min, max)) = modeler.session.model.bounds() {
         let radius = (max - min).length() * 0.5;
         orbit.scene_radius = radius.max(0.01);
@@ -772,4 +789,73 @@ pub(crate) fn drawn(model: &modeler::Model, part: &modeler::Part) -> bool {
             .ops
             .iter()
             .any(|o| matches!(o, modeler::Op::Terrain { name, .. } if *name == part.name))
+}
+
+/// The models markers name in `preview` (what game code builds there), each
+/// with the marker's transform and the prefab's visible parts. Prefabs load
+/// in the model's own project; one that fails to load is skipped.
+pub(crate) fn marker_previews(
+    model: &modeler::Model,
+) -> Vec<(Transform, Vec<std::sync::Arc<modeler::Part>>)> {
+    let Ok(markers) = modeler::game::markers(model) else {
+        return Vec::new();
+    };
+    let mut loaded: std::collections::HashMap<String, Vec<std::sync::Arc<modeler::Part>>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+    // Previews stand on the ground (markers sit at y = 0; the game snaps to
+    // the terrain), hidden terrain included.
+    let mut ground = modeler::Model::named("ground");
+    for p in &model.parts {
+        if model
+            .ops
+            .iter()
+            .any(|o| matches!(o, modeler::Op::Terrain { name, .. } if *name == p.name))
+        {
+            let mut p = (**p).clone();
+            p.visible = true;
+            ground.parts.push(std::sync::Arc::new(p));
+        }
+    }
+    for mut m in markers {
+        let Some(name) = m.preview.clone() else {
+            continue;
+        };
+        let name = name.as_str();
+        if !ground.parts.is_empty()
+            && let Some(hit) = modeler::contact::ray_cast(
+                &ground,
+                Vec3::new(m.position.x, 10_000.0, m.position.z),
+                Vec3::NEG_Y,
+                None,
+            )
+            .first()
+        {
+            m.position.y = hit.point.y;
+        }
+        if !loaded.contains_key(name) {
+            let parts = modeler::catalog::with_project(model.project.clone(), || {
+                let Ok(mut src) = modeler::catalog::load_prefab(name) else {
+                    return Vec::new();
+                };
+                if src.parts.is_empty() && !src.ops.is_empty() && src.refresh().is_err() {
+                    return Vec::new();
+                }
+                src.parts
+                    .iter()
+                    .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
+                    .cloned()
+                    .collect()
+            });
+            loaded.insert(name.to_string(), parts);
+        }
+        let parts = loaded.get(name).cloned().unwrap_or_default();
+        if !parts.is_empty() {
+            out.push((
+                Transform::from_translation(m.position).with_rotation(m.rotation),
+                parts,
+            ));
+        }
+    }
+    out
 }

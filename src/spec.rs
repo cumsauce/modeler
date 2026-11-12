@@ -2163,6 +2163,11 @@ pub struct MarkerSpec {
     /// A part the marker rides with through moves and places.
     #[serde(default)]
     attach: Option<String>,
+    /// A catalog prefab drawn at the marker (its origin on the marker, turned
+    /// by yaw) in the window and agent views only, never exported: shows
+    /// what game code builds there ("sp-warehouse-exterior").
+    #[serde(default)]
+    preview: Option<String>,
     /// Game components from the project's vocabulary (.modeler/components.json):
     /// {"Place": {"name": "wendys"}}. Written by a .bsn scene export.
     #[serde(default)]
@@ -3602,6 +3607,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 size: s.size,
                 data: s.data,
                 attach: s.attach,
+                preview: s.preview,
                 components: {
                     crate::scene::check_components(&s.components)
                         .map_err(|e| format!("{ctx}: {e}"))?;

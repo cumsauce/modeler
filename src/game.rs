@@ -17,6 +17,8 @@ pub struct Marker {
     pub rotation: Quat,
     pub size: Option<[f32; 3]>,
     pub data: Option<Value>,
+    /// A catalog prefab to draw here in previews (see `Op::Marker`).
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +81,7 @@ fn unmoved_markers(
                 size,
                 data,
                 attach,
+                preview,
                 ..
             } => out.push((
                 Marker {
@@ -88,6 +91,7 @@ fn unmoved_markers(
                     rotation: Quat::from_rotation_y(yaw.unwrap_or(0.0).to_radians()),
                     size: *size,
                     data: data.clone(),
+                    preview: preview.clone(),
                 },
                 attach.clone(),
             )),

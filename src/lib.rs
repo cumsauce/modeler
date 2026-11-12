@@ -1227,6 +1227,10 @@ pub enum Op {
         data: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach: Option<String>,
+        /// A catalog prefab drawn at the marker in the window and agent
+        /// views only (never exported): what game code builds there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
         /// Game components from the project's vocabulary (`components.json`),
         /// written on this entity by a `.bsn` scene export.
         #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
