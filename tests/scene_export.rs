@@ -20,7 +20,9 @@ fn map_exports_as_a_jackdaw_scene() {
         json!({"header": ["// SALT: required comment"],
                "components": {
                  "Place": {"type": "my_game::places::Place", "fields": {"name": "string", "radius": "f32"}},
-                 "Spawn": {"type": "my_game::Spawn"}}})
+                 "Spawn": {"type": "my_game::Spawn"},
+                 "Hangout": {"type": "my_game::Hangout"},
+                 "Path": {"type": "my_game::Path", "fields": {"to": "refs", "from": "ref", "tags": "strings"}}}})
         .to_string(),
     )
     .unwrap();
@@ -49,7 +51,9 @@ fn map_exports_as_a_jackdaw_scene() {
                    "components": {"Place": {"name": "depot", "radius": 4}}}),
             json!({"type": "prefab", "name": "crate2", "prefab": "crate", "translation": [-3, 0, 0]}),
             json!({"type": "marker", "name": "spawn", "kind": "spawn", "translation": [0, 1, 0], "yaw": 90,
-                   "components": {"Spawn": {}}}),
+                   "components": {"Spawn": {}, "Hangout": {}}}),
+            json!({"type": "marker", "name": "path", "kind": "path", "size": [2, 1, 3],
+                   "components": {"Path": {"from": "spawn", "to": ["crate1", "crate2"], "tags": ["dirt"]}}}),
         ],
     )
     .unwrap();
@@ -64,7 +68,22 @@ fn map_exports_as_a_jackdaw_scene() {
     assert!(text.contains("\"models/prefabs/crate.gltf\""), "{text}");
     assert!(text.contains("\"maps/commune.gltf\""), "{text}");
     assert!(tmp.join("assets/models/prefabs/crate.gltf").exists());
+    assert!(text.contains(r#"to: ["crate1", "crate2"]"#), "{text}");
+    assert!(text.contains("    my_game::Hangout\n"), "{text}");
     jackdaw_bsn::parse_bsn_text(&text).unwrap_or_else(|e| panic!("{e:?}\n{text}"));
+
+    // The plain data file: rotation, yaw, kind and size, components as written.
+    let map: modeler::scene::MapFile = serde_json::from_str(
+        &std::fs::read_to_string(tmp.join("assets/maps/commune.map.json")).unwrap(),
+    )
+    .unwrap();
+    let spawn = map.entities.iter().find(|e| e.name == "spawn").unwrap();
+    assert_eq!(spawn.kind.as_deref(), Some("spawn"));
+    assert!((spawn.yaw - 90.0).abs() < 1e-3, "{}", spawn.yaw);
+    let path = map.entities.iter().find(|e| e.name == "path").unwrap();
+    assert_eq!(path.size, Some([2.0, 1.0, 3.0]));
+    assert_eq!(path.components["Path"]["to"], json!(["crate1", "crate2"]));
+    assert_eq!(map.terrains[0].heights, "maps/commune.ground.heights");
 
     // Heights round-trip.
     let bytes = std::fs::read(tmp.join("assets/maps/commune.ground.heights")).unwrap();
@@ -91,4 +110,14 @@ fn map_exports_as_a_jackdaw_scene() {
     let again = modeler::scene::export_scene(&s.model, &out, &Default::default()).unwrap();
     assert!(!again.contains("exported prefab"), "{again}");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), text);
+
+    // A reference to an entity the map doesn't have fails the export.
+    s.apply_values(
+        None,
+        vec![json!({"type": "marker", "name": "path", "kind": "path",
+                    "components": {"Path": {"to": ["crate1", "crate9"]}}})],
+    )
+    .unwrap();
+    let err = modeler::scene::export_scene(&s.model, &out, &Default::default()).unwrap_err();
+    assert!(err.to_string().contains("`crate9`"), "{err}");
 }

@@ -30,7 +30,9 @@ documents, authorship, undo guards). Closing the window ends the server;
 the next call restarts it from autosave. **Every project shares that one
 daemon** (`/tmp/modeler-mcp.sock`): each session's proxy names its project
 (the game project its working directory is in, or none for the shared
-library) in every call's `_meta` (`modeler/project`), and the server
+library; from a repo root, the one `.modeler/` project up to three levels
+below, so a session in `friendSLOP/` works in `friendSLOP/crates/game`) in
+every call's `_meta` (`modeler/project`), and the server
 switches the catalog, exports and prefab lookups to it for that call
 (`catalog::set_call_project`; autosaves and the session lock stay in the
 server's own home library). Documents remember their project
@@ -957,8 +959,19 @@ instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
   vocabulary `.modeler/components.json`: `{"header": ["// ..."],
   "components": {"Place": {"type": "my_game::places::Place", "fields":
   {"name": "string"}, "doc": "..."}}}` (field types string, f32, i32, u32,
-  bool, vec2, vec3; omitted fields keep the component default). `header`
-  lines open every scene file (a project's required comment).
+  bool, vec2, vec3, `strings` (a list), and `ref` / `refs`: names of other
+  entities in the same map (markers, prefab instances), `String` /
+  `Vec<String>` in the game, and the export fails naming any that don't
+  exist; omitted fields keep the component default; a component with no
+  `fields` is a marker component, written as `{}`). `header` lines open
+  every scene file (a project's required comment).
+- **Plain data**: `<stem>.map.json` beside the scene holds the same
+  entities (`scene::MapFile`): name, marker `kind` and `size`,
+  `translation`, `rotation` (quaternion), `yaw` (degrees, 0 = +z),
+  `scale`, `gltf`, `components` by vocabulary name as written, plus the
+  terrains' heights files. Read it (serde_json) when code needs the layout
+  before the game world exists, instead of parsing the BSN text. A
+  marker's yaw is in both files' rotation, its size only in the JSON.
 
 **Skeletons and animation:** Rig a model after its shape and materials are done: shape, then materials,
 then the rig. Rig items are `apply_ops` items like any other (upserts,

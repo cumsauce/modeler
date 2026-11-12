@@ -526,10 +526,33 @@ def default_socket(cwd=None):
     return SOCKET
 
 
+def project_below(start, depth=3):
+    """The one game project (a folder with .modeler/) a few levels under
+    `start`, when there is exactly one: a session in a repo's root whose
+    game lives in crates/game. None when there are none or several."""
+    start = os.path.abspath(start)
+    if start in (os.path.expanduser("~"), "/"):
+        return None
+    found = []
+    skip = {"target", "node_modules", "vendor", "dist", "build"}
+    for root, dirs, _ in os.walk(start):
+        if ".modeler" in dirs:
+            found.append(root)
+        rel = os.path.relpath(root, start)
+        level = 0 if rel == "." else rel.count(os.sep) + 1
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip
+                   and level < depth]
+        if len(found) > 1:
+            return None
+    return found[0] if found else None
+
+
 def project_of(cwd=None):
-    """The caller's project for `_meta` "modeler/project": its path, or ""
+    """The caller's project for `_meta` "modeler/project": the project its
+    folder is in, else the one project just below it (a repo root), else ""
     for the shared library."""
-    return find_project(cwd or os.getcwd()) or ""
+    cwd = cwd or os.getcwd()
+    return find_project(cwd) or project_below(cwd) or ""
 
 
 def ensure_daemon(socket_path, mode="windowed", wait=90):

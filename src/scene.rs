@@ -23,7 +23,16 @@
 //!      "Rigged": {"type": "friendslop::props::Rigged"}}}
 //!   ```
 //!
-//!   Field types: `string`, `f32`, `i32`, `u32`, `bool`, `vec2`, `vec3`.
+//!   Field types: `string`, `f32`, `i32`, `u32`, `bool`, `vec2`, `vec3`,
+//!   `strings` (a list, `Vec<String>`), and `ref` / `refs`: the name(s) of
+//!   other entities in the same map (a marker or a prefab instance;
+//!   `String` / `Vec<String>` in the game), checked when the map is
+//!   exported. A component with no `fields` is a marker component (`{}`).
+//! - **A plain data file** beside the scene, `<scene>.map.json`, holds the
+//!   same entities for code that needs the layout before the game world
+//!   exists: name, kind and size (markers), translation, rotation
+//!   (quaternion) and yaw, scale, glTF, and components by their vocabulary
+//!   name with the values as written (see [`MapFile`]).
 //!   `header` lines go at the top of every scene file (a project's required
 //!   comment). Fields left out keep the component's default (BSN patches).
 //! - **Heights.** Each `terrain` op writes `<scene>.<terrain>.heights`
@@ -70,7 +79,9 @@ pub struct ComponentDef {
     pub doc: String,
 }
 
-const FIELD_TYPES: [&str; 7] = ["string", "f32", "i32", "u32", "bool", "vec2", "vec3"];
+const FIELD_TYPES: [&str; 10] = [
+    "string", "f32", "i32", "u32", "bool", "vec2", "vec3", "strings", "ref", "refs",
+];
 
 /// Where the game's vocabulary lives: `components.json` beside the catalog
 /// folders (`<project>/.modeler/components.json`).
@@ -177,8 +188,24 @@ fn emit_value(t: &str, v: &serde_json::Value) -> Result<String, String> {
             })
             .collect()
     };
+    let strings = || -> Result<Vec<String>, String> {
+        v.as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|x| x.as_str().map(String::from))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| format!("expected a list of strings ({t}), got {v}"))
+    };
     Ok(match t {
-        "string" => {
+        "strings" | "refs" => {
+            let items: Vec<String> = strings()?
+                .iter()
+                .map(|x| serde_json::to_string(x).unwrap_or_default())
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        "string" | "ref" => {
             let s = v
                 .as_str()
                 .ok_or_else(|| format!("expected a string, got {v}"))?;
@@ -271,6 +298,13 @@ fn entity_name(n: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct Entity {
     pub name: String,
+    /// A marker's kind (None for prefab instances and the ground).
+    pub kind: Option<String>,
+    /// A marker's box size.
+    pub size: Option<[f32; 3]>,
+    /// The components as written on the item (vocabulary names, JSON
+    /// values), for the plain data file and reference checks.
+    pub raw: serde_json::Map<String, serde_json::Value>,
     pub transform: Affine3A,
     /// glTF path relative to the asset folder.
     pub gltf: Option<String>,
@@ -549,6 +583,9 @@ pub fn export_scene(
         );
         entities.push(Entity {
             name: name.clone(),
+            kind: None,
+            size: None,
+            raw: components.clone(),
             transform: instance_transform(model, name, source.as_ref(), fallback),
             gltf: Some(gltf),
             components: resolve_components(vocab.as_ref(), components)
@@ -573,6 +610,9 @@ pub fn export_scene(
             .unwrap_or_default();
         entities.push(Entity {
             name: m.name.clone(),
+            kind: Some(m.kind.clone()),
+            size: m.size,
+            raw: comps.clone(),
             transform: Affine3A::from_rotation_translation(m.rotation, m.position),
             gltf: None,
             components: resolve_components(vocab.as_ref(), &comps)
@@ -607,16 +647,25 @@ pub fn export_scene(
         ));
         entities.push(Entity {
             name: format!("{stem}_ground"),
+            kind: None,
+            size: None,
+            raw: Default::default(),
             transform: Affine3A::IDENTITY,
             gltf: Some(rel(&root, &file)),
             components: Vec::new(),
         });
     }
+    check_refs(vocab.as_ref(), &entities)?;
     // Terrain heights.
+    let mut terrains = Vec::new();
     for op in &model.ops {
         if let Op::Terrain { name, def } = op {
             let file = dir.join(format!("{stem}.{name}.heights"));
             let (nx, nz) = write_heights(def, &file)?;
+            terrains.push(MapTerrain {
+                name: name.clone(),
+                heights: rel(&root, &file),
+            });
             report.push(format!(
                 "terrain `{name}` heights {nx} x {nz} -> {}",
                 rel(&root, &file)
@@ -626,6 +675,12 @@ pub fn export_scene(
     let header = vocab.as_ref().map(|v| v.header.clone()).unwrap_or_default();
     let text = emit(&stem, &header, &entities);
     crate::catalog::atomic_write(path, text.as_bytes())?;
+    let data = map_file(&stem, &entities, terrains);
+    let json = dir.join(format!("{stem}.map.json"));
+    let body =
+        serde_json::to_string_pretty(&data).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    crate::catalog::atomic_write(&json, body.as_bytes())?;
+    report.push(format!("plain data -> {}", rel(&root, &json)));
     let n_inst = entities.iter().filter(|e| e.gltf.is_some()).count();
     Ok(format!(
         "scene `{}`: {} entities ({} with a glTF), {} prefab(s) referenced\n{}",
@@ -635,6 +690,115 @@ pub fn export_scene(
         exported.len(),
         report.join("\n")
     ))
+}
+
+/// Every `ref` / `refs` field names an entity of this map.
+fn check_refs(vocab: Option<&Vocabulary>, entities: &[Entity]) -> Result<(), ModelerError> {
+    let Some(v) = vocab else {
+        return Ok(());
+    };
+    let names: std::collections::BTreeSet<&str> =
+        entities.iter().map(|e| e.name.as_str()).collect();
+    let mut bad = Vec::new();
+    for e in entities {
+        for (comp, value) in &e.raw {
+            let (Some(def), Some(fields)) = (v.components.get(comp), value.as_object()) else {
+                continue;
+            };
+            for (f, val) in fields {
+                let wanted: Vec<&str> = match def.fields.get(f).map(String::as_str) {
+                    Some("ref") => val.as_str().into_iter().collect(),
+                    Some("refs") => val
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default(),
+                    _ => continue,
+                };
+                for w in wanted {
+                    if !names.contains(w) {
+                        bad.push(format!("`{}`: {comp}.{f} names `{w}`", e.name));
+                    }
+                }
+            }
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} reference(s) to entities this map doesn't have: {} (entities: {})",
+        bad.len(),
+        bad.join("; "),
+        names.into_iter().collect::<Vec<_>>().join(", ")
+    )
+    .into())
+}
+
+/// `<scene>.map.json`: the map as plain data, for code that needs the
+/// layout before the game world exists (no BSN parsing needed).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MapFile {
+    pub scene: String,
+    /// Sorted by name, like the scene.
+    pub entities: Vec<MapEntity>,
+    pub terrains: Vec<MapTerrain>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MapEntity {
+    pub name: String,
+    /// A marker's kind (absent on prefab instances and the ground).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub translation: [f32; 3],
+    /// Quaternion [x, y, z, w].
+    pub rotation: [f32; 4],
+    /// The rotation about +y in degrees (0 faces +z), as a marker's yaw.
+    pub yaw: f32,
+    pub scale: [f32; 3],
+    /// A marker's box size [x, y, z].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gltf: Option<String>,
+    /// By vocabulary name, values as written on the item.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub components: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MapTerrain {
+    pub name: String,
+    /// The heights file, relative to the asset folder.
+    pub heights: String,
+}
+
+fn map_file(stem: &str, entities: &[Entity], terrains: Vec<MapTerrain>) -> MapFile {
+    let mut es: Vec<&Entity> = entities.iter().collect();
+    es.sort_by(|a, b| a.name.cmp(&b.name));
+    let round = |x: f32| (x * 1e5).round() / 1e5 + 0.0;
+    MapFile {
+        scene: stem.to_string(),
+        entities: es
+            .into_iter()
+            .map(|e| {
+                let (s, r, t) = e.transform.to_scale_rotation_translation();
+                let f = r * Vec3::Z;
+                MapEntity {
+                    name: e.name.clone(),
+                    kind: e.kind.clone(),
+                    translation: t.to_array().map(round),
+                    rotation: r.normalize().to_array().map(round),
+                    yaw: round(f.x.atan2(f.z).to_degrees()),
+                    scale: s.to_array().map(round),
+                    size: e.size,
+                    gltf: e.gltf.clone(),
+                    components: e.raw.clone(),
+                }
+            })
+            .collect(),
+        terrains,
+    }
 }
 
 /// Magic at the start of a heights file.
