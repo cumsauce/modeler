@@ -161,6 +161,7 @@ type, so there is no need to memorise field names.
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [preview], [components] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
+| `decal` | name, pbr (a `decal`-domain material), size [w, h] or [w, h, depth], [on], [at], [toward down], [translation], [direction], [roll], [attach], [kind clustered / forward], [params] |
 | `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
 | `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
 | `clip` | name, skeleton, duration, tracks {bone: {rotate / translate / scale: keys or wave}}, [mirror {bone: {from, phase}}], [loop true], [interp smooth] |
@@ -891,6 +892,35 @@ extras since glTF has no flag). The preview lights them on top of the
 studio; `agent_views(..., lighting: "scene")` renders with the model's
 lights only (studio off, faint environment) to judge how the level is lit.
 
+**Decals:** a decal projects a material onto whatever surface it covers
+(graffiti, posters, stains, cracks, road markings, logos, bullet holes):
+no geometry of its own, it follows curved and uneven surfaces. Make the
+image as a material with `domain: "decal"` (a `tile`-meter image, top
+row = the image's top, `opacity` 0 around the shape: like a leaf card),
+then place it: `{"type": "decal", "name": "tag", "pbr": "graffiti",
+"size": [1.2, 0.8], "on": "wall_back", "toward": "back", "at": [0.4,
+1.5]}` sticks it on `wall_back`'s surface, travelling `toward` (down by
+default; `at` is the two cross axes, as for `place`: down `[x, z]`,
+back/front `[x, y]`, left/right `[z, y]`). Or give `translation` (the
+box centre) and `direction` (the projection, default down) by hand.
+`size` is the image's width and height in meters plus the box's depth
+along the projection (default half the smaller side): everything within
+it gets painted, so keep it shallow next to other parts. The image stays
+upright on walls (its up = world up) and points back (-z) on floors;
+`roll` turns it (degrees). `attach` makes it ride a part's moves; prefab
+instances bring their decals. `kind` is for the game (`clustered`, the
+default, or `forward`). The preview (window and agent views) draws every
+decal as a Bevy `ForwardDecal` (clustered decals need bindless textures,
+which Bevy turns off on Metal). The export writes each decal as a flat
+textured quad on the surface with `extras.decal {size, kind}`, so any
+viewer shows a sticker; `modeler_bevy`'s plugin swaps it for a
+`ForwardDecal` (the camera needs a `DepthPrepass`) or, for `clustered`
+where `ModelerDecals.clustered` allows, a `ClusteredDecal`. In a `.bsn`
+map the map's own decals go into its ground glTF; prefab instances keep
+theirs in their own file. The window lists decals in the Model and Map
+panes (a Decals layer toggle in Map) and their materials under "Decal
+materials" in Material mode.
+
 **Game data (colliders, markers):**
 
 - `collider` rules give parts collision shapes:
@@ -1254,7 +1284,8 @@ work, and every material has its own history tree.
   (box-unwrapped islands at one texel density, dilated gutter). `card`:
   one `tile`-meter image (like a tile, coordinates in meters, top row =
   v 0) laid once over each part's own 0..1 uvs instead of remapped: leaf
-  cards, decals, signs. One shared texture, like a tile.
+  cards, signs. One shared texture, like a tile. `decal`: the same image
+  space as `card`, for `decal` items (which accept `card` materials too).
 - **Node families.** Coords: input, transform, combine, split, polar,
   kaleido, warp, tile_grid (ports local / cell / id / edge), repeat,
   triplanar. 2D SDFs: circle, rect, segment, polygon, star, hexagon, arc,

@@ -235,7 +235,7 @@ pub(crate) fn build_with(
         .filter(|p| p.visible)
         .map(|p| (**p).clone())
         .collect();
-    if visible.is_empty() {
+    if visible.is_empty() && crate::decal::collect(model)?.is_empty() {
         return Err(format!("model '{}' has no visible parts to export", model.name).into());
     }
     for (i, part) in visible.iter().enumerate() {
@@ -259,6 +259,14 @@ pub(crate) fn build_with(
             p.rotation = [0.0, 0.0, 0.0, 1.0];
             p.scale = [1.0; 3];
         }
+    }
+    // Decals: a flat textured quad each (a sticker in any viewer), marked
+    // with `extras.decal` so a game swaps it for a projected decal.
+    let decals = crate::decal::collect(model)?;
+    for d in &decals {
+        prepared.parts.push(crate::decal::quad_part(d));
+        prepared.meshes.push(crate::export_opt::MeshRef::Own);
+        prepared.lod.push(None);
     }
     let exported = &prepared.parts;
     crate::material::pbr::prebake(
@@ -622,6 +630,9 @@ pub(crate) fn build_with(
                 extras["comments"] = json!(notes);
             }
             node["extras"] = extras;
+        }
+        if let Some(d) = decals.iter().find(|d| d.name == part.name) {
+            node["extras"]["decal"] = crate::decal::extras(d);
         }
         part_nodes.push(nodes.len());
         nodes.push(node);

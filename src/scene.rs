@@ -637,6 +637,10 @@ pub fn export_scene(
         }
     }
     area.parts = parts;
+    // Prefab instances bring their decals (and lights) in their own glTF:
+    // keep only the map's own here, so nothing is drawn twice.
+    area.ops.retain(|o| !matches!(o, crate::Op::Prefab { .. }));
+    kept += crate::decal::collect(&area)?.len();
     if kept > 0 {
         let file = dir.join(format!("{stem}.gltf"));
         let r = crate::gltf::export_gltf_with(&area, &file, &opts.optimize)?;

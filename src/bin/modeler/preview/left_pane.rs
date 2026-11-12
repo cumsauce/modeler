@@ -33,6 +33,7 @@ pub(crate) struct LayerVisibility {
     pub(crate) markers: bool,
     pub(crate) colliders: bool,
     pub(crate) lights: bool,
+    pub(crate) decals: bool,
 }
 
 impl Default for LayerVisibility {
@@ -44,6 +45,7 @@ impl Default for LayerVisibility {
             markers: true,
             colliders: true,
             lights: true,
+            decals: true,
         }
     }
 }
@@ -56,6 +58,7 @@ pub(crate) enum Layer {
     Markers,
     Colliders,
     Lights,
+    Decals,
 }
 
 impl LayerVisibility {
@@ -67,6 +70,7 @@ impl LayerVisibility {
             Layer::Markers => self.markers,
             Layer::Colliders => self.colliders,
             Layer::Lights => self.lights,
+            Layer::Decals => self.decals,
         }
     }
 
@@ -78,6 +82,7 @@ impl LayerVisibility {
             Layer::Markers => &mut self.markers,
             Layer::Colliders => &mut self.colliders,
             Layer::Lights => &mut self.lights,
+            Layer::Decals => &mut self.decals,
         };
         *v = !*v;
     }
@@ -123,6 +128,7 @@ enum Icon {
     Marker,
     Collider,
     Light,
+    Decal,
 }
 
 impl Icon {
@@ -140,6 +146,7 @@ impl Icon {
             Icon::Marker => ds::Icon::Pin,
             Icon::Collider => ds::Icon::Zone,
             Icon::Light => ds::Icon::Light,
+            Icon::Decal => ds::Icon::Swatch,
         }
     }
 }
@@ -414,7 +421,7 @@ fn icon_for(r: &Row) -> Icon {
 
 fn model_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
     let tree = outline::build(model);
-    outline::flatten(&tree, &|k| expanded.contains(k))
+    let mut out: Vec<Item> = outline::flatten(&tree, &|k| expanded.contains(k))
         .into_iter()
         .map(|(depth, r)| {
             let mut it = Item::new(r.key.clone(), r.label.clone(), Act::Parts);
@@ -425,6 +432,30 @@ fn model_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
             it.group = !r.children.is_empty();
             it.open = expanded.contains(&r.key);
             it.parts = r.parts.clone();
+            it
+        })
+        .collect();
+    let decals = decal_items(model);
+    if !decals.is_empty() {
+        out.push(Item::heading("Decals"));
+        out.extend(decals);
+    }
+    out
+}
+
+/// One row per decal: a click frames it.
+fn decal_items(model: &Model) -> Vec<Item> {
+    modeler::decal::collect(model)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| {
+            let mut it = Item::new(
+                format!("decal:{}", d.name),
+                d.name.clone(),
+                Act::Spot(d.position, d.size.max_element().max(0.5) * 2.0),
+            );
+            it.icon = Some(Icon::Decal);
+            it.detail = d.pbr.material.clone();
             it
         })
         .collect()
@@ -506,6 +537,29 @@ fn material_items(session: &Session, expanded: &HashSet<String>) -> Vec<Item> {
         e.dim = true;
         out.push(e);
     }
+    // Decal materials: what this document's decals project.
+    let mut decal_mats: Vec<(String, usize)> = Vec::new();
+    for o in &model.ops {
+        if let Op::Decal { pbr, .. } = o {
+            match decal_mats.iter_mut().find(|(n, _)| *n == pbr.material) {
+                Some((_, n)) => *n += 1,
+                None => decal_mats.push((pbr.material.clone(), 1)),
+            }
+        }
+    }
+    if !decal_mats.is_empty() {
+        out.push(Item::heading("Decal materials"));
+        for (name, n) in &decal_mats {
+            let mut it = Item::new(
+                format!("dmat:{name}"),
+                name.clone(),
+                Act::Material(name.clone()),
+            );
+            it.icon = Some(Icon::Decal);
+            it.detail = format!("{n} decal{}", if *n == 1 { "" } else { "s" });
+            out.push(it);
+        }
+    }
     // The library: working materials, then the catalog's.
     let mut lib: Vec<(String, &'static str)> = session
         .materials
@@ -522,7 +576,9 @@ fn material_items(session: &Session, expanded: &HashSet<String>) -> Vec<Item> {
             lib.push((e.name, "library"));
         }
     }
-    lib.retain(|(n, _)| !used.iter().any(|(u, _, _)| u == n));
+    lib.retain(|(n, _)| {
+        !used.iter().any(|(u, _, _)| u == n) && !decal_mats.iter().any(|(d, _)| d == n)
+    });
     lib.sort();
     out.push(Item::heading("Library"));
     for (name, detail) in lib {
@@ -636,6 +692,12 @@ fn map_items(model: &Model, layers: &LayerVisibility) -> Vec<Item> {
             Icon::Light,
             count(|o| matches!(o, Op::Light { .. })),
         ),
+        (
+            Layer::Decals,
+            "Decals",
+            Icon::Decal,
+            count(|o| matches!(o, Op::Decal { .. })),
+        ),
     ] {
         let mut it = Item::new(format!("layer:{label}"), label, Act::Layer(layer));
         it.icon = Some(icon);
@@ -682,6 +744,7 @@ fn map_items(model: &Model, layers: &LayerVisibility) -> Vec<Item> {
         }
         out.push(it);
     }
+    out.extend(decal_items(model));
     out
 }
 

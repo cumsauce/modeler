@@ -341,7 +341,10 @@ pub(crate) fn process_agent_shot(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut pbr_cache: ResMut<PbrCache>,
+    (mut pbr_cache, mut decal_mats): (
+        ResMut<PbrCache>,
+        ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
+    ),
     mut cameras: Query<(&mut Projection, &mut RenderTarget, &mut Transform), With<AgentCamera>>,
     modeler: Res<Modeler>,
     env_ready: Query<(), (With<AgentCamera>, With<bevy::light::EnvironmentMapLight>)>,
@@ -350,6 +353,7 @@ pub(crate) fn process_agent_shot(
     mut studio: Query<(Entity, &mut DirectionalLight), With<StudioLight>>,
     mut env: Query<(&mut bevy::light::EnvironmentMapLight, &mut AmbientLight), With<AgentCamera>>,
     playback: Res<Playback>,
+    built: Res<super::app::SceneBuilt>,
     mut commands: Commands,
 ) {
     // A camera with a generated environment light draws nothing until its
@@ -491,7 +495,12 @@ pub(crate) fn process_agent_shot(
     let mut stand_ins: Vec<Entity> = Vec::new();
     // The window may be playing a clip: its meshes are posed, so draw the
     // model from stand-ins (at rest, or this shot's own pose) instead.
-    if style.ids || style.curvature || rig_shot || playback.posed {
+    // The window's scene shows another document (the human's, while an
+    // agent works in its own) or hasn't caught up: draw this model's own
+    // parts instead of the window's entities.
+    let stale =
+        built.doc.as_deref() != Some(model.name.as_str()) || built.version != Some(model.version);
+    if style.ids || style.curvature || rig_shot || playback.posed || stale {
         let source = posed_parts.as_ref().unwrap_or(&model.parts);
         let drawable = source
             .iter()
@@ -531,6 +540,16 @@ pub(crate) fn process_agent_shot(
             );
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
+        }
+        if !style.ids && !style.curvature {
+            stand_ins.extend(super::decals::spawn_decals(
+                &mut commands,
+                model,
+                &mut images,
+                &mut pbr_cache,
+                &mut decal_mats,
+                Some(ID_LAYER),
+            ));
         }
         if let Some(b) = &style.weights {
             legend.push((format!("weight of `{b}` = 1"), [235, 40, 30, 255]));
@@ -650,7 +669,7 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
-    let ids = style.ids || style.curvature || rig_shot || playback.posed;
+    let ids = style.ids || style.curvature || rig_shot || playback.posed || stale;
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands

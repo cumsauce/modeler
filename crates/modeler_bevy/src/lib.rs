@@ -14,9 +14,17 @@
 //! - `extras.collider` becomes [`ModelerCollider`] and `extras.marker`
 //!   becomes [`ModelerMarker`], for game code to map onto its physics engine
 //!   and spawn points.
+//! - `extras.decal` (a `decal` item) on a textured quad node: the plugin
+//!   replaces the quad with a projected decal of the same textures, a
+//!   [`ForwardDecal`] (any platform; the camera needs a `DepthPrepass`) or,
+//!   for `kind: "clustered"` where [`ModelerDecals::clustered`] allows, a
+//!   [`ClusteredDecal`] (needs bindless textures: not on Metal / WebGL).
+//!   Without the plugin the quad still draws as a flat sticker.
 
 use bevy::app::AnimationSystems;
 use bevy::gltf::GltfExtras;
+use bevy::light::ClusteredDecal;
+use bevy::pbr::decal::{ForwardDecal, ForwardDecalMaterial, ForwardDecalMaterialExt};
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 pub use modeler_anim::{Spring, SpringSim, SwayKind, SwayRig, Wind as WindSettings};
@@ -25,13 +33,16 @@ pub struct ModelerPlugin;
 
 impl Plugin for ModelerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Wind>().add_systems(
-            PostUpdate,
-            (read_extras, run_sway)
-                .chain()
-                .after(AnimationSystems)
-                .before(TransformSystems::Propagate),
-        );
+        app.init_resource::<Wind>()
+            .init_resource::<ModelerDecals>()
+            .add_systems(Update, make_decals)
+            .add_systems(
+                PostUpdate,
+                (read_extras, run_sway)
+                    .chain()
+                    .after(AnimationSystems)
+                    .before(TransformSystems::Propagate),
+            );
     }
 }
 
@@ -141,6 +152,124 @@ pub enum ColliderShape {
     Trimesh,
 }
 
+/// How exported decals are drawn.
+#[derive(Resource, Clone, Debug)]
+pub struct ModelerDecals {
+    /// Draw `kind: "clustered"` decals as [`ClusteredDecal`]s. Off on macOS
+    /// (Bevy disables them on Metal) and the web; forward decals otherwise.
+    pub clustered: bool,
+}
+
+impl Default for ModelerDecals {
+    fn default() -> Self {
+        Self {
+            clustered: !cfg!(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_arch = "wasm32"
+            )),
+        }
+    }
+}
+
+/// A decal exported by the modeler (`extras.decal`), before and after the
+/// plugin turned its quad into a projected decal.
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct ModelerDecal {
+    /// Width, height (the image) and depth (the projection), meters.
+    pub size: Vec3,
+    /// "clustered" or "forward".
+    pub kind: String,
+}
+
+/// Parses a node's decal extras.
+pub fn decal_of(v: &serde_json::Value) -> Option<ModelerDecal> {
+    let d = v.get("decal")?;
+    Some(ModelerDecal {
+        size: vec3(d.get("size")?)?,
+        kind: d
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("clustered")
+            .to_string(),
+    })
+}
+
+#[derive(Component)]
+struct DecalDone;
+
+/// Swaps each decal node's quad for a projected decal once its material
+/// has loaded. The node's frame has +Z into the surface and +Y the image's
+/// up, centred on the surface.
+fn make_decals(
+    mut commands: Commands,
+    decals: Query<(Entity, &ModelerDecal, Option<&Children>), Without<DecalDone>>,
+    quads: Query<&MeshMaterial3d<StandardMaterial>>,
+    std_mats: Option<Res<Assets<StandardMaterial>>>,
+    fwd_mats: Option<ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>>,
+    settings: Res<ModelerDecals>,
+) {
+    // Without a renderer (headless tests) there is nothing to draw.
+    let (Some(std_mats), Some(mut fwd_mats)) = (std_mats, fwd_mats) else {
+        return;
+    };
+    for (e, d, children) in &decals {
+        // Bevy puts a node's mesh on a child entity (one per primitive).
+        let Some((quad, mat)) = children
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(&e))
+            .find_map(|c| quads.get(*c).ok().map(|m| (*c, m)))
+        else {
+            continue;
+        };
+        let Some(m) = std_mats.get(&mat.0) else {
+            continue;
+        };
+        let mut ec = commands.spawn(ChildOf(e));
+        if d.kind == "clustered" && settings.clustered {
+            ec.insert((
+                ClusteredDecal {
+                    base_color_texture: m.base_color_texture.clone(),
+                    normal_map_texture: m.normal_map_texture.clone(),
+                    metallic_roughness_texture: m.metallic_roughness_texture.clone(),
+                    emissive_texture: m.emissive_texture.clone(),
+                    tag: 0,
+                },
+                // The clustered box projects along -Z, u along +x, v down +y.
+                Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::PI))
+                    .with_scale(d.size),
+            ));
+        } else {
+            let mut base = m.clone();
+            base.alpha_mode = AlphaMode::Blend;
+            ec.insert((
+                ForwardDecal,
+                MeshMaterial3d(fwd_mats.add(ForwardDecalMaterial {
+                    base,
+                    extension: ForwardDecalMaterialExt {
+                        depth_fade_factor: (d.size.z * 0.5).max(0.01),
+                    },
+                })),
+                // The forward quad lies in local xz projecting down -y.
+                Transform::from_rotation(
+                    Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+                        * Quat::from_rotation_y(std::f32::consts::PI),
+                )
+                .with_scale(Vec3::new(d.size.x, d.size.z, d.size.y)),
+            ));
+        }
+        if quad == e {
+            commands
+                .entity(e)
+                .remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>();
+        } else {
+            commands.entity(quad).despawn();
+        }
+        commands.entity(e).insert(DecalDone);
+    }
+}
+
 /// A named point for game code (`marker` items): spawns, waypoints, zones.
 #[derive(Component, Clone, Debug, PartialEq)]
 pub struct ModelerMarker {
@@ -216,6 +345,9 @@ fn read_extras(
         }
         if let Some(m) = marker_of(&v) {
             commands.entity(e).insert(m);
+        }
+        if let Some(d) = decal_of(&v) {
+            commands.entity(e).insert(d);
         }
         let Some(rig) = v
             .get("sway")

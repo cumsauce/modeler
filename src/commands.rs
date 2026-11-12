@@ -1228,8 +1228,10 @@ impl Session {
     /// Embeds the graph of a `material` item's `pbr` (from the working
     /// materials first, then the library), so the model is self-contained.
     fn resolve_pbr(&self, item: &mut BatchItem) -> Result<(), String> {
+        let decal = matches!(item, BatchItem::Op(Op::Decal { .. }));
         let r = match item {
             BatchItem::Op(Op::Material { pbr: Some(r), .. }) => r,
+            BatchItem::Op(Op::Decal { pbr: r, .. }) => r,
             BatchItem::Op(Op::Deform { def, .. }) if def.pbr.is_some() => match &mut def.pbr {
                 Some(r) => r,
                 None => return Ok(()),
@@ -1267,6 +1269,12 @@ impl Session {
                 }
             ));
         }
+        if decal && !matches!(doc.domain.as_str(), "decal" | "card") {
+            return Err(format!(
+                "decal: `{}` is a {} material; a decal needs one image: make it with domain \"decal\" (material_ops)",
+                r.material, doc.domain
+            ));
+        }
         r.graph = Some(std::sync::Arc::new(doc.graph()));
         Ok(())
     }
@@ -1285,6 +1293,7 @@ impl Session {
         for op in &mut self.model.ops {
             let r = match op {
                 Op::Material { pbr: Some(r), .. } => Some(r),
+                Op::Decal { pbr: r, .. } => Some(r),
                 Op::Deform { def, .. } => def.pbr.as_mut(),
                 _ => None,
             };

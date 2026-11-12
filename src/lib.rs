@@ -66,6 +66,7 @@ pub mod catalog;
 pub mod commands;
 pub mod contact;
 pub mod csg;
+pub mod decal;
 pub mod decimate;
 pub mod deform;
 pub mod error;
@@ -1166,6 +1167,41 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         each: bool,
     },
+    /// A decal: a box that projects a material (a `decal` or `card` domain
+    /// one: an image with alpha, optionally normal / roughness / emissive)
+    /// onto whatever surface is inside it, curves included (see
+    /// `crate::decal`). Writes no part; exported as a node with
+    /// `extras.decal` that the game turns into a Bevy decal.
+    Decal {
+        name: String,
+        pbr: material::PbrRef,
+        /// Width and height of the image on the surface, and how deep the
+        /// box reaches along the projection (meters).
+        size: [f32; 3],
+        #[serde(default)]
+        translation: [f32; 3],
+        /// The way the decal projects, into the surface (default down).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<[f32; 3]>,
+        /// Turns the image about the projection axis (degrees).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        roll: f32,
+        /// Stick it on this part: cast toward `toward` at `at` (the cross
+        /// axes, as for `place`) and centre the box on the hit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<[f32; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        toward: Option<String>,
+        /// A part the decal rides with through moves and places.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<String>,
+        /// "clustered" (default: any surface, needs bindless textures) or
+        /// "forward" (a quad that fades into the surface: WebGL2 / WebGPU).
+        #[serde(default = "clustered", skip_serializing_if = "is_clustered")]
+        kind: String,
+    },
     /// A light: `point`, `spot` or `directional` (see `crate::light`). Writes
     /// no part; collected after the graph, following `attach`'s moves.
     Light {
@@ -1506,6 +1542,14 @@ pub enum AnnotationTarget {
         material: String,
         node: Option<String>,
     },
+}
+
+fn clustered() -> String {
+    "clustered".into()
+}
+
+fn is_clustered(k: &String) -> bool {
+    k == "clustered"
 }
 
 #[cfg(test)]

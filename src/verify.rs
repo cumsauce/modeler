@@ -374,7 +374,7 @@ pub fn cutout(p: &crate::Part) -> bool {
         .as_ref()
         .and_then(|r| r.graph.as_ref())
         .is_some_and(|g| {
-            g.domain == "card"
+            (g.domain == "card" || g.domain == "decal")
                 && g.nodes.iter().any(|n| {
                     n.get("type").and_then(|t| t.as_str()) == Some("output")
                         && n.get("opacity").is_some()

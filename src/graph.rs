@@ -133,6 +133,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             op,
             Op::Move { .. }
                 | Op::Light { .. }
+                | Op::Decal { .. }
                 | Op::Collider { .. }
                 | Op::Marker { .. }
                 | Op::Skeleton { .. }
@@ -638,6 +639,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         // Applied after the graph, in `evaluate_with`.
         Op::Move { .. }
         | Op::Light { .. }
+        | Op::Decal { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1307,6 +1309,7 @@ pub fn output(op: &Op) -> &str {
     match op {
         Op::Move { name, .. }
         | Op::Light { name, .. }
+        | Op::Decal { name, .. }
         | Op::Collider { name, .. }
         | Op::Marker { name, .. }
         | Op::Skeleton { name, .. }
@@ -1354,6 +1357,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
         // Writes no part of its own: it re-places finished parts.
         Op::Move { .. }
         | Op::Light { .. }
+        | Op::Decal { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1413,6 +1417,7 @@ pub fn kind(op: &Op) -> &'static str {
     match op {
         Op::Move { .. } => "move",
         Op::Light { .. } => "light",
+        Op::Decal { .. } => "decal",
         Op::Collider { .. } => "collider",
         Op::Marker { .. } => "marker",
         Op::Skeleton { .. } => "skeleton",
@@ -1457,6 +1462,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
     match op {
         Op::Move { .. }
         | Op::Light { .. }
+        | Op::Decal { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1634,6 +1640,39 @@ pub fn describe(ops: &[Op]) -> String {
                 }
                 if let Some(a) = attach {
                     s += &format!(" attach=`{a}`");
+                }
+                s
+            }
+            Op::Decal {
+                name,
+                pbr,
+                size,
+                translation,
+                on,
+                toward,
+                at,
+                attach,
+                kind,
+                ..
+            } => {
+                let mut s = format!(
+                    "decal `{name}` pbr=`{}` size={size:?}",
+                    pbr.material
+                );
+                match on {
+                    Some(on) => {
+                        s += &format!(" on=`{on}` toward={}", toward.as_deref().unwrap_or("down"));
+                        if let Some(a) = at {
+                            s += &format!(" at={a:?}");
+                        }
+                    }
+                    None => s += &format!(" at={translation:?}"),
+                }
+                if let Some(a) = attach {
+                    s += &format!(" attach=`{a}`");
+                }
+                if kind != "clustered" {
+                    s += &format!(" kind={kind}");
                 }
                 s
             }

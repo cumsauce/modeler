@@ -60,6 +60,8 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, file: Res<FileName>) 
     });
     commands.spawn((
         Camera3d::default(),
+        // Forward decals read the depth prepass.
+        bevy::core_pipeline::prepass::DepthPrepass,
         Transform::default(),
         Orbit {
             yaw: 0.6,
@@ -175,12 +177,14 @@ fn keys(
 }
 
 /// With `VIEWER_SHOT`: a screenshot at 3 s, a report, and exit.
+#[allow(clippy::too_many_arguments)]
 fn smoke_test(
     mut commands: Commands,
     time: Res<Time>,
     mut frame: Local<u32>,
     mut start: Local<Option<Vec<Quat>>>,
     sways: Query<&Sway>,
+    decals: Query<&modeler_bevy::ModelerDecal>,
     joints: Query<&Transform>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -217,7 +221,8 @@ fn smoke_test(
                 })
                 .unwrap_or(0);
             println!(
-                "smoke: {} sway rig(s), {} joint(s), {moved} moved",
+                "smoke: {} decal(s), {} sway rig(s), {} joint(s), {moved} moved",
+                decals.iter().count(),
                 sways.iter().count(),
                 now.len()
             );

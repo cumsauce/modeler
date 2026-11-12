@@ -3,10 +3,10 @@ name = "modeler_bevy"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Bevy plugin for modeler exports: live wind and spring sway, colliders and markers from glTF extras"
+description = "Bevy plugin for modeler exports: live wind and spring sway, colliders, markers and decals from glTF extras"
 
 [dependencies]
-bevy = { version = "=0.20.0", default-features = false, features = ["bevy_gltf"] }
+bevy = { version = "=0.20.0", default-features = false, features = ["bevy_gltf", "bevy_pbr", "bevy_light"] }
 modeler_anim = { path = "../modeler_anim" }
 serde_json = "1"
 

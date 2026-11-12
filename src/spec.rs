@@ -2090,6 +2090,52 @@ pub struct PrefabSpec {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct DecalSpec {
+    name: String,
+    /// The decal's look: a procedural material of domain "decal" (or
+    /// "card"): one image laid over the decal, `opacity` cutting its shape,
+    /// optionally normal, roughness / metallic and emissive.
+    pbr: String,
+    /// Param overrides for this use of the material.
+    #[serde(default)]
+    params: Option<std::collections::BTreeMap<String, f64>>,
+    /// [width, height] of the image on the surface, or [width, height,
+    /// depth] (depth: how far the box reaches along the projection, default
+    /// half the smaller side; deep boxes reach round curves but also onto
+    /// anything near).
+    size: Vec<f32>,
+    /// Stick it on this part: cast `toward` (default down) through `at`
+    /// and centre the box where it meets the surface.
+    #[serde(default)]
+    on: Option<String>,
+    /// With `on`: the cross axes, as for `place` (down / up: [x, z];
+    /// back / front: [x, y]; left / right: [z, y]). Default: the part's centre.
+    #[serde(default)]
+    at: Option<[f32; 2]>,
+    /// With `on`: down (default), up, back, front, left or right.
+    #[serde(default)]
+    toward: Option<String>,
+    /// Without `on`: the box centre...
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    /// ...and the projection direction, into the surface (default down).
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
+    /// Turns the image about the projection axis (degrees).
+    #[serde(default)]
+    roll: f32,
+    /// A part the decal rides with through moves and places (without `on`).
+    #[serde(default)]
+    attach: Option<String>,
+    /// "clustered" (default: projects onto any surface; needs bindless
+    /// textures, not WebGL2 / WebGPU) or "forward" (a quad fading into the
+    /// surface, for those targets: suits flat ground and walls).
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LightSpec {
     name: String,
     /// point, spot or directional.
@@ -2534,6 +2580,7 @@ pub enum OpSpec {
     Transform(TransformSpec),
     Move(MoveSpec),
     Light(LightSpec),
+    Decal(DecalSpec),
     Collider(ColliderSpec),
     Marker(MarkerSpec),
     Skeleton(SkeletonSpec),
@@ -2558,6 +2605,7 @@ pub enum OpSpec {
 pub const OP_TYPES: &[&str] = &[
     "repeat",
     "light",
+    "decal",
     "collider",
     "marker",
     "skeleton",
@@ -3615,6 +3663,65 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 },
             })
         }
+        "decal" => {
+            let s: DecalSpec = de(&ctx, &body)?;
+            let size = match s.size.as_slice() {
+                [w, h] => [*w, *h, w.min(*h) * 0.5],
+                [w, h, d] => [*w, *h, *d],
+                _ => {
+                    return Err(format!(
+                        "{ctx}: size is [width, height] or [width, height, depth]"
+                    ));
+                }
+            };
+            if size.iter().any(|v| !(*v > 0.0 && v.is_finite())) {
+                return Err(format!("{ctx}: size must be positive"));
+            }
+            let kind = s.kind.unwrap_or_else(|| "clustered".into());
+            if !matches!(kind.as_str(), "clustered" | "forward") {
+                return Err(format!("{ctx}: kind: `{kind}`: use clustered or forward"));
+            }
+            if let Some(t) = &s.toward
+                && crate::decal::toward_dir(t).is_none()
+            {
+                return Err(format!(
+                    "{ctx}: toward: `{t}`: use down, up, left, right, back or front"
+                ));
+            }
+            if s.on.is_none() && (s.at.is_some() || s.toward.is_some()) {
+                return Err(format!(
+                    "{ctx}: at / toward go with `on` (the part to stick to)"
+                ));
+            }
+            if s.on.is_some() && (s.direction.is_some() || s.attach.is_some()) {
+                return Err(format!(
+                    "{ctx}: with `on` the decal follows that part and projects `toward`; drop direction / attach"
+                ));
+            }
+            if let Some(d) = s.direction
+                && d.iter().map(|v| v * v).sum::<f32>() < 1e-12
+            {
+                return Err(format!("{ctx}: direction must not be zero"));
+            }
+            BatchItem::Op(Op::Decal {
+                name: s.name,
+                pbr: crate::material::PbrRef {
+                    material: s.pbr,
+                    params: s.params.unwrap_or_default(),
+                    scale: 1.0,
+                    graph: None,
+                },
+                size,
+                translation: s.translation,
+                direction: s.direction,
+                roll: s.roll,
+                on: s.on,
+                at: s.at,
+                toward: s.toward,
+                attach: s.attach,
+                kind,
+            })
+        }
         "light" => {
             let s: LightSpec = de(&ctx, &body)?;
             if !matches!(s.kind.as_str(), "point" | "spot" | "directional") {
@@ -4008,6 +4115,8 @@ pub fn example(ty: &str) -> Option<Value> {
             "direction": [1, 0, 0.3], "strength": 0.6, "gust": 0.4, "flutter": 0.5, "duration": 4}),
         "marker" => json!({"type": "marker", "name": "spawn_1", "kind": "spawn",
             "translation": [0, 0, 2], "yaw": 180, "data": {"team": 1}}),
+        "decal" => json!({"type": "decal", "name": "tag", "pbr": "graffiti",
+            "size": [1.2, 0.8], "on": "wall_back", "toward": "back", "at": [0.5, 1.4]}),
         "light" => json!({"type": "light", "name": "lamp_bulb", "kind": "point",
             "translation": [0, 1.4, 0], "color": "#ffd8a8", "intensity": 800, "attach": "lamp_shade"}),
         "delete" => json!({"type": "delete", "name": "leg_raised"}),
@@ -4070,6 +4179,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "move" => schemars::schema_for!(MoveSpec),
         "repeat" => schemars::schema_for!(RepeatSpec),
         "light" => schemars::schema_for!(LightSpec),
+        "decal" => schemars::schema_for!(DecalSpec),
         "collider" => schemars::schema_for!(ColliderSpec),
         "marker" => schemars::schema_for!(MarkerSpec),
         "skeleton" => schemars::schema_for!(SkeletonSpec),

@@ -188,9 +188,9 @@ impl MatDoc {
         let mut next = self.clone();
         next.history = History::default();
         if let Some(d) = domain {
-            if !["tile", "object", "card"].contains(&d.as_str()) {
+            if !["tile", "object", "card", "decal"].contains(&d.as_str()) {
                 return Err(format!(
-                    "domain: `{d}`: use \"tile\", \"object\" or \"card\""
+                    "domain: `{d}`: use \"tile\", \"object\", \"card\" or \"decal\""
                 ));
             }
             next.domain = d;

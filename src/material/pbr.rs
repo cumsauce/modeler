@@ -90,7 +90,7 @@ pub fn map_part(part: &mut Part) -> Result<(), String> {
         atlas::box_atlas(part, n);
     } else if g.domain == "object" {
         atlas::box_atlas(part, atlas_size(g));
-    } else if g.domain == "card" {
+    } else if g.domain == "card" || g.domain == "decal" {
         // The part's own uvs (0..1 per card) carry the image as authored.
         if part.uvs.len() != part.verts.len() {
             crate::uv::metric_box(part);
@@ -317,6 +317,23 @@ pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
     );
     cache_put(key, ch.clone());
     Ok(Some(ch))
+}
+
+/// Bakes a material on its own (a decal's image: one `tile`-meter square,
+/// independent of any mesh), cached like a tile bake.
+pub fn bake_ref(r: &PbrRef) -> Result<Arc<Channels>, String> {
+    let key = bake_key(r, None);
+    if let Some(hit) = cache_get(key) {
+        return Ok(hit);
+    }
+    let g = r.graph()?;
+    let s = Samples::tile((g.resolution as usize).clamp(16, 2048), g.tile);
+    let ch = Arc::new(
+        bake::bake(&g.nodes, &r.params(g), &s, true)
+            .map_err(|e| format!("material `{}`: {e}", r.material))?,
+    );
+    cache_put(key, ch.clone());
+    Ok(ch)
 }
 
 /// Bakes every part's material in parallel (parts at once, not just the

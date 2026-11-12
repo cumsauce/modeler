@@ -90,6 +90,8 @@ fn spawn_lights(commands: &mut Commands, model: &modeler::Model) {
 #[derive(Resource, Default)]
 pub(crate) struct SceneBuilt {
     pub(crate) version: Option<u64>,
+    /// The document the window's scene entities show.
+    pub(crate) doc: Option<String>,
     /// The model the camera was last framed for.
     pub(crate) framed: Option<String>,
 }
@@ -420,11 +422,12 @@ pub(crate) fn rebuild_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut pbr_cache: ResMut<PbrCache>,
+    mut decal_mats: ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
     mut orbit: ResMut<Orbit>,
     mut built: ResMut<SceneBuilt>,
     existing: Query<Entity, With<PreviewPart>>,
     pins: Query<Entity, With<AnnotationPin>>,
-    lights: Query<Entity, With<SceneLight>>,
+    lights: Query<Entity, Or<(With<SceneLight>, With<super::decals::SceneDecal>)>>,
     layers: Option<Res<LayerVisibility>>,
     mut built_layers: Local<Option<LayerVisibility>>,
 ) {
@@ -438,6 +441,7 @@ pub(crate) fn rebuild_scene(
         return;
     }
     built.version = Some(version);
+    built.doc = Some(modeler.session.model.name.clone());
     *built_layers = Some(layers);
     pbr_cache.tick();
     for e in existing.iter().chain(&pins).chain(&lights) {
@@ -445,6 +449,16 @@ pub(crate) fn rebuild_scene(
     }
     if layers.lights {
         spawn_lights(&mut commands, &modeler.session.model);
+    }
+    if layers.decals {
+        super::decals::spawn_decals(
+            &mut commands,
+            &modeler.session.model,
+            &mut images,
+            &mut pbr_cache,
+            &mut decal_mats,
+            None,
+        );
     }
     // The model changed under any pending pin; drop it so no stale comment lands.
     modeler.session.pending_pin = None;
@@ -517,7 +531,7 @@ pub(crate) fn rebuild_scene(
 
 /// Uploads one RGBA8 texture with a box-filtered mip chain and a repeating,
 /// anisotropic sampler.
-fn pbr_image(
+pub(crate) fn pbr_image(
     w: usize,
     h: usize,
     px: &[u8],
@@ -667,6 +681,9 @@ pub(crate) struct PbrCache {
     fingerprints: std::collections::HashMap<(usize, usize, usize, u64), u64>,
     meshes: std::collections::HashMap<(u64, bool), (Handle<Mesh>, u64)>,
     flat: std::collections::HashMap<[u32; 6], Handle<StandardMaterial>>,
+    /// A decal material's textures by bake key: base colour (alpha =
+    /// opacity), normal, metallic-roughness, emissive.
+    pub(crate) decals: std::collections::HashMap<u64, super::decals::DecalTextures>,
     generation: u64,
 }
 
