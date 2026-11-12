@@ -1105,7 +1105,8 @@ fn build_feed<'a>(
                     ChildOf(row),
                 ))
                 .id();
-            let mut label = label.replace('\n', " ");
+            // Plex's backtick combines onto the letter before it ("centrè").
+            let mut label = label.replace('\n', " ").replace('`', "'");
             if label.chars().count() > 64 {
                 label = label.chars().take(63).collect::<String>() + "\u{2026}";
             }

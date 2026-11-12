@@ -3,7 +3,7 @@
 //! `ds.rs`). The layout
 //! is `workbench.rs`, the top bar `top_bar.rs`.
 
-use bevy::feathers::constants::{fonts, size};
+use bevy::feathers::constants::size;
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor};
 use bevy::feathers::tokens;
 
@@ -15,15 +15,15 @@ pub(crate) const HEADER_H: f32 = 30.0;
 /// Text in the theme's UI font.
 pub(crate) fn ui_text(assets: &AssetServer, px: f32, bold: bool) -> TextFont {
     TextFont {
-        font: assets
-            // Fira Bold is heavier than the concept's 600 weight: keep it
-            // for titles (14 px and up); smaller emphasis is colour only.
-            .load(if bold && px >= 14.0 {
-                fonts::BOLD
+        font: ds::font(
+            assets,
+            if bold {
+                ds::Face::Medium
             } else {
-                fonts::REGULAR
-            })
-            .into(),
+                ds::Face::Regular
+            },
+        )
+        .into(),
         font_size: FontSize::Px(px),
         ..default()
     }

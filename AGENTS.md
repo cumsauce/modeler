@@ -1413,7 +1413,7 @@ around true world bounds (bounds include part transforms), while edits to
 the same model keep a camera the human steered.
 
 **Design system** (`preview/ds.rs`): every pane builds from its tokens
-(the concept's colours `BG` / `PANEL` / `RAISE` / `LINE` / `FG` / `DIM` /
+(IBM Plex Sans and Mono from `fonts/`, loaded once as `ds::Face`; the concept's colours `BG` / `PANEL` / `RAISE` / `LINE` / `FG` / `DIM` /
 `FAINT` / `ACCENT`, type scale `ds::Type`, `ds::theme()` retuning Feathers'
 widgets to the same palette), its line icons (`ds::Icon`, rasterized once,
 tinted) and its pieces (`ds::piece(Kind::Tab | Row | Chip | Button |

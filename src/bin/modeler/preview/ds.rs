@@ -168,18 +168,18 @@ fn styled(
     wrap: bool,
 ) -> impl Bundle {
     let s: String = s.into();
-    let (font, px, base, s) = match ty {
-        Type::Body => (fonts::REGULAR, 13.0, FG, s),
-        Type::Small => (fonts::REGULAR, 12.0, FG, s),
-        Type::Caption => (fonts::REGULAR, 11.0, FAINT, s.to_uppercase()),
-        Type::Meta => (fonts::REGULAR, 11.0, FAINT, s),
-        Type::Mono => (fonts::MONO, 11.5, DIM, s),
-        Type::Title => (fonts::BOLD, 13.0, FG, s),
+    let (face, px, base, s) = match ty {
+        Type::Body => (Face::Regular, 13.0, FG, s),
+        Type::Small => (Face::Regular, 12.0, FG, s),
+        Type::Caption => (Face::SemiBold, 11.0, FAINT, s.to_uppercase()),
+        Type::Meta => (Face::Regular, 11.0, FAINT, s),
+        Type::Mono => (Face::Mono, 11.5, DIM, s),
+        Type::Title => (Face::SemiBold, 13.0, FG, s),
     };
     (
         Text::new(s),
         TextFont {
-            font: assets.load(font).into(),
+            font: font(assets, face).into(),
             font_size: FontSize::Px(px),
             ..default()
         },
@@ -190,6 +190,42 @@ fn styled(
             TextLayout::no_wrap()
         },
     )
+}
+
+/// The window's typefaces: IBM Plex Sans and Mono (SIL OFL, `fonts/`),
+/// the concept's fonts, bundled into the binary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Face {
+    Regular,
+    Medium,
+    SemiBold,
+    Mono,
+}
+
+static PLEX: std::sync::OnceLock<[Handle<Font>; 4]> = std::sync::OnceLock::new();
+
+/// The handle for a face (Feathers' Fira before [`ds_plugin`] loaded Plex).
+pub(crate) fn font(assets: &AssetServer, face: Face) -> Handle<Font> {
+    match PLEX.get() {
+        Some(h) => h[face as usize].clone(),
+        None => assets.load(match face {
+            Face::Mono => fonts::MONO,
+            Face::SemiBold => fonts::BOLD,
+            _ => fonts::REGULAR,
+        }),
+    }
+}
+
+fn load_plex(mut fonts: ResMut<Assets<Font>>) {
+    if PLEX.get().is_some() {
+        return;
+    }
+    let mut add = |bytes: &'static [u8]| fonts.add(Font::from_bytes(bytes.to_vec()));
+    let a = add(include_bytes!("../../../../fonts/IBMPlexSans-Regular.ttf"));
+    let b = add(include_bytes!("../../../../fonts/IBMPlexSans-Medium.ttf"));
+    let c = add(include_bytes!("../../../../fonts/IBMPlexSans-SemiBold.ttf"));
+    let d = add(include_bytes!("../../../../fonts/IBMPlexMono-Regular.ttf"));
+    let _ = PLEX.set([a, b, c, d]);
 }
 
 // ---------- icons ----------
@@ -882,5 +918,6 @@ pub(crate) fn divider(vertical: bool) -> impl Bundle {
 
 pub(crate) fn ds_plugin(app: &mut App) {
     app.init_resource::<Icons>()
+        .add_systems(PreStartup, load_plex.run_if(windowed))
         .add_systems(PostUpdate, paint.run_if(windowed));
 }
