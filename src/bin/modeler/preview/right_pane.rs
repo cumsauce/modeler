@@ -402,8 +402,7 @@ impl Build<'_> {
 
     fn hint(&self, c: &mut Commands, parent: Entity, text: &str) {
         c.spawn((
-            ds::text_wrap(self.assets, ds::Type::Small, text),
-            TextColor(ds::DIM),
+            ds::text_wrap_in(self.assets, ds::Type::Small, text, ds::DIM),
             ChildOf(parent),
         ));
     }

@@ -155,6 +155,16 @@ pub(crate) fn text_in(
     styled(assets, ty, s, Some(color), false)
 }
 
+/// [`text_wrap`] in another colour.
+pub(crate) fn text_wrap_in(
+    assets: &AssetServer,
+    ty: Type,
+    s: impl Into<String>,
+    color: Color,
+) -> impl Bundle {
+    styled(assets, ty, s, Some(color), true)
+}
+
 /// Wrapping text (comments, hints).
 pub(crate) fn text_wrap(assets: &AssetServer, ty: Type, s: impl Into<String>) -> impl Bundle {
     styled(assets, ty, s, None, true)

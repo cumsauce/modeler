@@ -285,6 +285,13 @@ fn apply_ui(
             format!("selected {p}")
         });
     }
+    if let Some(p) = u.popup {
+        wb.doc_popup = p;
+        said.push(format!(
+            "document popup {}",
+            if p { "open" } else { "closed" }
+        ));
+    }
     if let Some(c) = u.comments {
         wb.show_comments = c;
         said.push(format!("comments {}", if c { "open" } else { "closed" }));

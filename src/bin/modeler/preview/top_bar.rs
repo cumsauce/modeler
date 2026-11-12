@@ -193,7 +193,7 @@ fn sync_top_bar(
     );
     commands
         .entity(doc)
-        .insert(TopTip("Switch document  ⌘K".into()));
+        .insert(TopTip("Switch document  Cmd+K".into()));
     commands.spawn((
         ds::text(&assets, ds::Type::Small, format!("{project} /")),
         ds::Ink::Meta,

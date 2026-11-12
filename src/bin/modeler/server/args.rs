@@ -343,6 +343,9 @@ pub(crate) struct UiArg {
     pub(crate) shading: Option<String>,
     #[serde(default)]
     pub(crate) capture: Option<String>,
+    /// Open (true) or close the document popup (⌘K).
+    #[serde(default)]
+    pub(crate) popup: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

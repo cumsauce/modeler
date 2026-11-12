@@ -568,14 +568,19 @@ pub(crate) fn update_grid(
     let scroll_y = grid.scroll;
 
     if let Ok(mut t) = texts.get_mut(ui.count) {
-        set_text(
-            &mut t,
-            if shown == total {
+        set_text(&mut t, {
+            let mut c = if shown == total {
                 format!("{total} documents")
             } else {
                 format!("{shown} of {total} documents")
-            },
-        );
+            };
+            // Unsaved work a restart parked: found in the popup.
+            let parked = modeler.session.parked.len();
+            if parked > 0 {
+                c += &format!(" · {parked} recovered after restart (Cmd+K)");
+            }
+            c
+        });
     }
 
     // Section headings.

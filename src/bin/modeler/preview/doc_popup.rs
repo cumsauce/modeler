@@ -1,4 +1,4 @@
-//! The document popup from the top bar (click the document half, or ⌘K):
+//! The document popup from the top bar (click the document half, or Cmd+K):
 //! a searchable list of the open documents grouped by project, each row
 //! with a live dot, its name, the modes it has, its last author, how long
 //! ago it changed and "unsaved"; and per project an "Open from library…"
@@ -34,6 +34,8 @@ struct Pick {
     doc: String,
     project: Option<PathBuf>,
     open: bool,
+    /// A parked document (unsaved work from before a restart): restore it.
+    parked: bool,
 }
 
 #[derive(Component)]
@@ -142,6 +144,9 @@ fn doc_popup(
             (&m.name, m.version, s.is_saved_doc(&m.name)).hash(&mut h);
             ago(s.last_touched(&m.name), now).hash(&mut h);
         }
+        for m in &s.parked {
+            (&m.name, m.version).hash(&mut h);
+        }
         h.finish()
     };
     if pop.shown == Some(key) {
@@ -154,6 +159,68 @@ fn doc_popup(
     commands.entity(list).despawn_children();
     let matches = |name: &str| query.is_empty() || name.to_lowercase().contains(&query);
     let mut first = None;
+    // Unsaved work a restart parked: reachable here, restored on a click.
+    let parked: Vec<&Model> = s.parked.iter().filter(|m| matches(&m.name)).collect();
+    if !parked.is_empty() {
+        let head = row(&mut commands, list, None, false);
+        text(
+            &mut commands,
+            &assets,
+            head,
+            "Recovered after restart",
+            11.0,
+            true,
+            true,
+        );
+        spacer(&mut commands, head);
+        text(
+            &mut commands,
+            &assets,
+            head,
+            "unsaved, not open",
+            11.0,
+            false,
+            true,
+        );
+        for m in parked {
+            let pick = Pick {
+                doc: m.name.clone(),
+                project: m.project.clone(),
+                open: false,
+                parked: true,
+            };
+            first.get_or_insert(pick.clone());
+            let r = row(&mut commands, list, Some(pick), false);
+            dot(&mut commands, r, ds::WARN);
+            text(&mut commands, &assets, r, &m.name, 13.0, false, false);
+            text(
+                &mut commands,
+                &assets,
+                r,
+                &project_label(m),
+                10.0,
+                false,
+                true,
+            );
+            spacer(&mut commands, r);
+            let by = m
+                .history
+                .current
+                .and_then(|c| m.history.nodes.get(c))
+                .and_then(|n| n.author.clone())
+                .map(|a| a.chars().take(16).collect::<String>())
+                .unwrap_or_default();
+            text(
+                &mut commands,
+                &assets,
+                r,
+                &format!("{by}  restore"),
+                11.0,
+                false,
+                true,
+            );
+        }
+    }
     // Projects: the active document's first, then by label.
     let mut groups: Vec<(String, Option<PathBuf>)> = docs
         .iter()
@@ -201,6 +268,7 @@ fn doc_popup(
                 doc: m.name.clone(),
                 project: m.project.clone(),
                 open: true,
+                parked: false,
             };
             first.get_or_insert(pick.clone());
             let is_active = m.name == s.model.name;
@@ -272,6 +340,7 @@ fn doc_popup(
                 doc: n.clone(),
                 project: project.clone(),
                 open: false,
+                parked: false,
             };
             first.get_or_insert(pick.clone());
             let r = row(&mut commands, list, Some(pick), false);
@@ -376,7 +445,16 @@ fn spawn_popup(commands: &mut Commands, top: Rect) -> (Entity, Entity) {
 }
 
 fn open_pick(s: &mut Session, p: &Pick) {
-    let r = if p.open {
+    let r = if p.parked {
+        // A saved copy of the same name in the way (opened from the
+        // catalog since): close it, nothing is lost, then restore.
+        if (s.model.name == p.doc || s.others.iter().any(|m| m.name == p.doc))
+            && s.is_saved_doc(&p.doc)
+        {
+            let _ = s.scene("close", Some(&p.doc));
+        }
+        catalog::with_project(p.project.clone(), || s.scene("restore", Some(&p.doc)))
+    } else if p.open {
         s.scene("open", Some(&p.doc))
     } else {
         catalog::with_project(p.project.clone(), || s.scene("open", Some(&p.doc)))

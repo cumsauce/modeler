@@ -806,10 +806,10 @@ name: the producer first, then in-place material/visibility/transform edits).
   same yaw convention as agent cameras).
   Render tools time out after 15 s instead of hanging. **Always look at an
   image after building**: the data can be right while the render is wrong.
-- `set_camera(ui: {mode, select, comments, shading, capture})` drives the
+- `set_camera(ui: {mode, select, comments, shading, popup, capture})` drives the
   window's workbench for checking the UI: `mode` model / material /
   animate / map / grid, `select` a part (`""` clears), `comments` open or
-  closed, `shading` lit / clay / parts, and `capture: "window"` makes
+  closed, `popup` the document popup open or closed, `shading` lit / clay / parts, and `capture: "window"` makes
   `screenshot` capture the whole window (panes included) instead of the 3D
   view.
 
@@ -1136,7 +1136,9 @@ every unsaved one is **parked** (`Session::park_restored`, kept in
 server starts on an empty document, so a restart never puts a stale copy in
 front of agents. `scene list` / `scene restore` show the parked ones,
 `scene restore` NAME opens one (refused while a document of that name is
-open: close it first), `scene close` NAME drops it. The window's outliner
+open: close it first), `scene close` NAME drops it. Humans find them in the
+document popup (⌘K) under "Recovered after restart"; a click restores one
+(closing a saved copy of the same name first). The window's outliner
 lists the open documents (click to switch).
 
 Saved documents nobody has touched for 20 minutes are **closed
