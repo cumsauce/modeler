@@ -65,6 +65,7 @@ pub mod catalog;
 pub mod commands;
 pub mod contact;
 pub mod csg;
+pub mod decimate;
 pub mod deform;
 pub mod error;
 pub mod export_opt;
@@ -115,10 +116,18 @@ pub struct Material {
 }
 
 impl Material {
+    /// A procedural material the user chose (not the plain graph a baked
+    /// decimate wears to carry its normal map).
+    pub fn has_pbr(&self) -> bool {
+        self.pbr
+            .as_ref()
+            .is_some_and(|r| r.material != crate::decimate::PLAIN)
+    }
+
     /// Still the untouched default look (no material item reached it).
     pub fn is_default(&self) -> bool {
         let d = Material::default();
-        self.pbr.is_none()
+        !self.has_pbr()
             && self.base_color == d.base_color
             && self.roughness == d.roughness
             && self.metalness == d.metalness
@@ -161,6 +170,11 @@ pub struct Part {
     /// flank). Derived after moves; never saved.
     #[serde(skip)]
     pub occluders: Option<std::sync::Arc<Vec<Vec<[[f32; 3]; 3]>>>>,
+    /// The dense surface a `decimate` with `bake` made this part from: the
+    /// material bake writes its normals and height onto this mesh. Derived
+    /// by the op; never saved.
+    #[serde(skip)]
+    pub detail: Option<std::sync::Arc<crate::decimate::Detail>>,
 }
 
 fn one() -> f32 {
@@ -992,6 +1006,14 @@ pub enum Op {
         name: String,
         #[serde(flatten)]
         def: Box<crate::sdf::SkinDef>,
+    },
+    /// A lighter copy of a dense mesh (quadric edge collapse), optionally
+    /// baking the input's surface into its normal and height maps.
+    Decimate {
+        name: String,
+        input: String,
+        #[serde(flatten)]
+        def: Box<crate::decimate::Decimate>,
     },
     /// Taubin relax, isotropic remesh or Catmull-Clark subdivision.
     Smooth {

@@ -1758,6 +1758,36 @@ pub struct SmoothSpec {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct DecimateSpec {
+    name: String,
+    /// The dense part to lighten (hide it; it stays in the graph, so the
+    /// decimate is re-derived when it changes).
+    input: String,
+    /// Share of the input's triangles to keep, (0, 1]: 0.05 keeps 5%.
+    #[serde(default)]
+    ratio: Option<f32>,
+    /// Target triangle count instead of a ratio.
+    #[serde(default)]
+    tris: Option<u32>,
+    /// Bake the input's surface onto the result: its normals become the
+    /// result's normal map and its offset the height channel, over
+    /// whatever material the result wears (exported with the textures).
+    #[serde(default)]
+    bake: bool,
+    /// Bake atlas size in texels, 64..4096 (default 1024).
+    #[serde(default)]
+    resolution: Option<u32>,
+    /// How far (meters) the bake looks from the low surface for the dense
+    /// one (default: 1.5 x the largest gap measured, at least 1% of size).
+    #[serde(default)]
+    cage: Option<f32>,
+    /// Normals crease where faces meet at more than this (default 60).
+    #[serde(default)]
+    crease: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ShellSpec {
     name: String,
     /// A closed solid to hollow (a box makes a cabinet carcass or drawer).
@@ -2142,6 +2172,7 @@ pub enum OpSpec {
     Sdf(SdfSpec),
     Skin(SkinSpec),
     Smooth(SmoothSpec),
+    Decimate(DecimateSpec),
     Shell(ShellSpec),
     Transform(TransformSpec),
     Move(MoveSpec),
@@ -2187,6 +2218,7 @@ pub const OP_TYPES: &[&str] = &[
     "sdf",
     "skin",
     "smooth",
+    "decimate",
     "shell",
     "transform",
     "move",
@@ -2859,6 +2891,23 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 def: Box::new(def),
             })
         }
+        "decimate" => {
+            let s: DecimateSpec = de(&ctx, &body)?;
+            let def = crate::decimate::Decimate {
+                ratio: s.ratio,
+                tris: s.tris,
+                bake: s.bake,
+                resolution: s.resolution,
+                cage: s.cage,
+                crease: s.crease,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Decimate {
+                name: s.name,
+                input: s.input,
+                def: Box::new(def),
+            })
+        }
         "smooth" => {
             let s: SmoothSpec = de(&ctx, &body)?;
             let def = crate::smooth::Smooth {
@@ -3296,6 +3345,9 @@ pub fn example(ty: &str) -> Option<Value> {
                 ["body", [0, 0.42, 0, 0.1]]
             ], "mirror": "x"})
         }
+        "decimate" => {
+            json!({"type": "decimate", "name": "statue", "input": "statue_hi", "ratio": 0.05, "bake": true})
+        }
         "smooth" => {
             json!({"type": "smooth", "name": "pebble", "input": "pebble_cage", "mode": "subdiv", "levels": 3})
         }
@@ -3398,6 +3450,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "sdf" => schemars::schema_for!(SdfSpec),
         "skin" => schemars::schema_for!(SkinSpec),
         "smooth" => schemars::schema_for!(SmoothSpec),
+        "decimate" => schemars::schema_for!(DecimateSpec),
         "shell" => schemars::schema_for!(ShellSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),

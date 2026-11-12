@@ -554,7 +554,7 @@ pub fn lints(model: &Model) -> Vec<String> {
         .parts
         .iter()
         .filter(|p| {
-            p.visible && !p.material.is_default() && p.material.pbr.is_none() && !p.material.flat
+            p.visible && !p.material.is_default() && !p.material.has_pbr() && !p.material.flat
         })
         .map(|p| p.name.as_str())
         .collect();

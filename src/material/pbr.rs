@@ -84,7 +84,11 @@ pub fn map_part(part: &mut Part) -> Result<(), String> {
     if part.verts.is_empty() {
         return Ok(());
     }
-    if g.domain == "object" {
+    if let Some(d) = &part.detail {
+        // A decimate bake needs its own texels: always an atlas.
+        let n = d.resolution as usize;
+        atlas::box_atlas(part, n);
+    } else if g.domain == "object" {
         atlas::box_atlas(part, atlas_size(g));
     } else {
         crate::uv::metric_box(part);
@@ -122,8 +126,11 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
         }
     }
     if let (Some(p), Some(g)) = (part, &r.graph)
-        && g.domain == "object"
+        && (g.domain == "object" || p.detail.is_some())
     {
+        if let Some(d) = &p.detail {
+            d.key.hash(&mut h);
+        }
         for v in p.verts.iter().chain(&p.normals) {
             v.map(f32::to_bits).hash(&mut h);
         }
@@ -220,6 +227,23 @@ pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
         return Ok(Some(hit));
     }
     let g = r.graph()?;
+    if let Some(d) = &part.detail {
+        let ch = if g.domain == "object" {
+            let s = atlas::samples(part, d.resolution as usize);
+            let base = bake::bake(&g.nodes, &r.params(g), &s, true)
+                .map_err(|e| format!("material `{}` on `{}`: {e}", r.material, part.name))?;
+            crate::decimate::bake(part, d, crate::decimate::Base::Atlas(&base))
+        } else {
+            let s = Samples::tile((g.resolution as usize).clamp(16, 2048), g.tile);
+            let base = bake::bake(&g.nodes, &r.params(g), &s, true)
+                .map_err(|e| format!("material `{}` on `{}`: {e}", r.material, part.name))?;
+            let period = (g.tile * r.scale.max(1e-6)).max(1e-6);
+            crate::decimate::bake(part, d, crate::decimate::Base::Tile(&base, period))
+        };
+        let ch = Arc::new(ch);
+        cache_put(key, ch.clone());
+        return Ok(Some(ch));
+    }
     let s = if g.domain == "object" {
         atlas::samples(part, atlas_size(g))
     } else {

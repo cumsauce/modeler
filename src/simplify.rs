@@ -73,7 +73,6 @@ struct Cand {
     u: u32,
     v: u32,
     ver_u: u32,
-    ver_v: u32,
 }
 impl PartialEq for Cand {
     fn eq(&self, o: &Self) -> bool {
@@ -122,6 +121,10 @@ struct State<'a> {
     quad: Vec<Quadric>,
     locked: Vec<bool>,
     ver: Vec<u32>,
+    /// Neighbours the last collapse gave its target (sorted).
+    fresh: Vec<u32>,
+    /// Each triangle's unit normal before any collapse.
+    orig: Vec<[f64; 3]>,
 }
 
 impl State<'_> {
@@ -159,16 +162,22 @@ impl State<'_> {
         quadric_eval(&self.quad[u as usize], pv).max(0.0) + 1e-9 * dot(e, e)
     }
 
-    fn push_edges(&self, heap: &mut BinaryHeap<Cand>, p: u32) {
+    /// After `u` collapsed onto `p`: `p`'s quadric changed, so its own
+    /// candidates are re-costed; a neighbour's candidate toward `p` keeps
+    /// its cost (vertices never move) unless it is a new edge (`fresh`).
+    fn push_edges(&self, heap: &mut BinaryHeap<Cand>, p: u32, fresh: &[u32]) {
         for q in self.neighbors(p) {
+            let back = fresh.binary_search(&q).is_ok();
             for (u, v) in [(p, q), (q, p)] {
+                if u == q && !back {
+                    continue;
+                }
                 if !self.locked[u as usize] {
                     heap.push(Cand {
                         cost: self.cost(u, v),
                         u,
                         v,
                         ver_u: self.ver[u as usize],
-                        ver_v: self.ver[v as usize],
                     });
                 }
             }
@@ -203,6 +212,12 @@ impl State<'_> {
         if common != shared.len() {
             return 0;
         }
+        self.fresh.clear();
+        self.fresh.extend(
+            nu.iter()
+                .copied()
+                .filter(|x| *x != v && nv.binary_search(x).is_err()),
+        );
         // The wedge of v that u's corners become: all shared triangles agree.
         let mut target: Option<u32> = None;
         for &t in &shared {
@@ -227,10 +242,19 @@ impl State<'_> {
                 .map(|q| if q == u { pv } else { self.pos[q as usize] });
             let n_new = cross(sub(np[1], np[0]), sub(np[2], np[0]));
             let (lo, ln) = (len(n_old), len(n_new));
-            if ln <= 1e-12 * (1.0 + lo) {
+            // Needles: twice the area against the squared edge lengths.
+            let e2 = dot(sub(np[1], np[0]), sub(np[1], np[0]))
+                + dot(sub(np[2], np[1]), sub(np[2], np[1]))
+                + dot(sub(np[0], np[2]), sub(np[0], np[2]));
+            if ln <= 1e-12 * (1.0 + lo) || ln <= 1e-4 * e2 {
                 return 0;
             }
             if lo > 1e-20 && dot(n_old, n_new) < 0.2 * lo * ln {
+                return 0;
+            }
+            // Small turns add up over many collapses: never past a right
+            // angle from the triangle's original facing either.
+            if dot(self.orig[t as usize], n_new) <= 0.0 {
                 return 0;
             }
         }
@@ -258,10 +282,10 @@ impl State<'_> {
     }
 }
 
-/// A copy of `part` with about `ratio` (clamped 0.01..1) of its triangles.
+/// A copy of `part` with about `ratio` (clamped 0.00001..1) of its triangles.
 /// Locked seams, borders and hard edges can stop it short of the target.
 pub fn simplify(part: &Part, ratio: f32) -> Part {
-    let ratio = ratio.clamp(0.01, 1.0);
+    let ratio = ratio.clamp(1e-5, 1.0);
     let n_tris = part.indices.len() / 3;
     let target = ((n_tris as f32 * ratio).round() as usize).max(1);
     if target >= n_tris || part.verts.is_empty() {
@@ -338,6 +362,15 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
         }
     }
 
+    let orig: Vec<[f64; 3]> = tris
+        .iter()
+        .map(|t| {
+            let c = t.map(|w| pos[wpos[w as usize] as usize]);
+            let n = cross(sub(c[1], c[0]), sub(c[2], c[0]));
+            let l = len(n).max(1e-300);
+            n.map(|x| x / l)
+        })
+        .collect();
     let mut st = State {
         part,
         wpos,
@@ -348,6 +381,8 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
         quad,
         locked,
         ver: vec![0; np],
+        fresh: Vec::new(),
+        orig,
     };
     let mut live = st.tris.len();
 
@@ -364,20 +399,23 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
                         u: p,
                         v: q,
                         ver_u: st.ver[p as usize],
-                        ver_v: st.ver[q as usize],
                     });
                 }
             }
         }
         while live > target {
             let Some(c) = heap.pop() else { break };
-            if st.ver[c.u as usize] != c.ver_u || st.ver[c.v as usize] != c.ver_v {
+            // Only u's quadric sets the cost (v stays put); a dead v makes
+            // the collapse find no shared triangle.
+            if st.ver[c.u as usize] != c.ver_u {
                 continue;
             }
             let removed = st.collapse(c.u, c.v);
             if removed > 0 {
                 live -= removed;
-                st.push_edges(&mut heap, c.v);
+                let fresh = std::mem::take(&mut st.fresh);
+                st.push_edges(&mut heap, c.v, &fresh);
+                st.fresh = fresh;
             }
         }
         if live <= target || live == before {

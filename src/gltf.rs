@@ -288,7 +288,8 @@ pub(crate) fn build_with(
                 let ch = crate::material::pbr::bake_part(bake_src)?
                     .ok_or_else(|| format!("part '{}': no bake", part.name))?;
                 let t = crate::material::pbr::textures(&ch);
-                let per_part = r.graph().is_ok_and(|g| g.domain == "object");
+                let per_part =
+                    bake_src.detail.is_some() || r.graph().is_ok_and(|g| g.domain == "object");
                 let mut add = |px: &[u8], what: &str| -> Result<u32, String> {
                     let name = format!("{}-{what}", r.material);
                     let (png, ext, mime) = if tex_out.map_or(embed_ktx2, |o| o.ktx2) {

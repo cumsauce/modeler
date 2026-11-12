@@ -10,11 +10,22 @@ use bevy::math::Vec3;
 use rayon::prelude::*;
 
 /// A part's triangles in world space, welded by position (`ids` per corner).
-struct World {
-    v: Vec<Vec3>,
-    t: Vec<[u32; 3]>,
+pub(crate) struct World {
+    pub(crate) v: Vec<Vec3>,
+    pub(crate) t: Vec<[u32; 3]>,
     /// Welded id of each of the part's own vertices.
     of: Vec<u32>,
+}
+
+impl World {
+    /// Raw triangles (no weld), for ray casts against a mesh.
+    pub(crate) fn raw(v: Vec<Vec3>, t: Vec<[u32; 3]>) -> World {
+        World {
+            v,
+            t,
+            of: Vec::new(),
+        }
+    }
 }
 
 fn world(part: &Part) -> World {
@@ -58,7 +69,7 @@ fn world(part: &Part) -> World {
 }
 
 /// A uniform grid of triangle lists over a part's box.
-struct TriGrid {
+pub(crate) struct TriGrid {
     lo: Vec3,
     cell: f32,
     n: [usize; 3],
@@ -66,7 +77,7 @@ struct TriGrid {
 }
 
 impl TriGrid {
-    fn new(w: &World) -> TriGrid {
+    pub(crate) fn new(w: &World) -> TriGrid {
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for p in &w.v {
             lo = lo.min(*p);
@@ -100,6 +111,19 @@ impl TriGrid {
 
     /// First hit of the ray `o + t d` (t in (tmin, tmax)), walking cells.
     fn ray(&self, w: &World, o: Vec3, d: Vec3, tmin: f32, tmax: f32, skip: u32) -> Option<f32> {
+        self.ray_hit(w, o, d, tmin, tmax, skip).map(|h| h.0)
+    }
+
+    /// First hit of the ray and the triangle it hit.
+    pub(crate) fn ray_hit(
+        &self,
+        w: &World,
+        o: Vec3,
+        d: Vec3,
+        tmin: f32,
+        tmax: f32,
+        skip: u32,
+    ) -> Option<(f32, u32)> {
         let g = (o - self.lo) / self.cell;
         let mut c = [0i64; 3];
         let mut step = [0i64; 3];
@@ -118,6 +142,7 @@ impl TriGrid {
             }
         }
         let mut best = tmax;
+        let mut hit = u32::MAX;
         loop {
             let i = ((c[2] as usize * self.n[1]) + c[1] as usize) * self.n[0] + c[0] as usize;
             for &ti in &self.cells[i] {
@@ -130,6 +155,7 @@ impl TriGrid {
                     && t < best
                 {
                     best = t;
+                    hit = ti;
                 }
             }
             let k = if tnext[0] <= tnext[1] && tnext[0] <= tnext[2] {
@@ -148,7 +174,7 @@ impl TriGrid {
             }
             tnext[k] += tdelta[k];
         }
-        (best < tmax).then_some(best)
+        (best < tmax).then_some((best, hit))
     }
 }
 

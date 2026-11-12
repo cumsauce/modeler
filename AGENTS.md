@@ -107,6 +107,7 @@ type, so there is no need to memorise field names.
 | `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution] (analytic distance-field modeling) |
 | `skin` | name, chains [[[x, y, z, r] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution] (a skeleton with radii as one smooth skin) |
 | `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
+| `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
@@ -492,6 +493,26 @@ A visible part with only a flat colour (no `pbr`) is a warning in
     meet at more than `crease` degrees stay sharp (`crease: 60` on a
     cylinder cage keeps the rims, smooths the sides); open borders stay
     sharp too.
+- **`decimate`** makes a lighter copy of a dense part (an `sdf` / `skin` /
+  `deform` / `blob` result easily runs to 300k+ triangles): quadric edge
+  collapse down to `ratio` of the triangles or a `tris` count, keeping
+  closed solids closed and the shape's silhouette. It is an op like any
+  other, so it is **non-destructive**: the dense input stays in the graph
+  (hide it), any change to it re-derives the decimate, and re-issuing with
+  another `ratio` re-tunes it. `bake: true` keeps the dense surface's look
+  on the light mesh: the result's material bake (whatever it wears: a tile
+  or object pbr material, or a flat colour) gets the dense surface's
+  normals blended into its normal map and its offset added to `height`, on
+  a per-part atlas of `resolution` texels. `cage` (meters) is how far from
+  the light surface the bake looks for the dense one (default 1.5 x the
+  largest gap measured, so it rarely needs setting). A 349k-triangle
+  sculpt at `tris: 1500` with `bake` reads almost like the original.
+  `{"type": "decimate", "name": "statue", "input": "statue_hi", "tris":
+  4000, "bake": true}` plus `{"type": "hide_part", "part": "statue_hi"}`.
+  Moves, transforms, arrays, scatters and mirrors carry the bake along; an
+  op that reshapes the mesh (deform, boolean, round, ...) drops it, so
+  decimate last. Exports write the bake as the part's textures (per-part
+  KTX2); export `lods` then simplify the light mesh further and reuse them.
 - **`split`** cuts a closed solid by a plane into `name_above` (the side
   `plane.normal` points to) and `name_below`, both closed with flat caps:
   broken pots, cutaway views, parts that open or animate apart.

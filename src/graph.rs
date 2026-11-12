@@ -62,6 +62,25 @@ pub fn cache_len() -> usize {
         .unwrap_or(0)
 }
 
+/// Ops whose outputs keep the input's mesh as it is (or map a baked dense
+/// surface along, like mirror), so a decimate's bake stays valid.
+fn keeps_detail(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Decimate { .. }
+            | Op::Transform { .. }
+            | Op::Material { .. }
+            | Op::Visibility { .. }
+            | Op::Rename { .. }
+            | Op::Mirror { .. }
+            | Op::RadialArray { .. }
+            | Op::LinearArray { .. }
+            | Op::PathArray { .. }
+            | Op::Scatter { .. }
+            | Op::Prefab { .. }
+    )
+}
+
 fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -124,6 +143,17 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             None => {
                 RUNS.with(|r| r.set(r.get() + 1));
                 run_op(op, &mut named)?;
+                // A baked dense surface only stays valid through ops that
+                // keep the part's mesh (moves, copies, materials).
+                if !keeps_detail(op) {
+                    for n in &outs {
+                        if let Some((_, p)) = named.iter_mut().find(|(m, _)| m == n)
+                            && p.detail.is_some()
+                        {
+                            Arc::make_mut(p).detail = None;
+                        }
+                    }
+                }
                 if use_cache && !matches!(op, Op::Rename { .. }) {
                     let produced: Named = outs
                         .iter()
@@ -154,6 +184,16 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     // Procedural materials map their parts last, so cuts and copies made
     // after the material op are mapped too (one tile = its real size).
     for (_, part) in named.iter_mut() {
+        if part.detail.is_some() && part.material.pbr.is_none() {
+            // A baked part with a flat colour: a plain graph carries the
+            // normal map, the colour stays the factor.
+            Arc::make_mut(part).material.pbr = Some(crate::material::PbrRef {
+                material: crate::decimate::PLAIN.into(),
+                params: Default::default(),
+                scale: 1.0,
+                graph: Some(Arc::new(crate::decimate::plain_graph())),
+            });
+        }
         if part.material.pbr.is_some() {
             crate::material::pbr::map_part(Arc::make_mut(part))?;
         }
@@ -780,6 +820,12 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let part = crate::smooth::smooth(name, &src, def)?;
             upsert(named, name, part);
         }
+        Op::Decimate { name, input, def } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::decimate::decimate(name, &src, def)
+                .map_err(|e| ModelerError::Invalid(format!("decimate `{name}`: {e}")))?;
+            upsert(named, name, part);
+        }
         Op::Split {
             name,
             input,
@@ -1045,6 +1091,22 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             part.normals.clear();
             crate::uv::ensure_normals(&mut part);
             crate::uv::ensure_uvs(&mut part, Some("box"))?;
+            // A baked dense surface goes through the same reflection.
+            if let Some(d) = part.detail.take() {
+                let reflect = |mut v: Vec3| {
+                    v[ax] = -v[ax];
+                    v
+                };
+                part.detail = Some(Arc::new(d.mapped(
+                    |v| {
+                        let mut w = rot * (v * scale) + translation;
+                        w[ax] = 2.0 * plane - w[ax];
+                        w
+                    },
+                    |n| reflect(rot * (n / scale)),
+                    true,
+                )));
+            }
             part.translation = [0.0; 3];
             part.rotation = Quat::IDENTITY.to_array();
             part.scale = [1.0; 3];
@@ -1215,6 +1277,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Sdf { name, .. }
         | Op::Skin { name, .. }
         | Op::Smooth { name, .. }
+        | Op::Decimate { name, .. }
         | Op::Split { name, .. }
         | Op::LSystem { name, .. }
         | Op::Text { name, .. }
@@ -1309,6 +1372,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Sdf { .. } => "sdf",
         Op::Skin { .. } => "skin",
         Op::Smooth { .. } => "smooth",
+        Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
         Op::LSystem { .. } => "lsystem",
         Op::Text { .. } => "text",
@@ -1363,7 +1427,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Deform { input, .. } => vec![input],
         Op::Sdf { def, .. } => def.reads(),
         Op::Skin { .. } => Vec::new(),
-        Op::Smooth { input, .. } => vec![input],
+        Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
         Op::Shell { input, .. } | Op::Split { input, .. } => vec![input],
         Op::Scatter { input, on, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
@@ -1700,6 +1764,9 @@ pub fn describe(ops: &[Op]) -> String {
             Op::Skin { name, def } => format!("#{i} skin `{name}` {}", def.summary()),
             Op::Smooth { name, input, def } => {
                 format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
+            }
+            Op::Decimate { name, input, def } => {
+                format!("#{i} decimate `{name}` <- `{input}` {}", def.summary())
             }
             Op::Shell {
                 name,

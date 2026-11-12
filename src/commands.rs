@@ -74,7 +74,7 @@ pub fn material_gaps(model: &Model) -> (Vec<String>, Vec<String>) {
     for p in model.parts.iter().filter(|p| p.visible) {
         if p.material.is_default() {
             bare.push(p.name.clone());
-        } else if p.material.pbr.is_none() && !p.material.flat {
+        } else if !p.material.has_pbr() && !p.material.flat {
             flat.push(p.name.clone());
         }
     }
@@ -5605,6 +5605,46 @@ mod tests {
             .apply_values_as(None, items, true)
             .unwrap_or_else(|e| panic!("{e}"));
         (s, t)
+    }
+
+    #[test]
+    fn a_baked_decimate_wears_its_detail_through_copies_and_drops_it_on_reshaping() {
+        let mut s = Session::default();
+        let arr = |v: serde_json::Value| v.as_array().cloned().unwrap_or_default();
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "ball", "kind": "sphere", "size": 0.3, "translation": [0, 0.3, 0]},
+            {"type": "deform", "name": "rock_hi", "input": "ball", "mode": "displace", "amount": 0.02, "scale": 0.08, "detail": 0.01},
+            {"type": "decimate", "name": "rock", "input": "rock_hi", "tris": 300, "bake": true, "resolution": 128},
+            {"type": "mirror", "name": "rock_m", "input": "rock", "axis": "x", "offset": [0.5, 0, 0]},
+            {"type": "deform", "name": "rock_bent", "input": "rock", "mode": "twist", "degrees": 20},
+            {"type": "material", "name": "rock*", "color": "#887766"},
+            {"type": "hide_part", "part": "ball"},
+            {"type": "hide_part", "part": "rock_hi"}
+        ]);
+        let out = s
+            .apply_values_as(None, arr(items), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let part = |n: &str| s.model.part(n).unwrap_or_else(|| panic!("{n}"));
+        let rock = part("rock");
+        assert!(rock.tri_count() <= 330, "{}", rock.tri_count());
+        // A flat colour still warns (the carrier graph is not a choice).
+        assert!(out.contains("rock"), "{out}");
+        let r = rock
+            .material
+            .pbr
+            .as_ref()
+            .unwrap_or_else(|| panic!("carrier"));
+        assert_eq!(r.material, crate::decimate::PLAIN);
+        assert!(!rock.material.has_pbr());
+        let ch = crate::material::pbr::bake_part(rock)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("bake"));
+        assert_eq!(ch.w, 128);
+        assert!(ch.normal.iter().filter(|n| n[2] < 0.98).count() > 128 * 128 / 20);
+        assert!(part("rock_m").detail.is_some(), "mirror keeps the bake");
+        assert!(part("rock_bent").detail.is_none(), "a twist reshapes it");
+        let (_, flat) = material_gaps(&s.model);
+        assert!(flat.contains(&"rock".to_string()), "{flat:?}");
     }
 
     #[test]
