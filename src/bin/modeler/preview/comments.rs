@@ -58,6 +58,8 @@ pub(crate) struct CommentBox {
     action: Option<Action>,
     /// The right pane's spot for the box (it is rebuilt with the pane).
     host: Option<Entity>,
+    /// What is typed so far: kept when the pane rebuilds under the box.
+    draft: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -70,12 +72,14 @@ impl CommentBox {
     /// Open the box for a target (replaces any open one).
     pub(crate) fn request(&mut self, t: AnnotationTarget) {
         self.target = Some(CommentTarget::Target(t));
+        self.draft.clear();
         self.dirty = true;
     }
 
     /// Open the box for the spot just clicked on `part`.
     pub(crate) fn request_spot(&mut self, part: String) {
         self.target = Some(CommentTarget::Spot(part));
+        self.draft.clear();
         self.dirty = true;
     }
 
@@ -96,6 +100,10 @@ impl CommentBox {
         self.flash = Some((msg, now));
     }
 }
+
+/// The comment box's text input (other panes have inputs of their own).
+#[derive(Component)]
+pub(crate) struct CommentInput;
 
 #[derive(Component)]
 pub(crate) struct DeleteComment(pub(crate) u32);
@@ -138,8 +146,8 @@ pub(crate) fn comment_box(
     mut typing: ResMut<PinTyping>,
     mut modeler: ResMut<Modeler>,
     mut focus: ResMut<InputFocus>,
-    inputs: Query<(Entity, &EditableText)>,
-    new_inputs: Query<Entity, Added<EditableText>>,
+    mut inputs: Query<(Entity, &mut EditableText), With<CommentInput>>,
+    new_inputs: Query<Entity, Added<CommentInput>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     uncommitted: Query<
         (Entity, &MeshMaterial3d<StandardMaterial>),
@@ -158,6 +166,17 @@ pub(crate) fn comment_box(
     // Focus the input as soon as it exists.
     if let Some(e) = new_inputs.iter().next() {
         focus.set(e, FocusCause::Auto);
+        // A rebuilt box gets back what was typed in the old one.
+        if !cb.draft.is_empty()
+            && let Ok((_, mut t)) = inputs.get_mut(e)
+        {
+            t.queue_edit(bevy::text::TextEdit::Insert(cb.draft.as_str().into()));
+        }
+    } else if let Some((_, t)) = inputs.iter().next() {
+        let v = t.value().to_string();
+        if v != cb.draft {
+            cb.draft = v;
+        }
     }
     if cb.is_open() {
         if keys.just_pressed(KeyCode::Escape) {
@@ -176,6 +195,7 @@ pub(crate) fn comment_box(
                 }
             }
             cb.target = None;
+            cb.draft.clear();
             cb.dirty = true;
         }
         Some(Action::Submit) => {
@@ -211,6 +231,7 @@ pub(crate) fn comment_box(
                         modeler.session.mark_autosave(true, false, false);
                         cb.say(msg, now);
                         cb.target = None;
+                        cb.draft.clear();
                         cb.dirty = true;
                     }
                     Err(e) => cb.say(e.to_string(), now),
@@ -328,7 +349,7 @@ fn spawn_box(
             ChildOf(root),
         ))
         .id();
-    // The input.
+    // The input (tagged once its scene has spawned: see `tag_input`).
     commands
         .spawn_scene(bsn! {
             @FeathersTextInputContainer
@@ -336,7 +357,7 @@ fn spawn_box(
                 @FeathersTextInput
             ]
         })
-        .insert(ChildOf(body));
+        .insert((ChildOf(body), CommentInputHost));
     // Buttons.
     let buttons = commands
         .spawn((
@@ -392,5 +413,23 @@ pub(crate) fn update_typing_hud(
     };
     if text.0 != msg {
         text.0 = msg;
+    }
+}
+
+/// The container the comment box's input spawns in.
+#[derive(Component)]
+pub(crate) struct CommentInputHost;
+
+/// Tags the text input inside the comment box once the scene has made it,
+/// so the box reads (and focuses) its own field, never another pane's.
+pub(crate) fn tag_input(
+    new: Query<(Entity, &ChildOf), (Added<EditableText>, Without<CommentInput>)>,
+    hosts: Query<(), With<CommentInputHost>>,
+    mut commands: Commands,
+) {
+    for (e, parent) in &new {
+        if hosts.contains(parent.parent()) {
+            commands.entity(e).insert(CommentInput);
+        }
     }
 }

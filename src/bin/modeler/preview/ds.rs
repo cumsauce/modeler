@@ -118,6 +118,12 @@ pub(crate) fn theme() -> ThemeProps {
         t.semantic_base.insert(k, c);
     }
     t.semantic_overrides.clear();
+    // Feathers draws text-input text in "text on accent" (white on its grey
+    // fields); here that token is dark, for text on the blue accent.
+    t.token_assignments.insert(
+        bevy::feathers::tokens::TEXT_INPUT_TEXT,
+        semantic::TEXT_DEFAULT,
+    );
     t
 }
 

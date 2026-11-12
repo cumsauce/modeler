@@ -303,7 +303,7 @@ fn main() -> AppExit {
                 .after(rebuild_scene)
                 .run_if(windowed)
                 .run_if(grid_off),
-            comment_box.run_if(windowed),
+            (tag_input, comment_box).chain().run_if(windowed),
             update_typing_hud.run_if(windowed),
             highlight_selected.run_if(windowed),
             update_material_pane.run_if(windowed),
