@@ -20,9 +20,25 @@ change.
 
 ## Getting started (agent)
 
+**One server, one window for every session.** The MCP config runs
+`python3 mcp_driver.py --proxy`, not the binary: each Claude session gets a
+thin stdio proxy, and all proxies share one daemon (started windowed on
+first use, detached, so it outlives the sessions). The `mcp__modeler__*`
+tools and the driver below therefore talk to the same server and the same
+preview window. Each session is its own client (per-client active
+documents, authorship, undo guards). Closing the window ends the server;
+the next call restarts it from autosave. The shared library uses
+`/tmp/modeler-mcp.sock`; a game project gets its own daemon and socket
+(`/tmp/modeler-mcp-<hash>.sock`, server working in that project), since a
+server works in one project at a time. After `cargo build`, restart the
+server with `pkill -f target/debug/modeler` (the daemon respawns it on the
+next call) or stop everything with a `quit` call.
+
+Without MCP tools (or for scripted batches), use the driver directly:
+
 ```sh
 cargo build                # or skip if target/debug/modeler is current
-python3 mcp_driver.py --daemon --windowed &   # one persistent server + preview
+python3 mcp_driver.py --daemon --windowed &   # skip if the shared daemon is up
 ```
 
 Without `--windowed` the daemon runs `--offscreen`: the full renderer with no
@@ -1285,8 +1301,8 @@ Material / Grid toggles match O, S, M and G.
   `AccumulatedMouseScroll` for the wheel; winit sends `Key::Space`, not a
   space character.
 - **Restart flow** (after code changes): `cargo build`, then
-  `pkill -f target/debug/modeler` — the MCP client respawns the server from
-  the binary on disk on the next tool call. The respawned session AUTOSAVES
+  `pkill -f target/debug/modeler` — the shared daemon (behind the MCP
+  proxy) respawns the server from the binary on disk on the next tool call. The respawned session AUTOSAVES
   and RESTORES: mutations are written to `session.json` in the catalog dir
   0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server started with `--restore` (the driver always does) restores it on startup, so
   unnamed WIP survives restarts. `new_model` starts clean (the old model

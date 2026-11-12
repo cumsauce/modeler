@@ -18,8 +18,17 @@ cargo run                # MCP server on stdio + preview window
 cargo run -- --headless  # no window/render, for CI or remote agents
 ```
 
-Point your agent's MCP config at the `modeler` binary
-(`cargo run` or `target/debug/modeler`).
+Point your agent's MCP config at the proxy, so every agent session shares
+one server and one preview window:
+
+```json
+"modeler": {"type": "stdio", "command": "python3",
+            "args": ["/path/to/modeler/mcp_driver.py", "--proxy"]}
+```
+
+The first session starts the shared daemon (windowed); later sessions join
+it. Pointing the config at `target/debug/modeler` instead gives each session
+its own server and window.
 
 ## What's inside
 

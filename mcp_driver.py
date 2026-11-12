@@ -2,7 +2,17 @@
 """Drive the modeler MCP server over stdio (fallback while the session's
 MCP tool list is frozen without mcp__modeler__* tools).
 
-Two modes:
+Proxy (what the MCP config runs: one shared server and window for every
+Claude session):
+    mcp_driver.py --proxy [--offscreen | --headless] [--socket PATH]
+        an MCP stdio server that passes JSON-RPC through to the daemon,
+        starting it (windowed by default, detached) when none answers. Every
+        session's proxy shares that one daemon, so there is one modeler server
+        and one preview window however many sessions are open. Closing the
+        window ends the server; the next call restarts it from autosave.
+        The socket is /tmp/modeler-mcp.sock for the shared library and one
+        per game project (/tmp/modeler-mcp-<hash>.sock, with the server
+        working in that project), the same default --daemon and --connect use.
 
 Daemon (keeps ONE modeler process — and its preview window — alive across
 many driver invocations):
@@ -175,9 +185,11 @@ class ModelerSession:
 
     def _handshake(self):
         self._send({"jsonrpc": "2.0", "id": self.next_id, "method": "initialize",
-                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                                "clientInfo": {"name": "mcp-driver", "version": "0"}}})
-        self._recv()
+        # Kept for --proxy: every MCP client of a shared daemon gets the
+        # server's own initialize answer (instructions, capabilities).
+        self.init_result = self._recv().get("result", {})
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.next_id += 1
 
@@ -188,6 +200,19 @@ class ModelerSession:
             resp = self._recv()
             if resp.get("id") == rid:
                 return sorted(t["name"] for t in resp["result"]["tools"])
+
+    def raw(self, method, params=None):
+        """One JSON-RPC request passed through as is (for --proxy): returns
+        {"result": ...} or {"error": ...}, images and all."""
+        rid = self.next_id; self.next_id += 1
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._send(msg)
+        while True:
+            resp = self._recv()
+            if resp.get("id") == rid:
+                return {k: resp[k] for k in ("result", "error") if k in resp}
 
     def call(self, name, args=None, save_shot=None, save_dir=None, b64=False, shots=None,
              meta=None):
@@ -304,6 +329,12 @@ def claim_socket(socket_path):
     sys.exit(1)
 
 
+def client_identity_of(pid):
+    """An MCP proxy's parent is the agent session itself; the driver's
+    shells are its children, so both name the same client."""
+    return f"pid:{pid}"
+
+
 def client_identity():
     """Who is calling: the agent session behind this shell. Each agent's
     commands run in fresh shells under one long-lived process, so the
@@ -350,6 +381,21 @@ def daemon_mode(socket_path, mode):
     lock = threading.Lock()
     told_slot = set()  # clients already told this server autosaves to a slot
 
+    def live_session():
+        """The running server (call with the lock held), respawned first when
+        it has exited (killed, crashed, rebuilt, window closed): autosave
+        restores the session. Returns (session, note or None)."""
+        session = state["session"]
+        if session.proc.poll() is None:
+            return session, None
+        why = session.exit_reason()
+        session = ModelerSession(mode=mode, log=daemon_log_path(),
+                                 slot=daemon_slot(socket_path))
+        state["session"] = session
+        return session, (f"daemon: the modeler server had exited ({why}); "
+                         "restarted it, session restored from autosave"
+                         + (" (its own slot file)" if session.slot_note else ""))
+
     def serve(conn):
         shots = ShotNamer()  # one --save-shot counter per client run
         client, pin, pending_note = None, None, None
@@ -372,10 +418,13 @@ def daemon_mode(socket_path, mode):
                         continue
                     is_quit = c == "quit" or (isinstance(c, dict) and c.get("name") == "quit")
                     if is_quit:
-                        conn.sendall((json.dumps(
-                            {"ok": True, "text": ["daemon stopping"],
-                             "n_images": 0, "saved_images": []}) + "\n").encode())
-                        state["stop"] = True
+                        state["stop"] = True  # first: the sender may not wait for the reply
+                        try:
+                            conn.sendall((json.dumps(
+                                {"ok": True, "text": ["daemon stopping"],
+                                 "n_images": 0, "saved_images": []}) + "\n").encode())
+                        except OSError:
+                            pass
                         try:  # wake accept()
                             w = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                             w.connect(socket_path)
@@ -383,24 +432,38 @@ def daemon_mode(socket_path, mode):
                         except OSError:
                             pass
                         return
-                    note = None
+                    if isinstance(c, dict) and ("raw" in c or "init" in c):
+                        # --proxy: MCP JSON-RPC passed through untouched.
+                        with lock:
+                            session, note = live_session()
+                            if "init" in c:
+                                out = {"result": session.init_result}
+                            else:
+                                req = c["raw"]
+                                params = req.get("params")
+                                if req.get("method") == "tools/call" and client:
+                                    params = dict(params or {})
+                                    m = dict(params.get("_meta") or {})
+                                    m.setdefault("modeler/client", client)
+                                    params["_meta"] = m
+                                out = session.raw(req.get("method"), params)
+                        if pending_note:
+                            note = f"{note}\n{pending_note}" if note else pending_note
+                            pending_note = None
+                        res = out.get("result")
+                        if note and isinstance(res, dict) and isinstance(res.get("content"), list):
+                            res["content"] = [{"type": "text", "text": note}] + res["content"]
+                        elif note:
+                            pending_note = note  # says it on the next tool call
+                        conn.sendall((json.dumps(out) + "\n").encode())
+                        continue
                     meta = {}
                     if client:
                         meta["modeler/client"] = client
                     if pin:
                         meta["modeler/doc"] = pin
                     with lock:
-                        session = state["session"]
-                        if session.proc.poll() is not None:
-                            # The modeler exited (killed, crashed, rebuilt):
-                            # respawn it; autosave restores the session.
-                            why = session.exit_reason()
-                            session = ModelerSession(mode=mode, log=daemon_log_path(),
-                                                     slot=daemon_slot(socket_path))
-                            state["session"] = session
-                            note = (f"daemon: the modeler server had exited ({why}); "
-                                    "restarted it, session restored from autosave"
-                                    + (" (its own slot file)" if session.slot_note else ""))
+                        session, note = live_session()
                         out = session.call(c["name"], c.get("args", {}),
                                            c.get("save_shot"), c.get("save_dir"),
                                            c.get("b64", False), shots, meta)
@@ -433,6 +496,142 @@ def daemon_mode(socket_path, mode):
         srv.close()
         if os.path.exists(socket_path):
             os.unlink(socket_path)
+
+
+def find_project(start):
+    """The game project a directory belongs to (the server's own rule): the
+    nearest ancestor with a .modeler/ folder, or a Cargo.toml beside assets/."""
+    env = os.environ.get("MODELER_PROJECT")
+    if env:
+        return os.path.abspath(env)
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(d, ".modeler")) or (
+                os.path.isfile(os.path.join(d, "Cargo.toml"))
+                and os.path.isdir(os.path.join(d, "assets"))):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def default_socket(cwd=None):
+    """One shared daemon per library: SOCKET for the shared library, one
+    socket per game project (a server works in one project at a time)."""
+    root = find_project(cwd or os.getcwd())
+    if not root:
+        return SOCKET
+    import hashlib
+    return f"/tmp/modeler-mcp-{hashlib.sha1(root.encode()).hexdigest()[:8]}.sock"
+
+
+def ensure_daemon(socket_path, mode="windowed", wait=90):
+    """Connects to the daemon on socket_path, starting one (detached, so it
+    outlives this process) when none answers. Returns the connected socket."""
+    def connect():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(socket_path)
+            return s
+        except OSError:
+            s.close()
+            return None
+    s = connect()
+    if s:
+        return s
+    root = find_project(os.getcwd())
+    env = dict(os.environ)
+    if root:
+        env["MODELER_PROJECT"] = root
+    cmd = [sys.executable, os.path.abspath(__file__), "--daemon", "--socket", socket_path]
+    if mode == "windowed":
+        cmd.append("--windowed")
+    elif mode == "headless":
+        cmd.append("--headless")
+    # A racing second proxy starts one too: claim_socket makes it exit.
+    subprocess.Popen(cmd, cwd=root or os.path.expanduser("~"), env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(0.2)
+        s = connect()
+        if s:
+            return s
+    raise RuntimeError(f"no modeler daemon came up on {socket_path} within {wait} s")
+
+
+def proxy_mode(socket_path, mode):
+    """An MCP stdio server that is only a doorway: every Claude session runs
+    its own proxy (the MCP config's command), and all of them share one
+    daemon, so there is one modeler server and one preview window however
+    many sessions are open. The daemon is started on first use and outlives
+    the sessions; closing the window just restarts the server (from
+    autosave) on the next call."""
+    client = client_identity_of(os.getppid())
+    conn = {"s": None, "f": None}
+
+    def link():
+        s = ensure_daemon(socket_path, mode)
+        conn["s"], conn["f"] = s, s.makefile("r")
+        s.sendall((json.dumps({"hello": {"client": client}}) + "\n").encode())
+
+    def ask(payload):
+        for attempt in (0, 1):  # the daemon was stopped: start it again once
+            try:
+                if conn["s"] is None:
+                    link()
+                conn["s"].sendall((json.dumps(payload) + "\n").encode())
+                line = conn["f"].readline()
+                if line:
+                    return json.loads(line)
+            except OSError:
+                pass
+            try:
+                conn["s"] and conn["s"].close()
+            except OSError:
+                pass
+            conn["s"] = None
+        return {"error": {"code": -32603, "message":
+                          f"modeler daemon on {socket_path} is not answering"}}
+
+    out = sys.stdout
+    def reply(rid, body):
+        msg = {"jsonrpc": "2.0", "id": rid}
+        msg.update(body if ("result" in body or "error" in body)
+                   else {"error": {"code": -32603, "message": str(body)}})
+        out.write(json.dumps(msg) + "\n")
+        out.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(req, dict) or "method" not in req:
+            continue  # a response to us (we send no requests): ignore
+        method, rid = req["method"], req.get("id")
+        if rid is None:
+            continue  # notifications (initialized, cancelled) stay here
+        if method == "initialize":
+            body = ask({"init": True})
+            if "result" in body:
+                res = dict(body["result"])
+                want = (req.get("params") or {}).get("protocolVersion")
+                # Answer in the client's version when it is no newer than the
+                # server's (dated versions compare as strings).
+                if want and want <= res.get("protocolVersion", want):
+                    res["protocolVersion"] = want
+                body = {"result": res}
+            reply(rid, body)
+        elif method == "ping":
+            reply(rid, {"result": {}})
+        else:
+            reply(rid, ask({"raw": {"method": method, "params": req.get("params")}}))
 
 
 def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, json_only=False):
@@ -476,7 +675,7 @@ def main():
     # The daemon renders agent views by default (offscreen, no window);
     # --windowed adds the preview window, --headless drops rendering.
     mode = "windowed" if windowed else ("headless" if "--headless" in argv else "offscreen")
-    socket_path = SOCKET
+    socket_path = default_socket()
     if "--socket" in argv:
         socket_path = argv[argv.index("--socket") + 1]
     save_shot = None
@@ -491,7 +690,11 @@ def main():
     if "--calls" in argv:
         calls_path = argv[argv.index("--calls") + 1]
 
-    if daemon:
+    if "--proxy" in argv:
+        # The MCP config's command: windowed unless told otherwise.
+        proxy_mode(socket_path, "headless" if "--headless" in argv else
+                   ("offscreen" if "--offscreen" in argv else "windowed"))
+    elif daemon:
         daemon_mode(socket_path, mode)
     elif connect:
         client_mode(socket_path, calls_path, save_shot, save_dir, b64, json_only)
