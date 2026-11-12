@@ -11,7 +11,7 @@ pub(crate) fn err_result(message: String) -> CallToolResult {
 /// The MCP tool surface. Every tool ships a command to the Bevy loop and awaits its
 /// oneshot reply, so state changes always happen on the main thread.
 pub(crate) struct Tools {
-    pub(crate) tx: mpsc::Sender<Cmd>,
+    pub(crate) tx: crate::server::CmdSender,
     /// The latest render per (view, size, focus, style), for `diff`.
     last_shots: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
 }
@@ -37,24 +37,9 @@ fn fit_budget(w: u32, h: u32, cols: u32, rows: u32) -> (u32, u32) {
 impl Tools {
     pub(crate) fn new(tx: mpsc::Sender<Cmd>) -> Self {
         Self {
-            tx,
+            tx: crate::server::CmdSender(tx),
             last_shots: Default::default(),
         }
-    }
-
-    /// Runs `f` on the session (on the app thread) and returns its value;
-    /// for bookkeeping around a call, not tool work (no autosave marking).
-    async fn exec<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut Session) -> T + Send + 'static,
-    ) -> Option<T> {
-        let (tx, rx) = oneshot::channel();
-        let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
-            let _ = tx.send(f(s));
-            Ok(String::new())
-        }));
-        self.tx.send(cmd).await.ok()?;
-        rx.await.ok()
     }
 
     async fn run(
@@ -1601,31 +1586,49 @@ impl rmcp::ServerHandler for Tools {
         // serves every project, switching per call.
         let project =
             meta("modeler/project").map(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
-        let note = match &client {
+        // Bookkeeping is queued, not awaited one by one: the app loop drains
+        // the whole queue in one frame, so begin_call, the tool's own work
+        // and end_call run together (each await used to cost a frame).
+        let note_rx = match &client {
             Some(c) => {
                 let (c, pin) = (c.clone(), pin.clone());
-                self.exec(move |s| s.begin_call(Some(&c), pin.as_deref(), project))
-                    .await
-                    .flatten()
+                let (tx, rx) = oneshot::channel();
+                let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
+                    let _ = tx.send(s.begin_call(Some(&c), pin.as_deref(), project));
+                    Ok(String::new())
+                }));
+                if self.tx.send(cmd).await.is_err() {
+                    None
+                } else {
+                    Some(rx)
+                }
             }
             None => None,
         };
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let mut result = Self::tool_router().call(tcc).await;
-        if client.is_some() {
-            self.exec(|s| s.end_call()).await;
-        }
-        self.exec(|s| {
-            let closed = s.close_idle(modeler::commands::IDLE_CLOSE);
-            if !closed.is_empty() {
-                eprintln!(
-                    "closed {} idle saved document(s): {}",
-                    closed.len(),
-                    closed.join(", ")
-                );
-            }
-        })
-        .await;
+        let note = match note_rx {
+            Some(rx) => rx.await.ok().flatten(),
+            None => None,
+        };
+        let ending = client.is_some();
+        let _ = self
+            .tx
+            .send(Cmd::Exec(Box::new(move |s: &mut Session| {
+                if ending {
+                    s.end_call();
+                }
+                let closed = s.close_idle(modeler::commands::IDLE_CLOSE);
+                if !closed.is_empty() {
+                    eprintln!(
+                        "closed {} idle saved document(s): {}",
+                        closed.len(),
+                        closed.join(", ")
+                    );
+                }
+                Ok(String::new())
+            })))
+            .await;
         let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
         let error = match &result {
             Err(e) => e.message.to_string(),

@@ -36,3 +36,36 @@ impl Bridge {
         self.server_done.load(Ordering::Relaxed)
     }
 }
+
+/// Wakes the winit loop from the MCP thread, so a reactive (grid) or idle
+/// window runs the queued command at once instead of after its wait.
+pub(crate) static WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// The MCP side's command sender: every send wakes the app loop.
+#[derive(Clone)]
+pub(crate) struct CmdSender(pub(crate) mpsc::Sender<Cmd>);
+
+impl CmdSender {
+    pub(crate) async fn send(&self, cmd: Cmd) -> Result<(), mpsc::error::SendError<Cmd>> {
+        let r = self.0.send(cmd).await;
+        if let Some(w) = WAKE.get() {
+            w();
+        }
+        r
+    }
+}
+
+/// Startup: hand the winit proxy to [`WAKE`] (absent offscreen/headless,
+/// where the loop runs on a timer anyway).
+pub(crate) fn install_wake(proxy: Option<Res<bevy::winit::EventLoopProxyWrapper>>) {
+    let Some(p) = proxy else {
+        return;
+    };
+    let p = std::sync::Mutex::new((**p).clone());
+    let _ = WAKE.set(Box::new(move || {
+        if let Ok(p) = p.lock() {
+            let _ = p.send_event(bevy::winit::WinitUserEvent::WakeUp);
+        }
+    }));
+}
