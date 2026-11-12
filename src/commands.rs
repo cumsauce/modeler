@@ -278,7 +278,23 @@ pub struct Session {
     /// loaded or saved it. `save_prefab` refuses to overwrite a file that
     /// changed since (another agent or server saved it) unless forced.
     pub catalog_base: HashMap<String, u64>,
+    /// Per document: its history (node count, cursor) when it last matched
+    /// its catalog file (saved, or opened from the catalog). A document
+    /// still in that state loses nothing by closing.
+    saved_state: HashMap<String, (usize, Option<usize>)>,
+    /// Per document: when a call last worked in it (documents not touched
+    /// since this server started count from `started`).
+    touched: HashMap<String, std::time::Instant>,
+    started: std::time::Instant,
+    idle_checked: Option<std::time::Instant>,
+    /// Restored documents found to differ from their catalog file.
+    unsaved_checked: std::collections::HashSet<String>,
 }
+
+/// Saved, unchanged documents nobody has worked in for this long are closed
+/// (they reopen from the catalog on demand), so a long multi-agent session
+/// doesn't pile up hundreds of open documents.
+pub const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 #[derive(Clone, Debug, Default)]
 struct ClientView {
@@ -319,6 +335,11 @@ impl Default for Session {
             clients: HashMap::new(),
             op_authors: HashMap::new(),
             catalog_base: HashMap::new(),
+            saved_state: HashMap::new(),
+            touched: HashMap::new(),
+            started: std::time::Instant::now(),
+            idle_checked: None,
+            unsaved_checked: Default::default(),
         }
     }
 }
@@ -1717,6 +1738,10 @@ impl Session {
                                 if let Some(h) = crate::catalog::prefab_file_hash(name) {
                                     self.catalog_base.insert(crate::catalog::sanitize(name), h);
                                 }
+                                self.saved_state.insert(
+                                    name.to_string(),
+                                    (m.history.nodes.len(), m.history.current),
+                                );
                                 (m, "opened catalog entry")
                             }
                             Err(_) => (Model::named(name), "opened new empty document"),
@@ -1861,6 +1886,8 @@ impl Session {
     /// Ends a call: remembers the client's document and how much of its
     /// history it has seen.
     pub fn end_call(&mut self) {
+        self.touched
+            .insert(self.model.name.clone(), std::time::Instant::now());
         if let Some(me) = self.client.take() {
             let told_switch = self.clients.get(&me).is_some_and(|v| v.told_switch);
             self.clients.insert(
@@ -1873,6 +1900,62 @@ impl Session {
                 },
             );
         }
+    }
+
+    /// Notes that the active document matches its catalog file now (just
+    /// saved or loaded): closing it while it stays so loses nothing.
+    pub fn mark_saved(&mut self) {
+        let h = &self.model.history;
+        self.saved_state
+            .insert(self.model.name.clone(), (h.nodes.len(), h.current));
+    }
+
+    /// Closes inactive documents that are saved, unchanged since, and idle
+    /// for `idle` (checked at most once a minute). Unsaved work is never
+    /// closed. Returns the names closed.
+    pub fn close_idle(&mut self, idle: std::time::Duration) -> Vec<String> {
+        if self
+            .idle_checked
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+        {
+            return Vec::new();
+        }
+        self.idle_checked = Some(std::time::Instant::now());
+        // Documents restored from the autosave: compare with the catalog
+        // file once.
+        for m in &self.others {
+            if !self.saved_state.contains_key(&m.name) && !self.unsaved_checked.contains(&m.name) {
+                if crate::catalog::matches_prefab_file(m) {
+                    self.saved_state
+                        .insert(m.name.clone(), (m.history.nodes.len(), m.history.current));
+                } else {
+                    self.unsaved_checked.insert(m.name.clone());
+                }
+            }
+        }
+        let started = self.started;
+        let mut closed = Vec::new();
+        let (touched, saved) = (&self.touched, &self.saved_state);
+        self.others.retain(|m| {
+            let last = touched.get(&m.name).copied().unwrap_or(started);
+            let unchanged = saved
+                .get(&m.name)
+                .is_some_and(|k| *k == (m.history.nodes.len(), m.history.current));
+            if unchanged && last.elapsed() >= idle {
+                closed.push(m.name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for n in &closed {
+            crate::catalog::set_open_doc(n, None);
+            self.touched.remove(n);
+        }
+        if !closed.is_empty() {
+            self.mark_autosave(false, true, false);
+        }
+        closed
     }
 
     /// `undo`, but when the step it would revert was made by another client
@@ -1921,6 +2004,7 @@ impl Session {
             .into());
         }
         let r = crate::catalog::save_prefab(&self.model, description, tags, prompt)?;
+        self.mark_saved();
         if let Some(h) = crate::catalog::prefab_file_hash(&r.0) {
             self.catalog_base.insert(r.0.clone(), h);
         }

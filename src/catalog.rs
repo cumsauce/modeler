@@ -985,6 +985,29 @@ pub fn prefab_file_hash(name: &str) -> Option<u64> {
 }
 
 /// [`load_prefab`] from the catalog file only, ignoring open documents.
+/// Whether a model's ops and params equal its catalog file's (read as plain
+/// JSON, nothing derived): closing it loses nothing.
+pub fn matches_prefab_file(model: &Model) -> bool {
+    let Ok(dir) = catalog_dir() else {
+        return false;
+    };
+    let path = dir.join(format!("{}.json", sanitize(&model.name)));
+    let Some(file) = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return false;
+    };
+    let same = |key: &str, v: serde_json::Result<serde_json::Value>| {
+        v.ok().is_some_and(|v| {
+            file.get(key).unwrap_or(&serde_json::Value::Null) == &v
+                || (v.as_object().is_some_and(|o| o.is_empty()) && file.get(key).is_none())
+        })
+    };
+    same("ops", serde_json::to_value(&model.ops))
+        && same("params", serde_json::to_value(&model.params))
+}
+
 pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
     if !path.exists() {
@@ -1045,6 +1068,44 @@ mod tests {
     /// FRIENDSLOP_DATA_DIR is process-global, so tests that set it must not
     /// run in parallel with each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Idle documents close only when saved and unchanged since; restored
+    /// ones are compared with their catalog file.
+    #[test]
+    fn idle_saved_documents_close_and_unsaved_ones_stay() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("idle")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let box_ = |n: &str| {
+            vec![serde_json::json!({"type": "primitive", "name": n, "kind": "box", "size": 1})]
+        };
+        let mut s = crate::commands::Session::default();
+        for name in ["saved", "edited", "draft"] {
+            ok(s.scene("open", Some(name)));
+            ok(s.apply_values(None, box_("b")));
+            if name != "draft" {
+                s.save_prefab_checked("x", &[], "x", false)
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        ok(s.scene("switch", Some("edited")));
+        ok(s.apply_values(None, box_("c")));
+        ok(s.scene("open", Some("other")));
+        // A restored copy of `saved`: no saved state, but equal to its file.
+        let restored = s.others.iter().find(|m| m.name == "saved").cloned();
+        let closed = s.close_idle(std::time::Duration::ZERO);
+        assert_eq!(closed, vec!["saved".to_string()]);
+        let mut fresh = crate::commands::Session::default();
+        fresh.others.extend(restored);
+        assert_eq!(
+            fresh.close_idle(std::time::Duration::ZERO),
+            vec!["saved".to_string()]
+        );
+        // Reopening it comes back from the catalog.
+        ok(s.scene("open", Some("saved")));
+        assert!(s.model.part("b").is_some());
+    }
 
     /// Two agents sharing one server: each keeps its document, edits are
     /// credited, undo won't revert the other's step unasked, and a prefab

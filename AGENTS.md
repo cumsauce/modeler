@@ -1070,6 +1070,12 @@ items that read tokens (`@color`, presets) follow. The inactive docs
 autosave to `open_docs.json` and come back with `--restore`; the preview window
 shows tabs for open docs (click to switch).
 
+Saved documents nobody has touched for 20 minutes are **closed
+automatically** (`IDLE_CLOSE`): only when unchanged since they were saved or
+opened from the catalog (restored ones are compared with their file), so no
+work is lost; opening one again loads it from the catalog. Unsaved
+documents stay open.
+
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`
 (omit the optionals to consume a spot the human clicked; `material` + optional `node`
 comments on a procedural material or one of its nodes; humans also comment on
@@ -1353,9 +1359,16 @@ start; the keys toggle them):
 - **S**, the style pane, under the outliner (`preview/style_pane.rs`): the
   model's tokens, read-only: the brief, colour chips with hex, material
   presets, numbers and defaults. It follows every `style` call.
-- **G**, the grid (`preview/grid.rs`, `MODELER_GRID=1` at start): every
-  open document (up to 9) side by side in the 3D area, so a human can watch
-  several agents build at once. Each tile is labelled with the document,
+- **G**, the grid (`preview/grid.rs`), **on by default** in the window
+  (`MODELER_GRID=0` starts without; never offscreen): the 9 most recently
+  changed open documents side by side, so a human can watch several agents
+  build at once. Slots are steady: a shown document keeps its tile however
+  often it changes, one not shown takes the front slot when it changes and
+  the stalest tile drops off; a line says how many more are open. The
+  window's own scene is not rebuilt while the grid covers it (parallel
+  agents switch the active document on nearly every call). The tab strip
+  (grid off) follows the same order, as many tabs as fit, then `+N more`
+  (opens the grid). Each tile is labelled with the document,
   its visible part count, the agent that made its latest step (`by
   <client>`) and when it last changed; "(active)" marks the active one.
   Click a tile to switch to that document and leave the grid. Cheap by

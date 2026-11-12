@@ -704,6 +704,7 @@ Style::default()
             model.version = s.model.version + 1;
             // The prefab brings its own history tree (its saved story).
             s.model = model;
+            s.mark_saved();
             Ok(format!("loaded prefab `{name}`\n{}", s.load_brief()))
         })
         .await
@@ -1597,6 +1598,17 @@ impl rmcp::ServerHandler for Tools {
         if client.is_some() {
             self.exec(|s| s.end_call()).await;
         }
+        self.exec(|s| {
+            let closed = s.close_idle(modeler::commands::IDLE_CLOSE);
+            if !closed.is_empty() {
+                eprintln!(
+                    "closed {} idle saved document(s): {}",
+                    closed.len(),
+                    closed.join(", ")
+                );
+            }
+        })
+        .await;
         let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
         let error = match &result {
             Err(e) => e.message.to_string(),

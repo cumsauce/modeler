@@ -12,6 +12,12 @@
 //! or SSAO, and their light casts no shadows.
 //!
 //! Click a tile to make that document active and leave the grid.
+//!
+//! On by default. The tiles show the most recently changed documents
+//! ([`Recency`]), and steadily: a shown document keeps its slot however
+//! often it changes; one that isn't shown takes the front slot when it
+//! changes, and the stalest tile drops off the end. With parallel agents
+//! each keeps its tile instead of the view jumping between their documents.
 
 use std::time::Instant;
 
@@ -35,8 +41,81 @@ pub(crate) struct Grid {
     tiles: Vec<Tile>,
 }
 
+/// Every open document, most recently changed first, and the grid's steady
+/// slots (shared with the tab strip).
+#[derive(Resource, Default)]
+pub(crate) struct Recency {
+    /// History (node count, cursor) last seen per document: a change in it
+    /// is an edit, undo or jump (switching documents doesn't count).
+    keys: std::collections::HashMap<String, (usize, Option<usize>)>,
+    /// When each document last changed while the window watched.
+    pub(crate) changed: std::collections::HashMap<String, Instant>,
+    /// All open documents, most recently changed first.
+    pub(crate) order: Vec<String>,
+    /// At most [`MAX_TILES`], steady (see the module docs).
+    pub(crate) slots: Vec<String>,
+    started: bool,
+}
+
+pub(crate) fn track_recency(modeler: Res<Modeler>, mut r: ResMut<Recency>) {
+    let s = &modeler.session;
+    // The active document, then the others most recently switched away
+    // from first: the starting order before any change is seen.
+    let docs: Vec<&modeler::Model> = std::iter::once(&s.model)
+        .chain(s.others.iter().rev())
+        .collect();
+    if r.order.len() != docs.len() || !r.started {
+        let names: std::collections::HashSet<&str> = docs.iter().map(|m| m.name.as_str()).collect();
+        r.order.retain(|n| names.contains(n.as_str()));
+        r.slots.retain(|n| names.contains(n.as_str()));
+        r.keys.retain(|n, _| names.contains(n.as_str()));
+        r.changed.retain(|n, _| names.contains(n.as_str()));
+    }
+    let started = r.started;
+    for m in docs {
+        let key = (m.history.nodes.len(), m.history.current);
+        let front = match r.keys.get(&m.name) {
+            None => {
+                r.keys.insert(m.name.clone(), key);
+                // New since startup (an agent opened it): to the front.
+                if !started {
+                    r.order.push(m.name.clone());
+                    false
+                } else {
+                    true
+                }
+            }
+            Some(k) if *k != key => {
+                r.keys.insert(m.name.clone(), key);
+                true
+            }
+            _ => false,
+        };
+        if front {
+            r.changed.insert(m.name.clone(), Instant::now());
+            r.order.retain(|n| *n != m.name);
+            r.order.insert(0, m.name.clone());
+            if !r.slots.contains(&m.name) {
+                r.slots.insert(0, m.name.clone());
+                r.slots.truncate(MAX_TILES);
+            }
+        }
+    }
+    r.started = true;
+    if r.slots.len() < MAX_TILES {
+        let missing: Vec<String> = r
+            .order
+            .iter()
+            .filter(|n| !r.slots.contains(n))
+            .take(MAX_TILES - r.slots.len())
+            .cloned()
+            .collect();
+        r.slots.extend(missing);
+    }
+}
+
 impl Grid {
-    /// Off at start unless MODELER_GRID=1.
+    /// On at start unless MODELER_GRID=0.
     pub(crate) fn open(on: bool) -> Self {
         Grid {
             on,
@@ -57,7 +136,8 @@ struct Tile {
     built: Option<(u64, usize)>,
     parts: Vec<Entity>,
     frames_left: u32,
-    changed_at: Instant,
+    /// When it last changed while the window watched (None: not yet).
+    changed_at: Option<Instant>,
     parts_n: usize,
     author: Option<String>,
     /// Where the tile camera should be (applied once the camera exists:
@@ -122,6 +202,8 @@ pub(crate) fn update_grid(
     mut nodes: Query<(&mut Node, &mut ImageNode), With<GridTileNode>>,
     mut texts: Query<(&mut Text, &mut Node), Without<GridTileNode>>,
     mut label_tick: Local<Option<Instant>>,
+    recency: Res<Recency>,
+    mut more: Local<Option<Entity>>,
     winit: Option<ResMut<bevy::winit::WinitSettings>>,
 ) {
     // While the grid is up nothing animates (tiles render only on change),
@@ -146,6 +228,9 @@ pub(crate) fn update_grid(
             for t in grid.tiles.drain(..) {
                 despawn_tile(&mut commands, &t);
             }
+        }
+        if let Some(e) = more.take() {
+            commands.entity(e).despawn();
         }
         if !main.is_active {
             main.is_active = true;
@@ -175,11 +260,8 @@ pub(crate) fn update_grid(
     };
     let sf = windows.single().map(|w| w.scale_factor()).unwrap_or(1.0);
     let s = &mut modeler.session;
-    let names: Vec<String> = {
-        let mut n = s.doc_names();
-        n.truncate(MAX_TILES);
-        n
-    };
+    let names: Vec<String> = recency.slots.clone();
+    let total = recency.order.len();
     // Drop tiles of closed documents.
     let mut keep = Vec::new();
     for t in grid.tiles.drain(..) {
@@ -202,6 +284,52 @@ pub(crate) fn update_grid(
     let refresh_labels = label_tick.is_none_or(|t| t.elapsed().as_millis() >= 500);
     if refresh_labels {
         *label_tick = Some(Instant::now());
+    }
+    // How many are open beyond the tiles, over the grid's top-left corner.
+    let note = (total > names.len()).then(|| {
+        format!(
+            "{} of {total} open documents, most recently changed first (O lists them all)",
+            names.len()
+        )
+    });
+    match (&note, *more) {
+        (Some(t), None) => {
+            *more = Some(
+                commands
+                    .spawn((
+                        Name::new("grid more"),
+                        Text::new(t.clone()),
+                        ui_text(&assets, 13.0, false),
+                        ui_color(false),
+                        TextLayout::no_wrap(),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(r.min.x + GAP + 2.0),
+                            top: Val::Px(r.min.y - 28.0),
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                        GlobalZIndex(1),
+                    ))
+                    .id(),
+            );
+        }
+        (Some(t), Some(e)) if refresh_labels => {
+            if let Ok((mut text, mut node)) = texts.get_mut(e) {
+                if text.0 != *t {
+                    text.0 = t.clone();
+                }
+                let want = (Val::Px(r.min.x + GAP + 2.0), Val::Px(r.min.y - 28.0));
+                if (node.left, node.top) != want {
+                    (node.left, node.top) = want;
+                }
+            }
+        }
+        (None, Some(e)) => {
+            commands.entity(e).despawn();
+            *more = None;
+        }
+        _ => {}
     }
     for (i, name) in names.iter().enumerate() {
         let model: &modeler::Model = if *name == s.model.name {
@@ -307,7 +435,7 @@ pub(crate) fn update_grid(
                     built: None,
                     parts: Vec::new(),
                     frames_left: SETTLE_FRAMES,
-                    changed_at: Instant::now(),
+                    changed_at: None,
                     parts_n: 0,
                     author: None,
                     view: Transform::default(),
@@ -316,6 +444,11 @@ pub(crate) fn update_grid(
             }
         };
         let tile = &mut grid.tiles[idx];
+        if tile.built.is_none()
+            && let Some(t) = recency.changed.get(name)
+        {
+            tile.changed_at = Some(*t);
+        }
         // Place the image and its label.
         if let Ok((mut node, mut img)) = nodes.get_mut(tile.node) {
             let want = (
@@ -343,7 +476,10 @@ pub(crate) fn update_grid(
             let first = tile.built.is_none();
             tile.built = Some(key);
             if !first {
-                tile.changed_at = Instant::now();
+                tile.changed_at = Some(Instant::now());
+            }
+            if let Some(t) = recency.changed.get(name) {
+                tile.changed_at = Some(*t);
             }
             tile.author = model
                 .history
@@ -357,7 +493,7 @@ pub(crate) fn update_grid(
             // only its ops: derive its parts on a copy.
             let derived;
             let model = if model.parts.is_empty() && !model.ops.is_empty() {
-                let mut m = model.clone();
+                let mut m = model.clone_without_history();
                 let _ = m.refresh();
                 derived = m;
                 &derived
@@ -409,17 +545,19 @@ pub(crate) fn update_grid(
             && let Ok((mut text, mut node)) = texts.get_mut(tile.label)
         {
             {
-                let active = *name == s.model.name;
                 let by = tile
                     .author
                     .as_deref()
                     .map(|a| format!(" · by {a}"))
                     .unwrap_or_default();
+                let when = tile
+                    .changed_at
+                    .map(|t| format!(" · {}", ago(t)))
+                    .unwrap_or_default();
+                let n = tile.parts_n;
                 let t = format!(
-                    "{name}{} · {} parts{by} · {}",
-                    if active { " (active)" } else { "" },
-                    tile.parts_n,
-                    ago(tile.changed_at)
+                    "{name} · {n} part{}{by}{when}",
+                    if n == 1 { "" } else { "s" }
                 );
                 if text.0 != t {
                     text.0 = t;

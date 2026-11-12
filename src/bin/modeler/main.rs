@@ -237,17 +237,20 @@ fn main() -> AppExit {
     ))
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
-    // Every pane starts closed (just the 3D view) unless set to 1; O, S, M
-    // and G (the grid of open documents) toggle them.
+    // Every pane starts closed unless set to 1; O, S, M and G (the grid of
+    // open documents, open by default) toggle them.
     .insert_resource(MatPane::open(
         std::env::var("MODELER_MATERIALS").is_ok_and(|v| v == "1"),
     ))
     .insert_resource(OutlinePane::open(
         std::env::var("MODELER_OUTLINE").is_ok_and(|v| v == "1"),
     ))
+    // The grid is the default view in the window (not offscreen, where
+    // `screenshot` renders the window camera); MODELER_GRID=0 starts without.
     .insert_resource(Grid::open(
-        std::env::var("MODELER_GRID").is_ok_and(|v| v == "1"),
+        !offscreen && std::env::var("MODELER_GRID").map_or(true, |v| v != "0"),
     ))
+    .init_resource::<Recency>()
     .init_resource::<PinTyping>()
     .init_resource::<Playback>()
     .init_resource::<CommentBox>()
@@ -259,7 +262,10 @@ fn main() -> AppExit {
             quit_when_server_done(headless || offscreen),
             autosave_tick,
             take_screenshot.run_if(windowed),
-            rebuild_scene.run_if(windowed),
+            // The grid covers the window's own view: rebuild it only when
+            // it shows (parallel agents switch the active document per call).
+            track_recency.run_if(windowed),
+            rebuild_scene.run_if(windowed).run_if(grid_off),
             (playback_keys, play_animation)
                 .chain()
                 .after(rebuild_scene)

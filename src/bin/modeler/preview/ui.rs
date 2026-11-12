@@ -292,7 +292,10 @@ pub(crate) fn sync_toolbar(
 }
 
 /// The open-document tabs over the 3D view's top-left corner (shown only
-/// when more than one document is open). Rebuilt when the open set changes.
+/// when more than one document is open and the grid is off). They follow
+/// the grid's steady recent-first slots, as many as fit the width (the
+/// active document always among them), then a `+N` button that opens the
+/// grid. Rebuilt only when what they show changes.
 #[derive(Component)]
 pub(crate) struct DocTabs;
 
@@ -300,15 +303,31 @@ pub(crate) struct DocTabs;
 #[derive(Component)]
 pub(crate) struct DocTab(pub(crate) String);
 
+/// The `+N more` tab: opens the grid.
+#[derive(Component)]
+pub(crate) struct MoreTab;
+
+/// Rough width of a tab with this caption (13 px Fira, padding, gap).
+fn tab_width(name: &str) -> f32 {
+    name.chars().count() as f32 * 7.4 + 30.0
+}
+
 pub(crate) fn sync_doc_tabs(
     mut commands: Commands,
     modeler: Res<Modeler>,
     view: Option<Res<View3d>>,
     grid: Option<Res<Grid>>,
+    recency: Option<Res<Recency>>,
     mut bars: Query<(Entity, &mut Node), With<DocTabs>>,
     mut shown: Local<Vec<String>>,
 ) {
-    let left = view.map(|v| v.rect.min.x + 8.0).unwrap_or(8.0);
+    let left = view.as_ref().map(|v| v.rect.min.x + 8.0).unwrap_or(8.0);
+    // Leave room for the toolbar at the top right.
+    let room = view
+        .as_ref()
+        .map(|v| v.rect.width() - 16.0 - 330.0)
+        .unwrap_or(600.0)
+        .max(160.0);
     // The grid labels every document itself.
     let display = if grid.is_some_and(|g| g.on) {
         Display::None
@@ -323,18 +342,53 @@ pub(crate) fn sync_doc_tabs(
             node.display = display;
         }
     }
-    let names = modeler.session.doc_names();
-    let mut key = names.clone();
-    key.sort();
-    key.push(names[0].clone());
-    if *shown == key {
+    let active = modeler.session.model.name.clone();
+    let total = modeler.session.others.len() + 1;
+    let candidates: Vec<String> = match &recency {
+        Some(r) if !r.slots.is_empty() => r
+            .slots
+            .iter()
+            .chain(r.order.iter().filter(|n| !r.slots.contains(n)))
+            .cloned()
+            .collect(),
+        _ => modeler.session.doc_names(),
+    };
+    let more_w = tab_width("+999 more");
+    let mut tabs: Vec<String> = Vec::new();
+    let mut used = tab_width(&active) + 8.0;
+    for n in &candidates {
+        if *n == active {
+            continue;
+        }
+        let w = tab_width(n);
+        if used + w + more_w > room {
+            break;
+        }
+        used += w;
+        tabs.push(n.clone());
+    }
+    // The active document in its slot order (first if it has none shown).
+    let at = candidates
+        .iter()
+        .filter(|n| **n == active || tabs.contains(n))
+        .position(|n| *n == active)
+        .unwrap_or(0);
+    tabs.insert(at.min(tabs.len()), active.clone());
+    let hidden = total.saturating_sub(tabs.len());
+    let mut key = tabs.clone();
+    key.push(active.clone());
+    key.push(hidden.to_string());
+    if total < 2 {
+        key.clear();
+    }
+    if *shown == key && (total < 2 || !bars.is_empty()) {
         return;
     }
     *shown = key;
     for (b, _) in &bars {
         commands.entity(b).despawn();
     }
-    if names.len() < 2 {
+    if total < 2 {
         return;
     }
     let bar = commands
@@ -345,6 +399,7 @@ pub(crate) fn sync_doc_tabs(
                 position_type: PositionType::Absolute,
                 top: Val::Px(8.0),
                 left: Val::Px(left),
+                display,
                 flex_direction: FlexDirection::Row,
                 column_gap: Val::Px(4.0),
                 padding: UiRect::all(Val::Px(4.0)),
@@ -355,21 +410,35 @@ pub(crate) fn sync_doc_tabs(
             GlobalZIndex(3),
         ))
         .id();
-    let mut sorted = names.clone();
-    sorted.sort();
-    for name in sorted {
-        let active = name == names[0];
+    for name in tabs {
+        let is_active = name == active;
         let label = name.clone();
         commands
             .spawn_scene(bsn! {
                 @FeathersToolButton {
-                    @variant: ButtonVariant::selected(active),
+                    @variant: ButtonVariant::selected(is_active),
                     @caption: bsn! { @caption(label) }
                 }
             })
             .insert((DocTab(name), ChildOf(bar)))
             .observe(on_doc_tab);
     }
+    if hidden > 0 {
+        let label = format!("+{hidden} more");
+        commands
+            .spawn_scene(bsn! {
+                @FeathersToolButton {
+                    @variant: ButtonVariant::selected(false),
+                    @caption: bsn! { @caption(label) }
+                }
+            })
+            .insert((MoreTab, ChildOf(bar)))
+            .observe(on_more_tab);
+    }
+}
+
+fn on_more_tab(_: On<Activate>, mut grid: ResMut<Grid>) {
+    grid.on = true;
 }
 
 fn on_doc_tab(activate: On<Activate>, tabs: Query<&DocTab>, mut modeler: ResMut<Modeler>) {
