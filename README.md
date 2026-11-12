@@ -28,7 +28,7 @@ one server and one preview window:
 
 The first session starts the shared daemon (windowed); later sessions join
 it, whatever project they are in: one window shows every agent's work, its
-outliner lists the open documents grouped by project, and a new agent
+document list groups the open documents by project, and a new agent
 brings it to the front. A restart reopens only unsaved documents. Pointing the config at `target/debug/modeler` instead gives each session
 its own server and window.
 
@@ -104,10 +104,13 @@ modeler --offscreen
 
 ## Preview window controls
 
-The window opens on just the 3D view. Mouse drag orbits / pans, scroll
-zooms; `O` toggles the outliner, `S` the style pane, `M` the material pane
-(the active material's nodes with live thumbnails and a lit preview), and
-`G` the grid: every open document side by side, labelled with the agent
-that last changed it, so you can watch several agents at once (click a
-tile to switch to it). Click a part then type to annotate (Enter commits,
-Esc cancels).
+The window opens on All documents: every open document side by side,
+grouped by project, labelled with the agent that last changed it, with an
+agent feed beside them (click a tile to open it; `G` comes back). The top
+bar switches documents (search with ⌘K) and modes: `1` Model, `2`
+Material (the node graph with a lit preview), `3` Animate (a timeline;
+Space plays), `4` Map (fly with WASD, a minimap). Left-drag orbits,
+middle-drag pans, right-drag looks around and flies with WASD, scroll
+zooms. Click a part to select it (its properties and comments open on the
+right); `C` opens comments, and a click then pins a spot to comment on
+(Enter commits, Esc cancels).
