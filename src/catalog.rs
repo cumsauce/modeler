@@ -1614,7 +1614,7 @@ mod tests {
         ));
         s.save_prefab_checked("x", &[], "x", false)
             .unwrap_or_else(|e| panic!("{e}"));
-        s.end_call();
+        s.end_call(Some("A"));
         assert_eq!(s.model.project, Some(a.clone()));
         assert!(a.join(".modeler/prefabs/crate.json").is_file());
         assert!(!b.join(".modeler/prefabs/crate.json").exists());
@@ -1628,15 +1628,15 @@ mod tests {
                 .is_err_and(|e| e.to_string().contains("game_a")),
             "{clash:?}"
         );
-        s.end_call();
+        s.end_call(Some("B"));
         // B starting a model while A's document is in front keeps A's open.
         s.begin_call(Some("A"), None, Some(Some(a.clone())));
         assert_eq!(s.model.name, "crate");
-        s.end_call();
+        s.end_call(Some("A"));
         s.begin_call(Some("B"), None, Some(Some(b.clone())));
         ok(s.new_model("b_doc"));
         assert!(s.others.iter().any(|m| m.name == "crate"));
-        s.end_call();
+        s.end_call(Some("B"));
         assert_eq!(s.model.project, Some(b.clone()));
         let _ = fs::remove_dir_all(&root);
     }
@@ -1659,17 +1659,17 @@ mod tests {
         ok(s.scene("open", Some("shed")));
         ok(s.apply_values(None, box_("wall", 1.0)));
         ok(s.save_prefab_checked("d", &[], "p", false).map(|r| r.0));
-        s.end_call();
+        s.end_call(Some("A"));
         // B works elsewhere.
         s.begin_call(Some("B"), None, None);
         ok(s.scene("open", Some("cart")));
         ok(s.apply_values(None, box_("bed", 1.0)));
-        s.end_call();
+        s.end_call(Some("B"));
         // A is put back on its own doc.
         let note = s.begin_call(Some("A"), None, None).unwrap_or_default();
         assert_eq!(s.model.name, "shed");
         assert!(note.contains("switched back to your `shed`"), "{note}");
-        s.end_call();
+        s.end_call(Some("A"));
         // B edits A's doc (pinned), replacing A's op: warned.
         s.begin_call(Some("B"), Some("shed"), None);
         let out = ok(s.apply_values(None, box_("wall", 2.0)));
@@ -1677,7 +1677,7 @@ mod tests {
             out.contains("another agent wrote") && out.contains("(by A)"),
             "{out}"
         );
-        s.end_call();
+        s.end_call(Some("B"));
         // A hears about it, and its undo is refused until forced.
         let note = s.begin_call(Some("A"), None, None).unwrap_or_default();
         assert!(note.contains("B made 1 edit"), "{note}");
@@ -1695,7 +1695,7 @@ mod tests {
             .map_err(|e| e.to_string());
         assert!(e.is_err_and(|e| e.contains("changed since you loaded")));
         ok(s.save_prefab_checked("d", &[], "p", true).map(|r| r.0));
-        s.end_call();
+        s.end_call(Some("A"));
     }
 
     fn temp_root(tag: &str) -> PathBuf {

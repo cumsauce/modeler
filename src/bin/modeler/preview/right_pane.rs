@@ -123,7 +123,7 @@ fn update_right_pane(
         doc: model.name.clone(),
         version: model.version,
         annotations: model.annotations.len(),
-        resolved: model.annotations.iter().filter(|a| !a.is_open()).count(),
+        resolved: modeler.session.annotation_rev as usize,
         box_open: cb.is_open(),
     };
     if pane.shown.as_ref() == Some(&key) {

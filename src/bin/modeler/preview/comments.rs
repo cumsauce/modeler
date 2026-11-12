@@ -185,6 +185,11 @@ pub(crate) fn comment_box(
         }
     }
     let now = time.elapsed_secs_f64();
+    // While an agent's call has its own document active, a comment would
+    // land there: hold the submit until the call ends.
+    if cb.action == Some(Action::Submit) && modeler.session.viewer_away() {
+        return;
+    }
     match cb.action.take() {
         Some(Action::Cancel) => {
             if matches!(cb.target, Some(CommentTarget::Spot(_))) {

@@ -134,7 +134,7 @@ pub(crate) fn sync_pins(
         (
             model.version,
             model.annotations.len(),
-            model.annotations.iter().filter(|a| !a.is_open()).count(),
+            modeler.session.annotation_rev as usize,
             model.name.clone(),
         )
     });

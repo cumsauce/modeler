@@ -271,6 +271,13 @@ pub struct Session {
     /// `None` until the human picks one: the window then shows whatever the
     /// last call worked on.
     pub viewer_doc: Option<String>,
+    /// Agent calls begun and not yet ended (calls overlap while one
+    /// renders), and the document each in-flight client works in.
+    in_flight: usize,
+    call_doc: HashMap<String, String>,
+    /// Bumped by every comment edit (they don't bump the model version), so
+    /// the window redraws its comments and pins.
+    pub annotation_rev: u64,
     /// Autosaves waiting to be written (see [`Session::flush_autosave`]).
     pub autosave_due: AutosaveDue,
     /// How much of the history the autosave journal already holds.
@@ -386,6 +393,9 @@ impl Default for Session {
             others: Vec::new(),
             parked: Vec::new(),
             viewer_doc: None,
+            in_flight: 0,
+            call_doc: HashMap::new(),
+            annotation_rev: 0,
             autosave_due: AutosaveDue::default(),
             journal: Default::default(),
             client: None,
@@ -1782,22 +1792,62 @@ impl Session {
     /// The active document is `self.model`; the rest wait in `others`, each
     /// with its own history, and are visible to prefab instances by name.
     pub fn scene(&mut self, action: &str, name: Option<&str>) -> CmdResult {
-        let r = self.scene_impl(action, name);
-        // The window (no client) picking a document: it stays on it.
-        if r.is_ok() && self.client.is_none() && matches!(action, "switch" | "open" | "restore") {
-            self.viewer_doc = Some(self.model.name.clone());
-        }
-        r
+        self.scene_impl(action, name)
     }
 
-    /// True while an agent's call has another document active than the one
-    /// the human is looking at: the window keeps showing what it showed.
+    /// `scene` from the human's window: the document it switches to, opens
+    /// or restores becomes the one the window stays on. While agent calls
+    /// are in flight their document stays active (the window catches up
+    /// when they end), and the document an agent is working in can't be
+    /// closed under it.
+    pub fn window_scene(&mut self, action: &str, name: Option<&str>) -> CmdResult {
+        let busy = self.in_flight > 0;
+        let prev = self.model.name.clone();
+        if busy && action == "close" && name.is_none_or(|n| n == prev) {
+            return Err(
+                format!("an agent is working in `{prev}` right now; close it in a moment").into(),
+            );
+        }
+        if busy && action == "switch" {
+            let n = name.ok_or("scene switch: needs a name")?;
+            if n != prev && !self.others.iter().any(|m| m.name == n) {
+                return Err(format!("no open document `{n}`").into());
+            }
+            self.viewer_doc = Some(n.to_string());
+            return Ok(format!("showing `{n}`"));
+        }
+        let r = self.scene_impl(action, name)?;
+        match action {
+            "switch" | "open" | "restore" => self.viewer_doc = Some(self.model.name.clone()),
+            "close" if self.viewer_doc.as_deref() == Some(name.unwrap_or(prev.as_str())) => {
+                self.viewer_doc = None;
+            }
+            _ => {}
+        }
+        // Give the agent its document back until its calls end.
+        if busy && self.model.name != prev && self.others.iter().any(|m| m.name == prev) {
+            let _ = self.scene_impl("switch", Some(&prev));
+        }
+        Ok(r)
+    }
+
+    /// True while agent calls are in flight on another document than the
+    /// one the human is looking at: the window keeps showing what it showed
+    /// and holds anything it would write.
     pub fn viewer_away(&self) -> bool {
-        self.client.is_some()
+        self.in_flight > 0
             && self
                 .viewer_doc
                 .as_ref()
                 .is_some_and(|v| *v != self.model.name)
+    }
+
+    /// The active document was renamed (set_model_name): a window on it
+    /// follows the new name.
+    pub fn renamed_active(&mut self, old: &str) {
+        if self.viewer_doc.as_deref() == Some(old) {
+            self.viewer_doc = Some(self.model.name.clone());
+        }
     }
 
     fn scene_impl(&mut self, action: &str, name: Option<&str>) -> CmdResult {
@@ -2005,6 +2055,7 @@ impl Session {
         }
         self.derive_if_bare();
         let me = client?;
+        self.in_flight += 1;
         if !self.clients.contains_key(me) {
             // Raise the window for a new agent, unless the human is
             // already working in it.
@@ -2087,30 +2138,58 @@ impl Session {
                 ));
             }
         }
+        self.call_doc
+            .insert(me.to_string(), self.model.name.clone());
         (!notes.is_empty()).then(|| notes.join("\n"))
     }
 
     /// Ends a call: remembers the client's document and how much of its
     /// history it has seen.
-    pub fn end_call(&mut self) {
+    pub fn end_call(&mut self, client: Option<&str>) {
         if let Some(p) = crate::catalog::set_call_project(None) {
             self.model.project = p;
         }
         self.touched
             .insert(self.model.name.clone(), std::time::Instant::now());
-        if let Some(me) = self.client.take() {
+        if let Some(me) = client.map(String::from) {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            // Calls overlap: another client may have the active document
+            // now; this one's is where its call worked.
+            let mine = self.client.as_deref() == Some(me.as_str());
+            if mine {
+                self.client = None;
+            }
+            let doc = if mine {
+                self.model.name.clone()
+            } else {
+                self.call_doc
+                    .get(&me)
+                    .cloned()
+                    .unwrap_or_else(|| self.model.name.clone())
+            };
+            self.call_doc.remove(&me);
             let told_switch = self.clients.get(&me).is_some_and(|v| v.told_switch);
+            let (seen_nodes, seen_cursor) = if doc == self.model.name {
+                (self.model.history.nodes.len(), self.model.history.current)
+            } else {
+                self.others
+                    .iter()
+                    .find(|m| m.name == doc)
+                    .map(|m| (m.history.nodes.len(), m.history.current))
+                    .unwrap_or((0, None))
+            };
             self.clients.insert(
                 me,
                 ClientView {
-                    doc: self.model.name.clone(),
+                    doc,
                     told_switch,
-                    seen_nodes: self.model.history.nodes.len(),
-                    seen_cursor: self.model.history.current,
+                    seen_nodes,
+                    seen_cursor,
                 },
             );
-            // Back to the human's document, quietly.
-            if let Some(v) = self.viewer_doc.clone()
+            // Back to the human's document, quietly, once no call is left.
+            if self.in_flight == 0
+                && let Some(v) = self.viewer_doc.clone()
                 && v != self.model.name
             {
                 if self.others.iter().any(|m| m.name == v) {
@@ -3758,6 +3837,7 @@ impl Session {
         vertex: Option<u32>,
         position: Option<[f32; 3]>,
     ) -> CmdResult {
+        self.annotation_rev += 1;
         let (part, face, vertex, position) = if face.is_none()
             && vertex.is_none()
             && position.is_none()
@@ -3795,6 +3875,7 @@ impl Session {
     /// Comment on an outliner group or a material (node). Group comments sit
     /// at the group's centre; material comments have no position.
     pub fn annotate(&mut self, target: &crate::AnnotationTarget, text: &str) -> CmdResult {
+        self.annotation_rev += 1;
         use crate::AnnotationTarget as T;
         let (part, group, material, node, position) = match target {
             T::Part(p) => return self.add_annotation(p, text, None, None, None),
@@ -3890,6 +3971,7 @@ impl Session {
 
     /// Mark a comment resolved with a reply (`reopen`: open it again).
     pub fn resolve_annotation(&mut self, id: u32, reply: &str, reopen: bool) -> CmdResult {
+        self.annotation_rev += 1;
         let by = self.client.clone();
         let a = self
             .model
@@ -3919,6 +4001,7 @@ impl Session {
 
     /// Remove one annotation by id.
     pub fn delete_annotation(&mut self, id: u32) -> CmdResult {
+        self.annotation_rev += 1;
         let before = self.model.annotations.len();
         self.model.annotations.retain(|a| a.id != id);
         if self.model.annotations.len() == before {
@@ -4118,22 +4201,33 @@ mod tests {
     #[test]
     fn an_agent_call_leaves_the_human_on_their_document() {
         let mut s = Session::default();
-        s.scene("open", Some("agents_doc"))
+        s.window_scene("open", Some("agents_doc"))
             .unwrap_or_else(|e| panic!("{e}"));
-        s.scene("open", Some("humans_doc"))
+        s.window_scene("open", Some("humans_doc"))
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s.viewer_doc.as_deref(), Some("humans_doc"));
         s.begin_call(Some("agent"), Some("agents_doc"), None);
         assert_eq!(s.model.name, "agents_doc");
         assert!(s.viewer_away());
-        s.end_call();
+        s.end_call(Some("agent"));
         assert_eq!(s.model.name, "humans_doc");
         assert!(!s.viewer_away());
         // The agent's next call is back on its own document.
         s.begin_call(Some("agent"), None, None);
         assert_eq!(s.model.name, "agents_doc");
-        s.end_call();
+        s.end_call(Some("agent"));
         assert_eq!(s.model.name, "humans_doc");
+        // Two overlapping calls: back to the human's only after both, and
+        // the window's switch mid-call waits for them.
+        s.begin_call(Some("agent"), None, None);
+        s.begin_call(Some("other"), Some("agents_doc"), None);
+        s.window_scene("switch", Some("agents_doc"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.end_call(Some("agent"));
+        assert_eq!(s.model.name, "agents_doc");
+        s.end_call(Some("other"));
+        assert_eq!(s.viewer_doc.as_deref(), Some("agents_doc"));
+        assert!(!s.viewer_away());
     }
 
     #[test]

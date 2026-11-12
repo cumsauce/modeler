@@ -451,13 +451,15 @@ fn open_pick(s: &mut Session, p: &Pick) {
         if (s.model.name == p.doc || s.others.iter().any(|m| m.name == p.doc))
             && s.is_saved_doc(&p.doc)
         {
-            let _ = s.scene("close", Some(&p.doc));
+            let _ = s.window_scene("close", Some(&p.doc));
         }
-        catalog::with_project(p.project.clone(), || s.scene("restore", Some(&p.doc)))
+        catalog::with_project(p.project.clone(), || {
+            s.window_scene("restore", Some(&p.doc))
+        })
     } else if p.open {
-        s.scene("open", Some(&p.doc))
+        s.window_scene("open", Some(&p.doc))
     } else {
-        catalog::with_project(p.project.clone(), || s.scene("open", Some(&p.doc)))
+        catalog::with_project(p.project.clone(), || s.window_scene("open", Some(&p.doc)))
     };
     match r {
         Ok(_) => s.mark_autosave(true, true, false),

@@ -1426,7 +1426,7 @@ fn despawn_tile(commands: &mut Commands, t: &Tile) {
 fn switch_to(modeler: &mut Modeler, name: &str) {
     let s = &mut modeler.session;
     if s.model.name != name {
-        match s.scene("switch", Some(name)) {
+        match s.window_scene("switch", Some(name)) {
             Ok(_) => s.mark_autosave(true, true, false),
             Err(e) => eprintln!("switching document: {e}"),
         }
@@ -1514,7 +1514,7 @@ fn on_confirm(
 
 fn close_doc(modeler: &mut Modeler, name: &str) {
     let s = &mut modeler.session;
-    match s.scene("close", Some(name)) {
+    match s.window_scene("close", Some(name)) {
         Ok(_) => s.mark_autosave(true, true, false),
         Err(e) => eprintln!("closing document: {e}"),
     }

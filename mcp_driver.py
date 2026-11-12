@@ -426,6 +426,15 @@ def daemon_mode(socket_path, mode):
         it has exited (killed, crashed, rebuilt, window closed): autosave
         restores the session. Returns (session, note or None)."""
         session = state["session"]
+        if session.proc.poll() is None and getattr(session, "_closed", False):
+            # Its output is closed but it is still shutting down (a Bevy app
+            # takes a few seconds after SIGTERM): wait for it rather than
+            # failing every call until it is gone.
+            try:
+                session.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                session.proc.kill()
+                session.proc.wait()
         if session.proc.poll() is None:
             return session, None
         why = session.exit_reason()

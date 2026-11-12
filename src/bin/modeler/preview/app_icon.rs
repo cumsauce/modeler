@@ -50,15 +50,28 @@ pub(crate) fn app_icon_plugin(app: &mut App) {
 }
 
 /// Runs until the icon is set (the window appears a frame or two in).
-fn set_icon(_main_thread: bevy::ecs::system::NonSendMarker, mut done: Local<bool>) {
+fn set_icon(
+    _main_thread: bevy::ecs::system::NonSendMarker,
+    mut done: Local<bool>,
+    mut pixels: Local<Option<(Vec<u8>, u32, u32)>>,
+) {
     if *done {
         return;
     }
-    let Some((rgba, w, h)) = rgba() else {
-        *done = true;
-        return;
-    };
-    *done = apply(rgba, w, h);
+    // Decoded once, kept until a window takes it.
+    if pixels.is_none() {
+        *pixels = rgba();
+        if pixels.is_none() {
+            *done = true;
+            return;
+        }
+    }
+    if let Some((rgba, w, h)) = pixels.as_ref() {
+        *done = apply(rgba.clone(), *w, *h);
+    }
+    if *done {
+        *pixels = None;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -68,7 +81,7 @@ fn apply(rgba: Vec<u8>, w: u32, h: u32) -> bool {
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
     let Some(mtm) = MainThreadMarker::new() else {
-        return false;
+        return true; // not the main thread: give up rather than retry forever
     };
     // NSImage reads PNG bytes: encode the masked pixels.
     let mut bytes = Vec::new();

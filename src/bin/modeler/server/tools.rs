@@ -715,7 +715,8 @@ Style::default()
         Parameters(NameArgs { name }): Parameters<NameArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
-            s.model.name = name.clone();
+            let old = std::mem::replace(&mut s.model.name, name.clone());
+            s.renamed_active(&old);
             let mut history = std::mem::take(&mut s.model.history);
             history.record(s.model.clone(), format!("name `{name}`"));
             s.model.history = history;
@@ -1630,12 +1631,12 @@ impl rmcp::ServerHandler for Tools {
             Some(rx) => rx.await.ok().flatten(),
             None => None,
         };
-        let ending = client.is_some();
+        let ending = client.clone();
         let _ = self
             .tx
             .send(Cmd::Exec(Box::new(move |s: &mut Session| {
-                if ending {
-                    s.end_call();
+                if ending.is_some() {
+                    s.end_call(ending.as_deref());
                 }
                 let closed = s.close_idle(modeler::commands::IDLE_CLOSE);
                 if !closed.is_empty() {
