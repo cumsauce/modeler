@@ -909,7 +909,9 @@ Style::default()
     /// Open documents (scenes): several models open at once, each with its own
     /// history and style; one is active and every other tool acts on it.
     /// A prefab item naming an open document instances the live doc, and
-    /// switching back re-syncs instances. Actions: list, open, switch, close.
+    /// switching back re-syncs instances. Actions: list, open, switch, close,
+    /// restore (a restarted server parks unsaved autosaved documents instead
+    /// of reopening them: `restore` lists them, `restore` NAME opens one).
     #[tool]
     async fn scene(
         &self,

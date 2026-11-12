@@ -1128,9 +1128,15 @@ re-derives it with the scene's tokens layered over its own (scene wins;
 re-themes with `style set` on the scene); an object patches tokens for that
 instance (`{"colors": {"primary": "#c33"}}`, a red-alert variant). Only
 items that read tokens (`@color`, presets) follow. The inactive docs
-autosave to `open_docs.json`; on `--restore` only **unsaved** documents come
-back (`Session::close_saved_documents`): one that matches its catalog file
-stays closed and reopens from the catalog on demand. The window's outliner
+autosave to `open_docs.json`. On `--restore` **no document reopens by
+itself**: one that matches its catalog file is dropped
+(`Session::close_saved_documents`; it opens from the catalog on demand) and
+every unsaved one is **parked** (`Session::park_restored`, kept in
+`parked_docs.json` with its history, across further restarts) while the
+server starts on an empty document, so a restart never puts a stale copy in
+front of agents. `scene list` / `scene restore` show the parked ones,
+`scene restore` NAME opens one (refused while a document of that name is
+open: close it first), `scene close` NAME drops it. The window's outliner
 lists the open documents (click to switch).
 
 Saved documents nobody has touched for 20 minutes are **closed
@@ -1166,7 +1172,7 @@ MCP config runs) starts empty and first moves the last autosave aside to
 `session.prev.json` (+ `.prev.history.jsonl`, `open_docs.prev.json`, the
 materials' `session.prev.json`), so its edits never overwrite it; a later
 `--restore` brings the kept one back when nothing newer was written.
-`mcp_driver.py` always passes `--restore`, so daemon restarts keep the work. Each open document's history tree goes to its
+`mcp_driver.py` always passes `--restore`, so daemon restarts keep the work (parked, see Scenes). Each open document's history tree goes to its
 own append-only journal (`session.history.<doc>.jsonl`, one node per line;
 `open_docs.json` holds the inactive documents without their nodes): a save
 appends only the new nodes, and rewrites a file only after undo branches
@@ -1565,8 +1571,8 @@ domain, tile and params).
   `pkill -f target/debug/modeler` — the shared daemon (behind the MCP
   proxy) respawns the server from the binary on disk on the next tool call. The respawned session AUTOSAVES
   and RESTORES: mutations are written to `session.json` in the catalog dir
-  0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server started with `--restore` (the driver always does) restores it on startup, so
-  unnamed WIP survives restarts. `new_model` starts clean (the old model
+  0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server started with `--restore` (the driver always does) parks it on startup, so
+  unsaved WIP survives restarts (`scene restore` NAME reopens it). `new_model` starts clean (the old model
   stays one undo away, also in the autosave). `--model <path>` skips the
   restore and loads that file instead. The MCP tool list is fixed per
   connection, so newly added tools only appear in a NEW session.

@@ -167,8 +167,8 @@ fn main() -> AppExit {
         if n > 0 {
             eprintln!("reclaimed the previous autosave from {n} *.prev.* file(s)");
         }
-        // Restore the last session's autosave so unnamed WIP (ops, parts,
-        // history tree, annotations) survives a restart.
+        // Read the last session's autosave so unsaved WIP (ops, parts,
+        // history tree, annotations) survives a restart, parked below.
         if let Some(model) = catalog::load_session_state() {
             eprintln!(
                 "restored session model `{}` (v{}) from autosave",
@@ -191,9 +191,17 @@ fn main() -> AppExit {
                 closed.join(", ")
             );
         }
+        // Unsaved documents are parked, not reopened: a restart must not
+        // put stale copies in front of agents (`scene restore` brings one
+        // back on request).
+        let parked = session.park_restored();
         session.register_docs();
-        if !session.others.is_empty() {
-            eprintln!("restored {} unsaved open document(s)", session.others.len());
+        if !session.parked.is_empty() {
+            eprintln!(
+                "parked {} unsaved document(s) ({}): scene restore opens one",
+                session.parked.len(),
+                parked.join(", ")
+            );
         }
         session.materials = modeler::material::Library::restore();
         if !session.materials.docs.is_empty() {

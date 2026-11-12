@@ -671,6 +671,7 @@ fn autosave_files() -> Vec<(PathBuf, PathBuf)> {
     }
     if let Ok(d) = home_dir(Kind::Prefabs) {
         out.push(prev(d.join(autosave_file("open_docs"))));
+        out.push(prev(d.join(autosave_file("parked_docs"))));
     }
     if let Ok(d) = home_dir(Kind::Materials) {
         out.push(prev(d.join(autosave_file("session"))));
@@ -745,6 +746,51 @@ pub fn save_open_docs(docs: &mut [Model], st: &mut JournalState) -> Result<(), M
         d.history.nodes = n;
     }
     atomic_write(&dir.join(autosave_file("open_docs")), text?.as_bytes())
+}
+
+/// Autosaves the parked documents (`parked_docs.json`, see
+/// `Session::parked`) with their histories inline: a parked document's name
+/// may be reopened from the catalog meanwhile, whose journal would not
+/// match this history.
+pub fn save_parked_docs(docs: &[Model]) -> Result<(), ModelerError> {
+    let dir = home_dir(Kind::Prefabs)?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
+    let path = dir.join(autosave_file("parked_docs"));
+    if docs.is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
+    let slim: Vec<Model> = docs
+        .iter()
+        .map(|d| {
+            let mut d = d.clone();
+            if d.parts_derive_from_ops() {
+                d.parts.clear();
+            }
+            d
+        })
+        .collect();
+    let text = serde_json::to_string(&slim).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&path, text.as_bytes())
+}
+
+/// The parked documents' autosave (empty when missing or unreadable).
+pub fn load_parked_docs() -> Vec<Model> {
+    let Ok(dir) = home_dir(Kind::Prefabs) else {
+        return Vec::new();
+    };
+    let Some(text) = read_autosave(&dir, "parked_docs") else {
+        return Vec::new();
+    };
+    let docs: Vec<Model> = serde_json::from_str(&text).unwrap_or_default();
+    docs.into_iter()
+        .filter(|m| m.check_format().is_ok())
+        .map(|mut m| {
+            let _ = m.restore_parts();
+            m
+        })
+        .collect()
 }
 
 /// The autosaved inactive documents (empty when missing or unreadable).
@@ -1484,6 +1530,40 @@ mod tests {
         assert_eq!(closed, ["front", "saved"]);
         assert_eq!(fresh.model.name, "draft");
         assert!(fresh.others.is_empty());
+    }
+
+    /// A restart parks unsaved documents instead of opening them; an agent
+    /// brings one back with `scene restore`, which survives more restarts
+    /// until then.
+    #[test]
+    fn a_restart_parks_unsaved_documents_until_restored() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("park")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("draft")));
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "b", "kind": "box", "size": 1})],
+        ));
+        let mut fresh = crate::commands::Session::default();
+        fresh.model = s.model.clone();
+        fresh.others = s.others.clone();
+        fresh.close_saved_documents();
+        assert_eq!(fresh.park_restored(), ["draft"]);
+        assert_eq!(fresh.model.name, "model");
+        assert!(fresh.others.is_empty());
+        // Another restart before anyone asked: still parked.
+        let mut again = crate::commands::Session::default();
+        assert_eq!(again.park_restored(), Vec::<String>::new());
+        assert_eq!(again.parked.len(), 1);
+        let said = ok(again.scene("restore", Some("draft")));
+        assert!(said.contains("restored"), "{said}");
+        assert_eq!(again.model.name, "draft");
+        assert_eq!(again.model.ops.len(), 1);
+        assert!(again.parked.is_empty());
+        assert!(load_parked_docs().is_empty());
     }
 
     /// Calls name their project: the catalog follows it, and a document of

@@ -260,6 +260,11 @@ pub struct Session {
     batch_labels: Vec<String>,
     /// Open documents other than the active `model` (see [`Session::scene`]).
     pub others: Vec<Model>,
+    /// Unsaved documents a restarted server found in the autosave: kept
+    /// (`parked_docs.json`) but not open until an agent asks with
+    /// `scene restore`, so a restart never brings back stale copies on its
+    /// own.
+    pub parked: Vec<Model>,
     /// Autosaves waiting to be written (see [`Session::flush_autosave`]).
     pub autosave_due: AutosaveDue,
     /// How much of the history the autosave journal already holds.
@@ -370,6 +375,7 @@ impl Default for Session {
             batch_depth: 0,
             batch_labels: Vec::new(),
             others: Vec::new(),
+            parked: Vec::new(),
             autosave_due: AutosaveDue::default(),
             journal: Default::default(),
             client: None,
@@ -1803,6 +1809,9 @@ impl Session {
                 for m in &self.others {
                     s += &line(m, false);
                 }
+                if !self.parked.is_empty() {
+                    s += &self.parked_note();
+                }
                 Ok(s)
             }
             "open" | "switch" => {
@@ -1892,6 +1901,13 @@ impl Session {
                     self.derive_if_bare();
                 } else {
                     let Some(i) = self.others.iter().position(|m| m.name == name) else {
+                        if let Some(i) = self.parked.iter().position(|m| m.name == name) {
+                            self.parked.remove(i);
+                            self.save_parked();
+                            return Ok(format!(
+                                "dropped the parked autosave of `{name}` (it was not open)"
+                            ));
+                        }
                         return Err(format!("no open document `{name}`").into());
                     };
                     self.others.remove(i);
@@ -1902,9 +1918,46 @@ impl Session {
                     self.doc_names().join(", ")
                 ))
             }
-            other => {
-                Err(format!("scene: unknown action `{other}` (list, open, switch, close)").into())
+            "restore" => {
+                let Some(name) = name else {
+                    return Ok(if self.parked.is_empty() {
+                        "no parked documents: nothing unsaved was left in the autosave".into()
+                    } else {
+                        self.parked_note()
+                    });
+                };
+                let Some(i) = self.parked.iter().position(|m| m.name == name) else {
+                    return Err(format!(
+                        "no parked document `{name}` ({})",
+                        if self.parked.is_empty() {
+                            "none are parked".to_string()
+                        } else {
+                            self.parked
+                                .iter()
+                                .map(|m| m.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    )
+                    .into());
+                };
+                if self.model.name == name || self.others.iter().any(|m| m.name == name) {
+                    return Err(format!(
+                        "`{name}` is open already (from the catalog or new); close it first (scene close) to restore the autosaved copy"
+                    )
+                    .into());
+                }
+                let m = self.parked.remove(i);
+                self.save_parked();
+                let v = m.version;
+                self.others.push(m);
+                let r = self.scene("switch", Some(name))?;
+                Ok(format!("restored the autosaved `{name}` (v{v}); {r}"))
             }
+            other => Err(format!(
+                "scene: unknown action `{other}` (list, open, switch, close, restore)"
+            )
+            .into()),
         }
     }
 
@@ -2086,6 +2139,58 @@ impl Session {
             self.mark_autosave(false, true, false);
         }
         closed
+    }
+
+    /// The parked documents, one line each, with how to bring one back.
+    pub fn parked_note(&self) -> String {
+        let mut s = String::from(
+            "parked (unsaved work from before the last restart, not open; `scene restore` NAME opens one, `scene close` NAME drops it):\n",
+        );
+        for m in &self.parked {
+            s += &format!(
+                "  {} ({} ops, v{}{})\n",
+                m.name,
+                m.ops.len(),
+                m.version,
+                m.history
+                    .current
+                    .and_then(|c| m.history.nodes.get(c))
+                    .and_then(|n| n.author.as_deref())
+                    .map(|a| format!(", last edit by {a}"))
+                    .unwrap_or_default()
+            );
+        }
+        s
+    }
+
+    /// Writes the parked documents' autosave.
+    pub fn save_parked(&self) {
+        if let Err(e) = crate::catalog::save_parked_docs(&self.parked) {
+            eprintln!("parked docs autosave failed: {e}");
+        }
+    }
+
+    /// At startup (`--restore`): every unsaved document the autosave held
+    /// is parked instead of opened, and the server starts on an empty
+    /// document. Returns the parked names.
+    pub fn park_restored(&mut self) -> Vec<String> {
+        let mut parked = crate::catalog::load_parked_docs();
+        let version = self.model.version + 1;
+        let active = std::mem::replace(&mut self.model, Model::named("model"));
+        self.model.version = version;
+        let mut fresh = std::mem::take(&mut self.others);
+        if !(active.ops.is_empty() && active.parts.is_empty()) {
+            fresh.insert(0, active);
+        }
+        let names: Vec<String> = fresh.iter().map(|m| m.name.clone()).collect();
+        for m in fresh {
+            parked.retain(|p| !(p.name == m.name && p.project == m.project));
+            parked.push(m);
+        }
+        self.parked = parked;
+        self.save_parked();
+        self.mark_autosave(true, true, false);
+        names
     }
 
     /// After restoring an autosave: closes every document that matches its

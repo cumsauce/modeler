@@ -433,7 +433,7 @@ def daemon_mode(socket_path, mode):
                                  slot=daemon_slot(socket_path))
         state["session"] = session
         return session, (f"daemon: the modeler server had exited ({why}); "
-                         "restarted it, session restored from autosave"
+                         "restarted it; unsaved documents are parked, not open (scene restore lists them)"
                          + (" (its own slot file)" if session.slot_note else ""))
 
     def serve(conn):

@@ -138,7 +138,8 @@ pub(crate) fn drain_commands(
     mut agent_shots: ResMut<PendingAgentShots>,
     mut orbit: ResMut<Orbit>,
     mut playback: ResMut<Playback>,
-    (mut wb, mut grid): (ResMut<Workbench>, ResMut<Grid>),
+    // Window-only: absent headless, where `set_camera ui` says so.
+    (mut wb, mut grid): (Option<ResMut<Workbench>>, Option<ResMut<Grid>>),
 ) {
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
@@ -210,7 +211,13 @@ pub(crate) fn drain_commands(
                         None => Ok(String::new()),
                     };
                     if let (Some(u), Ok(m)) = (ui, &mut msg) {
-                        match apply_ui(&u, &modeler.session.model, &mut wb, &mut grid) {
+                        let applied = match (wb.as_deref_mut(), grid.as_deref_mut()) {
+                            (Some(wb), Some(grid)) => {
+                                apply_ui(&u, &modeler.session.model, wb, grid)
+                            }
+                            _ => Err("set_camera ui: no window (headless server)".to_string()),
+                        };
+                        match applied {
                             Ok(said) => {
                                 if !m.is_empty() {
                                     m.push('\n');
