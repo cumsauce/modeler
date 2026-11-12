@@ -139,7 +139,7 @@ fn native_data_dir() -> Result<PathBuf, ModelerError> {
     Ok(PathBuf::from(home).join(".local").join("share"))
 }
 
-fn sanitize(name: &str) -> String {
+pub fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -370,6 +370,8 @@ struct JournalLine {
     parent: Option<usize>,
     #[serde(default)]
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
 }
 
 fn journal_path() -> Result<PathBuf, ModelerError> {
@@ -412,6 +414,7 @@ pub fn save_session_journaled(
             model: n.model.for_file(),
             parent: n.parent,
             label: n.label.clone(),
+            author: n.author.clone(),
         })
         .map_err(|e| ModelerError::Parse(e.to_string()))
     };
@@ -468,6 +471,7 @@ fn read_journal(path: &std::path::Path) -> Option<Vec<crate::Snapshot>> {
             parent,
             children: Vec::new(),
             label: j.label,
+            author: j.author,
         });
     }
     Some(nodes)
@@ -936,6 +940,17 @@ pub fn open_doc(name: &str) -> Option<Model> {
         .and_then(|g| g.as_ref().and_then(|m| m.get(name).cloned()))
 }
 
+/// A fingerprint of the catalog file of prefab `name` (None: no file), so
+/// a save can tell whether someone else wrote it since it was loaded.
+pub fn prefab_file_hash(name: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let path = catalog_dir().ok()?.join(format!("{}.json", sanitize(name)));
+    let bytes = fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
 /// [`load_prefab`] from the catalog file only, ignoring open documents.
 pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
@@ -994,6 +1009,63 @@ mod tests {
     /// FRIENDSLOP_DATA_DIR is process-global, so tests that set it must not
     /// run in parallel with each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Two agents sharing one server: each keeps its document, edits are
+    /// credited, undo won't revert the other's step unasked, and a prefab
+    /// file another server wrote is not silently overwritten.
+    #[test]
+    fn agents_sharing_a_server_keep_their_docs_and_work() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("agents")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let box_ = |n: &str, size: f32| {
+            vec![serde_json::json!({"type": "primitive", "name": n, "kind": "box", "size": size})]
+        };
+        let mut s = crate::commands::Session::default();
+        // A opens its doc and builds.
+        s.begin_call(Some("A"), None);
+        ok(s.scene("open", Some("shed")));
+        ok(s.apply_values(None, box_("wall", 1.0)));
+        ok(s.save_prefab_checked("d", &[], "p", false).map(|r| r.0));
+        s.end_call();
+        // B works elsewhere.
+        s.begin_call(Some("B"), None);
+        ok(s.scene("open", Some("cart")));
+        ok(s.apply_values(None, box_("bed", 1.0)));
+        s.end_call();
+        // A is put back on its own doc.
+        let note = s.begin_call(Some("A"), None).unwrap_or_default();
+        assert_eq!(s.model.name, "shed");
+        assert!(note.contains("switched back to your `shed`"), "{note}");
+        s.end_call();
+        // B edits A's doc (pinned), replacing A's op: warned.
+        s.begin_call(Some("B"), Some("shed"));
+        let out = ok(s.apply_values(None, box_("wall", 2.0)));
+        assert!(
+            out.contains("another agent wrote") && out.contains("(by A)"),
+            "{out}"
+        );
+        s.end_call();
+        // A hears about it, and its undo is refused until forced.
+        let note = s.begin_call(Some("A"), None).unwrap_or_default();
+        assert!(note.contains("B made 1 edit"), "{note}");
+        let e = s.undo_checked(false).map_err(|e| e.to_string());
+        assert!(e.is_err_and(|e| e.contains("another agent (B)")));
+        assert!(s.history(None).contains("by B"));
+        ok(s.undo_checked(true));
+        // Another server rewrote the prefab file: A's save is refused.
+        let mut other = s.model.clone();
+        other.name = "shed".into();
+        other.ops.clear();
+        save_prefab(&other, "theirs", &[], "x").unwrap_or_else(|e| panic!("{e}"));
+        let e = s
+            .save_prefab_checked("d", &[], "p", false)
+            .map_err(|e| e.to_string());
+        assert!(e.is_err_and(|e| e.contains("changed since you loaded")));
+        ok(s.save_prefab_checked("d", &[], "p", true).map(|r| r.0));
+        s.end_call();
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

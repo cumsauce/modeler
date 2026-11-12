@@ -3,6 +3,7 @@
 
 use crate::Vec3;
 use crate::{Annotation, Axis, BoolOp, Model, ModelerError, Op, Part, PrimitiveKind, graph};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub type CmdResult = Result<String, ModelerError>;
@@ -242,6 +243,29 @@ pub struct Session {
     pub autosave_due: AutosaveDue,
     /// How much of the history the autosave journal already holds.
     pub journal: crate::catalog::JournalState,
+    /// Who is calling right now, when the call says (the driver daemon tags
+    /// every call with its agent): history nodes and op writes are credited
+    /// to it, and `undo` won't revert another client's edit unasked.
+    pub client: Option<String>,
+    /// Per client: its own active document, and how far it has seen that
+    /// document's history (node count, cursor), so each agent keeps its
+    /// document and hears about other agents' edits to it.
+    clients: HashMap<String, ClientView>,
+    /// Per (document, op template key): the client that last wrote the op.
+    op_authors: HashMap<(String, String), String>,
+    /// Per document name: the catalog file's fingerprint when this session
+    /// loaded or saved it. `save_prefab` refuses to overwrite a file that
+    /// changed since (another agent or server saved it) unless forced.
+    pub catalog_base: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClientView {
+    doc: String,
+    /// Already told that its document is kept for it (said once).
+    told_switch: bool,
+    seen_nodes: usize,
+    seen_cursor: Option<usize>,
 }
 
 /// Which autosaves are pending and since when: edits only mark them, and
@@ -270,6 +294,10 @@ impl Default for Session {
             others: Vec::new(),
             autosave_due: AutosaveDue::default(),
             journal: Default::default(),
+            client: None,
+            clients: HashMap::new(),
+            op_authors: HashMap::new(),
+            catalog_base: HashMap::new(),
         }
     }
 }
@@ -545,7 +573,8 @@ impl Session {
         // Move the tree out first, so the clone doesn't copy every snapshot.
         let mut history = std::mem::take(&mut self.model.history);
         let snapshot = self.model.clone();
-        history.record(snapshot, label);
+        let id = history.record(snapshot, label);
+        history.nodes[id].author = self.client.clone();
         self.model.history = history;
     }
 
@@ -1362,7 +1391,40 @@ impl Session {
                 lines.push(format!("re-derived {n} op(s) that read changed params"));
             }
         }
+        // Re-issuing an op another client wrote replaces their work: say so.
+        let doc = self.model.name.clone();
+        let keys: Vec<String> = parsed
+            .iter()
+            .filter_map(|(it, _)| match it {
+                BatchItem::Op(op) => Some(Self::template_key(op)),
+                _ => None,
+            })
+            .collect();
+        let mut taken = Vec::new();
+        if let Some(me) = self.client.clone() {
+            let live: Vec<String> = self.model.ops.iter().map(Self::template_key).collect();
+            for k in &keys {
+                if let Some(other) = self.op_authors.get(&(doc.clone(), k.clone()))
+                    && *other != me
+                    && live.contains(k)
+                {
+                    taken.push(format!("`{k}` (by {other})"));
+                }
+            }
+        }
         lines.push(self.apply_items(parsed, false)?);
+        if let Some(me) = self.client.clone() {
+            for k in keys {
+                self.op_authors.insert((doc.clone(), k), me.clone());
+            }
+        }
+        if !taken.is_empty() {
+            taken.dedup();
+            lines.push(format!(
+                "WARNING this call replaced op(s) another agent wrote in `{doc}`: {} (diff / history show their version; undo reverts this call)",
+                taken.join(", ")
+            ));
+        }
         Ok(lines.join("\n"))
     }
 
@@ -1595,6 +1657,9 @@ impl Session {
                         match crate::catalog::load_prefab_file(name) {
                             Ok(mut m) => {
                                 m.name = name.to_string();
+                                if let Some(h) = crate::catalog::prefab_file_hash(name) {
+                                    self.catalog_base.insert(crate::catalog::sanitize(name), h);
+                                }
                                 (m, "opened catalog entry")
                             }
                             Err(_) => (Model::named(name), "opened new empty document"),
@@ -1643,6 +1708,163 @@ impl Session {
                 Err(format!("scene: unknown action `{other}` (list, open, switch, close)").into())
             }
         }
+    }
+
+    /// Starts a call from `client` (None: an untagged call, nothing
+    /// changes). Puts that client's own document back in front if another
+    /// client switched away from it (or opens `pin`, the driver's --doc),
+    /// and says what other clients did to it since this client's last
+    /// call. Returns a note for the result, if any.
+    pub fn begin_call(&mut self, client: Option<&str>, pin: Option<&str>) -> Option<String> {
+        self.client = client.map(String::from);
+        let me = client?;
+        let mut notes = Vec::new();
+        let active = self.model.name.clone();
+        let mine = pin
+            .map(String::from)
+            .or_else(|| self.clients.get(me).map(|v| v.doc.clone()));
+        let told = self.clients.get(me).is_some_and(|v| v.told_switch);
+        if let Some(want) = mine.filter(|w| *w != active) {
+            let open = self.others.iter().any(|m| m.name == want);
+            if open || pin.is_some() {
+                match self.scene("open", Some(&want)) {
+                    Ok(_) => {
+                        self.mark_autosave(true, true, false);
+                        if pin.is_some() {
+                            notes.push(format!("switched to `{want}` (--doc)"));
+                        } else if !told {
+                            notes.push(format!(
+                                "the active document was `{active}` (another agent switched to it); switched back to your `{want}`. \
+                                 Each agent keeps its own document, so this happens quietly from now on"
+                            ));
+                            if let Some(v) = self.clients.get_mut(me) {
+                                v.told_switch = true;
+                            }
+                        }
+                    }
+                    Err(e) => notes.push(format!("could not switch back to your `{want}`: {e}")),
+                }
+            } else {
+                notes.push(format!(
+                    "your document `{want}` was closed (by another agent or the human); you are now on `{active}`"
+                ));
+                self.clients.remove(me);
+            }
+        }
+        // Other clients' edits to this document since we last looked.
+        if let Some(v) = self.clients.get(me).filter(|v| v.doc == self.model.name) {
+            let h = &self.model.history;
+            let theirs: Vec<(usize, &crate::Snapshot)> = h
+                .nodes
+                .iter()
+                .enumerate()
+                .skip(v.seen_nodes)
+                .filter(|(_, n)| n.author.as_deref() != Some(me))
+                .collect();
+            if !theirs.is_empty() {
+                let mut who: Vec<&str> = theirs
+                    .iter()
+                    .map(|(_, n)| {
+                        n.author
+                            .as_deref()
+                            .unwrap_or("the human / an untagged call")
+                    })
+                    .collect();
+                who.dedup();
+                let shown: Vec<String> = theirs
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .rev()
+                    .map(|(id, n)| format!("#{id} `{}`", n.label))
+                    .collect();
+                notes.push(format!(
+                    "since your last call, {} made {} edit(s) to `{}`: {}{} (scene_summary shows the result)",
+                    who.join(", "),
+                    theirs.len(),
+                    self.model.name,
+                    if theirs.len() > 4 { "… " } else { "" },
+                    shown.join("; ")
+                ));
+            } else if h.current != v.seen_cursor && h.nodes.len() == v.seen_nodes {
+                notes.push(format!(
+                    "the history cursor of `{}` moved from {} to {} since your last call (someone undid or jumped)",
+                    self.model.name,
+                    v.seen_cursor.map_or("-".into(), |c| format!("#{c}")),
+                    h.current.map_or("-".into(), |c| format!("#{c}"))
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join("\n"))
+    }
+
+    /// Ends a call: remembers the client's document and how much of its
+    /// history it has seen.
+    pub fn end_call(&mut self) {
+        if let Some(me) = self.client.take() {
+            let told_switch = self.clients.get(&me).is_some_and(|v| v.told_switch);
+            self.clients.insert(
+                me,
+                ClientView {
+                    doc: self.model.name.clone(),
+                    told_switch,
+                    seen_nodes: self.model.history.nodes.len(),
+                    seen_cursor: self.model.history.current,
+                },
+            );
+        }
+    }
+
+    /// `undo`, but when the step it would revert was made by another client
+    /// it refuses (unless `force`): one agent's undo must not silently
+    /// throw away another's work in a shared document.
+    pub fn undo_checked(&mut self, force: bool) -> CmdResult {
+        if !force
+            && let Some(me) = self.client.as_deref()
+            && let Some(cur) = self.model.history.current
+            && let Some(node) = self.model.history.nodes.get(cur)
+            && let Some(other) = node.author.as_deref()
+            && other != me
+        {
+            return Err(format!(
+                "the last step in `{}` (#{cur} `{}`) was made by another agent ({other}), not you: undo would revert their work. \
+                 Find your own step with history and use diff / cherry_pick, or undo with force: true if reverting it is intended",
+                self.model.name, node.label
+            )
+            .into());
+        }
+        self.undo()
+    }
+
+    /// Saves the active model as a catalog prefab, refusing (unless
+    /// `force`) when the catalog file changed since this session loaded or
+    /// last saved it: two agents (or two servers) saving one prefab must not
+    /// silently drop each other's work.
+    pub fn save_prefab_checked(
+        &mut self,
+        description: &str,
+        tags: &[&str],
+        prompt: &str,
+        force: bool,
+    ) -> Result<(String, bool), ModelerError> {
+        let name = crate::catalog::sanitize(&self.model.name);
+        let now = crate::catalog::prefab_file_hash(&name);
+        if !force
+            && let (Some(base), Some(now)) = (self.catalog_base.get(&name), now)
+            && *base != now
+        {
+            return Err(format!(
+                "the catalog entry `{name}` changed since you loaded or saved it (another agent or modeler server saved it): \
+                 saving would overwrite their version. Look at it in another document (scene open) or with catalog_describe, \
+                 then save_prefab with force: true to overwrite, or set_model_name to save under a new name"
+            )
+            .into());
+        }
+        let r = crate::catalog::save_prefab(&self.model, description, tags, prompt)?;
+        if let Some(h) = crate::catalog::prefab_file_hash(&r.0) {
+            self.catalog_base.insert(r.0.clone(), h);
+        }
+        Ok(r)
     }
 
     /// Names of every open document, the active one first.

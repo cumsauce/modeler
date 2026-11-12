@@ -8,6 +8,11 @@
 //!
 //! Every row carries the part names it covers, so selecting a group selects
 //! (highlights, frames) all of them.
+//!
+//! [`build_files`] adds a level above: every open document (the active one
+//! holding the part tree, the others a click away) and a `library` group of
+//! catalog prefabs not open yet, so the outliner is also how you move
+//! between files. A prefab instance row names its source (`open_doc`).
 
 use crate::{Model, Part};
 
@@ -27,6 +32,9 @@ pub struct Row {
     pub children: Vec<Row>,
     /// Hidden parts (drawn dimmed).
     pub dim: bool,
+    /// The document this row opens: another open document, a library
+    /// prefab, or (on a prefab instance) the instance's source.
+    pub open_doc: Option<String>,
 }
 
 /// `book_12` -> ("book", 12).
@@ -57,6 +65,7 @@ fn leaf(p: &Part, label: &str) -> Row {
         parts: vec![p.name.clone()],
         children: Vec::new(),
         dim: !p.visible,
+        open_doc: None,
     }
 }
 
@@ -72,6 +81,7 @@ fn group(key: String, label: String, children: Vec<Row>, dim: bool) -> Row {
         parts: children.iter().flat_map(|c| c.parts.clone()).collect(),
         children,
         dim,
+        open_doc: None,
     }
 }
 
@@ -156,12 +166,96 @@ pub fn build(model: &Model) -> Vec<Row> {
     let shown: Vec<&Part> = all().filter(|p| p.visible).collect();
     let hidden: Vec<&Part> = all().filter(|p| !p.visible).collect();
     let mut out = rows(&shown, "", false);
+    // Prefab instances name their source document.
+    let sources: std::collections::HashMap<&str, &str> = model
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            crate::Op::Prefab { name, prefab, .. } => Some((name.as_str(), prefab.as_str())),
+            _ => None,
+        })
+        .collect();
+    for r in &mut out {
+        if let Some(inst) = r.key.strip_prefix("prefab:")
+            && let Some(src) = sources.get(inst)
+        {
+            r.open_doc = Some(src.to_string());
+            r.detail = format!("prefab {src}");
+        }
+    }
     if !hidden.is_empty() {
         let kids = rows(&hidden, "", true);
         let n = hidden.len();
         let mut g = group("hidden".into(), format!("hidden ({n})"), kids, true);
         g.detail = "cutters, blanks, sources".into();
         out.push(g);
+    }
+    out
+}
+
+/// The files level: the active document (its part tree as children), the
+/// other open documents, then a `library` group of the catalog `prefabs`
+/// that are not open. Keys: `doc:<name>`, `library`, `lib:<name>`.
+pub fn build_files(active: &Model, others: &[&Model], prefabs: &[String]) -> Vec<Row> {
+    let doc = |m: &Model, children: Vec<Row>, open: bool| {
+        let n = m.parts.iter().filter(|p| p.visible).count();
+        Row {
+            key: format!("doc:{}", m.name),
+            label: m.name.clone(),
+            detail: if open {
+                format!("open · {n} parts")
+            } else {
+                format!("{n} parts")
+            },
+            swatch: if open {
+                [0.45, 0.5, 0.58]
+            } else {
+                [0.35, 0.62, 0.95]
+            },
+            parts: if open {
+                Vec::new()
+            } else {
+                children.iter().flat_map(|c| c.parts.clone()).collect()
+            },
+            children,
+            dim: false,
+            open_doc: open.then(|| m.name.clone()),
+        }
+    };
+    let mut out = vec![doc(active, build(active), false)];
+    let mut names: Vec<&str> = vec![active.name.as_str()];
+    let mut rest: Vec<&&Model> = others.iter().collect();
+    rest.sort_by(|a, b| a.name.cmp(&b.name));
+    for m in rest {
+        names.push(&m.name);
+        out.push(doc(m, Vec::new(), true));
+    }
+    let lib: Vec<Row> = prefabs
+        .iter()
+        .filter(|p| !names.iter().any(|n| crate::catalog::sanitize(n) == **p))
+        .map(|p| Row {
+            key: format!("lib:{p}"),
+            label: p.clone(),
+            detail: "prefab".into(),
+            swatch: [0.4, 0.42, 0.46],
+            parts: Vec::new(),
+            children: Vec::new(),
+            dim: false,
+            open_doc: Some(p.clone()),
+        })
+        .collect();
+    if !lib.is_empty() {
+        let n = lib.len();
+        out.push(Row {
+            key: "library".into(),
+            label: format!("library ({n})"),
+            detail: "catalog prefabs".into(),
+            swatch: [0.4, 0.42, 0.46],
+            parts: Vec::new(),
+            children: lib,
+            dim: false,
+            open_doc: None,
+        });
     }
     out
 }
@@ -245,5 +339,48 @@ mod tests {
         let kids: Vec<&str> = t[0].children.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(kids, ["pole", "shade"]);
         assert_eq!(t[0].parts, ["lamp1.pole", "lamp1.shade"]);
+    }
+
+    #[test]
+    fn files_level_lists_docs_library_and_instance_sources() {
+        let mut s = Session::default();
+        let items = json!([
+            {"type": "primitive", "name": "desk", "kind": "box", "size": 1}
+        ]);
+        s.apply_values_as(None, items.as_array().cloned().unwrap_or_default(), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.model.ops.push(crate::Op::Prefab {
+            name: "lamp1".into(),
+            prefab: "lamp".into(),
+            translation: [0.0; 3],
+            rotation: None,
+            scale: None,
+            parts: Vec::new(),
+            digest: 0,
+            style: None,
+            restyle: None,
+        });
+        let p = Part {
+            name: "lamp1.pole".into(),
+            verts: vec![[0.0; 3]; 3],
+            indices: vec![0, 1, 2],
+            visible: true,
+            ..Default::default()
+        };
+        s.model.parts.push(std::sync::Arc::new(p));
+        let other = Model::named("shed");
+        let t = build_files(
+            &s.model,
+            &[&other],
+            &["lamp".into(), "shed".into(), "tree".into()],
+        );
+        let labels: Vec<&str> = t.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["model", "shed", "library (2)"], "{t:#?}");
+        assert_eq!(t[1].open_doc.as_deref(), Some("shed"));
+        assert!(t[0].open_doc.is_none());
+        let inst = t[0].children.iter().find(|r| r.key == "prefab:lamp1");
+        assert_eq!(inst.and_then(|r| r.open_doc.as_deref()), Some("lamp"));
+        let lib: Vec<&str> = t[2].children.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(lib, ["lamp", "tree"]);
     }
 }

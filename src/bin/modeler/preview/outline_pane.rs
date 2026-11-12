@@ -1,8 +1,10 @@
-//! The outliner (O): the scene as a hierarchy in the left pane. Prefab
-//! instances and array runs fold into expandable groups, hidden parts sink
-//! into a dimmed group (the tree is `modeler::outline`). Click a row to
-//! select it (its parts pulse in 3D; a group's chevron or a second click
-//! opens it), double-click to frame it.
+//! The outliner (O): the open documents and the prefab library, then the
+//! active document as a hierarchy. Prefab instances and array runs fold
+//! into expandable groups, hidden parts sink into a dimmed group (the tree
+//! is `modeler::outline`). Click a row to select it (its parts pulse in 3D;
+//! a group's chevron or a second click opens it), double-click to frame it.
+//! Click another document or a library prefab to switch to / open it; a
+//! prefab instance's `open` opens its source.
 
 use std::collections::HashSet;
 
@@ -22,8 +24,11 @@ pub(crate) struct OutlinePane {
     /// The selected row's key and the parts it covers (they pulse in 3D).
     pub(crate) selected: Option<String>,
     pub(crate) selected_parts: Vec<String>,
-    /// The model version and selection the list was built for.
-    shown: Option<(u64, u64)>,
+    /// The model version, selection and open documents the list was built for.
+    shown: Option<(u64, u64, String)>,
+    /// Document rows already opened once by default (the active document
+    /// starts expanded; after that the human's choice sticks).
+    auto_opened: HashSet<String>,
     /// Bumped by clicks (expansion / selection), forcing a rebuild.
     generation: u64,
     tree: Vec<Row>,
@@ -49,7 +54,13 @@ pub(crate) struct OutlineList;
 pub(crate) struct OutlineRow {
     key: String,
     group: bool,
+    /// Clicking opens this document (another open doc, a library prefab).
+    opens: Option<String>,
 }
+
+/// The `open` button on a prefab instance row: opens its source document.
+#[derive(Component)]
+pub(crate) struct OutlineOpen(String);
 
 /// The chevron of a group row (a click there only opens / closes).
 #[derive(Component)]
@@ -101,13 +112,30 @@ pub(crate) fn update_outline_pane(
         }
     }
 
-    let model = &modeler.session.model;
-    let want = (model.version, pane.generation);
-    if pane.shown == Some(want) {
+    let session = &modeler.session;
+    let model = &session.model;
+    let want = (
+        model.version,
+        pane.generation,
+        session.doc_names().join("\n"),
+    );
+    if pane.shown.as_ref() == Some(&want) {
         return;
     }
-    if pane.shown.is_none_or(|s| s.0 != model.version) {
-        pane.tree = outline::build(model);
+    if pane
+        .shown
+        .as_ref()
+        .is_none_or(|s| s.0 != model.version || s.2 != want.2)
+    {
+        let library: Vec<String> = modeler::catalog::list()
+            .map(|es| es.into_iter().map(|e| e.name).collect())
+            .unwrap_or_default();
+        let others: Vec<&modeler::Model> = session.others.iter().collect();
+        pane.tree = outline::build_files(model, &others, &library);
+        let key = format!("doc:{}", model.name);
+        if pane.auto_opened.insert(key.clone()) {
+            pane.expanded.insert(key);
+        }
         // Keep the selection on the same row if it still exists.
         let keys: Vec<(String, Vec<String>)> = outline::flatten(&pane.tree, &|_| true)
             .into_iter()
@@ -134,11 +162,15 @@ pub(crate) fn update_outline_pane(
     for (depth, r) in rows {
         let selected = pane.selected.as_deref() == Some(r.key.as_str());
         let group = !r.children.is_empty();
+        // Document and library rows open on click; an instance row only
+        // through its `open` button (a click there selects its parts).
+        let instance = r.key.starts_with("prefab:");
         let row = commands
             .spawn((
                 OutlineRow {
                     key: r.key.clone(),
                     group,
+                    opens: if instance { None } else { r.open_doc.clone() },
                 },
                 Node {
                     height: Val::Px(ROW_H),
@@ -218,17 +250,42 @@ pub(crate) fn update_outline_pane(
             Pickable::IGNORE,
             ChildOf(row),
         ));
+        if instance && let Some(src) = &r.open_doc {
+            let open = commands
+                .spawn((
+                    OutlineOpen(src.clone()),
+                    Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        padding: UiRect::horizontal(Val::Px(4.0)),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.35, 0.62, 0.95, 0.25)),
+                    ChildOf(row),
+                ))
+                .id();
+            commands.spawn((
+                Text::new("open"),
+                ui_text(&assets, 11.0, false),
+                ui_color(false),
+                Pickable::IGNORE,
+                ChildOf(open),
+            ));
+        }
     }
 }
 
 /// Row clicks: the chevron opens / closes a group; elsewhere selects (a
 /// second click on a selected group opens it too); a double click frames
 /// the row's parts.
+#[allow(clippy::too_many_arguments)]
 fn on_row_click(
     click: On<PointerClick>,
     rows: Query<&OutlineRow>,
     chevrons: Query<&OutlineChevron>,
-    modeler: Res<Modeler>,
+    opens: Query<&OutlineOpen>,
+    mut modeler: ResMut<Modeler>,
     mut pane: ResMut<OutlinePane>,
     mut orbit: ResMut<Orbit>,
     mut comment: ResMut<CommentBox>,
@@ -257,6 +314,25 @@ fn on_row_click(
     }
     let key = row.key.clone();
     pane.generation += 1;
+    // Another document, a library prefab, or an instance's source: open it
+    // (an open document switches, a catalog entry opens as a new one).
+    let doc = opens
+        .get(target)
+        .ok()
+        .map(|o| o.0.clone())
+        .or_else(|| row.opens.clone());
+    if let Some(doc) = doc
+        && chevrons.get(target).is_err()
+    {
+        let s = &mut modeler.session;
+        match s.scene("open", Some(&doc)) {
+            Ok(_) => s.mark_autosave(true, true, false),
+            Err(e) => eprintln!("opening `{doc}`: {e}"),
+        }
+        pane.selected = None;
+        pane.selected_parts.clear();
+        return;
+    }
     if let Ok(ch) = chevrons.get(target) {
         if !pane.expanded.remove(&ch.0) {
             pane.expanded.insert(ch.0.clone());

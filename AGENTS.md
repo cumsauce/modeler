@@ -626,7 +626,10 @@ name: the producer first, then in-place material/visibility/transform edits).
 - `undo` / `redo` / `jump(id)` / `history(limit?)` / `history_prune(keep)`:
   the edit tree. Each `apply_ops` (or `cherry_pick`) call is ONE node, so
   one undo reverts the whole call. `history` shows the newest 30 nodes plus
-  the cursor by default. Editing after a jump branches.
+  the cursor by default. Editing after a jump branches. With several
+  agents on one server, each node records who made it (`history` shows
+  `by <client>`), and `undo` refuses to revert another agent's step
+  (`undo(force: true)` when that is intended).
 - `diff(from, to?)`: ops added (+), removed (-) and changed (~, with the old
   parameters) between two nodes (default `to`: the live model), plus param
   changes.
@@ -637,7 +640,9 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Model, catalog, output:** `new_model(name)` (the old model stays one undo
 away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
-tags, prompt)` (all required; reports when it overwrote an entry),
+tags, prompt, force?)` (reports when it overwrote an entry; refuses, unless
+`force`, when the catalog file changed since this session loaded or saved
+it: another agent or server saved it in between),
 `load_prefab(name)` (answers with a brief: counts, visible parts, params,
 named moves, warnings), `catalog_list` and `catalog_describe` (`delete: true` removes an entry;
 its file moves to `prefabs/removed/`; each entry also
@@ -1020,12 +1025,16 @@ pane and screen-space reflections line up: a camera viewport inside the
 window misplaced them), every pane open by default
 (`MODELER_OUTLINE=0` / `MODELER_STYLE=0` / `MODELER_MATERIALS=0` close one):
 
-- **O**, the outliner, top of the left column (40%, `PANE_FRACTION`): the
-  scene as a hierarchy (`src/outline.rs`): prefab instances and array runs
-  fold into expandable groups, hidden parts (cutters, blanks, sources) sink
-  into one dimmed group, each row shows its material. Click a row to select
-  it (its parts pulse in 3D), click a selected group or its chevron to open
-  it, double-click to frame it; the wheel scrolls.
+- **O**, the outliner, top of the left column (40%, `PANE_FRACTION`): files
+  first (`outline::build_files`): the active document (expanded into its
+  part tree), the other open documents (click to switch) and a `library`
+  group of catalog prefabs not open (click to open). Inside the document
+  the scene is a hierarchy (`src/outline.rs`): prefab instances and array
+  runs fold into expandable groups (an instance row says `prefab <name>`
+  and its `open` button opens the source), hidden parts (cutters, blanks,
+  sources) sink into one dimmed group, each row shows its material. Click a
+  row to select it (its parts pulse in 3D), click a selected group or its
+  chevron to open it, double-click to frame it; the wheel scrolls.
 - **S**, the style pane, under the outliner (`preview/style_pane.rs`): the
   model's tokens, read-only: the brief, colour chips with hex, material
   presets, numbers and defaults. It follows every `style` call.
@@ -1052,11 +1061,23 @@ Material toggles match O, S and M.
   stops it. The default throwaway mode spawns and kills a server per
   invocation — window flashes open/closed, state restored from autosave.
 
-- **Several agents can share one daemon.** Each client (the agent
-  session behind the calling shell, or `--client NAME`) keeps its own
-  active document: if another client switched documents in between, the
-  daemon switches back before your calls and says so in the first result.
-  `--doc NAME` pins a run to a document (opened, or new, if not open).
+- **Several agents can share one daemon.** Each connection has its own
+  thread and calls interleave one at a time, so one agent's long batch
+  doesn't block the others. Every call carries its client (the agent
+  session behind the calling shell, or `--client NAME`) in the MCP
+  `_meta` (`modeler/client`, `modeler/doc` for `--doc`), and the server
+  (`Session::begin_call` / `end_call`):
+  - keeps each client's own active document, switching back when another
+    client switched away (said once, then quietly);
+  - credits history nodes and op writes to the client, tells it what other
+    clients changed in its document since its last call ("since your last
+    call, B made 2 edit(s) ..."), warns when a batch replaces an op another
+    client wrote, and refuses an `undo` of another client's step unless
+    `force: true`;
+  - `--doc NAME` pins a run to a document (opened, or new, if not open).
+  Calls without `_meta` (a plain MCP client, the human's window) behave as
+  before. Separate servers sharing one catalog are guarded by the session
+  lock (autosave) and `save_prefab`'s changed-file check.
 - The daemon keeps the server's stderr (panics, bake errors) in
   `<catalog dir>/daemon.log` (rotated to `daemon.log.1` past 1 MB at each
   spawn; `MODELER_STDERR=<file>` overrides). The server's last line there

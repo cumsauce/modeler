@@ -452,6 +452,9 @@ pub struct Snapshot<T: Doc = Model> {
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub label: String,
+    /// Which client (agent) made this edit, when the call said so (several
+    /// agents can share one server; see `Session::client`).
+    pub author: Option<String>,
 }
 
 impl<T: Doc> Serialize for Snapshot<T> {
@@ -463,6 +466,9 @@ impl<T: Doc> Serialize for Snapshot<T> {
         st.serialize_field("parent", &self.parent)?;
         st.serialize_field("children", &self.children)?;
         st.serialize_field("label", &self.label)?;
+        if let Some(a) = &self.author {
+            st.serialize_field("author", a)?;
+        }
         st.end()
     }
 }
@@ -479,6 +485,8 @@ impl<'de, T: Doc> Deserialize<'de> for Snapshot<T> {
             children: Vec<usize>,
             #[serde(default)]
             label: String,
+            #[serde(default)]
+            author: Option<String>,
         }
         let raw = Raw::<T>::deserialize(d)?;
         Ok(Snapshot {
@@ -486,6 +494,7 @@ impl<'de, T: Doc> Deserialize<'de> for Snapshot<T> {
             parent: raw.parent,
             children: raw.children,
             label: raw.label,
+            author: raw.author,
         })
     }
 }
@@ -532,6 +541,7 @@ impl<T: Doc> History<T> {
             parent: self.current,
             children: Vec::new(),
             label: label.into(),
+            author: None,
         });
         if let Some(p) = self.current {
             self.nodes[p].children.push(id);
@@ -669,8 +679,13 @@ impl<T: Doc> History<T> {
             } else {
                 format!("`{}`", node.label)
             };
+            let by = node
+                .author
+                .as_deref()
+                .map(|a| format!(" by {a}"))
+                .unwrap_or_default();
             lines.push(format!(
-                "#{id} {parent}, {label}, v{}{cursor}",
+                "#{id} {parent}, {label}{by}, v{}{cursor}",
                 node.model.version()
             ));
         }

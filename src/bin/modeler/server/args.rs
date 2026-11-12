@@ -97,6 +97,10 @@ pub(crate) struct SavePrefabArgs {
     pub(crate) tags: Vec<String>,
     /// The prompt/idea that produced this model, for future agents.
     pub(crate) prompt: String,
+    /// Overwrite the catalog entry even if it changed since this session
+    /// loaded or saved it (refused otherwise: another agent saved it).
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -145,6 +149,17 @@ pub(crate) struct DocArgs {
     /// "model" (default) or "material:<name>" for a material's own history.
     #[serde(default)]
     pub(crate) doc: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct UndoArgs {
+    /// "model" (default) or "material:<name>" for a material's own history.
+    #[serde(default)]
+    pub(crate) doc: Option<String>,
+    /// Undo even when the last step was made by another agent sharing this
+    /// server (refused otherwise, so one agent can't silently revert another).
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

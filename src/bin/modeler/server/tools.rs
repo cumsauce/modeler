@@ -42,6 +42,21 @@ impl Tools {
         }
     }
 
+    /// Runs `f` on the session (on the app thread) and returns its value;
+    /// for bookkeeping around a call, not tool work (no autosave marking).
+    async fn exec<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Session) -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
+            let _ = tx.send(f(s));
+            Ok(String::new())
+        }));
+        self.tx.send(cmd).await.ok()?;
+        rx.await.ok()
+    }
+
     async fn run(
         &self,
         f: impl FnOnce(&mut Session) -> CmdResult + Send + 'static,
@@ -637,11 +652,13 @@ Style::default()
             description,
             tags,
             prompt,
+            force,
         }): Parameters<SavePrefabArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-            catalog::save_prefab(&s.model, &description, &tag_refs, &prompt).map(
+            s.save_prefab_checked(&description, &tag_refs, &prompt, force.unwrap_or(false))
+                .map(
                 |(name, overwrote)| {
                     let mut out = if overwrote {
                         format!("saved `{name}` — overwrote an existing catalog entry")
@@ -677,6 +694,9 @@ Style::default()
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             let model = catalog::load_prefab(&name)?;
+            if let Some(h) = catalog::prefab_file_hash(&model.name) {
+                s.catalog_base.insert(catalog::sanitize(&model.name), h);
+            }
             let mut model = model;
             model.version = s.model.version + 1;
             let snapshot = s.model.clone();
@@ -752,11 +772,11 @@ Style::default()
     #[tool]
     async fn undo(
         &self,
-        Parameters(DocArgs { doc }): Parameters<DocArgs>,
+        Parameters(UndoArgs { doc, force }): Parameters<UndoArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| match material_doc(doc.as_deref())? {
             Some(m) => Ok(s.materials.undo(m)?),
-            None => s.undo(),
+            None => s.undo_checked(force.unwrap_or(false)),
         })
         .await
     }
@@ -1431,8 +1451,35 @@ impl rmcp::ServerHandler for Tools {
             .map(|a| modeler::feedback::clip(&serde_json::Value::Object(a.clone()).to_string()))
             .unwrap_or_default();
         let started = std::time::Instant::now();
+        // The driver daemon tags each call with its agent (`_meta`
+        // "modeler/client", and "modeler/doc" for --doc): that agent's own
+        // document comes back in front, and its edits are credited to it.
+        let meta = |k: &str| -> Option<String> {
+            request
+                .meta
+                .as_ref()
+                .and_then(|m| m.get(k).cloned())
+                .or_else(|| context.meta.get(k).cloned())
+                .and_then(|v| v.as_str().map(String::from))
+        };
+        let (client, pin) = (meta("modeler/client"), meta("modeler/doc"));
+        let note = match &client {
+            Some(c) => {
+                let (c, pin) = (c.clone(), pin.clone());
+                self.exec(move |s| s.begin_call(Some(&c), pin.as_deref()))
+                    .await
+                    .flatten()
+            }
+            None => None,
+        };
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = Self::tool_router().call(tcc).await;
+        let mut result = Self::tool_router().call(tcc).await;
+        if client.is_some() {
+            self.exec(|s| s.end_call()).await;
+        }
+        if let (Some(note), Ok(r)) = (note, result.as_mut()) {
+            r.content.insert(0, rmcp::model::Content::text(note));
+        }
         let ok = result.as_ref().is_ok_and(|r| r.is_error != Some(true));
         let error = match &result {
             Err(e) => e.message.to_string(),
@@ -1458,6 +1505,7 @@ impl rmcp::ServerHandler for Tools {
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Every model gets materials: give each visible part a material item, preferably a procedural pbr one (material_ops, then {\"type\": \"material\", \"name\": part, \"pbr\": name}); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
+- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite).
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.

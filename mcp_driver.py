@@ -9,18 +9,22 @@ many driver invocations):
     mcp_driver.py --daemon [--windowed | --headless] [--socket PATH]
         spawns the modeler server (offscreen by default: agent_views render,
         no window; --windowed adds the preview window, --headless no renderer), listens on a unix socket, executes tool
-        calls from any connecting client (one at a time). Stays up when
-        clients disconnect; `quit` as a call shuts it down.
+        calls from any number of connected clients (each on its own thread;
+        calls interleave one at a time, so a long batch doesn't block other
+        agents). Stays up when clients disconnect; `quit` stops it.
 
 Client (connects to the daemon, or spawns a throwaway server):
     mcp_driver.py --connect [--socket PATH] --calls calls.json [--save-shot p]
     mcp_driver.py --calls calls.json ...          # throwaway mode, as before
-Several agents may share one daemon: each client (the agent session
-behind the calling shell, or --client NAME) keeps its own active document.
-If another client switched documents in between, the daemon switches back
-before this client's calls and says so in the first result. --doc NAME
-pins the document for this run (opened from the catalog, or new, if not
-open).
+Several agents may share one daemon: every call carries its client (the
+agent session behind the calling shell, or --client NAME) to the server,
+which keeps each client's own active document (switching back, and saying
+so, when another client switched away), credits history steps to it, tells
+it what other clients changed in its document since its last call, refuses
+an undo that would revert another client's step (undo force: true
+overrides) and warns when a batch replaces ops another client wrote.
+--doc NAME pins the document for this run (opened from the catalog, or new,
+if not open).
 Image options: --save-shot PATH (the run's first image to PATH, every later
 image from any call of the same client run to PATH_2, PATH_3, ...),
 --save-dir DIR (every image, numbered), --b64 (also print base64; off by default).
@@ -185,10 +189,13 @@ class ModelerSession:
             if resp.get("id") == rid:
                 return sorted(t["name"] for t in resp["result"]["tools"])
 
-    def call(self, name, args=None, save_shot=None, save_dir=None, b64=False, shots=None):
+    def call(self, name, args=None, save_shot=None, save_dir=None, b64=False, shots=None,
+             meta=None):
         rid = self.next_id; self.next_id += 1
-        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
-                    "params": {"name": name, "arguments": args or {}}})
+        params = {"name": name, "arguments": args or {}}
+        if meta:
+            params["_meta"] = meta  # which agent is calling (see daemon_mode)
+        self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": params})
         while True:
             resp = self._recv()
             if resp.get("id") != rid:
@@ -297,18 +304,6 @@ def claim_socket(socket_path):
     sys.exit(1)
 
 
-def active_doc(session):
-    """The server's active document name (from `scene list`), or None."""
-    try:
-        out = session.call("scene", {"action": "list"})
-    except Exception:
-        return None
-    for line in "\n".join(out.get("text", [])).splitlines():
-        if line.startswith("* "):
-            return line[2:].split(" (")[0].strip()
-    return None
-
-
 def client_identity():
     """Who is calling: the agent session behind this shell. Each agent's
     commands run in fresh shells under one long-lived process, so the
@@ -336,86 +331,105 @@ def daemon_mode(socket_path, mode):
     srv.listen(16)
     log = daemon_log_path()
     try:
-        session = ModelerSession(mode=mode, log=log, slot=daemon_slot(socket_path))
+        first = ModelerSession(mode=mode, log=log, slot=daemon_slot(socket_path))
     except Exception:
         srv.close()
         os.unlink(socket_path)
         raise
     print(f"modeler daemon ready on {socket_path}"
           + (f" (server log: {log})" if log else ""), flush=True)
-    # Each client's own active document: several agents share one daemon,
-    # and a `scene switch` by one must not redirect another's edits.
-    client_doc = {}
+    # Several agents share one daemon. Each connection gets its own thread
+    # and the calls interleave one at a time (a lock around the server), so
+    # one agent's long batch doesn't hold every other agent at the door.
+    # Every call carries its agent in `_meta` ("modeler/client", plus
+    # "modeler/doc" for --doc): the server keeps each agent's own active
+    # document, credits history steps to it, and tells it what other agents
+    # changed in its document since its last call.
+    import threading
+    state = {"session": first, "stop": False}
+    lock = threading.Lock()
     told_slot = set()  # clients already told this server autosaves to a slot
-    try:
-        while True:
-            conn, _ = srv.accept()
-            shots = ShotNamer()  # one --save-shot counter per client run
-            client = None
-            pending_note = None
-            with conn:
-                f = conn.makefile("r")
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        c = json.loads(line)
-                        if isinstance(c, dict) and "hello" in c:
-                            h = c["hello"]
-                            client = h.get("client")
+
+    def serve(conn):
+        shots = ShotNamer()  # one --save-shot counter per client run
+        client, pin, pending_note = None, None, None
+        with conn:
+            f = conn.makefile("r")
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                    if isinstance(c, dict) and "hello" in c:
+                        h = c["hello"]
+                        client, pin = h.get("client"), h.get("doc")
+                        with lock:
+                            session = state["session"]
                             if session.slot_note and (client, session.proc.pid) not in told_slot:
                                 told_slot.add((client, session.proc.pid))
                                 pending_note = session.slot_note
-                            want = h.get("doc") or client_doc.get(client)
-                            now = active_doc(session) if want else None
-                            if want and now and now != want:
-                                sw = session.call("scene", {"action": "open", "name": want})
-                                if sw.get("ok"):
-                                    pending_note = ((pending_note + "\n") if pending_note else "") + (
-                                        f"daemon: the active document was `{now}` (another "
-                                        f"client switched it); switched back to your `{want}`"
-                                        if not h.get("doc") else
-                                        f"daemon: switched to `{want}` (--doc)")
-                            continue
-                        is_quit = c == "quit" or (isinstance(c, dict) and c.get("name") == "quit")
-                        if is_quit:
-                            conn.sendall((json.dumps(
-                                {"ok": True, "text": ["daemon stopping"],
-                                 "n_images": 0, "saved_images": []}) + "\n").encode())
-                            return
-                        note = None
+                        continue
+                    is_quit = c == "quit" or (isinstance(c, dict) and c.get("name") == "quit")
+                    if is_quit:
+                        conn.sendall((json.dumps(
+                            {"ok": True, "text": ["daemon stopping"],
+                             "n_images": 0, "saved_images": []}) + "\n").encode())
+                        state["stop"] = True
+                        try:  # wake accept()
+                            w = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            w.connect(socket_path)
+                            w.close()
+                        except OSError:
+                            pass
+                        return
+                    note = None
+                    meta = {}
+                    if client:
+                        meta["modeler/client"] = client
+                    if pin:
+                        meta["modeler/doc"] = pin
+                    with lock:
+                        session = state["session"]
                         if session.proc.poll() is not None:
                             # The modeler exited (killed, crashed, rebuilt):
                             # respawn it; autosave restores the session.
                             why = session.exit_reason()
                             session = ModelerSession(mode=mode, log=daemon_log_path(),
                                                      slot=daemon_slot(socket_path))
+                            state["session"] = session
                             note = (f"daemon: the modeler server had exited ({why}); "
                                     "restarted it, session restored from autosave"
                                     + (" (its own slot file)" if session.slot_note else ""))
                         out = session.call(c["name"], c.get("args", {}),
                                            c.get("save_shot"), c.get("save_dir"),
-                                           c.get("b64", False), shots)
-                        if pending_note:
-                            note = f"{note}\n{pending_note}" if note else pending_note
-                            pending_note = None
-                        if note:
-                            out["text"] = [note] + list(out.get("text", []))
-                    except Exception as e:  # bad line or dead server
-                        msg = f"daemon error: {e}"
-                        if session.proc.poll() is not None:
-                            msg += f" (the modeler server exited: {session.exit_reason()})"
-                        out = {"ok": False, "text": [msg], "n_images": 0, "saved_images": []}
+                                           c.get("b64", False), shots, meta)
+                    if pending_note:
+                        note = f"{note}\n{pending_note}" if note else pending_note
+                        pending_note = None
+                    if note:
+                        out["text"] = [note] + list(out.get("text", []))
+                except Exception as e:  # bad line or dead server
+                    msg = f"daemon error: {e}"
+                    session = state["session"]
+                    if session.proc.poll() is not None:
+                        msg += f" (the modeler server exited: {session.exit_reason()})"
+                    out = {"ok": False, "text": [msg], "n_images": 0, "saved_images": []}
+                try:
                     conn.sendall((json.dumps(out) + "\n").encode())
-            # client disconnected: keep the modeler (and window) alive, and
-            # remember which document this client left active.
-            if client:
-                doc = active_doc(session)
-                if doc:
-                    client_doc[client] = doc
+                except OSError:
+                    return  # the client went away mid-call
+
+    try:
+        while not state["stop"]:
+            conn, _ = srv.accept()
+            if state["stop"]:
+                conn.close()
+                break
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
     finally:
-        session.close()
+        with lock:
+            state["session"].close()
         srv.close()
         if os.path.exists(socket_path):
             os.unlink(socket_path)
