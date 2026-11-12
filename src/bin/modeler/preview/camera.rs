@@ -47,8 +47,17 @@ pub(crate) struct CameraDrag {
 #[derive(Component)]
 pub(crate) struct MainCamera;
 
+/// How the mouse steers in Map mode (the Fly / Orbit segment, F).
+#[derive(Resource, Default)]
+pub(crate) struct CameraNav {
+    /// Fly: left-drag looks around from the eye and WASD always moves.
+    /// Off: orbit (left-drag orbits, right-drag + WASD flies).
+    pub(crate) fly: bool,
+}
+
 /// Mouse and keyboard camera control: left-drag orbits, middle-drag pans,
-/// right-drag looks around and flies with WASD / Q E (Shift faster),
+/// right-drag looks around (in Map's Fly mode left-drag too, and WASD
+/// always moves), and flies with WASD / Q E (Shift faster),
 /// scroll wheel zooms, arrows/PageUp/PageDown still work. A slow auto-drift runs
 /// until the user first moves the camera themselves.
 pub(crate) fn orbit_camera(
@@ -61,7 +70,10 @@ pub(crate) fn orbit_camera(
     mut drag: ResMut<CameraDrag>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
     wb: Res<Workbench>,
+    nav: Option<Res<CameraNav>>,
+    typing: Res<PinTyping>,
 ) {
+    let fly = wb.mode == Mode::Map && nav.is_some_and(|n| n.fly) && !typing.open;
     let scroll_y = if wb.ui_hover {
         0.0
     } else {
@@ -98,20 +110,19 @@ pub(crate) fn orbit_camera(
                 let d = cursor - drag.last;
                 drag.moved += d.length();
                 drag.last = cursor;
+                let look = button == MouseButton::Right || (fly && button == MouseButton::Left);
                 match button {
-                    // Left-drag orbits around the target; click-without-drag pins.
-                    MouseButton::Left => {
-                        orbit.yaw += d.x * 0.01;
-                        orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-1.4, 1.4);
-                        orbit.user = true;
-                    }
-                    // Right-drag looks around from where the camera is (fly
-                    // mode, with WASD below): the eye stays, the target turns.
-                    MouseButton::Right => {
+                    _ if look => {
                         let eye = orbit_eye(&orbit);
                         orbit.yaw += d.x * 0.004;
                         orbit.pitch = (orbit.pitch + d.y * 0.004).clamp(-1.5, 1.5);
                         orbit.target = eye - orbit_dir(&orbit) * orbit.dist;
+                        orbit.user = true;
+                    }
+                    // Left-drag orbits around the target; click-without-drag pins.
+                    MouseButton::Left => {
+                        orbit.yaw += d.x * 0.01;
+                        orbit.pitch = (orbit.pitch + d.y * 0.01).clamp(-1.4, 1.4);
                         orbit.user = true;
                     }
                     // Middle-drag pans the target in the camera's screen plane.
@@ -161,7 +172,7 @@ pub(crate) fn orbit_camera(
     // Fly: hold the right button and WASD moves along the view, Q/E down /
     // up, Shift 4x. Speed scales with the scene (a 200 m map flies faster
     // than a mug).
-    if mouse.pressed(MouseButton::Right) && drag.button == Some(MouseButton::Right) {
+    if fly || (mouse.pressed(MouseButton::Right) && drag.button == Some(MouseButton::Right)) {
         let f = -orbit_dir(&orbit);
         let right = Vec3::new(orbit.yaw.sin(), 0.0, -orbit.yaw.cos());
         let mut v = Vec3::ZERO;

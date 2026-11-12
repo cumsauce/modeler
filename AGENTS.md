@@ -1473,6 +1473,18 @@ domain, tile and params).
 
 - **Top bar** (`preview/top_bar.rs`): [All documents (N open)] [project / document ▾], the mode buttons 1-4 (unavailable ones dimmed with the `mode_available` reason as a tooltip), and one pill per agent (`Session::clients()`) with a green dot while its document changed in the last 4 s (`last_touched`). It is rebuilt only when a hash of what it shows changes. The document half or ⌘K / Ctrl+K opens the **document popup** (`preview/doc_popup.rs`): a search box, the open documents grouped by project (modes, last author, time ago, unsaved), and per project "Open from library…" listing matching catalog prefabs once something is typed. A click or Enter (the first row) switches or opens; Esc closes.
 
+- **Animate dock, View menu, Map navigation** (`timeline.rs`, `shading.rs`,
+  `camera.rs`, `minimap.rs`): Animate shows a dock under the 3D view (Play /
+  Pause, the clip (click cycles), a ruler to drag-scrub, one lane per bone
+  with diamond keys, hollow for mirrored tracks, a line for wave / sway
+  motion, a playhead; Space plays) and draws the bones as window-only gizmos
+  (render layer 30, which only the window camera adds). `HudRow` is the
+  chip row at the 3D view's top right: the View menu (Lit / Clay / By part
+  swaps `MeshMaterial3d`, restoring each part's `LitMaterial`) and, in Map,
+  Fly / Orbit (F; fly = left-drag looks, WASD always moves). Map's minimap
+  (bottom right) renders only for a few frames after the model changes;
+  click or drag it to move the camera target.
+
 ## Dev notes / gotchas
 
 - Agents driving the server over stdio (frozen MCP tool list) should run

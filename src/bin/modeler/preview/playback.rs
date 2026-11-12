@@ -32,7 +32,7 @@ impl Default for Playback {
     }
 }
 
-/// The playback HUD line (bottom left).
+/// The old playback HUD line (spawned in app.rs; kept hidden).
 #[derive(Component)]
 pub(crate) struct PlaybackHud;
 
@@ -46,7 +46,7 @@ pub(crate) struct PlayRequest {
     pub(crate) paused: Option<bool>,
 }
 
-fn clip_names(model: &modeler::Model) -> Vec<String> {
+pub(crate) fn clip_names(model: &modeler::Model) -> Vec<String> {
     model
         .ops
         .iter()
@@ -165,40 +165,16 @@ pub(crate) fn play_animation(
     mut built: ResMut<SceneBuilt>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut parts: Query<(&Name, &Mesh3d, &mut Transform), With<PreviewPart>>,
-    mut hud: Query<(&mut Text, &mut Visibility), With<PlaybackHud>>,
+    mut hud: Query<(&Text, &mut Visibility), With<PlaybackHud>>,
 ) {
     let model = &modeler.session.model;
     let clip = pb
         .clip
         .clone()
         .and_then(|c| modeler::anim::clip(model, Some(&c)).ok());
-    let hud_line = match (&clip, clip_names(model).is_empty()) {
-        (_, true) => String::new(),
-        (None, false) => "P play  [ ] clip".to_string(),
-        (Some((c, _)), _) => format!(
-            "{} {}  {:.2} / {:.2} s{}   P {}  [ ] clip{}",
-            if pb.playing { ">" } else { "||" },
-            c.name,
-            c.wrap(pb.time),
-            c.duration,
-            if (pb.speed - 1.0).abs() > 1e-3 {
-                format!("  {}x", pb.speed)
-            } else {
-                String::new()
-            },
-            if pb.playing { "pause" } else { "play" },
-            if pb.playing { "" } else { "  , . step" }
-        ),
-    };
-    if let Ok((mut text, mut vis)) = hud.single_mut() {
-        *vis = if hud_line.is_empty() {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
-        if text.0 != hud_line {
-            text.0 = hud_line;
-        }
+    // The Animate dock (`timeline.rs`) replaced the old HUD line.
+    if let Ok((_, mut vis)) = hud.single_mut() {
+        vis.set_if_neq(Visibility::Hidden);
     }
     let Some((c, skel)) = clip else {
         if pb.clip.is_some() {
