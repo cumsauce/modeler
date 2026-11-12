@@ -684,7 +684,10 @@ name: the producer first, then in-place material/visibility/transform edits).
     material; `"pbr"` also fails flat colours, so every part needs a
     procedural material (`material_ops`, then a `material` item with
     `pbr`). **Every model should pass `materials: true`**, and prefer
-    `"pbr"` for anything that ships: put it in the build's `expect`.
+    `"pbr"` for anything that ships. Work shape first: build and check the
+    geometry, then make the materials and assign them in a later
+    `apply_ops` (a `pbr` item needs its material to exist), with the
+    `materials` check in that batch's `expect`.
     `save_prefab` warns about grey parts (and notes flat colours).
   - `self_intersections: true`: no part's surface passes through itself
     (a deform, warp or skin that folded it); fails with the crossing count
