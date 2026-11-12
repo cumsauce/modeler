@@ -1715,6 +1715,24 @@ impl Session {
         Ok(changed)
     }
 
+    /// A document restored from the autosave holds only its ops (parts
+    /// re-derive): derive them when it becomes the active one, or it shows
+    /// nothing but its marker gizmos.
+    fn derive_if_bare(&mut self) {
+        if !self.model.parts.is_empty() || self.model.ops.is_empty() {
+            return;
+        }
+        let p = self.model.project.clone();
+        let r = if crate::catalog::call_project().is_none() {
+            crate::catalog::with_project(p, || self.model.refresh())
+        } else {
+            self.model.refresh()
+        };
+        if let Err(e) = r {
+            eprintln!("deriving `{}`: {e}", self.model.name);
+        }
+    }
+
     /// Open documents: `list`, `open` (an open doc, the catalog entry, or a
     /// new empty model), `switch` (same as open for an open doc), `close`.
     /// The active document is `self.model`; the rest wait in `others`, each
@@ -1815,6 +1833,7 @@ impl Session {
                 self.others.push(outgoing);
                 self.model.version = bump;
                 self.pending_pin = None;
+                self.derive_if_bare();
                 // The window switching documents (no call): look prefabs up
                 // in the incoming document's own project.
                 let synced = if crate::catalog::call_project().is_none() {
@@ -1842,6 +1861,7 @@ impl Session {
                     let bump = self.model.version.max(next.version) + 1;
                     self.model = next;
                     self.model.version = bump;
+                    self.derive_if_bare();
                 } else {
                     let Some(i) = self.others.iter().position(|m| m.name == name) else {
                         return Err(format!("no open document `{name}`").into());
@@ -1875,6 +1895,7 @@ impl Session {
         if project.is_some() {
             crate::catalog::set_call_project(project);
         }
+        self.derive_if_bare();
         let me = client?;
         if !self.clients.contains_key(me) {
             self.focus_requested = true;
