@@ -61,6 +61,12 @@ result line is `{"ok", "text", "json"?, ...}`; `--json` drops the prose when
 structured JSON is present. The daemon keeps the preview window open; check
 it with `agent_views` / `screenshot` and verify numerically with `verify`.
 
+**In CI** (Linux, no GPU): the `cumsauce/modeler@main` action installs the
+`latest` release build and adds `modeler --headless --project <repo>` to
+`.mcp.json` (README, "In CI"). Headless runs every tool except the renders
+(`agent_views`, `screenshot`): judge with `verify`, `inspect`, `probe_ray`
+and `material_view`.
+
 ## Units
 
 **1 unit = 1 meter, always.** Y is up and the ground is y = 0. Size things

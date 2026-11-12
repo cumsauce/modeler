@@ -11,7 +11,14 @@ modeler_anim = { path = "../modeler_anim" }
 serde_json = "1"
 
 [dev-dependencies]
-bevy = { version = "=0.20.0" }
+# The viewer example: the same feature set as the modeler (no audio or
+# gamepads), so the workspace builds Bevy once.
+bevy = { version = "=0.20.0", default-features = false, features = [
+    "std", "bevy_winit", "bevy_clipboard", "default_font", "multi_threaded",
+    "x11", "wayland", "custom_cursor", "sysinfo_plugin",
+    "default_app", "scene", "picking", "2d_bevy_render", "3d_bevy_render",
+    "ui_api", "ui_bevy_render", "bevy_ui_widgets", "bevy_feathers",
+] }
 
 [lints.clippy]
 unwrap_used = "deny"

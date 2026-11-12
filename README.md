@@ -30,6 +30,35 @@ The first session starts the shared daemon (windowed); later sessions join
 it. Pointing the config at `target/debug/modeler` instead gives each session
 its own server and window.
 
+## In CI (Linux, headless)
+
+Every push to `main` builds a Linux x86_64 binary (no window, no GPU, no
+audio) and publishes it as the rolling
+[`latest`](https://github.com/cumsauce/modeler/releases/tag/latest) release.
+To give a Claude Code run in another repo's workflow the `mcp__modeler__*`
+tools, add the action before it:
+
+```yaml
+jobs:
+  claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cumsauce/modeler@main        # installs it, writes .mcp.json
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: --mcp-config .mcp.json --allowedTools "mcp__modeler__*"
+```
+
+The action adds `{"modeler": {"command": ..., "args": ["--headless",
+"--project", <repo root>]}}` to `.mcp.json` (inputs: `release`, `mcp-config`,
+`project`; output: `bin`). Headless means every tool but the renders
+(`agent_views`, `screenshot`): build, `verify`, `inspect`, `probe_ray`,
+`material_view` (CPU) and `export_model` all work, and relative exports land
+in the project's `assets/`. Anywhere else on Linux, download the tarball from
+the release and run `modeler --headless`.
+
 ## What's inside
 
 - **Primitives**: box, sphere, cylinder, cone, torus, capsule, plane,

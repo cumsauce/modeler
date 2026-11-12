@@ -1,0 +1,61 @@
+# Installs the modeler (Linux x86_64, headless) in another repo's workflow
+# and registers it as an MCP server, so a Claude Code run in that job gets
+# the mcp__modeler__* tools.
+#
+#   - uses: cumsauce/modeler@main
+#   - uses: anthropics/claude-code-action@v1
+#     with:
+#       claude_args: --allowedTools "mcp__modeler__*"
+name: modeler
+description: Install the headless modeler MCP server and add it to .mcp.json
+inputs:
+  release:
+    description: Release tag to download (the rolling `latest` tracks main)
+    default: latest
+  mcp-config:
+    description: MCP config file to add the server to (created if missing)
+    default: .mcp.json
+  project:
+    description: Game project the server works in (its .modeler/ and assets/); default the repo root
+    default: ${{ github.workspace }}
+outputs:
+  bin:
+    description: Absolute path of the modeler binary
+    value: ${{ steps.install.outputs.bin }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        REL: ${{ inputs.release }}
+        CFG: ${{ inputs.mcp-config }}
+        PROJ: ${{ inputs.project }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+          echo "::error::the modeler action ships a Linux x86_64 build only"; exit 1
+        fi
+        dir="${RUNNER_TOOL_CACHE:-$HOME/.cache}/modeler/$REL"
+        mkdir -p "$dir"
+        curl -fsSL "https://github.com/cumsauce/modeler/releases/download/$REL/modeler-linux-x86_64.tar.gz" \
+          | tar -xz -C "$dir" --strip-components=1
+        chmod +x "$dir/modeler"
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "bin=$dir/modeler" >> "$GITHUB_OUTPUT"
+        python3 - "$CFG" "$dir/modeler" "$PROJ" <<'PY'
+        import json, os, sys
+        cfg, binary, project = sys.argv[1:4]
+        data = {}
+        if os.path.exists(cfg):
+            with open(cfg) as f:
+                data = json.load(f)
+        data.setdefault("mcpServers", {})["modeler"] = {
+            "command": binary,
+            "args": ["--headless", "--project", project],
+        }
+        with open(cfg, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"modeler MCP server added to {cfg}")
+        PY

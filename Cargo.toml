@@ -10,7 +10,16 @@ members = [".", "crates/modeler_anim", "crates/modeler_bevy"]
 
 [dependencies]
 modeler_anim = { path = "crates/modeler_anim" }
-bevy = { version = "=0.20.0", features = ["picking", "bevy_feathers"] }
+# Bevy's defaults minus audio and gamepads (nothing here plays sound or
+# reads a pad), so a Linux build needs no ALSA or udev.
+bevy = { version = "=0.20.0", default-features = false, features = [
+    # default_platform without bevy_gilrs
+    "std", "bevy_winit", "bevy_clipboard", "default_font", "multi_threaded",
+    "x11", "wayland", "custom_cursor", "sysinfo_plugin",
+    # 2d + 3d + ui without audio
+    "default_app", "scene", "picking", "2d_bevy_render", "3d_bevy_render",
+    "ui_api", "ui_bevy_render", "bevy_ui_widgets", "bevy_feathers",
+] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
