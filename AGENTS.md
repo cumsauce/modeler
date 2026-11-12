@@ -97,7 +97,8 @@ Three layers, read top to bottom:
      `Cargo.toml` beside an `assets/` folder. Relative `export_model` paths
      land in `<project>/assets/` (`"models/crate.glb"` ->
      `assets/models/crate.glb`). `.modeler/.gitignore` is written once to
-     keep the per-machine autosaves (`session.json`, `open_docs.json`) out
+     keep the per-machine autosaves (`session.json`, `open_docs.json`) and the
+     prefabs' undo histories (`*.history.json` sidecars) out
      of git. `catalog_list`'s first line says which library is in use.
    - **Otherwise** the shared library
      `~/Library/Application Support/friendslop/modeler/` (this repo: no
@@ -1313,8 +1314,13 @@ work, and every material has its own history tree.
   the other branch had and `cherry_pick` to bring it over.
 - **Save format is versioned** (`Model::format_version`, `FORMAT_VERSION`):
   old files read as 0 and load; files from a newer build are rejected.
-  Fully op-derived prefabs save ops, params, templates, history and
-  annotations without parts. Writes are `.tmp` + rename.
+  Fully op-derived prefabs save ops, params, templates and annotations
+  without parts; the **history goes to a sidecar** `<name>.history.json`
+  beside the file (git-ignored in a project, per machine like the
+  autosaves), so the tracked file holds only what rebuilds the model.
+  Loading reads the sidecar; files saved before it (history inline) still
+  load, and `modeler --project <dir> --split-history` moves their history
+  out. Writes are `.tmp` + rename.
 
 `scene_summary` warnings: full-ring radial arrays whose copy 0 overlaps the
 source (only with `include_source: false`), visible parts still wearing the

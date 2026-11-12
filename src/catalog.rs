@@ -3,7 +3,7 @@
 //! All IO is behind the public functions so tests can point `FRIENDSLOP_DATA_DIR` at a tempdir.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -111,14 +111,27 @@ fn ensure_project_gitignore() {
         return;
     };
     let ign = root.join(PROJECT_DIR).join(".gitignore");
-    if ign.exists() || std::env::var("FRIENDSLOP_DATA_DIR").is_ok_and(|d| !d.is_empty()) {
+    if std::env::var("FRIENDSLOP_DATA_DIR").is_ok_and(|d| !d.is_empty()) {
+        return;
+    }
+    // Prefab undo histories live in sidecars, per machine like autosaves:
+    // add the rule to a .gitignore written before them.
+    const HISTORY: &str = "*/*.history.json";
+    if let Ok(text) = fs::read_to_string(&ign) {
+        if !text.lines().any(|l| l.trim() == HISTORY) {
+            let sep = if text.ends_with('\n') { "" } else { "\n" };
+            let _ = fs::write(
+                &ign,
+                format!("{text}{sep}# prefab undo histories (per machine)\n{HISTORY}\n"),
+            );
+        }
         return;
     }
     let _ = fs::create_dir_all(root.join(PROJECT_DIR));
     let _ = fs::write(
         ign,
         "# modeler autosaves (per machine); prefabs/styles/materials are the sources\n\
-         */session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/feedback.jsonl\n*/daemon.log\n*/daemon.log.1\n\
+         */*.history.json\n*/session.json\n*/session.history.jsonl\n*/session.*.history.jsonl\n*/open_docs.json\n*/session.*.json\n*/open_docs.*.json\n*/session.lock\n*/feedback.jsonl\n*/daemon.log\n*/daemon.log.1\n\
          *.tmp\n*/*.tmp\n",
     );
 }
@@ -788,7 +801,10 @@ pub fn save_prefab(
     let name = sanitize(&model.name);
     let mut catalog = load_catalog()?;
     let overwrote = catalog.entries.iter().any(|e| e.name == name);
-    let mut saved = model.clone();
+    // The model without its history: the undo tree goes to a git-ignored
+    // sidecar (see `history_path`), so the tracked file holds only what
+    // rebuilds the model.
+    let mut saved = model.clone_without_history();
     saved.name = name.clone();
     if saved.parts_derive_from_ops() {
         saved.parts.clear();
@@ -796,10 +812,12 @@ pub fn save_prefab(
     let dir = catalog_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
+    ensure_project_gitignore();
     let file = format!("{name}.json");
     let text =
         serde_json::to_string_pretty(&saved).map_err(|e| ModelerError::Parse(e.to_string()))?;
     let path = dir.join(&file);
+    write_history_sidecar(&dir, &name, &model.history)?;
     atomic_write(&path, text.as_bytes())?;
 
     let entry = CatalogEntry {
@@ -900,6 +918,10 @@ pub fn delete_doc(kind: Kind, name: &str) -> Result<(), ModelerError> {
     fs::create_dir_all(&bin)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", bin.display())))?;
     let _ = fs::rename(dir.join(&e.file), bin.join(&e.file));
+    let side = history_path(&dir, &e.name);
+    if let Some(f) = side.file_name() {
+        let _ = fs::rename(&side, bin.join(f));
+    }
     save_index(kind, &catalog)
 }
 
@@ -1008,8 +1030,71 @@ pub fn matches_prefab_file(model: &Model) -> bool {
         && same("params", serde_json::to_value(&model.params))
 }
 
+/// A prefab's undo tree, beside it: `<name>.history.json` (git-ignored in a
+/// project; per machine, like the session autosave).
+pub fn history_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.history.json", sanitize(name)))
+}
+
+/// Writes (or, for an empty history, removes) a prefab's history sidecar.
+/// Compact: snapshots repeat most of the model, so pretty printing would
+/// multiply the size.
+fn write_history_sidecar(
+    dir: &Path,
+    name: &str,
+    history: &crate::History,
+) -> Result<(), ModelerError> {
+    let path = history_path(dir, name);
+    if history.nodes.is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
+    let text = serde_json::to_string(history).map_err(|e| ModelerError::Parse(e.to_string()))?;
+    atomic_write(&path, text.as_bytes())
+}
+
+/// Moves the history out of every prefab file in the catalog that still
+/// holds it inline (files saved before the sidecar), leaving the model
+/// itself unchanged. Returns (files rewritten, bytes before, bytes after).
+pub fn split_prefab_histories() -> Result<(usize, u64, u64), ModelerError> {
+    ensure_project_gitignore();
+    let dir = catalog_dir()?;
+    let (mut n, mut before, mut after) = (0, 0u64, 0u64);
+    for e in load_catalog()?.entries {
+        let path = dir.join(&e.file);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        let Some(hist) = obj.remove("history") else {
+            continue;
+        };
+        let has_nodes = hist
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if has_nodes {
+            let h = serde_json::to_string(&hist).map_err(|e| ModelerError::Parse(e.to_string()))?;
+            atomic_write(&history_path(&dir, &e.name), h.as_bytes())?;
+        }
+        let out =
+            serde_json::to_string_pretty(&v).map_err(|e| ModelerError::Parse(e.to_string()))?;
+        atomic_write(&path, out.as_bytes())?;
+        before += text.len() as u64;
+        after += out.len() as u64;
+        n += 1;
+    }
+    Ok((n, before, after))
+}
+
 pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
-    let path = catalog_dir()?.join(format!("{}.json", sanitize(name)));
+    let dir = catalog_dir()?;
+    let path = dir.join(format!("{}.json", sanitize(name)));
     if !path.exists() {
         return Err(ModelerError::Io(missing_prefab(name)));
     }
@@ -1018,6 +1103,13 @@ pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let mut model: Model = serde_json::from_str(&text)
         .map_err(|e| ModelerError::Parse(format!("parsing {}: {e}", path.display())))?;
     model.check_format()?;
+    // The history from its sidecar (files saved before it hold it inline).
+    if model.history.nodes.is_empty()
+        && let Ok(t) = fs::read_to_string(history_path(&dir, name))
+        && let Ok(h) = serde_json::from_str::<crate::History>(&t)
+    {
+        model.history = h;
+    }
     // Only re-derive what was saved without parts; models that kept their
     // parts (baked edits on top of ops) must not lose those edits.
     model.restore_parts()?;
@@ -1068,6 +1160,66 @@ mod tests {
     /// FRIENDSLOP_DATA_DIR is process-global, so tests that set it must not
     /// run in parallel with each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The undo tree goes to a sidecar beside the prefab file and comes back
+    /// on load; old files with inline history split out unchanged.
+    #[test]
+    fn prefab_history_lives_in_a_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_root("sidecar");
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &root) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        s.model.name = "crate".into();
+        for size in [1.0, 1.5, 2.0] {
+            ok(s.apply_values(
+                None,
+                vec![serde_json::json!({"type": "primitive", "name": "b", "kind": "box", "size": size})],
+            ));
+        }
+        let nodes = s.model.history.nodes.len();
+        assert!(nodes >= 3);
+        save_prefab(&s.model, "d", &[], "p").unwrap_or_else(|e| panic!("{e}"));
+        let dir = catalog_dir().unwrap_or_else(|e| panic!("{e}"));
+        let main: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("crate.json")).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let inline = main["history"]["nodes"].as_array().map_or(0, |a| a.len());
+        assert_eq!(inline, 0, "the tracked file holds no history");
+        assert!(history_path(&dir, "crate").exists());
+        let back = load_prefab_file("crate").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back.history.nodes.len(), nodes);
+        assert_eq!(back.history.current, s.model.history.current);
+        // An old-style file: history inline, no sidecar.
+        let mut old = s.model.clone();
+        old.name = "crate".into();
+        old.parts.clear();
+        let _ = fs::remove_file(history_path(&dir, "crate"));
+        fs::write(
+            dir.join("crate.json"),
+            serde_json::to_string_pretty(&old).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            load_prefab_file("crate")
+                .map(|m| m.history.nodes.len())
+                .ok(),
+            Some(nodes),
+            "inline history still loads"
+        );
+        let (n, before, after) = split_prefab_histories().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(n, 1);
+        assert!(after < before, "{before} -> {after}");
+        let split = load_prefab_file("crate").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(split.history.nodes.len(), nodes);
+        assert_eq!(split.ops.len(), s.model.ops.len());
+        // Deleting the entry takes the sidecar along.
+        delete_doc(Kind::Prefabs, "crate").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!history_path(&dir, "crate").exists());
+        assert!(dir.join("removed").join("crate.history.json").exists());
+    }
 
     /// Idle documents close only when saved and unchanged since; restored
     /// ones are compared with their catalog file.

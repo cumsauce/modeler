@@ -80,6 +80,21 @@ fn main() -> AppExit {
                 );
                 return AppExit::Success;
             }
+            "--split-history" => {
+                // Prefab files saved before history sidecars: move it out.
+                match modeler::catalog::split_prefab_histories() {
+                    Ok((n, before, after)) => println!(
+                        "moved the history out of {n} prefab file(s) into git-ignored *.history.json sidecars: {:.1} MB -> {:.1} MB tracked",
+                        before as f64 / 1e6,
+                        after as f64 / 1e6
+                    ),
+                    Err(e) => {
+                        eprintln!("split-history failed: {e}");
+                        return AppExit::error();
+                    }
+                }
+                return AppExit::Success;
+            }
             "--project" => {
                 let Some(dir) = args.next() else {
                     eprintln!("--project needs a directory");
@@ -90,7 +105,7 @@ fn main() -> AppExit {
                 unsafe { std::env::set_var("MODELER_PROJECT", dir) };
             }
             other => eprintln!(
-                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json> | --restore] [--project <game dir>] [--print-catalog-dir] [--feedback-report])"
+                "unknown argument `{other}` (usage: modeler [--headless | --offscreen] [--model <path.json> | --restore] [--project <game dir>] [--print-catalog-dir] [--feedback-report] [--split-history])"
             ),
         }
     }
