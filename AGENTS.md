@@ -150,7 +150,7 @@ type, so there is no need to memorise field names.
 | `boolean` | name, op (union / difference / intersection), a, b |
 | `radial_array` | name, input, count, [center], [degrees 360], [start_degrees], [axis y], [include_source true] |
 | `linear_array` | name, input, count, offset, [local] |
-| `path_array` | name, input, path, count or spacing, [smooth], [closed], [align true], [roll_step] |
+| `path_array` | name, input, path, count or spacing, [smooth], [closed], [align true], [roll_step], [on], [follow upright / slope / normal], [between] |
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness] |
 | `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale], [components] |
@@ -320,6 +320,21 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   the path). `roll_step: 90` rolls each copy 90 degrees more about the
   tangent than the last (interlocking chain links); `closed` loops the
   path with no copy doubled at the seam. Hide the source.
+  **On uneven ground** give `on: "ground"` (terrain, a hill, any part):
+  the path is dropped onto its surface (path y becomes a height above it,
+  usually 0; spacing is measured in plan) and re-follows when the ground
+  changes. `follow` turns the copies: `upright` (default: posts, lamps,
+  trees stand straight), `slope` (pitched along the ground: kerbs, walls,
+  rails) or `normal` (on the surface normal). `between: true` puts copies
+  between consecutive points instead of at them, each turned along and
+  stretched over its span (model the source along +x, any length, centred
+  on the origin): one fewer copy than points. A fence on a hill is two
+  items with the same path and spacing:
+  `{"type": "path_array", "name": "posts", "input": "post", "path": [[-10,
+  0, -4], [0, 0, 2], [10, 0, -3]], "smooth": true, "spacing": 2, "on":
+  "ground"}` and the same with `"name": "rails", "input": "rail",
+  "between": true`: posts upright on the slope, rails running post to
+  post.
 - **`lsystem`** grows branching structures: trees, bushes, ferns, weeds,
   roots, coral, antlers, cracks. A `preset` gives a ready plant at real size
   (`tree` ~4.5 m broadleaf, `pine` conifer, `bush` ~1 m shrub, `fern` five

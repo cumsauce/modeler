@@ -979,6 +979,20 @@ pub enum Op {
         align: bool,
         #[serde(default, skip_serializing_if = "is_zero")]
         roll_step: f32,
+        /// Drop the path onto this part's surface (terrain): the path's y
+        /// becomes a height above it, spacing is measured in plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<String>,
+        /// On a surface: "upright" (default; turned only about y: posts,
+        /// trees), "slope" (pitched along the ground: rails, walls, kerbs) or
+        /// "normal" (standing on the surface's normal).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        follow: String,
+        /// Copies between consecutive points instead of at them, each
+        /// stretched along x from one point to the next (fence rails, rope,
+        /// a wall between posts): one fewer than the points.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        between: bool,
     },
     /// An L-system grown by a 3D turtle (trees, bushes, roots, coral): wood
     /// in `name`, leaves in `name_leaves`.

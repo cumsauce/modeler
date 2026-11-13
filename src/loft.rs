@@ -910,3 +910,149 @@ mod tests {
         assert_eq!(p.len(), 8);
     }
 }
+
+/// Drops path placements (spaced in plan) onto `ground`'s surface: each
+/// point lands on the surface plus the path's own height there, and turns
+/// by `follow`: "" / "upright" (yaw only), "slope" (+x along the ground
+/// under the path) or "normal" (+y on the surface normal).
+pub fn drape(
+    at: &[(Vec3, Quat)],
+    path: &[[f32; 3]],
+    ground: &crate::Part,
+    follow: &str,
+) -> Result<Vec<(Vec3, Quat)>, String> {
+    let top = ground_top(ground);
+    let height = |x: f32, z: f32| -> Option<f32> {
+        let o = Vec3::new(x, top + 1.0, z);
+        crate::contact::ray_part(ground, o, Vec3::NEG_Y).map(|d| o.y - d)
+    };
+    let lift = |p: Vec3| -> f32 {
+        // The path's own y at its nearest point in plan: a height above.
+        path.iter()
+            .min_by(|a, b| {
+                let da = (a[0] - p.x).powi(2) + (a[2] - p.z).powi(2);
+                let db = (b[0] - p.x).powi(2) + (b[2] - p.z).powi(2);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map_or(0.0, |q| q[1])
+    };
+    let mut out = Vec::with_capacity(at.len());
+    for &(p, r) in at {
+        let Some(h) = height(p.x, p.z) else {
+            return Err(format!(
+                "the point ({:.2}, {:.2}) is off `{}` (nothing under it)",
+                p.x, p.z, ground.name
+            ));
+        };
+        let pos = Vec3::new(p.x, h + lift(p), p.z);
+        // Yaw only: the plan tangent with y up.
+        let t = (r * Vec3::X).with_y(0.0).normalize_or(Vec3::X);
+        let yaw = frame(t, Vec3::Y);
+        let e = 0.25;
+        let at_h = |q: Vec3| height(q.x, q.z).map(|y| Vec3::new(q.x, y, q.z));
+        let rot = match follow {
+            "slope" | "normal" => {
+                let along = match (at_h(p + t * e), at_h(p - t * e)) {
+                    (Some(a), Some(b)) => (a - b).normalize_or(t),
+                    (Some(a), None) => (a - pos.with_y(h)).normalize_or(t),
+                    (None, Some(b)) => (pos.with_y(h) - b).normalize_or(t),
+                    _ => t,
+                };
+                if follow == "slope" {
+                    let side = along.cross(Vec3::Y).normalize_or(Vec3::Z);
+                    frame(along, side.cross(along))
+                } else {
+                    let s = t.cross(Vec3::Y).normalize_or(Vec3::Z);
+                    let across = match (at_h(p + s * e), at_h(p - s * e)) {
+                        (Some(a), Some(b)) => (a - b).normalize_or(s),
+                        _ => s,
+                    };
+                    let n = across.cross(along).normalize_or(Vec3::Y);
+                    let n = if n.y < 0.0 { -n } else { n };
+                    frame(along, n)
+                }
+            }
+            _ => yaw,
+        };
+        // Keep the placement's own roll (roll_step) about its tangent.
+        let roll = yaw.inverse() * frame(r * Vec3::X, r * Vec3::Y);
+        let roll = if roll.is_finite() {
+            roll
+        } else {
+            Quat::IDENTITY
+        };
+        out.push((pos, (rot * roll).normalize()));
+    }
+    Ok(out)
+}
+
+/// The rotation with +x along `x` and +y as close to `up` as it can be.
+fn frame(x: Vec3, up: Vec3) -> Quat {
+    let x = x.normalize_or(Vec3::X);
+    let z = x.cross(up).normalize_or(Vec3::Z);
+    let y = z.cross(x);
+    Quat::from_mat3(&Mat3::from_cols(x, y, z)).normalize()
+}
+
+fn ground_top(p: &crate::Part) -> f32 {
+    let r = crate::quat_of(p.rotation);
+    let (s, t) = (Vec3::from(p.scale), Vec3::from(p.translation));
+    p.verts
+        .iter()
+        .map(|v| (r * (Vec3::from(*v) * s) + t).y)
+        .fold(f32::MIN, f32::max)
+}
+
+#[cfg(test)]
+mod drape_tests {
+    use super::*;
+    use crate::commands::Session;
+    use serde_json::json;
+
+    #[test]
+    fn a_fence_follows_a_slope() {
+        let mut s = Session::default();
+        s.apply_values(
+            None,
+            vec![
+                // A ramp rising 0.5 m per meter along +x.
+                json!({"type": "primitive", "name": "hill", "kind": "box", "size": [20, 1, 6],
+                       "translation": [0, 0, 0], "rotation": {"z": 26.565}}),
+                json!({"type": "primitive", "name": "post", "kind": "box",
+                       "size": [0.1, 1, 0.1], "translation": [0, 0.5, 0]}),
+                json!({"type": "primitive", "name": "rail", "kind": "box",
+                       "size": [1, 0.05, 0.05], "translation": [0, 0.8, 0]}),
+                json!({"type": "path_array", "name": "posts", "input": "post",
+                       "path": [[-4, 0, 0], [4, 0, 0]], "spacing": 2, "on": "hill"}),
+                json!({"type": "path_array", "name": "rails", "input": "rail",
+                       "path": [[-4, 0, 0], [4, 0, 0]], "spacing": 2, "on": "hill",
+                       "between": true}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let part = |n: &str| {
+            s.model
+                .parts
+                .iter()
+                .find(|p| p.name == n)
+                .cloned()
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        let (a, b) = (part("posts_0"), part("posts_4"));
+        // 8 m apart in plan, 4 m apart in height, both standing straight.
+        let rise = b.translation[1] - a.translation[1];
+        assert!((rise - 4.0).abs() < 0.05, "{rise}");
+        assert!((quat_of_arr(b.rotation) * Vec3::Y - Vec3::Y).length() < 1e-4);
+        // Four rails, each spanning post to post: pitched up, stretched.
+        assert!(s.model.parts.iter().any(|p| p.name == "rails_3"));
+        assert!(!s.model.parts.iter().any(|p| p.name == "rails_4"));
+        let r = part("rails_0");
+        let x = quat_of_arr(r.rotation) * Vec3::X;
+        assert!((x.y - 0.4472).abs() < 0.02, "{x}");
+        assert!((r.scale[0] - 5f32.sqrt()).abs() < 0.03, "{:?}", r.scale);
+    }
+
+    fn quat_of_arr(q: [f32; 4]) -> Quat {
+        Quat::from_array(q)
+    }
+}

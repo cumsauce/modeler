@@ -775,11 +775,59 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             spacing,
             align,
             roll_step,
+            on,
+            follow,
+            between,
         } => {
             let source = lookup(named, input)?;
             let path = crate::loft::sample_path(path, *closed, *smooth, *samples);
-            let at = crate::loft::placements(&path, *closed, *count, *spacing, *roll_step)
-                .map_err(|e| format!("path_array `{name}`: {e}"))?;
+            let mut at = match on {
+                None => crate::loft::placements(&path, *closed, *count, *spacing, *roll_step),
+                Some(_) => {
+                    // Spaced in plan, then dropped onto the surface.
+                    let flat: Vec<[f32; 3]> = path.iter().map(|p| [p[0], 0.0, p[2]]).collect();
+                    crate::loft::placements(&flat, *closed, *count, *spacing, *roll_step)
+                }
+            }
+            .map_err(|e| format!("path_array `{name}`: {e}"))?;
+            if let Some(on) = on {
+                let ground = lookup_shared(named, on)?;
+                at = crate::loft::drape(&at, &path, &ground, follow)
+                    .map_err(|e| format!("path_array `{name}`: {e}"))?;
+            }
+            let (t0, r0) = (Vec3::from(source.translation), quat_of(source.rotation));
+            if *between {
+                // One copy per span, along the chord and stretched over it.
+                let (lo, hi) = source
+                    .verts
+                    .iter()
+                    .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v[0]), b.max(v[0])));
+                let len = ((hi - lo) * source.scale[0]).max(1e-6);
+                let n = at.len();
+                let spans = if *closed { n } else { n.saturating_sub(1) };
+                for i in 0..spans {
+                    let (a, b) = (at[i].0, at[(i + 1) % n].0);
+                    let d = b - a;
+                    let x = d.normalize_or(Vec3::X);
+                    let side = x.cross(Vec3::Y).normalize_or(Vec3::Z);
+                    let y = side.cross(x).normalize_or(Vec3::Y);
+                    let r =
+                        bevy::math::Quat::from_mat3(&bevy::math::Mat3::from_cols(x, y, x.cross(y)))
+                            .normalize();
+                    let mut part = source.clone();
+                    part.name = format!("{name}_{i}");
+                    part.visible = true;
+                    let mut sc = Vec3::from(source.scale);
+                    sc.x *= d.length() / len;
+                    part.scale = sc.to_array();
+                    let mid = (a + b) * 0.5;
+                    part.translation = (mid + r * Vec3::new(0.0, t0.y, t0.z)).to_array();
+                    part.rotation = (r * r0).normalize().to_array();
+                    let part_name = part.name.clone();
+                    upsert(named, &part_name, part);
+                }
+                return Ok(());
+            }
             let (t0, r0) = (Vec3::from(source.translation), quat_of(source.rotation));
             for (i, (p, r)) in at.into_iter().enumerate() {
                 let mut part = source.clone();
@@ -1382,13 +1430,22 @@ pub fn outputs(op: &Op) -> Vec<String> {
             closed,
             count,
             spacing,
+            on,
+            between,
             ..
         } => {
-            let len = crate::loft::path_length(
-                &crate::loft::sample_path(path, *closed, *smooth, *samples),
-                *closed,
-            );
-            let n = crate::loft::count_for(len, *closed, *count, *spacing).unwrap_or(0);
+            let mut pts = crate::loft::sample_path(path, *closed, *smooth, *samples);
+            if on.is_some() {
+                // Spaced in plan on a surface.
+                for p in &mut pts {
+                    p[1] = 0.0;
+                }
+            }
+            let len = crate::loft::path_length(&pts, *closed);
+            let mut n = crate::loft::count_for(len, *closed, *count, *spacing).unwrap_or(0);
+            if *between && !*closed {
+                n = n.saturating_sub(1);
+            }
             (0..n).map(|i| format!("{name}_{i}")).collect()
         }
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
@@ -1478,7 +1535,13 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Text { .. }
         | Op::Terrain { .. }
         | Op::Prefab { .. } => Vec::new(),
-        Op::PathArray { input, .. } => vec![input],
+        Op::PathArray { input, on, .. } => {
+            let mut v = vec![input.as_str()];
+            if let Some(o) = on {
+                v.push(o.as_str());
+            }
+            v
+        }
         Op::Transform { input, .. }
         | Op::RadialArray { input, .. }
         | Op::Material { input, .. }
@@ -2312,6 +2375,9 @@ mod tests {
             spacing: 1.0,
             align: true,
             roll_step: 0.0,
+            on: None,
+            follow: String::new(),
+            between: false,
         };
         assert_eq!(outputs(&op).len(), 4);
         let parts = evaluate(&[

@@ -1144,6 +1144,24 @@ pub struct PathArraySpec {
     /// Extra roll per copy about the tangent, degrees: 90 for chain links.
     #[serde(default)]
     roll_step: f32,
+    /// Drop the path onto this part's surface (terrain, a hill, a roof):
+    /// the path is then [x, y, z] with y a height above the surface
+    /// (usually 0), and spacing is measured in plan.
+    #[serde(default)]
+    on: Option<String>,
+    /// With `on`: "upright" (default; copies stand straight, turned only
+    /// about y: posts, lamps, trees), "slope" (pitched to follow the ground
+    /// along the path: rails, walls, kerbs, steps of a ramp) or "normal"
+    /// (standing on the surface's normal: tilted on a slope sideways too).
+    #[serde(default)]
+    follow: Option<String>,
+    /// Copies go between consecutive points instead of at them, each turned
+    /// along and stretched over the span from one point to the next (model
+    /// the source at any length along +x, centred on the origin):
+    /// fence rails between posts, a wall between pillars, rope between
+    /// poles. One fewer copy than points; same count/spacing as the posts.
+    #[serde(default)]
+    between: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3093,6 +3111,26 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 spacing: s.spacing,
                 align: s.align,
                 roll_step: s.roll_step,
+                follow: match s.follow.as_deref() {
+                    None => String::new(),
+                    Some(f @ ("upright" | "slope" | "normal")) => {
+                        if s.on.is_none() {
+                            return Err(format!("{ctx}: follow needs on (the surface to follow)"));
+                        }
+                        if f == "upright" {
+                            String::new()
+                        } else {
+                            f.to_string()
+                        }
+                    }
+                    Some(f) => {
+                        return Err(format!(
+                            "{ctx}: follow: `{f}` is not upright, slope or normal"
+                        ));
+                    }
+                },
+                on: s.on,
+                between: s.between,
             })
         }
         "text" => {
