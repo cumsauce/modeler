@@ -73,6 +73,43 @@ pub fn polygon(p: V2, v: &[V2]) -> f32 {
     s * d.sqrt()
 }
 
+/// Signed distance to a set of closed rings filled even-odd (glyph outlines
+/// with their holes): negative inside. `boxes` are each ring's bounds
+/// (min, max), to skip rings too far to matter.
+pub fn filled(p: V2, rings: &[Vec<V2>], boxes: &[(V2, V2)]) -> f32 {
+    let mut d = f32::MAX;
+    let mut s = 1.0f32;
+    for (v, (lo, hi)) in rings.iter().zip(boxes) {
+        if v.len() < 3 {
+            continue;
+        }
+        // A ring changes the sign only where p's row crosses it.
+        let crosses = p[1] >= lo[1] && p[1] < hi[1] && p[0] >= lo[0];
+        let bx = (lo[0] - p[0]).max(p[0] - hi[0]).max(0.0);
+        let by = (lo[1] - p[1]).max(p[1] - hi[1]).max(0.0);
+        let near = bx * bx + by * by < d;
+        if !crosses && !near {
+            continue;
+        }
+        let mut j = v.len() - 1;
+        for i in 0..v.len() {
+            let e = sub2(v[j], v[i]);
+            let w = sub2(p, v[i]);
+            if near {
+                let h = (dot2(w, e) / dot2(e, e).max(1e-12)).clamp(0.0, 1.0);
+                let b = [w[0] - e[0] * h, w[1] - e[1] * h];
+                d = d.min(dot2(b, b));
+            }
+            let c = [p[1] >= v[i][1], p[1] < v[j][1], e[0] * w[1] > e[1] * w[0]];
+            if (c[0] && c[1] && c[2]) || (!c[0] && !c[1] && !c[2]) {
+                s = -s;
+            }
+            j = i;
+        }
+    }
+    s * d.sqrt()
+}
+
 /// A regular `n`-pointed star: outer radius `r`, inner radius `ri`.
 pub fn star(p: V2, r: f32, ri: f32, n: u32) -> f32 {
     let n = n.max(2);
@@ -193,5 +230,39 @@ mod tests {
         assert!((plane([0.0, 2.0, 0.0], [0.0, 1.0, 0.0], 0.5) - 1.5).abs() < 1e-6);
         assert!(smin(1.0, 1.0, 0.5) < 1.0);
         assert!((arc([0.0, 1.0], 1.0, 0.0, 180.0, 0.1) + 0.05).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    #[test]
+    fn letters_are_negative_inside_and_holes_stay_open() {
+        // An "O": a ring with a hole, 1 m tall, centred at the origin.
+        let rings = crate::text::outline("O", "sans", 1.0, "center", 1.0, 0.0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let boxes: Vec<([f32; 2], [f32; 2])> = rings
+            .iter()
+            .map(|r| {
+                r.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(a, b), p| {
+                    (
+                        [a[0].min(p[0]), a[1].min(p[1])],
+                        [b[0].max(p[0]), b[1].max(p[1])],
+                    )
+                })
+            })
+            .collect();
+        let (lo, hi) = boxes
+            .iter()
+            .fold(([f32::MAX; 2], [f32::MIN; 2]), |(a, b), (l, h)| {
+                (
+                    [a[0].min(l[0]), a[1].min(l[1])],
+                    [b[0].max(h[0]), b[1].max(h[1])],
+                )
+            });
+        let mid = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+        // The hole in the middle is outside, the stroke at the left is inside.
+        assert!(super::filled(mid, &rings, &boxes) > 0.0);
+        assert!(super::filled([lo[0] + 0.03, mid[1]], &rings, &boxes) < 0.0);
+        assert!(super::filled([hi[0] + 0.5, mid[1]], &rings, &boxes) > 0.4);
     }
 }

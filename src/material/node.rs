@@ -323,6 +323,7 @@ node_types! {
     "rect" => Rect,
     "segment" => Segment,
     "polygon" => Polygon,
+    "text" => Text,
     "star" => Star,
     "hexagon" => Hexagon,
     "arc" => Arc2,
@@ -881,6 +882,92 @@ impl Eval for Polygon {
         Ok(vec![(
             "",
             pf(cx.n(), |i| sdf::polygon(c.v2(i), &self.points)),
+        )])
+    }
+}
+
+/// Text SDF: the letters of `text` (negative inside), the block centred on
+/// `center`, `size` meters = capital height, reading left to right with
+/// the image's top up; `angle` turns it (degrees, counter-clockwise).
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Text {
+    #[serde(default)]
+    #[serde(alias = "input")]
+    pub coords: Option<In>,
+    /// The text; `\n` starts a line.
+    pub text: String,
+    /// Capital height, meters.
+    pub size: f32,
+    /// The centre of the text block (default [0.5, 0.5]).
+    #[serde(default)]
+    pub center: Option<[f32; 2]>,
+    /// sans (default), bold, mono, or a .ttf / .otf path.
+    #[serde(default)]
+    pub font: Option<String>,
+    /// Lines aligned left, center (default) or right.
+    #[serde(default)]
+    pub align: Option<String>,
+    /// Line height as a multiple of the font's (default 1).
+    #[serde(default)]
+    pub line_spacing: Option<f32>,
+    /// Extra space between letters, in capital heights (default 0).
+    #[serde(default)]
+    pub letter_spacing: Option<f32>,
+    /// Degrees, counter-clockwise as seen on the image.
+    #[serde(default)]
+    pub angle: f32,
+}
+
+impl Eval for Text {
+    fn eval(&self, cx: &Cx) -> Result<Outs, String> {
+        if self.size.is_nan() || self.size <= 0.0 {
+            return Err("size: the capital height in meters, above 0".into());
+        }
+        let rings = crate::text::outline(
+            &self.text,
+            self.font.as_deref().unwrap_or("sans"),
+            self.size,
+            self.align.as_deref().unwrap_or("center"),
+            self.line_spacing.unwrap_or(1.0),
+            self.letter_spacing.unwrap_or(0.0),
+        )?;
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in rings.iter().flatten() {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        let mid = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+        let c0 = self.center.unwrap_or([0.5, 0.5]);
+        let (sn, cs) = self.angle.to_radians().sin_cos();
+        // Image rows run down: flip y, then turn and centre.
+        let rings: Vec<Vec<[f32; 2]>> = rings
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|p| {
+                        let (x, y) = (p[0] - mid[0], p[1] - mid[1]);
+                        let (x, y) = (x * cs - y * sn, x * sn + y * cs);
+                        [c0[0] + x, c0[1] - y]
+                    })
+                    .collect()
+            })
+            .collect();
+        let boxes: Vec<([f32; 2], [f32; 2])> = rings
+            .iter()
+            .map(|r| {
+                r.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(a, b), p| {
+                    (
+                        [a[0].min(p[0]), a[1].min(p[1])],
+                        [b[0].max(p[0]), b[1].max(p[1])],
+                    )
+                })
+            })
+            .collect();
+        let c = cx.coords2(&self.coords)?;
+        Ok(vec![(
+            "",
+            pf(cx.n(), |i| sdf::filled(c.v2(i), &rings, &boxes)),
         )])
     }
 }
@@ -2077,6 +2164,7 @@ impl Eval for Output {
 pub fn refs(body: &Value) -> Vec<(String, String)> {
     const WORDS: &[&str] = &[
         "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path", "alpha",
+        "text", "font", "align",
     ];
     let mut out = Vec::new();
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {
@@ -2116,6 +2204,7 @@ pub fn example(ty: &str) -> Option<Value> {
         "rect" => json!({"coords": "bricks.local", "size": [0.24, 0.055], "round": 0.004}),
         "segment" => json!({"a": [0, 0], "b": [1, 1], "width": 0.01}),
         "polygon" => json!({"points": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.8]]}),
+        "text" => json!({"text": "OPEN", "size": 0.2, "center": [0.5, 0.5], "font": "bold"}),
         "star" => json!({"radius": 0.2, "inner": 0.08, "points": 5, "center": [0.5, 0.5]}),
         "hexagon" => json!({"coords": "cells.local", "radius": 0.04}),
         "arc" => json!({"radius": 0.3, "from": 0, "to": 180, "width": 0.02, "center": [0.5, 0.5]}),

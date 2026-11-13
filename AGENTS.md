@@ -1314,7 +1314,12 @@ work, and every material has its own history tree.
 - **Node families.** Coords: input, transform, combine, split, polar,
   kaleido, warp, tile_grid (ports local / cell / id / edge), repeat,
   triplanar. 2D SDFs: circle, rect, segment, polygon, star, hexagon, arc,
-  rings. 3D SDFs: sphere, box, torus, capsule, cylinder, plane. SDF ops:
+  rings, text (letters: `{"type": "text", "name": "t", "text": "OPEN",
+  "size": 0.2, "center": [0.5, 0.5], "font": "bold"}`, `size` = capital
+  height in meters, `\n` for lines, `align`, `line_spacing`,
+  `letter_spacing`, `angle` degrees; the same fonts as the `text` item;
+  feed it to `mask` for the fill, `mask` glow for an outline: signs,
+  labels, graffiti decals, stencils on crates). 3D SDFs: sphere, box, torus, capsule, cylinder, plane. SDF ops:
   sdf_op (union / intersect / subtract and smooth_ versions), sdf_round,
   onion, displace, mask (fill / stroke / glow, anti-aliased). Noise: noise
   (value / gradient; fbm / ridged / turbulence), worley (f1 / f2 / edge /
