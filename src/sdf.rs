@@ -107,6 +107,11 @@ pub struct SdfDef {
     pub warps: Vec<Deform>,
     #[serde(default, skip_serializing_if = "none")]
     pub resolution: Option<f32>,
+    /// Set by the graph (never read from input or saved) when the result
+    /// only feeds decimates: the most triangles any consumer keeps,
+    /// so the default resolution meshes only as finely as that needs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "none")]
+    pub target_tris: Option<u32>,
 }
 
 /// A chain point: `[x, y, z, radius]` or the name of a joint.
@@ -134,6 +139,11 @@ pub struct SkinDef {
     pub warps: Vec<Deform>,
     #[serde(default, skip_serializing_if = "none")]
     pub resolution: Option<f32>,
+    /// Set by the graph (never read from input or saved) when the result
+    /// only feeds decimates: the most triangles any consumer keeps,
+    /// so the default resolution meshes only as finely as that needs.
+    #[serde(default, skip_deserializing, skip_serializing_if = "none")]
+    pub target_tris: Option<u32>,
 }
 
 fn finite_pos(v: f32) -> bool {
@@ -470,6 +480,7 @@ impl SkinDef {
             mirror: self.mirror.clone(),
             warps: self.warps.clone(),
             resolution: self.resolution,
+            target_tris: self.target_tris,
         }
     }
 }
@@ -1208,6 +1219,17 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
         }
         None => {
             let mut r = (size / 120.0).min(thin / 3.0).max(1e-4);
+            if let Some(t) = def.target_tris {
+                // Mesh about 40x the kept triangles (at least 6000): enough
+                // for the decimate to pick a faithful light mesh. Surface
+                // area is guessed from the box (an ellipsoid's is ~0.55 of
+                // its box's); a level set makes ~2.2 triangles per r^2.
+                let e = hi - lo;
+                let area = 0.55 * 2.0 * (e.x * e.y + e.y * e.z + e.z * e.x);
+                let want = (40.0 * t as f32).max(6000.0);
+                let coarse = (2.2 * area / want).sqrt().min(size / 24.0).min(thin / 2.0);
+                r = r.max(coarse);
+            }
             if samples(r) > AUTO_SAMPLES {
                 r *= (samples(r) / AUTO_SAMPLES).cbrt() as f32 * 1.01;
             }

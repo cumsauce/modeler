@@ -218,3 +218,68 @@ fn material_bakes_stay_cached_and_parallel() {
     bake_all(&s);
     budget("re-bake after moving one part", t0.elapsed(), 400);
 }
+
+/// A creature the way agents build one: twelve independent sdf parts, each
+/// decimated to a few hundred triangles with the dense source hidden. The
+/// dense meshes are sized for their decimates and the pairs derive in
+/// parallel (this took about 30 s before both).
+#[test]
+fn sdf_creatures_mesh_for_their_decimates() {
+    let mut s = Session::default();
+    let _ = s.new_model("critters");
+    let t = Instant::now();
+    apply(
+        &mut s,
+        vec![json!({"type": "repeat", "var": "k", "count": 12, "items": [
+            {"type": "sdf", "name": "p{k}_hi", "blend": 0.03, "shapes": [
+                {"shape": "ellipsoid", "size": [0.12, 0.1, 0.16], "at": ["=$k * 0.5", 0.16, 0]},
+                {"shape": "sphere", "radius": 0.075, "at": ["=$k * 0.5", 0.27, 0.15]},
+                {"shape": "capsule", "from": ["=$k * 0.5 + 0.07", 0.12, 0.09],
+                 "to": ["=$k * 0.5 + 0.09", 0, 0.11], "radius": [0.03, 0.022]}]},
+            {"type": "decimate", "name": "p{k}", "input": "p{k}_hi", "tris": 400},
+            {"type": "hide_part", "part": "p{k}_hi"}
+        ]})],
+    );
+    let took = t.elapsed();
+    let dense = s
+        .model
+        .parts
+        .iter()
+        .find(|p| p.name == "p0_hi")
+        .map(|p| p.tri_count())
+        .unwrap_or(0);
+    println!("12 sdf + decimate pairs: {took:?} (dense source {dense} tris)");
+    assert!(
+        dense > 0 && dense < 40_000,
+        "the dense source should be meshed for a 400-triangle decimate, got {dense}"
+    );
+    budget("12 sdf + decimate pairs", took, 6000);
+    // The cache derived in parallel matches a plain serial re-derivation.
+    let spec: modeler::commands::VerifySpec =
+        serde_json::from_value(json!({"rebuild": true})).unwrap_or_else(|e| panic!("{e}"));
+    let (ok, v) = s.verify(&spec);
+    assert!(ok, "{v}");
+}
+
+/// A batch evaluates its graph items once, yet a failing item is still
+/// the one the error names, and nothing is applied.
+#[test]
+fn a_deferred_batch_names_its_failing_item() {
+    let mut s = Session::default();
+    let _ = s.new_model("defer");
+    let e = s
+        .apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "a", "kind": "box", "size": 1}),
+                json!({"type": "primitive", "name": "b", "kind": "box", "size": 1,
+                       "translation": [5, 0, 0]}),
+                json!({"type": "boolean", "name": "c", "op": "intersection", "a": "a", "b": "b"}),
+            ],
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(e.contains("#2"), "{e}");
+    assert!(s.model.ops.is_empty(), "the batch rolled back");
+}

@@ -257,6 +257,11 @@ pub struct Session {
     /// Nesting depth of [`Session::batch`]; while > 0, commits are collected
     /// into one history step recorded when the outermost batch ends.
     batch_depth: usize,
+    /// While a batch applies a run of graph items, the graph is evaluated
+    /// once for the run instead of after every item (`Some`): the ops as
+    /// they were before the run, and the items applied since, to replay one
+    /// by one when the run fails so the error names its item.
+    deferred: Option<(Vec<Op>, Vec<(usize, Op, String)>)>,
     batch_labels: Vec<String>,
     /// Open documents other than the active `model` (see [`Session::scene`]).
     pub others: Vec<Model>,
@@ -389,6 +394,7 @@ impl Default for Session {
             materials: Default::default(),
             pending_pin: None,
             batch_depth: 0,
+            deferred: None,
             batch_labels: Vec::new(),
             others: Vec::new(),
             parked: Vec::new(),
@@ -787,6 +793,10 @@ impl Session {
         match prev {
             Some(i) => self.model.ops[i] = op,
             None => self.model.ops.push(op),
+        }
+        if self.deferred.is_some() {
+            self.commit(label);
+            return Ok(format!("{label} ok"));
         }
         if let Err(e) = self.model.refresh() {
             // Never leave the graph in a state that does not evaluate.
@@ -2527,7 +2537,37 @@ impl Session {
     /// `apply_batch` with an optional parameter template per item: an op item
     /// stores its template (or drops a stale one) so parameter changes can
     /// re-derive it.
+    /// Evaluates a deferred run of graph items. On failure the ops go back
+    /// to how they were before the run and its items are applied again one
+    /// at a time, so the error is the failing item's own.
+    fn flush_deferred(&mut self) -> Result<(), String> {
+        let Some((before, items)) = self.deferred.take() else {
+            return Ok(());
+        };
+        if items.is_empty() || self.model.refresh().is_ok() {
+            return Ok(());
+        }
+        self.model.ops = before;
+        self.model.refresh().map_err(|e| e.to_string())?;
+        for (i, op, label) in items {
+            self.apply_op(op, &label)
+                .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     fn apply_items(
+        &mut self,
+        items: Vec<(BatchItem, Option<serde_json::Value>)>,
+        with_summary: bool,
+    ) -> CmdResult {
+        let r = self.apply_items_inner(items, with_summary);
+        // An early error leaves a run unflushed: the batch rolls back.
+        self.deferred = None;
+        r
+    }
+
+    fn apply_items_inner(
         &mut self,
         items: Vec<(BatchItem, Option<serde_json::Value>)>,
         with_summary: bool,
@@ -2545,6 +2585,27 @@ impl Session {
                         self.model.templates.remove(&key);
                     }
                 }
+            }
+            // Plain graph items run deferred (one evaluation for the run);
+            // anything that reads the evaluated parts flushes first.
+            let graph_item = match &item {
+                BatchItem::Op(Op::Material { name, input, .. })
+                | BatchItem::Op(Op::Transform {
+                    name,
+                    input,
+                    relative: false,
+                    ..
+                }) if name == input && !self.derived_by_ops(name) => false,
+                BatchItem::Op(Op::Scatter { .. }) => false,
+                BatchItem::Op(_) => true,
+                _ => false,
+            };
+            if graph_item {
+                if self.deferred.is_none() {
+                    self.deferred = Some((self.model.ops.clone(), Vec::new()));
+                }
+            } else {
+                self.flush_deferred()?;
             }
             let fail = |e: ModelerError| format!("batch item #{i} failed: {e}");
             let msg = match item {
@@ -2587,6 +2648,9 @@ impl Session {
                         .map_err(|e| format!("batch item #{i} failed: {e}"))?;
                     let label = Self::op_label(&op);
                     let note = self.scatter_note_for(&op);
+                    if let Some((_, items)) = &mut self.deferred {
+                        items.push((i, op.clone(), label.clone()));
+                    }
                     self.apply_op(op, &label)
                         .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
                     match note {
@@ -2646,6 +2710,7 @@ impl Session {
             };
             lines.push(format!("#{i} {msg}"));
         }
+        self.flush_deferred()?;
         if with_summary {
             lines.push(self.summary());
         }

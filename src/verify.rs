@@ -47,7 +47,37 @@ pub fn check_rebuild(model: &Model) -> CmdResult {
             model.parts.len()
         ))
     } else {
-        Err("cached parts differ from a fresh re-derivation — the parts cache is stale or an op is non-deterministic".into())
+        let key = |p: &crate::Part| {
+            format!(
+                "{:?} {:?} {:?} {:?} {:?}",
+                p.verts, p.indices, p.translation, p.rotation, p.scale
+            )
+        };
+        let mut diff: Vec<String> = Vec::new();
+        for p in &model.parts {
+            match clone.parts.iter().find(|q| q.name == p.name) {
+                None => diff.push(format!("`{}` (not re-derived)", p.name)),
+                Some(q) if key(p) != key(q) => diff.push(format!(
+                    "`{}` ({} -> {} verts, {} -> {} tris)",
+                    p.name,
+                    p.verts.len(),
+                    q.verts.len(),
+                    p.tri_count(),
+                    q.tri_count()
+                )),
+                _ => {}
+            }
+        }
+        for q in &clone.parts {
+            if !model.parts.iter().any(|p| p.name == q.name) {
+                diff.push(format!("`{}` (only in the re-derivation)", q.name));
+            }
+        }
+        Err(format!(
+            "cached parts differ from a fresh re-derivation — the parts cache is stale or an op is non-deterministic: {}",
+            diff.join(", ")
+        )
+        .into())
     }
 }
 

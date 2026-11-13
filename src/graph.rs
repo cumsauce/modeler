@@ -113,7 +113,154 @@ fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
     h.finish()
 }
 
+/// `sdf` / `skin` results that only feed `decimate`s (no bake) get
+/// the largest kept triangle count as a hint, so they mesh coarsely: a 6 cm
+/// eye decimated to 80 triangles needn't be meshed at 127k.
+fn with_mesh_hints(ops: &[Op]) -> std::borrow::Cow<'_, [Op]> {
+    let mut hints: Vec<(usize, u32)> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let (name, res) = match op {
+            Op::Sdf { name, def } => (name, def.resolution),
+            Op::Skin { name, def } => (name, def.resolution),
+            _ => continue,
+        };
+        if res.is_some() {
+            continue;
+        }
+        let mut most = 0u32;
+        let mut ok = true;
+        for o in ops {
+            if !inputs(o).contains(&name.as_str()) {
+                continue;
+            }
+            match o {
+                Op::Visibility { input, .. } if input == name => {}
+                Op::Material { name: n, input, .. } if n == name && input == name => {}
+                Op::Decimate { def, .. } if !def.bake => match def.tris {
+                    Some(t) => most = most.max(t),
+                    None => ok = false,
+                },
+                _ => ok = false,
+            }
+        }
+        if ok && most > 0 {
+            hints.push((i, most));
+        }
+    }
+    if hints.is_empty() {
+        return std::borrow::Cow::Borrowed(ops);
+    }
+    let mut v = ops.to_vec();
+    for (i, t) in hints {
+        match &mut v[i] {
+            Op::Sdf { def, .. } => def.target_tris = Some(t),
+            Op::Skin { def, .. } => def.target_tris = Some(t),
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(v)
+}
+
+fn cache_get(key: u64) -> Option<Named> {
+    OP_CACHE.lock().ok().and_then(|mut c| {
+        c.as_mut().and_then(|m| m.get_mut(&key)).map(|(p, used)| {
+            *used = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            p.clone()
+        })
+    })
+}
+
+fn cache_put(key: u64, produced: Named) {
+    if let Ok(mut c) = OP_CACHE.lock() {
+        let map = c.get_or_insert_with(HashMap::new);
+        if map.len() >= CACHE_MAX_ENTRIES {
+            let mut ticks: Vec<u64> = map.values().map(|(_, t)| *t).collect();
+            let mid = ticks.len() / 2;
+            let (_, cut, _) = ticks.select_nth_unstable(mid);
+            let cut = *cut;
+            map.retain(|_, (_, t)| *t > cut);
+        }
+        let tick = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        map.insert(key, (produced, tick));
+    }
+}
+
+/// Ops worth running in parallel: they take milliseconds to seconds and
+/// read only their inputs.
+fn slow(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Sdf { .. }
+            | Op::Skin { .. }
+            | Op::Blob { .. }
+            | Op::Decimate { .. }
+            | Op::Deform { .. }
+            | Op::Smooth { .. }
+            | Op::Round { .. }
+            | Op::Shell { .. }
+            | Op::LSystem { .. }
+            | Op::Terrain { .. }
+            | Op::Boolean { .. }
+    )
+}
+
+/// Runs, in parallel, the slow ops of `rest` (the evaluation order from the
+/// current op on) that are not cached and whose inputs no earlier op of
+/// `rest` writes, so their inputs are final in `named` now; their results
+/// go to the cache under the key the loop will look up. Returns how many
+/// ran. Failures are dropped: the loop runs that op again and reports it.
+fn prefetch(ops: &[Op], rest: &[usize], named: &Named, hashes: &HashMap<String, u64>) -> u64 {
+    use rayon::prelude::*;
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todo: Vec<(&Op, u64)> = Vec::new();
+    for &j in rest {
+        let op = &ops[j];
+        let ins = inputs(op);
+        let ready = ins
+            .iter()
+            .all(|n| !written.contains(*n) && hashes.contains_key(*n));
+        if ready && slow(op) {
+            let ih: Vec<u64> = ins.iter().map(|n| hashes[*n]).collect();
+            if let Ok(key) = op_key(op, &ih)
+                && cache_get(key).is_none()
+                && !todo.iter().any(|(_, k)| *k == key)
+            {
+                todo.push((op, key));
+            }
+        }
+        written.extend(outputs(op));
+    }
+    if todo.len() < 2 {
+        return 0;
+    }
+    let done: Vec<(u64, Named)> = todo
+        .par_iter()
+        .filter_map(|(op, key)| {
+            let mut local = named.clone();
+            run_op(op, &mut local).ok()?;
+            let produced: Named = outputs(op)
+                .iter()
+                .filter_map(|n| local.iter().find(|(m, _)| m == n).cloned())
+                .map(|(m, mut p)| {
+                    if !keeps_detail(op) && p.detail.is_some() {
+                        Arc::make_mut(&mut p).detail = None;
+                    }
+                    (m, p)
+                })
+                .collect();
+            Some((*key, produced))
+        })
+        .collect();
+    let n = done.len() as u64;
+    for (key, produced) in done {
+        cache_put(key, produced);
+    }
+    n
+}
+
 fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerError> {
+    let hinted = with_mesh_hints(ops);
+    let ops: &[Op] = &hinted;
     let order = eval_order(ops)?;
     let mut named: Named = Vec::new();
     // Content hash of each named part: the key of the op run that wrote it,
@@ -127,7 +274,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
         .filter(|o| matches!(o, Op::Scatter { .. }))
         .flat_map(outputs)
         .collect();
-    for i in order {
+    for (pos, &i) in order.iter().enumerate() {
         let op = &ops[i];
         if matches!(
             op,
@@ -155,16 +302,23 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             .map(|n| hashes.get(*n).copied().unwrap_or(0))
             .collect();
         let key = op_key(op, &input_hashes)?;
-        let hit = if use_cache && !matches!(op, Op::Rename { .. }) {
-            OP_CACHE.lock().ok().and_then(|mut c| {
-                c.as_mut().and_then(|m| m.get_mut(&key)).map(|(p, used)| {
-                    *used = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    p.clone()
-                })
-            })
+        let mut hit = if use_cache && !matches!(op, Op::Rename { .. }) {
+            cache_get(key)
         } else {
             None
         };
+        // A slow op to run: first run every other slow op whose inputs are
+        // already final alongside it (results go to the cache), so a model
+        // of many independent parts (a creature's sdf + decimate pairs)
+        // derives on every core. The loop then takes them as cache hits.
+        if hit.is_none() && use_cache && slow(op) {
+            let runs = prefetch(ops, &order[pos..], &named, &hashes);
+            RUNS.with(|r| r.set(r.get() + runs));
+            if runs > 0 {
+                // Counted in `runs`: the hit below is not a second run.
+                hit = cache_get(key);
+            }
+        }
         let outs = outputs(op);
         match hit {
             Some(parts) => {
@@ -196,18 +350,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                                 .map(|(m, p)| (m.clone(), p.clone()))
                         })
                         .collect();
-                    if let Ok(mut c) = OP_CACHE.lock() {
-                        let map = c.get_or_insert_with(HashMap::new);
-                        if map.len() >= CACHE_MAX_ENTRIES {
-                            let mut ticks: Vec<u64> = map.values().map(|(_, t)| *t).collect();
-                            let mid = ticks.len() / 2;
-                            let (_, cut, _) = ticks.select_nth_unstable(mid);
-                            let cut = *cut;
-                            map.retain(|_, (_, t)| *t > cut);
-                        }
-                        let tick = OP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        map.insert(key, (produced, tick));
-                    }
+                    cache_put(key, produced);
                 }
             }
         }

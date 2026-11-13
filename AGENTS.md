@@ -595,6 +595,12 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   sculpt at `tris: 1500` with `bake` reads almost like the original.
   `{"type": "decimate", "name": "statue", "input": "statue_hi", "tris":
   4000, "bake": true}` plus `{"type": "hide_part", "part": "statue_hi"}`.
+  An `sdf` / `skin` (without its own `resolution`) that only feeds
+  `decimate`s with `tris` and no `bake` is meshed for them (about 40x the
+  kept triangles, at least 6000) instead of at full detail: a 6 cm eye
+  decimated to 80 triangles meshes 6k, not 127k. Independent slow ops
+  (sdf, decimate, deform, booleans, ...) derive in parallel, and a batch
+  evaluates its run of graph items once, not after every item.
   Moves, transforms, arrays, scatters and mirrors carry the bake along; an
   op that reshapes the mesh (deform, boolean, round, ...) drops it, so
   decimate last. Exports write the bake as the part's textures (per-part

@@ -3306,6 +3306,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map(WarpSpec::into_deform)
                     .collect(),
                 resolution: s.resolution,
+                target_tris: None,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Sdf {
@@ -3339,6 +3340,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map(WarpSpec::into_deform)
                     .collect(),
                 resolution: s.resolution,
+                target_tris: None,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Skin {

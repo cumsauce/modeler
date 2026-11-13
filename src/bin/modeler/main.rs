@@ -147,8 +147,12 @@ fn main() -> AppExit {
                     .and_then(|m| m.check_format().map(|_| m).map_err(|e| e.to_string()))
             });
         match loaded {
-            Ok(model) => {
+            Ok(mut model) => {
                 eprintln!("loaded model `{}` from {}", model.name, path.display());
+                // Saved files hold ops, not parts: derive them now.
+                if let Err(e) = model.refresh() {
+                    eprintln!("could not derive {}: {e}", path.display());
+                }
                 session.model = model;
             }
             Err(e) => eprintln!("could not load {}: {e}", path.display()),
