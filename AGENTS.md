@@ -158,7 +158,7 @@ type, so there is no need to memorise field names.
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
-| `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor] |
+| `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor], [hidden] |
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [preview], [components] |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `decal` | name, pbr (a `decal`-domain material), size [w, h] or [w, h, depth], [on], [at], [toward down], [translation], [direction], [roll], [attach], [kind clustered / forward], [params] |
@@ -929,6 +929,16 @@ materials" in Material mode.
   geometry that needs its real shape (ramps, arches), `hull` for props,
   `body: "dynamic"` for things that fall and get pushed (hull or box only),
   `sensor: true` for triggers, `none` to exempt (decals, foliage).
+  A static `box` is the part's own box turned with it (a tilted ramp or
+  roof slope gets a tight box; the collider node carries the rotation);
+  moving bodies get a world-aligned box. Rules skip hidden parts unless
+  they say `hidden: true`: then a hidden part exports as a collider node
+  with no render mesh, so invisible blockers and trigger volumes live in
+  the model, not in game code (`{"type": "collider", "name": "blockers",
+  "parts": ["block_*"], "shape": "box", "hidden": true}`, with the
+  `block_*` boxes hidden; `box` / `hull` only). The window draws them as
+  gizmos too. Hidden parts don't come into prefab instances, so a scene
+  using the prefab gets its blockers from the prefab's own glTF.
 - `marker` items are named points for game code: spawns, waypoints, item
   spots, cameras, trigger zones (`size` = a box volume). `yaw` faces them
   (degrees about +y, 0 = +z), `data` carries any JSON (`{"team": 1}`),

@@ -2176,7 +2176,7 @@ pub struct ColliderSpec {
     name: String,
     /// Part names or `*` globs ("wall*", "crate1.*", "*").
     parts: Vec<String>,
-    /// box (axis-aligned, cheapest), hull (convex hull of the part), mesh
+    /// box (the part's own box, turned with the part; cheapest), hull (convex hull of the part), mesh
     /// (the render triangles: static level geometry only) or none (no
     /// collider, e.g. to exempt decals from a "*" rule).
     shape: String,
@@ -2186,6 +2186,10 @@ pub struct ColliderSpec {
     /// A trigger: reports overlaps, blocks nothing.
     #[serde(default)]
     sensor: bool,
+    /// Also give hidden parts a collider: they export as a collider node
+    /// with no render mesh (invisible blockers, trigger volumes).
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3408,6 +3412,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 shape: s.shape,
                 body: body_kind,
                 sensor: s.sensor,
+                hidden: s.hidden,
             })
         }
         "skeleton" => {

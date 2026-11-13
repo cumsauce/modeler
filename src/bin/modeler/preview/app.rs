@@ -1077,7 +1077,9 @@ pub(crate) fn draw_game_gizmos(
             Color::srgba(1.0, 0.6, 0.2, 0.6)
         };
         gizmos.cube(
-            Transform::from_translation(c.center).with_scale(c.half_extents * 2.0),
+            Transform::from_translation(c.center)
+                .with_rotation(c.rotation)
+                .with_scale(c.half_extents * 2.0),
             color,
         );
     }

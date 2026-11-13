@@ -32,6 +32,9 @@ pub struct Collider {
     /// World centre of the part's box (the collider node's origin).
     pub center: Vec3,
     pub half_extents: Vec3,
+    /// The box's orientation (the part's own rotation for a static box;
+    /// identity otherwise, with `half_extents` world-aligned).
+    pub rotation: bevy::math::Quat,
     /// Hull points relative to `center` (hull only).
     pub points: Vec<[f32; 3]>,
 }
@@ -42,6 +45,7 @@ struct Rule {
     shape: String,
     body: String,
     sensor: bool,
+    hidden: bool,
 }
 
 /// Every marker in world space, after moves.
@@ -137,12 +141,14 @@ fn rules(model: &Model, depth: u32) -> Vec<Rule> {
                 shape,
                 body,
                 sensor,
+                hidden,
                 ..
             } => out.push(Rule {
                 parts: parts.clone(),
                 shape: shape.clone(),
                 body: body.clone(),
                 sensor: *sensor,
+                hidden: *hidden,
             }),
             Op::Prefab { name, prefab, .. } => {
                 let Ok(src) = crate::catalog::prefab_instance(prefab) else {
@@ -172,16 +178,18 @@ pub fn colliders(model: &Model) -> Result<Vec<Collider>, ModelerError> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for part in model
-        .parts
-        .iter()
-        .filter(|p| p.visible && !p.verts.is_empty())
-    {
-        let Some(rule) = rules.iter().rev().find(|r| {
-            r.parts
-                .iter()
-                .any(|pat| crate::name_matches(pat, &part.name))
-        }) else {
+    for part in model.parts.iter().filter(|p| !p.verts.is_empty()) {
+        // A hidden part only gets a collider from a rule that asks for them.
+        let Some(rule) = rules
+            .iter()
+            .rev()
+            .filter(|r| part.visible || r.hidden)
+            .find(|r| {
+                r.parts
+                    .iter()
+                    .any(|pat| crate::name_matches(pat, &part.name))
+            })
+        else {
             continue;
         };
         if rule.shape == "none" {
@@ -207,13 +215,33 @@ pub fn colliders(model: &Model) -> Result<Vec<Collider>, ModelerError> {
         } else {
             Vec::new()
         };
+        // A static box turns with the part: its own (scaled) local box, so
+        // a tilted ramp or roof gets a tight box, not a fat world one.
+        let (center, half_extents, rotation) = if rule.shape == "box" && rule.body == "static" {
+            let s = Vec3::from(part.scale);
+            let (mut a, mut b) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for v in &part.verts {
+                let p = Vec3::from(*v) * s;
+                a = a.min(p);
+                b = b.max(p);
+            }
+            let r = quat_of(part.rotation);
+            (
+                r * ((a + b) * 0.5) + Vec3::from(part.translation),
+                ((b - a) * 0.5).abs(),
+                r,
+            )
+        } else {
+            (center, (hi - lo) * 0.5, bevy::math::Quat::IDENTITY)
+        };
         out.push(Collider {
             part: part.name.clone(),
             shape: rule.shape.clone(),
             body: rule.body.clone(),
             sensor: rule.sensor,
             center,
-            half_extents: (hi - lo) * 0.5,
+            half_extents,
+            rotation,
             points,
         });
     }
@@ -244,6 +272,47 @@ mod tests {
             panic!("array");
         };
         ok(s.apply_values(None, items));
+    }
+
+    #[test]
+    fn boxes_turn_with_their_part_and_hidden_blockers_export() {
+        let mut s = Session::default();
+        apply(
+            &mut s,
+            json!([
+                {"type": "primitive", "name": "ramp", "kind": "box", "size": [4, 0.1, 1],
+                 "translation": [0, 1, 0], "rotation": {"z": 30}},
+                {"type": "primitive", "name": "blocker", "kind": "box", "size": [1, 2, 1],
+                 "translation": [3, 1, 0]},
+                {"type": "hide_part", "part": "blocker"},
+                {"type": "collider", "name": "all", "parts": ["*"], "shape": "box"},
+                {"type": "collider", "name": "walls", "parts": ["blocker"], "shape": "box",
+                 "hidden": true}
+            ]),
+        );
+        let cs = ok(colliders(&s.model));
+        assert_eq!(cs.len(), 2);
+        let ramp = cs
+            .iter()
+            .find(|c| c.part == "ramp")
+            .unwrap_or_else(|| panic!("ramp"));
+        // Its own 4 x 0.1 x 1 box, turned 30 degrees, not a fat world box.
+        assert!((ramp.half_extents - Vec3::new(2.0, 0.05, 0.5)).length() < 1e-4);
+        assert!(ramp.rotation.angle_between(bevy::math::Quat::IDENTITY) > 0.5);
+        // A "*" rule alone skips hidden parts; `hidden: true` covers them.
+        let (doc, _, _) = ok(crate::gltf::build_with(
+            &s.model,
+            Some("t.bin".into()),
+            &crate::export_opt::Options::none(),
+            None,
+            false,
+        ));
+        let names: Vec<&str> = doc["nodes"]
+            .as_array()
+            .map(|ns| ns.iter().filter_map(|n| n["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"blocker.collider"), "{names:?}");
+        assert!(!names.contains(&"blocker"), "{names:?}");
     }
 
     #[test]

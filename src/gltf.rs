@@ -721,6 +721,9 @@ pub(crate) fn build_with(
             "translation": c.center.to_array(),
             "extras": {"collider": info},
         });
+        if c.rotation != bevy::math::Quat::IDENTITY {
+            node["rotation"] = json!(c.rotation.to_array());
+        }
         if c.body != "static"
             && let Some(i) = at
         {

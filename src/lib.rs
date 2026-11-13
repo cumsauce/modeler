@@ -1244,6 +1244,10 @@ pub enum Op {
         /// Detects overlaps without blocking (a trigger).
         #[serde(default)]
         sensor: bool,
+        /// Also covers hidden parts: they export as a collider with no
+        /// render mesh (invisible blockers, trigger volumes).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hidden: bool,
     },
     /// A named point for game code: a spawn, waypoint, trigger volume,
     /// camera spot. Exported as an empty node carrying `kind` and `data`.

@@ -1618,9 +1618,11 @@ pub fn describe(ops: &[Op]) -> String {
                 shape,
                 body,
                 sensor,
+                hidden,
             } => format!(
-                "#{i} collider `{name}` parts={parts:?} {shape} {body}{}",
-                if *sensor { " sensor" } else { "" }
+                "#{i} collider `{name}` parts={parts:?} {shape} {body}{}{}",
+                if *sensor { " sensor" } else { "" },
+                if *hidden { " +hidden" } else { "" }
             ),
             Op::Marker {
                 name,
