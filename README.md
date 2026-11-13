@@ -34,6 +34,14 @@ document list groups the open documents by project, and a new agent
 brings it to the front. A restart reopens only unsaved documents. Pointing the config at `target/debug/modeler` instead gives each session
 its own server and window.
 
+## Downloads
+
+The rolling [`latest` release](https://github.com/cumsauce/modeler/releases/tag/latest)
+has a build of `main` for every platform: the desktop app (preview window +
+MCP server) for macOS (Apple silicon and Intel, also as an unsigned
+`modeler.app`: right-click > Open the first time), Windows and Linux, plus
+the headless Linux build for CI below.
+
 ## In CI (Linux, headless)
 
 Every push to `main` builds a Linux x86_64 binary (no window, no GPU, no
