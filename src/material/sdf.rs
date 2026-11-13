@@ -76,6 +76,7 @@ pub fn polygon(p: V2, v: &[V2]) -> f32 {
 /// Signed distance to a set of closed rings filled even-odd (glyph outlines
 /// with their holes): negative inside. `boxes` are each ring's bounds
 /// (min, max), to skip rings too far to matter.
+#[cfg(test)]
 pub fn filled(p: V2, rings: &[Vec<V2>], boxes: &[(V2, V2)]) -> f32 {
     let mut d = f32::MAX;
     let mut s = 1.0f32;
@@ -108,6 +109,140 @@ pub fn filled(p: V2, rings: &[Vec<V2>], boxes: &[(V2, V2)]) -> f32 {
         }
     }
     s * d.sqrt()
+}
+
+/// Closed rings (filled even-odd) with their edges bucketed in a grid, so
+/// a distance query looks only at nearby cells and the inside test only at
+/// edges crossing its row: text with hundreds of edges stays fast.
+pub struct EdgeGrid {
+    edges: Vec<(V2, V2)>,
+    lo: V2,
+    cell: f32,
+    nx: usize,
+    ny: usize,
+    /// Per cell: edges touching it.
+    cells: Vec<Vec<u32>>,
+    /// Per row of cells: edges whose y span meets the row.
+    rows: Vec<Vec<u32>>,
+}
+
+impl EdgeGrid {
+    pub fn new(rings: &[Vec<V2>]) -> EdgeGrid {
+        let mut edges = Vec::new();
+        for r in rings {
+            for i in 0..r.len() {
+                edges.push((r[i], r[(i + 1) % r.len()]));
+            }
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for (a, b) in &edges {
+            for p in [a, b] {
+                lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+                hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+            }
+        }
+        if edges.is_empty() {
+            lo = [0.0; 2];
+            hi = [1.0; 2];
+        }
+        // About 4 edges a cell on average.
+        let area = ((hi[0] - lo[0]) * (hi[1] - lo[1])).max(1e-8);
+        let cell = (area / (edges.len() as f32 / 4.0).max(1.0))
+            .sqrt()
+            .max(1e-5);
+        let nx = (((hi[0] - lo[0]) / cell).ceil() as usize).clamp(1, 512);
+        let ny = (((hi[1] - lo[1]) / cell).ceil() as usize).clamp(1, 512);
+        let cell = ((hi[0] - lo[0]) / nx as f32)
+            .max((hi[1] - lo[1]) / ny as f32)
+            .max(1e-5);
+        let mut cells = vec![Vec::new(); nx * ny];
+        let mut rows = vec![Vec::new(); ny];
+        let ci = |v: f32, o: f32, n: usize| (((v - o) / cell).floor().max(0.0) as usize).min(n - 1);
+        for (k, (a, b)) in edges.iter().enumerate() {
+            let (x0, x1) = (ci(a[0].min(b[0]), lo[0], nx), ci(a[0].max(b[0]), lo[0], nx));
+            let (y0, y1) = (ci(a[1].min(b[1]), lo[1], ny), ci(a[1].max(b[1]), lo[1], ny));
+            for y in y0..=y1 {
+                rows[y].push(k as u32);
+                for x in x0..=x1 {
+                    cells[y * nx + x].push(k as u32);
+                }
+            }
+        }
+        EdgeGrid {
+            edges,
+            lo,
+            cell,
+            nx,
+            ny,
+            cells,
+            rows,
+        }
+    }
+
+    fn inside(&self, p: V2) -> bool {
+        let y = (p[1] - self.lo[1]) / self.cell;
+        if y < 0.0 || y >= self.ny as f32 {
+            return false;
+        }
+        let mut odd = false;
+        for &k in &self.rows[y as usize] {
+            let (a, b) = self.edges[k as usize];
+            if (a[1] > p[1]) != (b[1] > p[1]) {
+                let x = a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                if x > p[0] {
+                    odd = !odd;
+                }
+            }
+        }
+        odd
+    }
+
+    /// Signed distance: negative inside.
+    pub fn sdf(&self, p: V2) -> f32 {
+        if self.edges.is_empty() {
+            return f32::MAX;
+        }
+        let gx = (p[0] - self.lo[0]) / self.cell;
+        let gy = (p[1] - self.lo[1]) / self.cell;
+        let cx = (gx.floor().max(0.0) as usize).min(self.nx - 1) as i64;
+        let cy = (gy.floor().max(0.0) as usize).min(self.ny - 1) as i64;
+        // How far p is outside the grid (cells), so rings bound correctly.
+        let ox = (-gx).max(gx - self.nx as f32).max(0.0);
+        let oy = (-gy).max(gy - self.ny as f32).max(0.0);
+        let outside = (ox * ox + oy * oy).sqrt() * self.cell;
+        let mut best = f32::MAX;
+        let max_r = self.nx.max(self.ny) as i64;
+        for r in 0..=max_r {
+            // Every edge farther than this from p is in a later ring.
+            let bound = outside + (r as f32 - 1.0).max(0.0) * self.cell;
+            if best.sqrt() <= bound {
+                break;
+            }
+            for y in (cy - r)..=(cy + r) {
+                if y < 0 || y >= self.ny as i64 {
+                    continue;
+                }
+                for x in (cx - r)..=(cx + r) {
+                    if x < 0 || x >= self.nx as i64 {
+                        continue;
+                    }
+                    if (y - cy).abs() != r && (x - cx).abs() != r {
+                        continue;
+                    }
+                    for &k in &self.cells[y as usize * self.nx + x as usize] {
+                        let (a, b) = self.edges[k as usize];
+                        let e = sub2(b, a);
+                        let w = sub2(p, a);
+                        let h = (dot2(w, e) / dot2(e, e).max(1e-12)).clamp(0.0, 1.0);
+                        let q = [w[0] - e[0] * h, w[1] - e[1] * h];
+                        best = best.min(dot2(q, q));
+                    }
+                }
+            }
+        }
+        let d = best.sqrt();
+        if self.inside(p) { -d } else { d }
+    }
 }
 
 /// A regular `n`-pointed star: outer radius `r`, inner radius `ri`.
@@ -264,5 +399,15 @@ mod text_tests {
         assert!(super::filled(mid, &rings, &boxes) > 0.0);
         assert!(super::filled([lo[0] + 0.03, mid[1]], &rings, &boxes) < 0.0);
         assert!(super::filled([hi[0] + 0.5, mid[1]], &rings, &boxes) > 0.4);
+        // The grid gives the same field as the brute-force search.
+        let grid = super::EdgeGrid::new(&rings);
+        for i in 0..400 {
+            let p = [
+                lo[0] - 0.2 + (hi[0] - lo[0] + 0.4) * ((i * 37 % 400) as f32 / 400.0),
+                lo[1] - 0.2 + (hi[1] - lo[1] + 0.4) * ((i * 91 % 400) as f32 / 400.0),
+            ];
+            let (a, b) = (super::filled(p, &rings, &boxes), grid.sdf(p));
+            assert!((a - b).abs() < 1e-5, "{p:?}: {a} vs {b}");
+        }
     }
 }

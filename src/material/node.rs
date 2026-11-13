@@ -953,22 +953,9 @@ impl Eval for Text {
                     .collect()
             })
             .collect();
-        let boxes: Vec<([f32; 2], [f32; 2])> = rings
-            .iter()
-            .map(|r| {
-                r.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(a, b), p| {
-                    (
-                        [a[0].min(p[0]), a[1].min(p[1])],
-                        [b[0].max(p[0]), b[1].max(p[1])],
-                    )
-                })
-            })
-            .collect();
+        let grid = sdf::EdgeGrid::new(&rings);
         let c = cx.coords2(&self.coords)?;
-        Ok(vec![(
-            "",
-            pf(cx.n(), |i| sdf::filled(c.v2(i), &rings, &boxes)),
-        )])
+        Ok(vec![("", pf(cx.n(), |i| grid.sdf(c.v2(i))))])
     }
 }
 
