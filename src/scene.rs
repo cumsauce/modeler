@@ -849,22 +849,7 @@ pub fn write_heights(
         for i in 0..nx {
             let (x, z) = (x0 + i as f32 * step_x, z0 + j as f32 * step_z);
             h.push(t.height_at(x, z) + ty);
-            let mut m = 0u8;
-            if t.paths.iter().any(|p| {
-                p.points
-                    .windows(2)
-                    .any(|s| seg_dist([x, z], s[0], s[1]) <= p.width * 0.5)
-            }) {
-                m |= 1;
-            }
-            if t.flatten.iter().any(|p| match p.size {
-                Some([pw, pd]) => {
-                    (x - p.at[0]).abs() <= pw * 0.5 && (z - p.at[1]).abs() <= pd * 0.5
-                }
-                None => ((x - p.at[0]).powi(2) + (z - p.at[1]).powi(2)).sqrt() <= p.radius,
-            }) {
-                m |= 2;
-            }
+            let m = t.mask_at(x, z);
             mask.push(m);
         }
     }
@@ -888,19 +873,6 @@ pub fn write_heights(
     out.extend_from_slice(&mask);
     crate::catalog::atomic_write(path, &out)?;
     Ok((nx, nz))
-}
-
-fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let (ax, az, bx, bz) = (a[0], a[1], b[0], b[1]);
-    let (dx, dz) = (bx - ax, bz - az);
-    let l2 = dx * dx + dz * dz;
-    let t = if l2 > 0.0 {
-        (((p[0] - ax) * dx + (p[1] - az) * dz) / l2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (qx, qz) = (ax + t * dx - p[0], az + t * dz - p[1]);
-    (qx * qx + qz * qz).sqrt()
 }
 
 /// Reads a heights file back: (nx, nz, x0, z0, cell, heights, mask).

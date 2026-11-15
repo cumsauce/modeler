@@ -168,6 +168,107 @@ impl Tools {
 }
 
 impl Tools {
+    /// The model's contact regions, most telling first (`agent_views` joints).
+    async fn joint_regions(&self, n: usize) -> Option<Vec<modeler::contact::JointRegion>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.run(move |s| {
+            let _ = tx.send(modeler::contact::joint_regions(&s.model, n));
+            Ok(String::new())
+        })
+        .await
+        .ok()?;
+        rx.try_recv().ok()
+    }
+
+    /// `agent_views reference`: the silhouette in an orthographic view,
+    /// compared with a reference image from the call's project.
+    async fn reference_view(
+        &self,
+        r: ReferenceArg,
+        width: Option<u32>,
+        height: Option<u32>,
+        focus: Option<Vec<String>>,
+        clip: Option<String>,
+        time: Option<f32>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let view_name = r.view.unwrap_or_else(|| "front".into());
+        if !matches!(
+            view_name.as_str(),
+            "front" | "back" | "left" | "right" | "top" | "bottom"
+        ) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "reference.view: `{view_name}`: an orthographic view (front, back, left, right, top, bottom)"
+                ),
+                None,
+            ));
+        }
+        let view = parse_agent_view(&view_name).map_err(|e| ErrorData::invalid_params(e, None))?;
+        // Read the file inside the call (its project is set there).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = r.image.clone();
+        self.run(move |_| {
+            let project = modeler::catalog::project_root();
+            let got = super::ops_file::resolve_as(project.as_deref(), &file, "reference.image")
+                .and_then(|p| {
+                    std::fs::read(&p).map_err(|e| format!("reference.image `{file}`: {e}"))
+                });
+            let _ = tx.send(got);
+            Ok(String::new())
+        })
+        .await?;
+        let bytes = rx
+            .try_recv()
+            .map_err(|_| ErrorData::internal_error("reference: read did not finish", None))?
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let reference = modeler::raster::decode_image(&bytes).map_err(|e| {
+            ErrorData::invalid_params(format!("reference.image `{}`: {e}", r.image), None)
+        })?;
+        let (w0, h0) = (
+            width.unwrap_or(800).clamp(64, 2048),
+            height.unwrap_or(800).clamp(64, 2048),
+        );
+        let (w, h) = fit_budget(w0, h0, 2, 1);
+        let style = ShotStyle {
+            silhouette: true,
+            pose: time.map(|t| (clip.clone(), t)),
+            ..ShotStyle::default()
+        };
+        let (png, _) = self.agent_render(view, w, h, focus, style).await?;
+        let shot = decode_png(&png).map_err(|e| ErrorData::internal_error(e, None))?;
+        let mask = modeler::raster::silhouette_mask(&shot);
+        let d = modeler::raster::compare_silhouettes(&mask, shot.w, shot.h, &reference)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let overlay = d
+            .image
+            .to_png()
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        let shots = vec![
+            (png, format!("{view_name} silhouette")),
+            (overlay, format!("vs {}", r.image)),
+        ];
+        let grid = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
+        let mut text = vec![format!(
+            "reference `{}` vs the {view_name} silhouette: IoU {:.1}% (1: the silhouette, 2: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
+            r.image,
+            d.iou * 100.0,
+            d.model_only * 100.0,
+            d.reference_only * 100.0
+        )];
+        let (ra, ma) = d.aspects;
+        if (ra / ma - 1.0).abs() > 0.05 {
+            text.push(format!(
+                "the reference's subject is {} than the model (width/height {ra:.2} vs {ma:.2}); fitted by {}",
+                if ra > ma { "wider" } else { "narrower" },
+                if ra > 1.5 { "width" } else { "height" }
+            ));
+        }
+        Ok(CallToolResult::success(vec![
+            Content::text(text.join("\n")),
+            Content::image(B64.encode(grid), "image/png"),
+        ]))
+    }
+
     /// Visible, drawable part names in model order (the `ids` colour order).
     async fn visible_parts(&self) -> Option<Vec<String>> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1141,7 +1242,11 @@ Style::default()
     /// ({yaw, pitch, dist?, target?, ortho?, fov?}; yaw 0 = from +z/front, 90 =
     /// from +x/right). Several views come back tiled into ONE labelled image
     /// (grid: false for separate images), sized to stay under ~1.15 MP.
-    /// style "ids" paints each part a flat colour with a legend; "curvature"
+    /// style "silhouette" draws flat black parts on white; "density" tints
+    /// surfaces by local detail (red sparse, green busy); focus "joints" (or
+    /// joints: N) frames close-ups of where parts meet; reference {image,
+    /// view} compares the silhouette with a PNG in the project (overlay +
+    /// IoU). style "ids" paints each part a flat colour with a legend; "curvature"
     /// paints mean curvature (red convex, blue concave: lumps, pinches,
     /// creases) to judge organic surfaces; dims overlays
     /// sizes and a scale bar; diff highlights what changed since the previous
@@ -1163,8 +1268,25 @@ Style::default()
             time,
             times,
             bone,
+            joints,
+            reference,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let (focus, joints) = match focus {
+            Some(FocusArg::One(f)) if f == "joints" => (None, Some(joints.unwrap_or(4))),
+            Some(FocusArg::One(f)) => (Some(vec![f]), joints),
+            Some(FocusArg::Many(v)) => (Some(v), joints),
+            None => (None, joints),
+        };
+        if joints.is_some_and(|n| n == 0 || n > 9) {
+            return Err(ErrorData::invalid_params("joints: 1..9 close-ups", None));
+        }
+        if joints.is_some() && focus.is_some() {
+            return Err(ErrorData::invalid_params(
+                "joints frames the contact regions itself: drop focus",
+                None,
+            ));
+        }
         if views.is_empty() || views.len() > 9 {
             return Err(ErrorData::invalid_params(
                 "give 1..9 views, e.g. [\"front\", \"right\", \"top\", \"iso\"]",
@@ -1172,7 +1294,9 @@ Style::default()
             ));
         }
         let (ids, curvature, bones, weights) = match style.as_deref() {
-            None | Some("shaded") => (false, false, false, false),
+            None | Some("shaded") | Some("silhouette") | Some("density") => {
+                (false, false, false, false)
+            }
             Some("ids") => (true, false, false, false),
             Some("curvature") => (false, true, false, false),
             Some("bones") => (false, false, true, false),
@@ -1180,12 +1304,19 @@ Style::default()
             Some(other) => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "style must be \"shaded\", \"ids\", \"curvature\", \"bones\" or \"weights\", got `{other}`"
+                        "style must be \"shaded\", \"silhouette\", \"density\", \"ids\", \"curvature\", \"bones\" or \"weights\", got `{other}`"
                     ),
                     None,
                 ));
             }
         };
+        let silhouette = style.as_deref() == Some("silhouette");
+        let density = style.as_deref() == Some("density");
+        if let Some(r) = reference {
+            return self
+                .reference_view(r, width, height, focus, clip, time)
+                .await;
+        }
         if weights && bone.is_none() {
             return Err(ErrorData::invalid_params(
                 "style \"weights\" needs `bone` (the bone whose weights to paint)",
@@ -1236,6 +1367,9 @@ Style::default()
             weights: if weights { bone.clone() } else { None },
             ids,
             curvature,
+            silhouette,
+            density,
+            frame: None,
             dims,
             scene_lit,
         };
@@ -1255,11 +1389,41 @@ Style::default()
                 }),
             });
         }
-        // views x times: every view at each time.
-        let parsed: Vec<(AgentView, Option<f32>)> = pose_times
-            .iter()
-            .flat_map(|t| parsed.iter().map(move |v| (*v, *t)))
-            .collect();
+        // views x times: every view at each time; with joints, the first
+        // view once per contact region instead.
+        type Frame = Option<(Vec3, Vec3)>;
+        let parsed: Vec<(AgentView, Option<f32>, Frame, Option<String>)> = match joints {
+            Some(n) => {
+                if pose_times.len() > 1 {
+                    return Err(ErrorData::invalid_params(
+                        "joints renders one view per contact region: give time, not times",
+                        None,
+                    ));
+                }
+                let regions = self.joint_regions(n as usize).await.unwrap_or_default();
+                if regions.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "joints: no two visible parts touch or overlap (nothing to frame)",
+                    )]));
+                }
+                let view = parsed[0];
+                regions
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            view,
+                            pose_times[0],
+                            Some((r.center - r.half, r.center + r.half)),
+                            Some(r.label()),
+                        )
+                    })
+                    .collect()
+            }
+            None => pose_times
+                .iter()
+                .flat_map(|t| parsed.iter().map(move |v| (*v, *t, None, None)))
+                .collect(),
+        };
         let n = parsed.len() as u32;
         let grid = grid.unwrap_or(n > 1);
         let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
@@ -1286,21 +1450,26 @@ Style::default()
             if dims { "+dims" } else { "" }
         );
         let mut shots = Vec::with_capacity(parsed.len());
-        for (view, t) in &parsed {
+        for (view, t, frame, joint) in &parsed {
             let mut st = shot_style.clone();
             st.pose = t.map(|t| (clip.clone(), t));
+            st.frame = *frame;
             let (png, _) = self
                 .agent_render(*view, width, height, focus.clone(), st)
                 .await?;
             let tl = t.map(|t| format!(" t={t}")).unwrap_or_default();
-            let key =
-                format!("{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}");
+            let key = format!(
+                "{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}|{frame:?}"
+            );
             let prev = self
                 .last_shots
                 .lock()
                 .ok()
                 .and_then(|mut m| m.insert(key, png.clone()));
-            let label = format!("{view}{tl}");
+            let label = match joint {
+                Some(j) => format!("{view}{tl} joint {j}"),
+                None => format!("{view}{tl}"),
+            };
             if !diff {
                 shots.push((png, label));
                 continue;

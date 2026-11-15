@@ -407,6 +407,25 @@ pub(crate) struct CameraArg {
     pub(crate) fov: Option<f32>,
 }
 
+/// Parts to frame, or "joints".
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
+#[serde(untagged)]
+pub(crate) enum FocusArg {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReferenceArg {
+    /// A PNG inside the call's project (relative to its root).
+    pub(crate) image: String,
+    /// The orthographic view the image shows: front (default), back, left,
+    /// right, top or bottom.
+    #[serde(default)]
+    pub(crate) view: Option<String>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AgentViewsArgs {
     /// 1..9 views, each a name ("front", "back", "left", "right", "top",
@@ -423,14 +442,31 @@ pub(crate) struct AgentViewsArgs {
     /// Pixel height per view. Default 720 (480 per cell in a grid).
     #[serde(default)]
     pub(crate) height: Option<u32>,
-    /// Frame only these parts (hidden ones included) instead of the whole model.
+    /// Frame only these parts (hidden ones included) instead of the whole
+    /// model; or "joints": close-ups of where parts meet (see `joints`).
     #[serde(default)]
-    pub(crate) focus: Option<Vec<String>>,
+    pub(crate) focus: Option<FocusArg>,
+    /// Close-ups of up to N contact regions (deepest overlaps first, then
+    /// touching pairs), one labelled view each, seen from the first view
+    /// (iso when views is left at its default). `focus: "joints"` = 4.
+    #[serde(default)]
+    pub(crate) joints: Option<u32>,
+    /// Compare the model's orthographic silhouette with a reference image:
+    /// {"image": "refs/chair_front.png", "view": "front"} (a PNG inside the
+    /// project; the subject is its opaque pixels, or the pixels contrasting
+    /// with its border). Fitted to the model's silhouette box (same height,
+    /// same centre); returns the overlay (magenta model only, cyan
+    /// reference only, grey both) and the IoU.
+    #[serde(default)]
+    pub(crate) reference: Option<ReferenceArg>,
     /// Tile all views into ONE labelled image (row-major). Default true when
     /// there is more than one view; false returns one image per view.
     #[serde(default)]
     pub(crate) grid: Option<bool>,
-    /// "shaded" (default), "ids" (every part a flat distinct colour with a
+    /// "shaded" (default), "silhouette" (flat black parts on white, no
+    /// shading: outlines), "density" (each surface tinted by local detail:
+    /// red where little is nearby, white, green where busy: bare spots in a
+    /// level), "ids" (every part a flat distinct colour with a
     /// legend, to tell which shape is which part) or "curvature" (mean
     /// curvature heat map: red convex, white flat, blue concave; lumps,
     /// pinches and creases on organic surfaces stand out), "bones" (the

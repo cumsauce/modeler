@@ -53,6 +53,60 @@ pub struct ScatterDef {
     /// Relative odds of each set (default equal).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<f32>,
+    /// Only points within `near_distance` of these parts' surfaces (clutter
+    /// along wall bases, moss round a rock).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near: Vec<String>,
+    /// Meters from the `near` parts' surfaces (default 0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_distance: Option<f32>,
+    /// 0..1: prefer points near the `on` surface's boundary, creases and
+    /// corners (0 = uniform, 1 = hug the features).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub edge_bias: f32,
+    /// Copies gathered round `count` random centres within `radius`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clump: Option<Clump>,
+    /// Terrain mask (`on` must be a terrain): "path", "pad", "not_path",
+    /// "not_pad".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<String>,
+    /// Only points with world y in [min, max].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<[f32; 2]>,
+    /// The terrain `on` names, filled in before evaluation when `mask` is set.
+    #[serde(skip)]
+    pub terrain: Option<Box<crate::terrain::Terrain>>,
+}
+
+/// Cluster centres for a clumped scatter.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Clump {
+    /// Number of cluster centres.
+    pub count: u32,
+    /// Meters from a centre a copy may land.
+    pub radius: f32,
+}
+
+fn is_zero(x: &f32) -> bool {
+    *x == 0.0
+}
+
+/// A scattered decal: the image's size range and look (see `Op::DecalScatter`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DecalScatterDef {
+    pub pbr: crate::material::PbrRef,
+    /// Image width range [min, max], meters.
+    pub size: [f32; 2],
+    /// Height / width of the image.
+    pub aspect: f32,
+    /// Box depth along the projection (default half the smaller side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<f32>,
+    /// Random roll about the normal (default true).
+    pub roll: bool,
+    pub kind: String,
 }
 
 impl Default for ScatterDef {
@@ -71,6 +125,13 @@ impl Default for ScatterDef {
             region: None,
             faces: "up".into(),
             weights: Vec::new(),
+            near: Vec::new(),
+            near_distance: None,
+            edge_bias: 0.0,
+            clump: None,
+            mask: None,
+            height: None,
+            terrain: None,
         }
     }
 }
@@ -202,75 +263,426 @@ struct Tri {
     n: Vec3,
 }
 
+/// Closest point on triangle `t` to `p` (Ericson).
+fn closest_on_tri(p: Vec3, t: &[Vec3; 3]) -> Vec3 {
+    let [a, b, c] = *t;
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    a + ab * (vb * denom) + ac * (vc * denom)
+}
+
+/// Distance from `p` to the segment a..b.
+fn seg_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let d = b - a;
+    let l2 = d.length_squared();
+    let t = if l2 > 0.0 {
+        ((p - a).dot(d) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a + d * t).distance(p)
+}
+
+/// The eligible surface of a scatter's `on` part (facing, slope, region,
+/// height, near), plus what the per-point filters need: the near parts'
+/// triangles and the surface's feature edges (borders, creases) for
+/// `edge_bias`.
+struct Surface {
+    tris: Vec<Tri>,
+    cdf: Vec<f32>,
+    area: f32,
+    near: Vec<[Vec3; 3]>,
+    near_distance: f32,
+    features: Vec<(Vec3, Vec3)>,
+    /// Edge-bias falloff length, meters.
+    feature_len: f32,
+}
+
+impl Surface {
+    fn new(on: &Part, def: &ScatterDef, near_parts: &[Arc<Part>]) -> Result<Self, String> {
+        let cos_slope = def
+            .max_slope
+            .map_or(-2.0, |d| d.clamp(0.0, 180.0).to_radians().cos());
+        let up_only = def.faces != "all";
+        let near_distance = def.near_distance.unwrap_or(0.5).max(0.0);
+        let mut near = Vec::new();
+        let mut near_boxes = Vec::new();
+        for p in near_parts {
+            let (lo, hi) = p.bounds();
+            near_boxes.push((
+                lo - Vec3::splat(near_distance),
+                hi + Vec3::splat(near_distance),
+            ));
+            for t in p.indices.as_chunks::<3>().0 {
+                near.push(t.map(|i| p.world_vert(i as usize)));
+            }
+        }
+        let mut tris = Vec::new();
+        let mut cdf = Vec::new();
+        let mut area = 0.0f32;
+        for t in on.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| on.world_vert(i as usize));
+            let cr = (b - a).cross(c - a);
+            let len = cr.length();
+            if len < 1e-12 {
+                continue;
+            }
+            let n = cr / len;
+            if (up_only && n.y <= 1e-4) || n.y < cos_slope - 1e-6 {
+                continue;
+            }
+            let (mn, mx) = (a.min(b).min(c), a.max(b).max(c));
+            if let Some([lo, hi]) = def.region
+                && (mx.x < lo[0] || mn.x > hi[0] || mx.z < lo[1] || mn.z > hi[1])
+            {
+                continue;
+            }
+            if let Some([lo, hi]) = def.height
+                && (mx.y < lo || mn.y > hi)
+            {
+                continue;
+            }
+            if !near_boxes.is_empty()
+                && !near_boxes
+                    .iter()
+                    .any(|(lo, hi)| mx.cmpge(*lo).all() && mn.cmple(*hi).all())
+            {
+                continue;
+            }
+            area += len * 0.5;
+            cdf.push(area);
+            tris.push(Tri { a, b, c, n });
+        }
+        if tris.is_empty() {
+            let mut why = Vec::new();
+            if let Some(m) = def.max_slope {
+                why.push(format!("under max_slope {m}°"));
+            }
+            if def.region.is_some() {
+                why.push("inside region".to_string());
+            }
+            if let Some([lo, hi]) = def.height {
+                why.push(format!("at height {lo}..{hi}"));
+            }
+            if !def.near.is_empty() {
+                why.push(format!(
+                    "within near_distance {near_distance} of {:?}",
+                    def.near
+                ));
+            }
+            return Err(format!(
+                "`{}` has no {}surface{} to scatter on{}",
+                on.name,
+                if up_only { "upward-facing " } else { "" },
+                if why.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", why.join(", "))
+                },
+                if up_only {
+                    " (faces: \"all\" uses every face)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        let (features, feature_len) = if def.edge_bias > 0.0 {
+            let f = feature_edges(on);
+            let (lo, hi) = on.bounds();
+            let ext = hi - lo;
+            // A tenth of the surface's span (its middle-sized side).
+            let mut e = [ext.x, ext.y, ext.z];
+            e.sort_by(f32::total_cmp);
+            (f, (0.1 * e[1]).max(1e-3))
+        } else {
+            (Vec::new(), 1.0)
+        };
+        Ok(Self {
+            tris,
+            cdf,
+            area,
+            near,
+            near_distance,
+            features,
+            feature_len,
+        })
+    }
+
+    fn target(&self, def: &ScatterDef) -> u32 {
+        match (def.count, def.density) {
+            (Some(c), _) => c,
+            (None, Some(d)) => ((d.max(0.0) * self.area).round() as u32).min(def.max),
+            (None, None) => 0,
+        }
+        .min(MAX_COPIES)
+    }
+
+    /// A uniform area-weighted point and its triangle's normal.
+    fn point(&self, rng: &mut Rng) -> (Vec3, Vec3) {
+        let r = rng.f() * self.area;
+        let ti = self
+            .cdf
+            .partition_point(|&c| c < r)
+            .min(self.tris.len() - 1);
+        let t = &self.tris[ti];
+        let (mut u, mut v) = (rng.f(), rng.f());
+        if u + v > 1.0 {
+            u = 1.0 - u;
+            v = 1.0 - v;
+        }
+        (t.a + (t.b - t.a) * u + (t.c - t.a) * v, t.n)
+    }
+
+    /// The hard per-point filters: region, height, terrain mask, near.
+    fn accepts(&self, def: &ScatterDef, p: Vec3) -> bool {
+        if let Some([lo, hi]) = def.region
+            && (p.x < lo[0] || p.x > hi[0] || p.z < lo[1] || p.z > hi[1])
+        {
+            return false;
+        }
+        if let Some([lo, hi]) = def.height
+            && (p.y < lo || p.y > hi)
+        {
+            return false;
+        }
+        if let (Some(mask), Some(t)) = (&def.mask, &def.terrain) {
+            let m = t.mask_at(p.x - t.translation[0], p.z - t.translation[2]);
+            let ok = match mask.as_str() {
+                "path" => m & 1 != 0,
+                "not_path" => m & 1 == 0,
+                "pad" => m & 2 != 0,
+                "not_pad" => m & 2 == 0,
+                _ => true,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if !self.near.is_empty() {
+            let d2 = self.near_distance * self.near_distance;
+            let close = self.near.iter().any(|t| {
+                let (mn, mx) = (t[0].min(t[1]).min(t[2]), t[0].max(t[1]).max(t[2]));
+                let out = (mn - p).max(p - mx).max(Vec3::ZERO);
+                out.length_squared() <= d2 && closest_on_tri(p, t).distance_squared(p) <= d2
+            });
+            if !close {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Darts: up to `target` points at least `spacing` apart, through every
+    /// filter, edge-biased and clumped as `def` asks.
+    fn sample(
+        &self,
+        def: &ScatterDef,
+        target: u32,
+        spacing: f32,
+        rng: &mut Rng,
+    ) -> Vec<(Vec3, Vec3)> {
+        let mut centres: Vec<Vec3> = Vec::new();
+        let mut attempts = (target as usize).saturating_mul(30).max(64);
+        if let Some(c) = &def.clump {
+            let mut tries = 0;
+            while centres.len() < c.count as usize && tries < 64 * c.count.max(1) as usize {
+                tries += 1;
+                let (p, _) = self.point(rng);
+                if self.accepts(def, p) {
+                    centres.push(p);
+                }
+            }
+            // Most darts miss the clumps: throw more, in proportion.
+            let covered =
+                (centres.len() as f32 * std::f32::consts::PI * c.radius * c.radius).max(1e-6);
+            let factor = (self.area / covered).clamp(1.0, 50.0);
+            attempts = ((attempts as f32 * factor) as usize).min(2_000_000);
+        }
+        if def.edge_bias > 0.0 {
+            attempts = attempts.saturating_mul(4).min(2_000_000);
+        }
+        let cell = spacing.max(1e-4);
+        let key = |p: Vec3| {
+            (
+                (p.x / cell).floor() as i32,
+                (p.y / cell).floor() as i32,
+                (p.z / cell).floor() as i32,
+            )
+        };
+        let mut grid: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::new();
+        let mut points: Vec<(Vec3, Vec3)> = Vec::new();
+        if def.clump.is_some() && centres.is_empty() {
+            return points;
+        }
+        for _ in 0..attempts {
+            if points.len() >= target as usize {
+                break;
+            }
+            let (p, n) = self.point(rng);
+            // Both soft draws happen every attempt, so layouts stay stable.
+            let (keep_edge, keep_clump) = (rng.f(), rng.f());
+            if !self.accepts(def, p) {
+                continue;
+            }
+            if let Some(c) = &def.clump {
+                let d = centres
+                    .iter()
+                    .map(|q| q.distance(p))
+                    .fold(f32::MAX, f32::min);
+                let r = c.radius.max(1e-4);
+                if d > r || keep_clump >= 1.0 - 0.75 * (d / r) * (d / r) {
+                    continue;
+                }
+            }
+            if def.edge_bias > 0.0 && !self.features.is_empty() {
+                let d = self
+                    .features
+                    .iter()
+                    .map(|(a, b)| seg_dist(p, *a, *b))
+                    .fold(f32::MAX, f32::min);
+                let b = def.edge_bias.clamp(0.0, 1.0);
+                let w = (1.0 - b) + b * (-d / self.feature_len).exp();
+                if keep_edge >= w {
+                    continue;
+                }
+            }
+            if spacing > 0.0 {
+                let (kx, ky, kz) = key(p);
+                let mut close = false;
+                'search: for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            if let Some(list) = grid.get(&(kx + dx, ky + dy, kz + dz))
+                                && list
+                                    .iter()
+                                    .any(|q| q.distance_squared(p) < spacing * spacing)
+                            {
+                                close = true;
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+                if close {
+                    continue;
+                }
+                grid.entry(key(p)).or_default().push(p);
+            }
+            points.push((p, n));
+        }
+        points
+    }
+}
+
+/// `part`'s feature edges in world space: open borders (one face) and
+/// creases (faces meeting at more than 30 degrees). Vertices are welded by
+/// position first, since flat-shaded meshes split them per face.
+fn feature_edges(part: &Part) -> Vec<(Vec3, Vec3)> {
+    type Key = (i64, i64, i64);
+    let (lo, hi) = part.bounds();
+    let q = ((hi - lo).max_element() * 1e-5).max(1e-7);
+    let id = |v: Vec3| -> Key {
+        (
+            (v.x / q).round() as i64,
+            (v.y / q).round() as i64,
+            (v.z / q).round() as i64,
+        )
+    };
+    let mut edges: HashMap<(Key, Key), (Vec3, Vec3, Vec<Vec3>)> = HashMap::new();
+    for t in part.indices.as_chunks::<3>().0 {
+        let w = t.map(|i| part.world_vert(i as usize));
+        let n = (w[1] - w[0]).cross(w[2] - w[0]).normalize_or_zero();
+        if n == Vec3::ZERO {
+            continue;
+        }
+        for k in 0..3 {
+            let (a, b) = (w[k], w[(k + 1) % 3]);
+            let (ka, kb) = (id(a), id(b));
+            let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            edges
+                .entry(key)
+                .or_insert_with(|| (a, b, Vec::new()))
+                .2
+                .push(n);
+        }
+    }
+    let cos = 30f32.to_radians().cos();
+    let mut keyed: Vec<((Key, Key), (Vec3, Vec3))> = edges
+        .into_iter()
+        .filter(|(_, (_, _, ns))| ns.len() == 1 || ns.iter().any(|n| n.dot(ns[0]) < cos))
+        .map(|(k, (a, b, _))| (k, (a, b)))
+        .collect();
+    keyed.sort_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Where a decal scatter's decals go: `(point on the surface, its outward
+/// normal, image width, roll degrees)` per slot that fit, in slot order.
+pub fn decal_points(
+    on: &Part,
+    near: &[Arc<Part>],
+    def: &ScatterDef,
+    decal: &DecalScatterDef,
+) -> Result<Vec<(Vec3, Vec3, f32, f32)>, String> {
+    let surface = Surface::new(on, def, near)?;
+    let target = surface.target(def);
+    let (lo, hi) = (
+        decal.size[0].min(decal.size[1]),
+        decal.size[0].max(decal.size[1]),
+    );
+    let spacing = def.min_spacing.unwrap_or(0.8 * hi * decal.aspect.max(1.0));
+    let mut rng = Rng(def.seed ^ 0xDECA_1500_0000_0001);
+    let points = surface.sample(def, target, spacing, &mut rng);
+    Ok(points
+        .into_iter()
+        .map(|(p, n)| {
+            let w = lo + (hi - lo) * rng.f();
+            let roll = if decal.roll { rng.f() * 360.0 } else { 0.0 };
+            (p, n, w, roll)
+        })
+        .collect())
+}
+
 /// Places the copies. `sets[k]` holds the parts of set k; returns
 /// `(name, part)` pairs to add, in slot order.
 pub fn build(
     name: &str,
     sets: &[Vec<Arc<Part>>],
     on: &Part,
+    near: &[Arc<Part>],
     def: &ScatterDef,
 ) -> Result<Vec<(String, Part)>, String> {
     if sets.is_empty() || sets.iter().any(Vec::is_empty) {
         return Err("input: name at least one part to scatter".into());
     }
-    // Candidate triangles, filtered by facing, slope and region.
-    let cos_slope = def
-        .max_slope
-        .map_or(-2.0, |d| d.clamp(0.0, 180.0).to_radians().cos());
-    let up_only = def.faces != "all";
-    let mut tris = Vec::new();
-    let mut cdf = Vec::new();
-    let mut area = 0.0f32;
-    for t in on.indices.as_chunks::<3>().0 {
-        let [a, b, c] = t.map(|i| on.world_vert(i as usize));
-        let cr = (b - a).cross(c - a);
-        let len = cr.length();
-        if len < 1e-12 {
-            continue;
-        }
-        let n = cr / len;
-        if (up_only && n.y <= 1e-4) || n.y < cos_slope - 1e-6 {
-            continue;
-        }
-        if let Some([lo, hi]) = def.region {
-            let (mnx, mxx) = (a.x.min(b.x).min(c.x), a.x.max(b.x).max(c.x));
-            let (mnz, mxz) = (a.z.min(b.z).min(c.z), a.z.max(b.z).max(c.z));
-            if mxx < lo[0] || mnx > hi[0] || mxz < lo[1] || mnz > hi[1] {
-                continue;
-            }
-        }
-        area += len * 0.5;
-        cdf.push(area);
-        tris.push(Tri { a, b, c, n });
-    }
-    if tris.is_empty() {
-        return Err(format!(
-            "`{}` has no {} surface{}{} to scatter on{}",
-            on.name,
-            if up_only { "upward-facing" } else { "" },
-            match def.max_slope {
-                Some(m) => format!(" under max_slope {m}°"),
-                None => String::new(),
-            },
-            if def.region.is_some() {
-                " inside region"
-            } else {
-                ""
-            },
-            if up_only {
-                " (faces: \"all\" uses every face)"
-            } else {
-                ""
-            }
-        ));
-    }
-    let target = match (def.count, def.density) {
-        (Some(c), _) => c,
-        (None, Some(d)) => ((d.max(0.0) * area).round() as u32).min(def.max),
-        (None, None) => return Err("give count or density".into()),
-    }
-    .min(MAX_COPIES);
-
+    let surface = Surface::new(on, def, near)?;
+    let target = surface.target(def);
     // Each set's world vertices and its upright base (cached; a "random"
     // rotation recomputes the base per copy).
     let mut set_verts: Vec<Vec<Vec3>> = Vec::with_capacity(sets.len());
@@ -315,60 +727,7 @@ pub fn build(
     }
 
     let mut rng = Rng(def.seed ^ 0x5CA7_7E25_0000_0001);
-    let cell = spacing.max(1e-4);
-    let key = |p: Vec3| {
-        (
-            (p.x / cell).floor() as i32,
-            (p.y / cell).floor() as i32,
-            (p.z / cell).floor() as i32,
-        )
-    };
-    let mut grid: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::new();
-    let mut points: Vec<(Vec3, Vec3)> = Vec::new();
-    let attempts = (target as usize).saturating_mul(30).max(64);
-    for _ in 0..attempts {
-        if points.len() >= target as usize {
-            break;
-        }
-        let r = rng.f() * area;
-        let ti = cdf.partition_point(|&c| c < r).min(tris.len() - 1);
-        let t = &tris[ti];
-        let (mut u, mut v) = (rng.f(), rng.f());
-        if u + v > 1.0 {
-            u = 1.0 - u;
-            v = 1.0 - v;
-        }
-        let p = t.a + (t.b - t.a) * u + (t.c - t.a) * v;
-        if let Some([lo, hi]) = def.region
-            && (p.x < lo[0] || p.x > hi[0] || p.z < lo[1] || p.z > hi[1])
-        {
-            continue;
-        }
-        if spacing > 0.0 {
-            let (kx, ky, kz) = key(p);
-            let mut close = false;
-            'search: for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        if let Some(list) = grid.get(&(kx + dx, ky + dy, kz + dz))
-                            && list
-                                .iter()
-                                .any(|q| q.distance_squared(p) < spacing * spacing)
-                        {
-                            close = true;
-                            break 'search;
-                        }
-                    }
-                }
-            }
-            if close {
-                continue;
-            }
-            grid.entry(key(p)).or_default().push(p);
-        }
-        points.push((p, t.n));
-    }
-
+    let points = surface.sample(def, target, spacing, &mut rng);
     let mut out = Vec::new();
     let tau = std::f32::consts::TAU;
     for (i, (p, n)) in points.into_iter().enumerate() {
@@ -750,5 +1109,176 @@ mod hilly_ground {
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod smart_placement {
+    use crate::commands::Session;
+    use bevy::math::Vec3;
+    use serde_json::{Value, json};
+
+    fn ok<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
+        r.unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A 10 x 10 m slab (top at y 0.2), a wall along its +x edge and a
+    /// pebble to strew.
+    fn room() -> Session {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "floor", "kind": "box", "size": [10, 0.2, 10],
+                       "translation": [0, 0.1, 0]}),
+                json!({"type": "primitive", "name": "wall", "kind": "box", "size": [0.2, 2, 10],
+                       "translation": [4.9, 1.2, 0]}),
+                json!({"type": "primitive", "name": "pebble", "kind": "sphere", "size": 0.05,
+                       "translation": [30, 1, 0]}),
+                json!({"type": "hide_part", "part": "pebble"}),
+            ],
+        ));
+        s
+    }
+
+    fn strew(s: &mut Session, extra: Value) -> Vec<Vec3> {
+        let mut item = json!({"type": "scatter", "name": "bits", "input": "pebble", "on": "floor",
+                              "count": 40, "seed": 9, "min_spacing": 0.05});
+        if let (Some(o), Some(e)) = (item.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+        ok(s.apply_values(None, vec![item]));
+        let mut out = Vec::new();
+        while let Some(p) = s.model.part(&format!("bits_{}", out.len())) {
+            out.push(Vec3::from(p.translation));
+        }
+        out
+    }
+
+    #[test]
+    fn near_keeps_copies_by_the_wall() {
+        let mut s = room();
+        let pts = strew(&mut s, json!({"near": "wall", "near_distance": 0.6}));
+        assert_eq!(pts.len(), 40);
+        // The wall's face is at x 4.8; pebbles are 5 cm across.
+        for p in &pts {
+            assert!(p.x >= 4.8 - 0.6 - 0.06, "{p}");
+        }
+        let err = s
+            .apply_values(
+                None,
+                vec![
+                    json!({"type": "scatter", "name": "bits", "input": "pebble", "on": "floor",
+                            "count": 4, "near_distance": 1}),
+                ],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("near_distance goes with `near`"), "{err}");
+    }
+
+    #[test]
+    fn edge_bias_pulls_copies_to_the_border() {
+        let border = |pts: &[Vec3]| {
+            pts.iter()
+                .map(|p| 5.0 - p.x.abs().max(p.z.abs()))
+                .sum::<f32>()
+                / pts.len().max(1) as f32
+        };
+        let mut s = room();
+        let uniform = border(&strew(&mut s, json!({})));
+        let biased = border(&strew(&mut s, json!({"edge_bias": 1})));
+        assert!(biased < uniform * 0.6, "{biased} vs {uniform}");
+    }
+
+    #[test]
+    fn clumps_gather_copies() {
+        let mut s = room();
+        let pts = strew(
+            &mut s,
+            json!({"clump": {"count": 1, "radius": 0.8}, "count": 20}),
+        );
+        assert!(pts.len() >= 10, "{}", pts.len());
+        for a in &pts {
+            for b in &pts {
+                let d = Vec3::new(a.x - b.x, 0.0, a.z - b.z).length();
+                assert!(d <= 1.7, "{a} {b}");
+            }
+        }
+        let err = s
+            .apply_values(
+                None,
+                vec![
+                    json!({"type": "scatter", "name": "bits", "input": "pebble", "on": "floor",
+                            "count": 4, "clump": {"count": 0, "radius": 1}}),
+                ],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("clump"), "{err}");
+    }
+
+    #[test]
+    fn terrain_masks_and_height_limit_where_they_land() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "terrain", "name": "ground", "size": [30, 30], "resolution": 0.5,
+                       "height": 3, "seed": 4,
+                       "paths": [{"points": [[-15, 0], [15, 0]], "width": 3, "depth": 0.2}],
+                       "flatten": [{"at": [8, 8], "radius": 3, "falloff": 2}]}),
+                json!({"type": "primitive", "name": "pebble", "kind": "sphere", "size": 0.05,
+                       "translation": [60, 1, 0]}),
+                json!({"type": "hide_part", "part": "pebble"}),
+                json!({"type": "scatter", "name": "onpath", "input": "pebble", "on": "ground",
+                       "count": 30, "mask": "path", "min_spacing": 0.1}),
+                json!({"type": "scatter", "name": "offpath", "input": "pebble", "on": "ground",
+                       "count": 30, "mask": "not_path", "min_spacing": 0.1}),
+                json!({"type": "scatter", "name": "pad", "input": "pebble", "on": "ground",
+                       "count": 10, "mask": "pad", "min_spacing": 0.1}),
+                json!({"type": "scatter", "name": "low", "input": "pebble", "on": "ground",
+                       "count": 20, "height": [0, 1.0], "min_spacing": 0.1}),
+            ],
+        ));
+        let pts = |prefix: &str| {
+            let mut out = Vec::new();
+            while let Some(p) = s.model.part(&format!("{prefix}_{}", out.len())) {
+                out.push(Vec3::from(p.translation));
+            }
+            out
+        };
+        let on = pts("onpath");
+        assert_eq!(on.len(), 30);
+        assert!(on.iter().all(|p| p.z.abs() <= 1.5 + 0.05), "{on:?}");
+        let off = pts("offpath");
+        assert!(off.iter().all(|p| p.z.abs() >= 1.5 - 0.05), "{off:?}");
+        let pad = pts("pad");
+        assert!(!pad.is_empty());
+        assert!(
+            pad.iter()
+                .all(|p| ((p.x - 8.0).powi(2) + (p.z - 8.0).powi(2)).sqrt() <= 3.05)
+        );
+        let low = pts("low");
+        assert!(!low.is_empty());
+        assert!(low.iter().all(|p| p.y <= 1.05), "{low:?}");
+        // A mask needs a terrain under it.
+        let err = s
+            .apply_values(
+                None,
+                vec![
+                    json!({"type": "primitive", "name": "slab", "kind": "box", "size": [4, 0.2, 4]}),
+                    json!({"type": "scatter", "name": "m", "input": "pebble", "on": "slab",
+                           "count": 3, "mask": "path"}),
+                ],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("not a terrain"), "{err}");
     }
 }
