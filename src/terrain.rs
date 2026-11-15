@@ -303,6 +303,27 @@ impl Terrain {
         h
     }
 
+    /// The path / pad mask at local (x, z) (before translation): bit 0 on a
+    /// path's bed (within half its width of the centreline), bit 1 on a
+    /// flattened pad. The same bits the heights file stores.
+    pub fn mask_at(&self, x: f32, z: f32) -> u8 {
+        let mut m = 0u8;
+        if self.paths.iter().any(|p| {
+            p.points
+                .windows(2)
+                .any(|s| seg_dist([x, z], s[0], s[1]) <= p.width * 0.5)
+        }) {
+            m |= 1;
+        }
+        if self.flatten.iter().any(|p| match p.size {
+            Some([pw, pd]) => (x - p.at[0]).abs() <= pw * 0.5 && (z - p.at[1]).abs() <= pd * 0.5,
+            None => ((x - p.at[0]).powi(2) + (z - p.at[1]).powi(2)).sqrt() <= p.radius,
+        }) {
+            m |= 2;
+        }
+        m
+    }
+
     /// The final top height at local (x, z) (before translation).
     pub fn height_at(&self, x: f32, z: f32) -> f32 {
         let mut h = self.carved(x, z);
@@ -505,6 +526,20 @@ fn nearest_on(pts: &[[f32; 2]], x: f32, z: f32) -> (f32, f32, f32, f32, f32) {
         }
     }
     best
+}
+
+/// Distance from `p` to the segment a..b in the plane.
+fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (ax, az, bx, bz) = (a[0], a[1], b[0], b[1]);
+    let (dx, dz) = (bx - ax, bz - az);
+    let l2 = dx * dx + dz * dz;
+    let t = if l2 > 0.0 {
+        (((p[0] - ax) * dx + (p[1] - az) * dz) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (qx, qz) = (ax + t * dx - p[0], az + t * dz - p[1]);
+    (qx * qx + qz * qz).sqrt()
 }
 
 #[cfg(test)]

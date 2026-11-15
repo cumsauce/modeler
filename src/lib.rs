@@ -1216,6 +1216,17 @@ pub enum Op {
         #[serde(default = "clustered", skip_serializing_if = "is_clustered")]
         kind: String,
     },
+    /// Decals strewn over `on`'s surface like a scatter (cracks, stains,
+    /// fallen leaves): decals `name_0..`, each centred on a sampled point and
+    /// projecting along the surface's inward normal. Writes no part; expanded
+    /// into decals by `crate::decal::collect`.
+    DecalScatter {
+        name: String,
+        on: String,
+        #[serde(flatten)]
+        def: Box<crate::scatter::ScatterDef>,
+        decal: Box<crate::scatter::DecalScatterDef>,
+    },
     /// A light: `point`, `spot` or `directional` (see `crate::light`). Writes
     /// no part; collected after the graph, following `attach`'s moves.
     Light {

@@ -11,21 +11,31 @@ use std::path::{Path, PathBuf};
 /// Refuses paths that leave the project, through `..` or a symlink, and calls
 /// with no project (the shared library has no folder to read from).
 pub(crate) fn resolve(project: Option<&Path>, file: &str) -> Result<PathBuf, String> {
+    resolve_as(project, file, "ops_file")
+}
+
+/// [`resolve`] for any field that names a project file (`what` labels the
+/// errors: "ops_file", "reference.image").
+pub(crate) fn resolve_as(
+    project: Option<&Path>,
+    file: &str,
+    what: &str,
+) -> Result<PathBuf, String> {
     let Some(project) = project else {
         return Err(format!(
-            "ops_file `{file}`: this call has no project to read it from (ops_file reads a file inside the caller's game project)"
+            "{what} `{file}`: this call has no project to read it from ({what} reads a file inside the caller's game project)"
         ));
     };
     let root = project
         .canonicalize()
-        .map_err(|e| format!("ops_file `{file}`: project {}: {e}", project.display()))?;
+        .map_err(|e| format!("{what} `{file}`: project {}: {e}", project.display()))?;
     let path = root.join(file);
     let path = path
         .canonicalize()
-        .map_err(|e| format!("ops_file `{file}`: {e} (looked for {})", path.display()))?;
+        .map_err(|e| format!("{what} `{file}`: {e} (looked for {})", path.display()))?;
     if !path.starts_with(&root) {
         return Err(format!(
-            "ops_file `{file}` is outside the project {} (it must be a file inside it)",
+            "{what} `{file}` is outside the project {} (it must be a file inside it)",
             root.display()
         ));
     }

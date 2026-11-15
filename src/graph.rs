@@ -147,10 +147,31 @@ fn with_mesh_hints(ops: &[Op]) -> std::borrow::Cow<'_, [Op]> {
             hints.push((i, most));
         }
     }
-    if hints.is_empty() {
+    // A masked scatter reads its terrain's paths and pads.
+    let terrains: Vec<(usize, Box<crate::terrain::Terrain>)> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match o {
+            Op::Scatter { on, def, .. } if def.mask.is_some() && def.terrain.is_none() => ops
+                .iter()
+                .rev()
+                .find_map(|t| match t {
+                    Op::Terrain { name, def } if name == on => Some(def.clone()),
+                    _ => None,
+                })
+                .map(|t| (i, t)),
+            _ => None,
+        })
+        .collect();
+    if hints.is_empty() && terrains.is_empty() {
         return std::borrow::Cow::Borrowed(ops);
     }
     let mut v = ops.to_vec();
+    for (i, t) in terrains {
+        if let Op::Scatter { def, .. } = &mut v[i] {
+            def.terrain = Some(t);
+        }
+    }
     for (i, t) in hints {
         match &mut v[i] {
             Op::Sdf { def, .. } => def.target_tris = Some(t),
@@ -281,6 +302,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             Op::Move { .. }
                 | Op::Light { .. }
                 | Op::Decal { .. }
+                | Op::DecalScatter { .. }
                 | Op::Collider { .. }
                 | Op::Marker { .. }
                 | Op::Skeleton { .. }
@@ -783,6 +805,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         Op::Move { .. }
         | Op::Light { .. }
         | Op::Decal { .. }
+        | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1012,7 +1035,18 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 .map(|set| set.iter().map(|n| lookup_shared(named, n)).collect())
                 .collect::<Result<_, _>>()?;
             let on_part = lookup_shared(named, on)?;
-            let copies = crate::scatter::build(name, &sets, &on_part, def)
+            if def.mask.is_some() && def.terrain.is_none() {
+                return Err(format!(
+                    "scatter `{name}`: mask: `{on}` is not a terrain item (mask reads a terrain's paths and pads)"
+                )
+                .into());
+            }
+            let near: Vec<Arc<Part>> = def
+                .near
+                .iter()
+                .map(|n| lookup_shared(named, n))
+                .collect::<Result<_, _>>()?;
+            let copies = crate::scatter::build(name, &sets, &on_part, &near, def)
                 .map_err(|e| format!("scatter `{name}`: {e}"))?;
             for (n, p) in copies {
                 upsert(named, &n, p);
@@ -1501,6 +1535,7 @@ pub fn output(op: &Op) -> &str {
         Op::Move { name, .. }
         | Op::Light { name, .. }
         | Op::Decal { name, .. }
+        | Op::DecalScatter { name, .. }
         | Op::Collider { name, .. }
         | Op::Marker { name, .. }
         | Op::Skeleton { name, .. }
@@ -1549,6 +1584,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
         Op::Move { .. }
         | Op::Light { .. }
         | Op::Decal { .. }
+        | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1618,6 +1654,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Move { .. } => "move",
         Op::Light { .. } => "light",
         Op::Decal { .. } => "decal",
+        Op::DecalScatter { .. } => "decal_scatter",
         Op::Collider { .. } => "collider",
         Op::Marker { .. } => "marker",
         Op::Skeleton { .. } => "skeleton",
@@ -1663,6 +1700,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Move { .. }
         | Op::Light { .. }
         | Op::Decal { .. }
+        | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
         | Op::Skeleton { .. }
@@ -1704,15 +1742,41 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Skin { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
         Op::Shell { input, .. } | Op::Split { input, .. } => vec![input],
-        Op::Scatter { input, on, .. } => {
+        Op::Scatter { input, on, def, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
             v.push(on);
+            v.extend(def.near.iter().map(String::as_str));
             v
         }
         Op::Primitive {
             frame: Some(frame), ..
         } => vec![frame_part(frame)],
     }
+}
+
+/// The smarter-placement fields of a scatter, for `describe` (only those set).
+fn scatter_extras(def: &crate::scatter::ScatterDef) -> String {
+    let mut s = String::new();
+    if !def.near.is_empty() {
+        s += &format!(
+            " near={:?} near_distance={}",
+            def.near,
+            def.near_distance.unwrap_or(0.5)
+        );
+    }
+    if def.edge_bias > 0.0 {
+        s += &format!(" edge_bias={}", def.edge_bias);
+    }
+    if let Some(c) = &def.clump {
+        s += &format!(" clump={}x{}m", c.count, c.radius);
+    }
+    if let Some(m) = &def.mask {
+        s += &format!(" mask={m}");
+    }
+    if let Some(h) = def.height {
+        s += &format!(" height={h:?}");
+    }
+    s
 }
 
 /// The part a `frame` names (`"paper"` of `"paper:top-front"`).
@@ -2101,7 +2165,19 @@ pub fn describe(ops: &[Op]) -> String {
                 def.sink,
                 def.faces,
                 def.region
-            ),
+            ) + &scatter_extras(def),
+            Op::DecalScatter { name, on, def, decal } => format!(
+                "#{i} decal_scatter `{name}` pbr=`{}` size={:?} aspect={} on `{on}` count={:?} density={:?} seed={} max_slope={:?} faces={} region={:?}",
+                decal.pbr.material,
+                decal.size,
+                decal.aspect,
+                def.count,
+                def.density,
+                def.seed,
+                def.max_slope,
+                def.faces,
+                def.region
+            ) + &scatter_extras(def),
             Op::LSystem { name, def } => format!(
                 "#{i} lsystem `{name}` axiom={:?} rules={} iterations={} angle={} length={} radius={} seed={} at={:?}",
                 def.axiom,
