@@ -202,6 +202,30 @@ pub struct VerifySpec {
     /// too low, a gap too narrow, a slope too steep.
     #[serde(default)]
     pub walkable: Option<crate::walk::WalkableSpec>,
+    /// Pairs `[a, b]` (or `{"pair": [a, b], "tol", "axis"}`) whose centres
+    /// line up across `axis` (default y: x and z agree), within `tol`
+    /// (default 0.001 m).
+    #[serde(default)]
+    pub coaxial: Option<Vec<crate::quality::PairSpec>>,
+    /// `[{"a", "b", "face": "top", "tol"?}]`: that face of `a` lies in the
+    /// plane of the same face of `b`.
+    #[serde(default)]
+    pub flush: Option<Vec<crate::quality::FlushSpec>>,
+    /// Pairs `[a, b]`: `a`'s footprint centre (x, z) is `b`'s.
+    #[serde(default)]
+    pub centered_on: Option<Vec<crate::quality::PairSpec>>,
+    /// `{"parts"?, "axis"?: "x", "center"?: 0, "tol"?}`: every matched part
+    /// has a mirror twin about the plane.
+    #[serde(default)]
+    pub symmetric: Option<crate::quality::SymmetricSpec>,
+    /// `{"parts": "post_*", "tol"?}`: centres on a line, gaps equal.
+    #[serde(default)]
+    pub equal_spacing: Option<crate::quality::SpacingSpec>,
+    /// `{"min_features_per_m2"?: 0.25, "min_area"?: 4}`: every flat visible
+    /// surface over `min_area` m² has that many features (touching parts,
+    /// insets, decals) per m².
+    #[serde(default)]
+    pub density: Option<crate::quality::DensitySpec>,
 }
 
 /// `grounded: true` or `"strict"`.
@@ -3018,7 +3042,13 @@ impl Session {
             && spec.weights.is_none()
             && spec.animation.is_none()
             && spec.walkable.is_none()
-            && spec.materials.is_none();
+            && spec.materials.is_none()
+            && spec.coaxial.is_none()
+            && spec.flush.is_none()
+            && spec.centered_on.is_none()
+            && spec.symmetric.is_none()
+            && spec.equal_spacing.is_none()
+            && spec.density.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
             Ok(t) => out.push((name.to_string(), true, t)),
@@ -3213,6 +3243,27 @@ impl Session {
                     Err(format!("unsupported: {}", list.join("; "))),
                 );
             }
+        }
+        for p in spec.coaxial.iter().flatten() {
+            record("coaxial", crate::quality::coaxial(&self.model, p));
+        }
+        for f in spec.flush.iter().flatten() {
+            record("flush", crate::quality::flush(&self.model, f));
+        }
+        for p in spec.centered_on.iter().flatten() {
+            record("centered_on", crate::quality::centered_on(&self.model, p));
+        }
+        if let Some(sy) = &spec.symmetric {
+            record("symmetric", crate::quality::symmetric(&self.model, sy));
+        }
+        if let Some(sp) = &spec.equal_spacing {
+            record(
+                "equal_spacing",
+                crate::quality::equal_spacing(&self.model, sp),
+            );
+        }
+        if let Some(d) = &spec.density {
+            record("density", crate::quality::density(view, d));
         }
         if let Some(pairs) = &spec.rests {
             for [a, b] in pairs {
