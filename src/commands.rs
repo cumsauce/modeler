@@ -196,6 +196,12 @@ pub struct VerifySpec {
     /// `collisions` (`{"clip": "walk", "floor": 0.005, "collisions": true}`).
     #[serde(default)]
     pub animation: Option<crate::anim::check::AnimationSpec>,
+    /// A character can walk the route: `{from, to, via?, agent?: {radius
+    /// 0.3, height 1.8, step 0.3, max_slope 45}, cell?}` or a list of them.
+    /// Fails naming the blocker nearest the goal: a step too tall, headroom
+    /// too low, a gap too narrow, a slope too steep.
+    #[serde(default)]
+    pub walkable: Option<crate::walk::WalkableSpec>,
 }
 
 /// `grounded: true` or `"strict"`.
@@ -2996,6 +3002,7 @@ impl Session {
             && spec.thickness.is_none()
             && spec.weights.is_none()
             && spec.animation.is_none()
+            && spec.walkable.is_none()
             && spec.materials.is_none();
         let mut out = Vec::new();
         let mut record = |name: &str, r: Result<String, String>| match r {
@@ -3198,6 +3205,17 @@ impl Session {
                     &format!("rests {a} on {b}"),
                     crate::contact::rests_on(&self.model, a, b),
                 );
+            }
+        }
+        if let Some(w) = &spec.walkable {
+            let routes = w.routes();
+            for (i, r) in routes.iter().enumerate() {
+                let name = if routes.len() == 1 {
+                    "walkable".to_string()
+                } else {
+                    format!("walkable {i}")
+                };
+                record(&name, crate::walk::check(&self.model, r));
             }
         }
         let coll = match &spec.collisions {

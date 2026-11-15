@@ -690,7 +690,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, self_intersections?, thickness?, scope?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, self_intersections?, thickness?, walkable?, scope?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `scope: ["bars_*", "basket"]` limits what the other checks report to
     those parts (`*` globs): grounded / supported / rests / bounds /
@@ -736,6 +736,20 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `self_intersections: true`: no part's surface passes through itself
     (a deform, warp or skin that folded it); fails with the crossing count
     and a point.
+  - `walkable: {from, to, via?, agent?, cell?}` (or a list): a character
+    can walk from `from` to `to` (feet points, snapped to the floor
+    under them) over the visible parts and the ground. `agent` is
+    `{radius 0.3, height 1.8, step 0.3, max_slope 45}` (a human player).
+    The parts are rasterized into columns (`cell`, default radius / 4);
+    a floor is standable when its slope is walkable and nothing taller
+    than a step (or rising steeper than `max_slope`) sits within `radius`
+    below `height`; neighbours join when they differ by at most `step`.
+    A FAIL names up to four blockers nearest the goal (`step 0.40 m >
+    0.30 up onto `stair_1``, `headroom 1.70 m < 1.80 under `landing``,
+    `wall_l` in the way: a wall or a gap under 2 x radius, `slope 52°`)
+    and the closest point reached; a PASS gives the route length, its
+    tallest step and lowest headroom. `via` forces waypoints. Use it on
+    stairs, doorways, corridors and level layouts.
   - `thickness: 0.004`: every part is at least that many meters thick
     everywhere (sampled straight through along the inward normal); fails
     naming the part and where.
