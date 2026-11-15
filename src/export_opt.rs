@@ -622,8 +622,14 @@ impl Bvh {
                 continue;
             }
             if n.count > 0 {
-                for k in n.start as usize..(n.start + n.count) as usize {
-                    if let Some(t) = ray_tri(o, d, &self.tris[k])
+                for (k, tri) in self
+                    .tris
+                    .iter()
+                    .enumerate()
+                    .skip(n.start as usize)
+                    .take(n.count as usize)
+                {
+                    if let Some(t) = ray_tri(o, d, tri)
                         && t < tmax
                         && f(k, t)
                     {

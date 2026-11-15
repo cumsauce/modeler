@@ -1727,6 +1727,8 @@ mod tests {
             translation: [0.0, 0.5, 0.0],
             rotation: None,
             frame: None,
+            round: 0.0,
+            segments: 0,
         });
         model.refresh().unwrap();
         save_session_state(&model).unwrap();

@@ -198,6 +198,7 @@ fn slow(op: &Op) -> bool {
             | Op::Smooth { .. }
             | Op::Round { .. }
             | Op::Shell { .. }
+            | Op::Panel { .. }
             | Op::LSystem { .. }
             | Op::Terrain { .. }
             | Op::Boolean { .. }
@@ -796,9 +797,14 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             translation,
             rotation,
             frame,
+            round,
+            segments,
         } => {
-            let mut part =
-                primitives::primitive(*kind, *size, name).map_err(|e| format!("{name}: {e}"))?;
+            let mut part = if *round > 0.0 {
+                crate::csg::rounded_primitive(name, *kind, *size, *round, *segments)?
+            } else {
+                primitives::primitive(*kind, *size, name).map_err(|e| format!("{name}: {e}"))?
+            };
             part.translation = *translation;
             if let Some(r) = rotation {
                 part.rotation = *r;
@@ -1086,9 +1092,14 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             mode,
             radius,
             segments,
+            edges,
         } => {
             let src = lookup_shared(named, input)?;
-            let part = crate::csg::round(name, &src, mode, *radius, *segments)?;
+            let part = if edges.is_empty() || edges.iter().any(|e| e == "all") {
+                crate::csg::round(name, &src, mode, *radius, *segments)?
+            } else {
+                crate::csg::fillet_edges(name, &src, *radius, *segments, edges)?
+            };
             upsert(named, name, part);
         }
         Op::Deform { name, input, def } => {
@@ -1104,6 +1115,20 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         } => {
             let src = lookup_shared(named, input)?;
             let part = crate::csg::shell(name, &src, *thickness, open)?;
+            upsert(named, name, part);
+        }
+        Op::Panel {
+            name,
+            input,
+            face,
+            rows,
+            cols,
+            inset,
+            depth,
+            gap,
+        } => {
+            let src = lookup_shared(named, input)?;
+            let part = crate::csg::panel(name, &src, face, *rows, *cols, *inset, *depth, *gap)?;
             upsert(named, name, part);
         }
         Op::Group { name, inputs } => {
@@ -1528,6 +1553,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Round { name, .. }
         | Op::Deform { name, .. }
         | Op::Shell { name, .. }
+        | Op::Panel { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
         | Op::RadialArray { name, .. }
@@ -1645,6 +1671,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Round { .. } => "round",
         Op::Deform { .. } => "deform",
         Op::Shell { .. } => "shell",
+        Op::Panel { .. } => "panel",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
         Op::RadialArray { .. } => "radial",
@@ -1703,7 +1730,9 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Sdf { def, .. } => def.reads(),
         Op::Skin { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
-        Op::Shell { input, .. } | Op::Split { input, .. } => vec![input],
+        Op::Shell { input, .. } | Op::Split { input, .. } | Op::Panel { input, .. } => {
+            vec![input]
+        }
         Op::Scatter { input, on, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
             v.push(on);
@@ -1949,12 +1978,19 @@ pub fn describe(ops: &[Op]) -> String {
                 translation,
                 rotation,
                 frame,
+                round,
+                segments,
             } => format!(
-                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}{}",
+                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}{}{}",
                 rotation.map_or_else(String::new, |r| format!(" rot={r:?}")),
                 frame
                     .as_ref()
-                    .map_or_else(String::new, |f| format!(" frame=`{f}`"))
+                    .map_or_else(String::new, |f| format!(" frame=`{f}`")),
+                if *round > 0.0 {
+                    format!(" round={round} segments={segments}")
+                } else {
+                    String::new()
+                }
             ),
             Op::Extrude {
                 name,
@@ -2126,8 +2162,26 @@ pub fn describe(ops: &[Op]) -> String {
                 mode,
                 radius,
                 segments,
+                edges,
             } => format!(
-                "#{i} round `{name}` <- `{input}` {mode} radius={radius} segments={segments}"
+                "#{i} round `{name}` <- `{input}` {mode} radius={radius} segments={segments}{}",
+                if edges.is_empty() {
+                    String::new()
+                } else {
+                    format!(" edges={edges:?}")
+                }
+            ),
+            Op::Panel {
+                name,
+                input,
+                face,
+                rows,
+                cols,
+                inset,
+                depth,
+                gap,
+            } => format!(
+                "#{i} panel `{name}` <- `{input}` face={face} {rows}x{cols} inset={inset} depth={depth} gap={gap}"
             ),
             Op::Deform { name, input, def } => {
                 format!("#{i} deform `{name}` <- `{input}` {}", def.summary())
@@ -2320,6 +2374,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::Transform {
                 name: "lifted".into(),
@@ -2370,6 +2426,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -2422,6 +2480,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::Primitive {
                 name: "b".into(),
@@ -2430,6 +2490,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::Primitive {
                 name: "a".into(),
@@ -2438,6 +2500,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
         ];
         let parts = evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
@@ -2456,6 +2520,8 @@ mod tests {
                 translation: [0.0, 0.0, 0.5],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::RadialArray {
                 name: "ring".into(),
@@ -2489,6 +2555,8 @@ mod tests {
                 translation: [0.0, 0.5, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::LinearArray {
                 name: "fence".into(),
@@ -2531,6 +2599,8 @@ mod tests {
                 translation: [0.2, 0.5, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             op,
         ])
@@ -2585,6 +2655,8 @@ mod tests {
                 translation: [0.5, 0.0, 0.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::Mirror {
                 name: "arm_m".into(),
@@ -2660,6 +2732,8 @@ mod tests {
             translation: [0.0; 3],
             rotation: None,
             frame: None,
+            round: 0.0,
+            segments: 0,
         }
     }
 
@@ -2764,6 +2838,8 @@ mod tests {
                 translation: [1.0, 2.0, 3.0],
                 rotation: None,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             Op::Transform {
                 name: "b".into(),
