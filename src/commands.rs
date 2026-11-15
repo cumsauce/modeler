@@ -1385,18 +1385,30 @@ impl Session {
                 && makes_part
                 && !n.contains('*')
             {
-                names.push(n.to_string());
                 // Every part the op declares, when the item already parses
-                // (a path_array by spacing, a split's halves). A scatter
-                // declares every slot it might fill (up to `max`), so it
-                // keeps the literal-count guess below.
+                // (a path_array by spacing, a split's halves); only then is
+                // the bare name known to be a part or not (a linear_array's
+                // name is its copies' prefix). A scatter declares every slot
+                // it might fill (up to `max`), so it keeps the literal-count
+                // guess below; a decal scatter makes decals, no parts.
                 let ty0 = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if ty0 != "scatter"
-                    && let Ok(v) = crate::style::expand(raw, style)
-                    && let Ok(v) = crate::params::resolve(&v, full)
-                    && let Ok(BatchItem::Op(op)) = crate::spec::parse_item(0, &v)
-                {
-                    names.extend(crate::graph::outputs(&op));
+                if ty0 == "scatter" && raw.get("decal").is_some() {
+                    continue;
+                }
+                let parsed = (ty0 != "scatter")
+                    .then(|| {
+                        let v = crate::style::expand(raw, style).ok()?;
+                        let v = crate::params::resolve(&v, full).ok()?;
+                        match crate::spec::parse_item(0, &v) {
+                            Ok(BatchItem::Op(op)) => Some(crate::graph::outputs(&op)),
+                            _ => None,
+                        }
+                    })
+                    .flatten();
+                match parsed {
+                    Some(outs) => names.extend(outs),
+                    None if ty0 != "scatter" => names.push(n.to_string()),
+                    None => {}
                 }
                 // Parts an item writes besides its name (before params are
                 // read, so only literal counts): lsystem leaves, array copies.
@@ -6184,6 +6196,26 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("matches no part"), "{err}");
+    }
+
+    #[test]
+    fn a_material_pattern_skips_names_that_are_not_parts() {
+        // `posts` (a linear_array's prefix) and `rocks` (a scatter's) are
+        // item names, not parts: "*" with a bevel must not try to finish them.
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "floor", "kind": "box", "size": [4, 0.1, 4], "translation": [0, 0.05, 0]},
+                {"type": "primitive", "name": "post", "kind": "box", "size": [0.1, 1, 0.1], "translation": [-1, 0.6, 0]},
+                {"type": "linear_array", "name": "posts", "input": "post", "count": 3, "offset": [0.5, 0, 0]},
+                {"type": "primitive", "name": "rock", "kind": "sphere", "size": 0.05, "translation": [9, 1, 0]},
+                {"type": "scatter", "name": "rocks", "input": "rock", "on": "floor", "count": 3},
+                {"type": "hide_part", "part": "rock"},
+                {"type": "material", "name": "*", "color": "#888", "bevel": 0.005}
+            ]),
+        );
+        assert!(s.model.part("posts_2").is_some());
     }
 
     #[test]

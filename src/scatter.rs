@@ -319,6 +319,8 @@ struct Surface {
     area: f32,
     near: Vec<[Vec3; 3]>,
     near_distance: f32,
+    /// The near parts' boxes: copies stand beside them, not inside.
+    near_inside: Vec<(Vec3, Vec3)>,
     features: Vec<(Vec3, Vec3)>,
     /// Edge-bias falloff length, meters.
     feature_len: f32,
@@ -333,8 +335,10 @@ impl Surface {
         let near_distance = def.near_distance.unwrap_or(0.5).max(0.0);
         let mut near = Vec::new();
         let mut near_boxes = Vec::new();
+        let mut near_inside = Vec::new();
         for p in near_parts {
             let (lo, hi) = p.bounds();
+            near_inside.push((lo, hi));
             near_boxes.push((
                 lo - Vec3::splat(near_distance),
                 hi + Vec3::splat(near_distance),
@@ -429,6 +433,7 @@ impl Surface {
             area,
             near,
             near_distance,
+            near_inside,
             features,
             feature_len,
         })
@@ -460,7 +465,7 @@ impl Surface {
     }
 
     /// The hard per-point filters: region, height, terrain mask, near.
-    fn accepts(&self, def: &ScatterDef, p: Vec3) -> bool {
+    fn accepts(&self, def: &ScatterDef, p: Vec3, pad: f32) -> bool {
         if let Some([lo, hi]) = def.region
             && (p.x < lo[0] || p.x > hi[0] || p.z < lo[1] || p.z > hi[1])
         {
@@ -494,6 +499,19 @@ impl Surface {
             if !close {
                 return false;
             }
+            // Beside the near parts, never under them: a point of the floor
+            // covered by the wall it hugs is inside the wall. `pad` is about
+            // half a copy's footprint, so a copy's side stops at the wall.
+            if self.near_inside.iter().any(|(lo, hi)| {
+                p.x > lo.x - pad
+                    && p.x < hi.x + pad
+                    && p.z > lo.z - pad
+                    && p.z < hi.z + pad
+                    && p.y >= lo.y - 0.01
+                    && p.y < hi.y
+            }) {
+                return false;
+            }
         }
         true
     }
@@ -514,7 +532,7 @@ impl Surface {
             while centres.len() < c.count as usize && tries < 64 * c.count.max(1) as usize {
                 tries += 1;
                 let (p, _) = self.point(rng);
-                if self.accepts(def, p) {
+                if self.accepts(def, p, 0.625 * spacing) {
                     centres.push(p);
                 }
             }
@@ -547,7 +565,7 @@ impl Surface {
             let (p, n) = self.point(rng);
             // Both soft draws happen every attempt, so layouts stay stable.
             let (keep_edge, keep_clump) = (rng.f(), rng.f());
-            if !self.accepts(def, p) {
+            if !self.accepts(def, p, 0.625 * spacing) {
                 continue;
             }
             if let Some(c) = &def.clump {
@@ -1165,6 +1183,8 @@ mod smart_placement {
         // The wall's face is at x 4.8; pebbles are 5 cm across.
         for p in &pts {
             assert!(p.x >= 4.8 - 0.6 - 0.06, "{p}");
+            // Beside the wall, never on the floor strip under it.
+            assert!(p.x < 4.8, "{p} is inside the wall");
         }
         let err = s
             .apply_values(

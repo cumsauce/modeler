@@ -66,9 +66,27 @@ pub fn is_plain_box(p: &Part, lo: Vec3, hi: Vec3) -> bool {
 pub fn lints(model: &Model) -> Vec<String> {
     let vis = visible(model);
     let mut out = Vec::new();
-    if vis.len() >= 2 && vis.len() <= PAIR_LIMIT {
-        out.extend(capped(near_flush(&vis), "near-flush faces"));
-        out.extend(capped(near_sizes(&vis), "near-equal sizes"));
+    // Scattered copies vary in size and sit wherever they landed on
+    // purpose: near-miss pairs among them are noise, not mistakes.
+    let scatters: Vec<String> = model
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Scatter { .. }))
+        .map(|op| crate::graph::output(op).to_string())
+        .collect();
+    let pair_vis: Vec<_> = vis
+        .iter()
+        .copied()
+        .filter(|(p, _, _)| {
+            let s = stem(&p.name);
+            !scatters
+                .iter()
+                .any(|n| n == s || p.name.starts_with(&format!("{n}_")))
+        })
+        .collect();
+    if pair_vis.len() >= 2 && pair_vis.len() <= PAIR_LIMIT {
+        out.extend(capped(near_flush(&pair_vis), "near-flush faces"));
+        out.extend(capped(near_sizes(&pair_vis), "near-equal sizes"));
     }
     out.extend(near_symmetry(&vis));
     out.extend(capped(uneven_runs(model, &vis), "uneven runs"));
