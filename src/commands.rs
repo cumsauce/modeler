@@ -830,6 +830,8 @@ impl Session {
                 translation,
                 rotation,
                 frame: None,
+                round: 0.0,
+                segments: 0,
             },
             &format!("op primitive `{name}` ({kind})"),
         )
@@ -4590,6 +4592,8 @@ mod tests {
             translation,
             rotation: None,
             frame: None,
+            round: 0.0,
+            segments: 0,
         }
     }
 
@@ -6359,6 +6363,48 @@ mod tests {
             .apply_values_as(None, items, true)
             .unwrap_or_else(|e| panic!("{e}"));
         (s, t)
+    }
+
+    #[test]
+    fn rounded_primitives_edge_fillets_and_panels_through_apply_ops() {
+        let mut s = Session::default();
+        let style: crate::style::Style = serde_json::from_value(serde_json::json!({
+            "numbers": {"bevel": 0.02},
+            "defaults": {"primitive": {"round": "$bevel"}}
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.set_style(style).unwrap_or_else(|e| panic!("{e}"));
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "slab", "kind": "box", "size": [1, 0.5, 0.2], "translation": [0, 0.25, 0]},
+            {"type": "primitive", "name": "ball", "kind": "sphere", "size": 0.1, "translation": [2, 0.1, 0]},
+            {"type": "primitive", "name": "top_raw", "kind": "box", "size": [1, 0.1, 0.6], "translation": [0, 1, 0], "round": 0},
+            {"type": "round", "name": "top", "input": "top_raw", "mode": "fillet", "radius": 0.03, "edges": ["top", "vertical"]},
+            {"type": "hide_part", "part": "top_raw"},
+            {"type": "material", "name": "slab", "color": "#a33"},
+            {"type": "panel", "name": "door", "input": "slab", "face": "front", "rows": 2, "border": 0.05, "seam": 0.03},
+            {"type": "hide_part", "part": "slab"}
+        ]);
+        let serde_json::Value::Array(items) = items else {
+            panic!("array");
+        };
+        s.apply_values_as(None, items, true)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let slab = s.model.part("slab").map_or(0, |p| p.tri_count());
+        assert!(slab > 12, "the style default rounded the box ({slab} tris)");
+        let door = s.model.part("door").unwrap_or_else(|| panic!("door"));
+        assert_eq!(
+            door.material.base_color,
+            s.model
+                .part("slab")
+                .map(|p| p.material.base_color)
+                .unwrap_or_default()
+        );
+        let spec: VerifySpec = serde_json::from_value(serde_json::json!({"validate": true}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let checks = s.verify_checks(&spec);
+        assert!(checks.iter().all(|c| c.1), "{checks:?}");
+        let bad = serde_json::json!({"type": "round", "name": "x", "input": "top_raw", "mode": "fillet", "radius": 0.01, "edges": "sides"});
+        assert!(s.apply_values_as(None, vec![bad], true).is_err());
     }
 
     #[test]
