@@ -316,8 +316,15 @@ pub enum Base<'a> {
 /// high surface; its normal goes to tangent space (the same tangents the
 /// export writes) and is blended with the material's own normal, the gap
 /// is added to height.
-pub fn bake(part: &Part, d: &Detail, base: Base) -> Channels {
-    let n = d.resolution as usize;
+/// `d` is optional (a finish-only bake samples the material onto the
+/// atlas); `finish` adds bevelled-edge normals and macro variation.
+pub fn bake(
+    part: &Part,
+    d: Option<&Detail>,
+    n: usize,
+    base: Base,
+    finish: Option<&crate::material::finish::Finish>,
+) -> Channels {
     let nf = n as f32;
     let len = n * n;
     let lv = scaled(part);
@@ -361,13 +368,20 @@ pub fn bake(part: &Part, d: &Detail, base: Base) -> Channels {
             }
         }
     }
-    let (hw, hg) = target(
-        d.verts.iter().map(|v| Vec3::from(*v) * s).collect(),
-        &d.indices,
-        d.cage * 1.5,
-    );
-    let hn: Vec<Vec3> = d.normals.iter().map(|n| Vec3::from(*n) / s).collect();
-    let cage = d.cage;
+    let high = d.map(|d| {
+        let (hw, hg) = target(
+            d.verts.iter().map(|v| Vec3::from(*v) * s).collect(),
+            &d.indices,
+            d.cage * 1.5,
+        );
+        let hn: Vec<Vec3> = d.normals.iter().map(|n| Vec3::from(*n) / s).collect();
+        (hw, hg, hn, d.cage)
+    });
+    let edges = finish
+        .and_then(|f| f.bevel)
+        .map(|r| crate::material::finish::Edges::new(&lv, &tris, r))
+        .filter(|e| !e.is_empty());
+    let macro_ = finish.and_then(|f| f.macro_.as_ref());
 
     struct Texel {
         base: [f32; 3],
@@ -454,31 +468,50 @@ pub fn bake(part: &Part, d: &Detail, base: Base) -> Channels {
                     sample_tile(ch, *period, crate::uv::metric_uv(axis, sign, p))
                 }
             };
-            // The outermost high surface within the cage, along the normal.
-            let o = p + nn * cage;
-            let (nd, gap) = match hg.ray_hit(&hw, o, -nn, 0.0, 2.0 * cage, u32::MAX) {
-                Some((th, hti)) => {
-                    let [ha, hb, hc] = hw.t[hti as usize].map(|k| k as usize);
-                    let hit = o - nn * th;
-                    let bc = bary(hit, hw.v[ha], hw.v[hb], hw.v[hc]);
-                    let hnorm = if hn.len() > ha.max(hb).max(hc) {
-                        (hn[ha] * bc[0] + hn[hb] * bc[1] + hn[hc] * bc[2]).normalize_or(nn)
-                    } else {
-                        (hw.v[hb] - hw.v[ha])
-                            .cross(hw.v[hc] - hw.v[ha])
-                            .normalize_or(nn)
-                    };
-                    let v = Vec3::new(hnorm.dot(tt), hnorm.dot(bb), hnorm.dot(nn).max(0.05));
-                    (v.normalize(), cage - th)
-                }
-                None => (Vec3::Z, 0.0),
+            let to_tangent =
+                |v: Vec3| Vec3::new(v.dot(tt), v.dot(bb), v.dot(nn).max(0.05)).normalize();
+            let whiteout = |nd: Vec3, m: [f32; 3]| {
+                let m = Vec3::from(m);
+                Vec3::new(nd.x + m.x, nd.y + m.y, nd.z * m.z)
+                    .normalize_or(Vec3::Z)
+                    .to_array()
             };
-            // Whiteout blend of the detail and the material's own normal.
-            let m = Vec3::from(tx.normal);
-            tx.normal = Vec3::new(nd.x + m.x, nd.y + m.y, nd.z * m.z)
-                .normalize_or(Vec3::Z)
-                .to_array();
-            tx.height += gap;
+            if let Some((hw, hg, hn, cage)) = &high {
+                let cage = *cage;
+                // The outermost high surface within the cage, along the normal.
+                let o = p + nn * cage;
+                let (nd, gap) = match hg.ray_hit(hw, o, -nn, 0.0, 2.0 * cage, u32::MAX) {
+                    Some((th, hti)) => {
+                        let [ha, hb, hc] = hw.t[hti as usize].map(|k| k as usize);
+                        let hit = o - nn * th;
+                        let bc = bary(hit, hw.v[ha], hw.v[hb], hw.v[hc]);
+                        let hnorm = if hn.len() > ha.max(hb).max(hc) {
+                            (hn[ha] * bc[0] + hn[hb] * bc[1] + hn[hc] * bc[2]).normalize_or(nn)
+                        } else {
+                            (hw.v[hb] - hw.v[ha])
+                                .cross(hw.v[hc] - hw.v[ha])
+                                .normalize_or(nn)
+                        };
+                        (to_tangent(hnorm), cage - th)
+                    }
+                    None => (Vec3::Z, 0.0),
+                };
+                // Whiteout blend of the detail and the material's own normal.
+                tx.normal = whiteout(nd, tx.normal);
+                tx.height += gap;
+            }
+            if let Some(e) = &edges {
+                let nf = (lv[t[1]] - lv[t[0]])
+                    .cross(lv[t[2]] - lv[t[0]])
+                    .normalize_or(nn);
+                if let Some(bent) = e.bend(p, nf) {
+                    tx.normal = whiteout(to_tangent(bent), tx.normal);
+                }
+            }
+            if let Some(m) = macro_ {
+                let w = crate::material::finish::world(part, p);
+                crate::material::finish::apply_macro(m, w, &mut tx.base, &mut tx.rough);
+            }
             Some(tx)
         })
         .collect();
@@ -517,7 +550,17 @@ pub fn bake(part: &Part, d: &Detail, base: Base) -> Channels {
     let (extras, mut driven) = match &base {
         Base::Atlas(ch) | Base::Tile(ch, _) => (ch.extras.clone(), ch.driven.clone()),
     };
-    for c in ["normal", "height"] {
+    let mut more = vec![];
+    if high.is_some() {
+        more.extend(["normal", "height"]);
+    }
+    if edges.is_some() {
+        more.push("normal");
+    }
+    if macro_.is_some() {
+        more.extend(["base_color", "roughness"]);
+    }
+    for c in more {
         if !driven.contains(&c) {
             driven.push(c);
         }
@@ -641,7 +684,13 @@ mod tests {
             extras: Default::default(),
             runs: 0,
         };
-        let ch = bake(&lo, &det, Base::Tile(&flat, 1.0));
+        let ch = bake(
+            &lo,
+            Some(&det),
+            det.resolution as usize,
+            Base::Tile(&flat, 1.0),
+            None,
+        );
         // The bumps tilt the normals away from the low surface's.
         let tilted = ch.normal.iter().filter(|n| n[2] < 0.97).count();
         assert!(

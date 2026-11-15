@@ -84,10 +84,9 @@ pub fn map_part(part: &mut Part) -> Result<(), String> {
     if part.verts.is_empty() {
         return Ok(());
     }
-    if let Some(d) = &part.detail {
-        // A decimate bake needs its own texels: always an atlas.
-        let n = d.resolution as usize;
-        atlas::box_atlas(part, n);
+    if part.detail.is_some() || super::finish::of(part).is_some() {
+        // A decimate or finish bake needs its own texels: always an atlas.
+        atlas::box_atlas(part, own_atlas(part, g));
     } else if g.domain == "object" {
         atlas::box_atlas(part, atlas_size(g));
     } else if g.domain == "card" || g.domain == "decal" {
@@ -107,6 +106,28 @@ pub fn map_part(part: &mut Part) -> Result<(), String> {
 
 fn atlas_size(g: &MatGraph) -> usize {
     (g.resolution as usize).clamp(64, 2048)
+}
+
+/// The atlas size of a part baked on its own texels (decimate / finish).
+fn own_atlas(part: &Part, g: &MatGraph) -> usize {
+    match &part.detail {
+        Some(d) => d.resolution as usize,
+        None if g.domain == "object" => atlas_size(g).max(super::finish::RESOLUTION),
+        None => super::finish::RESOLUTION,
+    }
+}
+
+/// Whether the part's bake is its own (an atlas fitted to its mesh), not a
+/// tile or card texture shared by every part using the material.
+pub fn per_part(part: &Part) -> bool {
+    part.detail.is_some()
+        || super::finish::of(part).is_some()
+        || part
+            .material
+            .pbr
+            .as_ref()
+            .and_then(|r| r.graph.as_ref())
+            .is_some_and(|g| g.domain == "object")
 }
 
 /// The cache key of a bake for `part` (tile bakes are shared by every part
@@ -130,11 +151,20 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
             }
         }
     }
-    if let (Some(p), Some(g)) = (part, &r.graph)
-        && (g.domain == "object" || p.detail.is_some())
+    if let Some(p) = part
+        && r.graph.is_some()
+        && per_part(p)
     {
         if let Some(d) = &p.detail {
             d.key.hash(&mut h);
+        }
+        if let Some(f) = super::finish::of(p) {
+            let _ = serde_json::to_writer(&mut HashInto(&mut h), &f);
+            if f.macro_.is_some() {
+                // World-space noise: the bake depends on where the part is.
+                p.translation.map(f32::to_bits).hash(&mut h);
+                p.rotation.map(f32::to_bits).hash(&mut h);
+            }
         }
         geometry_hash(p).hash(&mut h);
         p.scale.map(f32::to_bits).hash(&mut h);
@@ -289,18 +319,22 @@ pub fn bake_part(part: &Part) -> Result<Option<Arc<Channels>>, String> {
         return Ok(Some(hit));
     }
     let g = r.graph()?;
-    if let Some(d) = &part.detail {
+    let finish = super::finish::of(part);
+    if part.detail.is_some() || finish.is_some() {
+        let n = own_atlas(part, g);
+        let d = part.detail.as_deref();
+        let f = finish.as_ref();
         let ch = if g.domain == "object" {
-            let s = atlas::samples(part, d.resolution as usize);
+            let s = atlas::samples(part, n);
             let base = bake::bake(&g.nodes, &r.params(g), &s, true)
                 .map_err(|e| format!("material `{}` on `{}`: {e}", r.material, part.name))?;
-            crate::decimate::bake(part, d, crate::decimate::Base::Atlas(&base))
+            crate::decimate::bake(part, d, n, crate::decimate::Base::Atlas(&base), f)
         } else {
             let s = Samples::tile((g.resolution as usize).clamp(16, 2048), g.tile);
             let base = bake::bake(&g.nodes, &r.params(g), &s, true)
                 .map_err(|e| format!("material `{}` on `{}`: {e}", r.material, part.name))?;
             let period = (g.tile * r.scale.max(1e-6)).max(1e-6);
-            crate::decimate::bake(part, d, crate::decimate::Base::Tile(&base, period))
+            crate::decimate::bake(part, d, n, crate::decimate::Base::Tile(&base, period), f)
         };
         let ch = Arc::new(ch);
         cache_put(key, ch.clone());

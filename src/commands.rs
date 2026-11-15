@@ -914,6 +914,7 @@ impl Session {
                 metalness,
                 pbr: None,
                 flat: false,
+                finish: None,
             },
             &format!("op material `{name}` <- `{input}`"),
         )
@@ -2618,7 +2619,14 @@ impl Session {
                     metalness,
                     pbr,
                     flat,
+                    finish,
                 }) if name == input && !self.derived_by_ops(&name) => {
+                    if finish.is_some() {
+                        return Err(format!(
+                            "batch item #{i}: bevel / macro need an op-derived part; `{name}` is baked"
+                        )
+                        .into());
+                    }
                     let has_pbr = pbr.is_some();
                     let msg = self
                         .set_material_with(&name, base_color, roughness, metalness, pbr)
@@ -3615,6 +3623,7 @@ impl Session {
                     metalness,
                     pbr,
                     flat: false,
+                    finish: None,
                 },
                 &format!("op material `{part}` <- `{part}`"),
             )?;
@@ -4767,6 +4776,7 @@ mod tests {
                 metalness: None,
                 pbr: None,
                 flat: false,
+                finish: None,
             },
         ];
         let out = s.apply_ops(ops).unwrap_or_else(|e| panic!("{e}"));
@@ -6496,6 +6506,78 @@ mod tests {
         // Prefab files carry the graph: a round trip keeps the material.
         let text = serde_json::to_string(&crate::Doc::for_file(&s.model)).unwrap_or_default();
         assert!(text.contains("tile_grid"));
+    }
+
+    #[test]
+    fn bevel_and_macro_bake_per_part_over_flat_and_tile_materials() {
+        let mut s = Session::default();
+        let arr = |v: serde_json::Value| v.as_array().cloned().unwrap_or_default();
+        s.materials
+            .ops(
+                "plaster",
+                arr(serde_json::json!([
+                    {"type": "output", "name": "out", "base_color": [0.8, 0.8, 0.8], "roughness": 0.5}
+                ])),
+                None,
+                None,
+                Some(0.5),
+                Some(32),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let items = serde_json::json!([
+            {"type": "primitive", "name": "crate", "kind": "box", "size": [1.0, 1.0, 1.0], "translation": [0, 0.5, 0]},
+            {"type": "material", "name": "crate", "color": "#a07040", "bevel": "$bevel"},
+            {"type": "primitive", "name": "wall", "kind": "box", "size": [4.0, 2.0, 0.2], "translation": [3, 1, 0]},
+            {"type": "material", "name": "wall", "pbr": "plaster",
+             "macro": {"amount": 0.2, "scale": 2, "ground_dirt": 0.6, "ground_height": 0.5, "seed": 1}}
+        ]);
+        s.apply_values_as(
+            Some(crate::params::Params::from([("bevel".to_string(), 0.02)])),
+            arr(items),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let bake = |name: &str| {
+            let p = s.model.part(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(crate::material::pbr::per_part(p));
+            crate::material::pbr::bake_part(p)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|| panic!("bake"))
+        };
+        // Flat colour + bevel: the plain graph carries a bent normal map.
+        let c = s.model.part("crate").unwrap_or_else(|| panic!("crate"));
+        assert_eq!(
+            c.material.pbr.as_ref().map(|r| r.material.as_str()),
+            Some(crate::decimate::PLAIN)
+        );
+        assert!(!c.material.has_pbr());
+        let ch = bake("crate");
+        assert_eq!(ch.w, crate::material::finish::RESOLUTION);
+        let bent = ch.normal.iter().filter(|n| n[2] < 0.99).count();
+        assert!(bent > 1000, "bent texels {bent}");
+        assert!(ch.driven.contains(&"normal"));
+        // Cached: the same Arc comes back.
+        let again = bake("crate");
+        assert!(std::sync::Arc::ptr_eq(&ch, &again));
+        // Tile + macro: the colour varies, darker near the ground.
+        let w = bake("wall");
+        let lum: Vec<f32> = w.base_color.iter().map(|c| c[0] + c[1] + c[2]).collect();
+        let (lo, hi) = lum
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        assert!(hi - lo > 0.3, "{lo} {hi}");
+        // A bad bevel names the field.
+        let e = s
+            .apply_values_as(
+                None,
+                arr(serde_json::json!([{"type": "material", "name": "crate", "bevel": -1}])),
+                false,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("bevel"), "{e}");
     }
 
     #[test]
