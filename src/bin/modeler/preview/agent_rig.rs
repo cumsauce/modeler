@@ -42,6 +42,13 @@ pub(crate) struct ShotStyle {
     /// Parts painted by mean curvature (white flat, red convex, blue
     /// concave), lit, on the stand-in layer like `ids`.
     pub(crate) curvature: bool,
+    /// Flat black parts on a white background, no shading (a silhouette
+    /// to compare outlines, or with a reference image).
+    pub(crate) silhouette: bool,
+    /// Parts painted by local detail: red sparse, white, green busy.
+    pub(crate) density: bool,
+    /// Frame this world box instead of the model / focus (joint close-ups).
+    pub(crate) frame: Option<(Vec3, Vec3)>,
     pub(crate) dims: bool,
     /// Light with the model's own lights only (studio lights hidden).
     pub(crate) scene_lit: bool,
@@ -345,7 +352,15 @@ pub(crate) fn process_agent_shot(
         ResMut<PbrCache>,
         ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
     ),
-    mut cameras: Query<(&mut Projection, &mut RenderTarget, &mut Transform), With<AgentCamera>>,
+    mut cameras: Query<
+        (
+            &mut Projection,
+            &mut RenderTarget,
+            &mut Transform,
+            &mut Camera,
+        ),
+        With<AgentCamera>,
+    >,
     modeler: Res<Modeler>,
     env_ready: Query<(), (With<AgentCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
@@ -392,6 +407,7 @@ pub(crate) fn process_agent_shot(
         },
         None => model.bounds(),
     };
+    let bounds = style.frame.or(bounds);
     // A pose (or a skeleton overlay): the parts posed on the CPU, and the
     // skeleton's segments to draw.
     let rig_shot = style.pose.is_some() || style.bones || style.weights.is_some();
@@ -465,11 +481,19 @@ pub(crate) fn process_agent_shot(
         }
         _ => None,
     };
-    let Ok((mut projection, mut render_target, mut transform)) = cameras.get_mut(camera_entity)
+    let Ok((mut projection, mut render_target, mut transform, mut camera)) =
+        cameras.get_mut(camera_entity)
     else {
         let _ = reply.send(Err("agent camera missing".into()));
         return;
     };
+    // A silhouette is black on white: clear to white for this shot only.
+    let restore_clear = style.silhouette.then(|| {
+        std::mem::replace(
+            &mut camera.clear_color,
+            ClearColorConfig::Custom(Color::WHITE),
+        )
+    });
     *projection = new_projection;
     *transform = Transform::from_translation(eye).looking_at(target, up);
     let cam = *transform;
@@ -500,7 +524,14 @@ pub(crate) fn process_agent_shot(
     // parts instead of the window's entities.
     let stale =
         built.doc.as_deref() != Some(model.name.as_str()) || built.version != Some(model.version);
-    if style.ids || style.curvature || rig_shot || playback.posed || stale {
+    if style.ids
+        || style.curvature
+        || style.silhouette
+        || style.density
+        || rig_shot
+        || playback.posed
+        || stale
+    {
         let source = posed_parts.as_ref().unwrap_or(&model.parts);
         let drawable = source
             .iter()
@@ -520,11 +551,21 @@ pub(crate) fn process_agent_shot(
             return;
         }
         let mut colored: Vec<Option<Mesh>> = Vec::new();
+        let density = style.density.then(|| {
+            let refs: Vec<&modeler::Part> = drawable.iter().map(|p| &***p).collect();
+            modeler::organic::density_colors(&refs)
+        });
+        let mut flat_black = Vec::new();
         for (i, part) in drawable.into_iter().enumerate() {
             if let Some(Some(bone)) = weight_bone {
                 colored.push(Some(weights_mesh(part, bone)));
+            } else if let Some(d) = &density {
+                colored.push(Some(colored_mesh(part, &d[i])));
             } else if style.curvature {
                 colored.push(Some(curvature_mesh(part)));
+            } else if style.silhouette {
+                flat_black.push(i);
+                colored.push(None);
             } else if !style.ids {
                 colored.push(None);
             } else {
@@ -541,7 +582,7 @@ pub(crate) fn process_agent_shot(
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
         }
-        if !style.ids && !style.curvature {
+        if !style.ids && !style.curvature && !style.silhouette && !style.density {
             stand_ins.extend(super::decals::spawn_decals(
                 &mut commands,
                 model,
@@ -558,6 +599,11 @@ pub(crate) fn process_agent_shot(
                 "0 (or another skeleton / unbound)".into(),
                 [30, 70, 200, 255],
             ));
+        }
+        if style.density {
+            legend.push(("sparse (little nearby)".into(), [255, 26, 26, 255]));
+            legend.push(("medium".into(), [250, 250, 250, 255]));
+            legend.push(("busy (many parts / edges)".into(), [38, 204, 51, 255]));
         }
         if style.curvature {
             legend.push((
@@ -578,6 +624,15 @@ pub(crate) fn process_agent_shot(
                 commands
                     .entity(*e)
                     .insert((Mesh3d(meshes.add(mesh)), MeshMaterial3d(m)));
+                continue;
+            }
+            if flat_black.contains(&k) {
+                let m = materials.add(StandardMaterial {
+                    base_color: Color::BLACK,
+                    unlit: true,
+                    ..default()
+                });
+                commands.entity(*e).insert(MeshMaterial3d(m));
                 continue;
             }
             if !style.ids {
@@ -669,7 +724,14 @@ pub(crate) fn process_agent_shot(
         }
     });
     let slot = Mutex::new(Some(reply));
-    let ids = style.ids || style.curvature || rig_shot || playback.posed || stale;
+    let silhouette = style.silhouette;
+    let ids = style.ids
+        || style.curvature
+        || style.silhouette
+        || style.density
+        || rig_shot
+        || playback.posed
+        || stale;
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands
@@ -681,7 +743,13 @@ pub(crate) fn process_agent_shot(
                 (&mut bevy::light::EnvironmentMapLight, &mut AmbientLight),
                 With<AgentCamera>,
             >,
-                  mut lights: Query<&mut DirectionalLight, With<StudioLight>>| {
+                  mut lights: Query<&mut DirectionalLight, With<StudioLight>>,
+                  mut cams: Query<&mut Camera, With<AgentCamera>>| {
+                if let Some(c) = &restore_clear
+                    && let Ok(mut cam) = cams.get_mut(camera_entity)
+                {
+                    cam.clear_color = *c;
+                }
                 for (e, lux) in &studio_lights {
                     if let Ok(mut l) = lights.get_mut(*e) {
                         l.illuminance = *lux;
@@ -706,6 +774,14 @@ pub(crate) fn process_agent_shot(
                     && let Some(reply) = s.take()
                 {
                     let out = image_to_canvas(&captured.image).and_then(|mut c| {
+                        if silhouette {
+                            // Pure black and white: anti-aliased edges
+                            // snap to whichever side they are nearer.
+                            let m = modeler::raster::silhouette_mask(&c);
+                            for (p, on) in c.px.as_chunks_mut::<4>().0.iter_mut().zip(m) {
+                                *p = if on { [0, 0, 0, 255] } else { [255; 4] };
+                            }
+                        }
                         if let Some(o) = &overlay {
                             o.draw(&mut c);
                         }
@@ -839,6 +915,31 @@ fn curvature_mesh(part: &modeler::Part) -> Mesh {
         .iter()
         .map(|&c| {
             let [r, g, b] = modeler::organic::curvature_color(c, size);
+            [r, g, b, 1.0]
+        })
+        .collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(part.indices.clone()));
+    if part.normals.len() == part.verts.len() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+    } else {
+        mesh.compute_normals();
+    }
+    mesh
+}
+
+/// A part's mesh with the given per-vertex colours (linear RGB).
+fn colored_mesh(part: &modeler::Part, colors: &[[f32; 3]]) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let colors: Vec<[f32; 4]> = (0..part.verts.len())
+        .map(|i| {
+            let [r, g, b] = colors.get(i).copied().unwrap_or([1.0; 3]);
             [r, g, b, 1.0]
         })
         .collect();
