@@ -245,6 +245,14 @@ pub struct PrimitiveSpec {
     /// this primitive follows it when it moves or turns.
     #[serde(default)]
     frame: Option<String>,
+    /// Box, cylinder and wedge only: round every edge (a cylinder's rims) by
+    /// this many meters, keeping the outer size. A closed solid, ready for
+    /// booleans. Style defaults can fill it: {"primitive": {"round": "$bevel"}}.
+    #[serde(default)]
+    round: f32,
+    /// Arc segments per rounded edge (default 4).
+    #[serde(default)]
+    segments: u32,
 }
 
 /// One entry of a profile ring: a point [a, b], or an arc that expands to
@@ -1457,6 +1465,40 @@ pub struct RoundSpec {
     /// Fillet sphere segments (default 16) or smooth refinement steps (default 3).
     #[serde(default)]
     segments: u32,
+    /// Fillet only: which edges to round, one word or a list: "all"
+    /// (default), "top" / "bottom" (horizontal edges in the upper / lower
+    /// half of the part's box), "horizontal" (both), "vertical" (edges along
+    /// y). Exact for axis-aligned edges; slanted edges follow the tool of
+    /// their half.
+    #[serde(default)]
+    edges: OneOrMany,
+}
+
+/// Recessed panels in one face of a closed solid.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PanelSpec {
+    name: String,
+    /// A closed solid (a wall, hull, door, crate side).
+    input: String,
+    /// top, bottom, left, right, front or back (world axes; front = +z): the
+    /// side of the input's box to panel.
+    face: String,
+    /// Panels down the face (along y on the sides, z on top/bottom). Default 1.
+    #[serde(default)]
+    rows: Option<u32>,
+    /// Panels across the face. Default 1.
+    #[serde(default)]
+    cols: Option<u32>,
+    /// Margin from the face's edges to the grid, meters (default 0.01). Alias: border.
+    #[serde(default, alias = "border")]
+    inset: Option<f32>,
+    /// How deep each panel is recessed, meters (default 0.005).
+    #[serde(default)]
+    depth: Option<f32>,
+    /// Seam width between panels, meters (default 0.01). Alias: seam.
+    #[serde(default, alias = "seam")]
+    gap: Option<f32>,
 }
 
 /// A number (both cross axes) or [a, b] (the two cross axes in x, y, z order).
@@ -2655,6 +2697,7 @@ pub const OP_TYPES: &[&str] = &[
     "smooth",
     "decimate",
     "shell",
+    "panel",
     "transform",
     "move",
     "place",
@@ -2977,6 +3020,22 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 size,
                 translation: s.translation,
                 rotation: rot(&ctx, &s.rotation)?,
+                round: {
+                    if s.round < 0.0 || s.round.is_nan() {
+                        return Err(format!("{ctx}: round: must be >= 0, got {}", s.round));
+                    }
+                    // Other kinds ignore it, so a style default
+                    // {"primitive": {"round": "$bevel"}} works on spheres too.
+                    if matches!(
+                        s.kind,
+                        PrimitiveKind::Box | PrimitiveKind::Cylinder | PrimitiveKind::Wedge
+                    ) {
+                        s.round
+                    } else {
+                        0.0
+                    }
+                },
+                segments: s.segments,
                 frame: match s.frame {
                     Some(f) => {
                         if let Some((p, words)) = f.split_once(':') {
@@ -3237,9 +3296,24 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             BatchItem::Op(Op::Round {
                 name: s.name,
                 input: s.input,
-                mode: s.mode,
+                mode: s.mode.clone(),
                 radius: s.radius,
                 segments: s.segments,
+                edges: {
+                    let edges = s.edges.into_vec();
+                    for e in &edges {
+                        if !["all", "top", "bottom", "vertical", "horizontal"].contains(&e.as_str())
+                        {
+                            return Err(format!(
+                                "{ctx}: edges: `{e}` is not an edge class; use all, top, bottom, vertical or horizontal"
+                            ));
+                        }
+                    }
+                    if !edges.is_empty() && s.mode != "fillet" {
+                        return Err(format!("{ctx}: edges: only mode fillet takes edges"));
+                    }
+                    edges
+                },
             })
         }
         "deform" => {
@@ -3400,6 +3474,25 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 input: s.input,
                 thickness: s.thickness,
                 open,
+            })
+        }
+        "panel" => {
+            let s: PanelSpec = de(&ctx, &body)?;
+            if !["top", "bottom", "left", "right", "front", "back"].contains(&s.face.as_str()) {
+                return Err(format!(
+                    "{ctx}: face: `{}` is not a face; use top, bottom, left, right, front or back",
+                    s.face
+                ));
+            }
+            BatchItem::Op(Op::Panel {
+                name: s.name,
+                input: s.input,
+                face: s.face,
+                rows: s.rows.unwrap_or(1),
+                cols: s.cols.unwrap_or(1),
+                inset: s.inset.unwrap_or(0.01),
+                depth: s.depth.unwrap_or(0.005),
+                gap: s.gap.unwrap_or(0.01),
             })
         }
         "group" => {
@@ -4106,6 +4199,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "smooth" => {
             json!({"type": "smooth", "name": "pebble", "input": "pebble_cage", "mode": "subdiv", "levels": 3})
         }
+        "panel" => {
+            json!({"type": "panel", "name": "door", "input": "door_raw", "face": "front", "rows": 2, "cols": 1, "inset": 0.06, "depth": 0.008, "gap": 0.05})
+        }
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
         }
@@ -4220,6 +4316,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "smooth" => schemars::schema_for!(SmoothSpec),
         "decimate" => schemars::schema_for!(DecimateSpec),
         "shell" => schemars::schema_for!(ShellSpec),
+        "panel" => schemars::schema_for!(PanelSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
         "repeat" => schemars::schema_for!(RepeatSpec),
