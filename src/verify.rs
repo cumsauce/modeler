@@ -693,6 +693,7 @@ pub fn lints(model: &Model) -> Vec<String> {
     out.extend(floating_parts(model).into_iter().map(|n| {
         format!("part `{n}` floats: it is off the ground and touches no other visible part")
     }));
+    out.extend(crate::quality::lints(model));
     out
 }
 
