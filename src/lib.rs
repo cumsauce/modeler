@@ -97,6 +97,7 @@ pub mod terrain;
 pub mod text;
 pub mod uv;
 pub mod verify;
+pub mod walk;
 
 use bevy::math::{Quat, Vec3};
 pub use error::ModelerError;
