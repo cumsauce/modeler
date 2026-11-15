@@ -265,6 +265,7 @@ macro_rules! node_types {
     ($( $ty:literal => $var:ident ),* $(,)?) => {
         /// One parsed node.
         #[derive(Clone, Debug)]
+        #[allow(clippy::large_enum_variant)]
         pub enum Node { $($var($var)),* }
 
         /// Every node type, as written in `"type"`.
@@ -2081,6 +2082,10 @@ pub struct Output {
     pub normal: Option<In>,
     #[serde(default)]
     pub normal_strength: Option<f32>,
+    /// Rounded-edge radius (meters) baked into the normal map of every
+    /// part wearing this material, at its sharp creases.
+    #[serde(default)]
+    pub bevel: Option<f32>,
     #[serde(default)]
     pub ao: Option<In>,
     #[serde(default)]

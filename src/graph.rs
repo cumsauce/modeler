@@ -365,7 +365,8 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
     // Procedural materials map their parts last, so cuts and copies made
     // after the material op are mapped too (one tile = its real size).
     for (_, part) in named.iter_mut() {
-        if part.detail.is_some() && part.material.pbr.is_none() {
+        if (part.detail.is_some() || part.material.finish.is_some()) && part.material.pbr.is_none()
+        {
             // A baked part with a flat colour: a plain graph carries the
             // normal map, the colour stays the factor.
             Arc::make_mut(part).material.pbr = Some(crate::material::PbrRef {
@@ -1247,8 +1248,12 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             metalness,
             pbr,
             flat,
+            finish,
         } => {
             let mut part = lookup(named, input)?;
+            if let Some(f) = finish {
+                part.material.finish = (!f.is_empty()).then(|| f.clone());
+            }
             part.name = name.clone();
             if name != input {
                 part.visible = true;
@@ -2259,10 +2264,22 @@ pub fn describe(ops: &[Op]) -> String {
                 metalness,
                 pbr,
                 flat,
+                finish,
             } => {
                 let mut s = format!("#{i} material `{name}` <- `{input}`");
                 if *flat {
                     s += " flat";
+                }
+                if let Some(f) = finish {
+                    if let Some(b) = f.bevel {
+                        s += &format!(" bevel={b}");
+                    }
+                    if let Some(m) = &f.macro_ {
+                        s += &format!(
+                            " macro={{amount {}, scale {}, ground_dirt {}, ground_height {}, seed {}}}",
+                            m.amount, m.scale, m.ground_dirt, m.ground_height, m.seed
+                        );
+                    }
                 }
                 if let Some(c) = base_color {
                     s += &format!(" color={c:?}");
@@ -2807,6 +2824,7 @@ mod tests {
                     metalness: None,
                     pbr: None,
                     flat: false,
+                    finish: None,
                 },
             ]
         };

@@ -2077,6 +2077,15 @@ pub struct MaterialSpec {
     /// colour" warning for this part.
     #[serde(default)]
     flat: bool,
+    /// Rounded-edge radius (meters) baked into the normal map at sharp
+    /// creases (no geometry change); gives the part its own atlas bake.
+    #[serde(default)]
+    bevel: Option<f32>,
+    /// Low-frequency world-space colour / roughness drift and darkening
+    /// toward y = 0: {amount 0.15, scale 4, ground_dirt 0, ground_height
+    /// 0.5, seed 0}. Gives the part its own atlas bake.
+    #[serde(default, rename = "macro")]
+    macro_: Option<crate::material::finish::Macro>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -4019,6 +4028,11 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             {
                 return Err(format!("{ctx}: scale: {k}: give a factor > 0"));
             }
+            let finish = crate::material::finish::Finish {
+                bevel: s.bevel,
+                macro_: s.macro_,
+            };
+            finish.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Material {
                 input: s.input.unwrap_or_else(|| s.name.clone()),
                 name: s.name,
@@ -4032,6 +4046,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     graph: None,
                 }),
                 flat: s.flat,
+                finish: (!finish.is_empty()).then_some(finish),
             })
         }
         "hide_part" => BatchItem::Hide {

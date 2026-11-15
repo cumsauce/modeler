@@ -7,6 +7,7 @@ pub mod bake;
 pub mod doc;
 pub mod env;
 pub mod eval;
+pub mod finish;
 pub mod meshvox;
 pub mod node;
 pub mod nodes2;
