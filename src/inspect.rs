@@ -234,8 +234,8 @@ pub fn section(
             continue;
         }
         let mut world = p.clone();
-        for i in 0..p.verts.len() {
-            world.verts[i] = to_plane(axis, p.world_vert(i)).to_array();
+        for (i, v) in world.verts.iter_mut().enumerate() {
+            *v = to_plane(axis, p.world_vert(i)).to_array();
         }
         world.translation = [0.0; 3];
         world.rotation = [0.0, 0.0, 0.0, 1.0];
