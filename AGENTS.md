@@ -690,7 +690,7 @@ name: the producer first, then in-place material/visibility/transform edits).
 
 **Verify (deterministic; prefer these over eyeballing renders):**
 
-- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, self_intersections?, thickness?, scope?)` (all
+- `verify(parts?, includes?, grounded?, supported?, rests?, collisions?, bounds?, validate?, rebuild?, stable?, materials?, self_intersections?, thickness?, coaxial?, flush?, centered_on?, symmetric?, equal_spacing?, density?, scope?)` (all
   optional; no arguments runs validate + rebuild). Over visible parts only:
   - `scope: ["bars_*", "basket"]` limits what the other checks report to
     those parts (`*` globs): grounded / supported / rests / bounds /
@@ -736,6 +736,23 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `self_intersections: true`: no part's surface passes through itself
     (a deform, warp or skin that folded it); fails with the crossing count
     and a point.
+  - **Relations** (boxes of the visible parts a name or `*` glob
+    matches; each PASS/FAIL gives the measured offset; `tol` defaults to
+    0.001 m): `coaxial: [["knob", "dial"]]` (or `{"pair": [a, b], "axis":
+    "x", "tol"}`: centres agree on the two axes across `axis`, default y),
+    `centered_on: [["vase", "table"]]` (footprint centre x/z on the other's),
+    `flush: [{"a": "lid", "b": "box", "face": "top", "tol"?}]` (that face of
+    both in one plane), `symmetric: {"parts"?: [...], "axis": "x",
+    "center"?: 0, "tol"?}` (every part has a mirror twin; fails naming the
+    ones without and how far off), `equal_spacing: {"parts": "post_*",
+    "tol"?}` (centres on a line, gaps equal; names the worst gap).
+  - `density: {min_features_per_m2?: 0.25, min_area?: 4}`: "sparse" scenes.
+    Every flat visible surface (coplanar triangles, undersides skipped)
+    over `min_area` m² needs that many features per m²: other parts
+    touching or standing on it, insets / relief of its own inside it, or
+    decals. Fails naming the part, the face's area and centre and whether
+    it wears a flat colour, with hints (scatter, panels, decals, macro
+    variation in the material).
   - `thickness: 0.004`: every part is at least that many meters thick
     everywhere (sampled straight through along the inward normal); fails
     naming the part and where.
@@ -1476,7 +1493,14 @@ volume sanity (a difference that didn't shrink its input = the cutter
 misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
 outputs are closed), and **floating parts** (off the ground and touching no
-other part, e.g. a copy transformed instead of its neighbour). Volume checks
+other part, e.g. a copy transformed instead of its neighbour). **Quality
+lints** (`src/quality.rs`, at most four lines per kind): near misses (a
+1-5 mm gap where two parts nearly touch, faces 1-5 mm off flush), a model
+mirror-symmetric about x = 0 or its centre plane except for a few parts a
+little off (named), runs of numbered or same-size parts with nearly but not
+quite even spacing, pairs of parts under 2% apart in size, and **boxy**
+(at least 5 and over 70% of visible parts are unrounded axis-aligned boxes:
+round, loft, deform taper, smooth subdiv). Volume checks
 and welds scale with the part, so centimetre-scale models validate
 correctly. Hidden parts are excluded. An empty list means none
 fired.

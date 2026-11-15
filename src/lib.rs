@@ -85,6 +85,7 @@ pub mod organic;
 pub mod outline;
 pub mod params;
 pub mod primitives;
+pub mod quality;
 pub mod raster;
 pub mod scatter;
 pub mod scene;
