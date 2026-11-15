@@ -938,12 +938,15 @@ Style::default()
     /// batch stops at the first error, naming the item and field. Pass
     /// `expect` to verify in the same call. The result ends with a brief
     /// summary (parts added/changed/removed + warnings; summary: "full" for
-    /// everything). Use describe_op(kind) for an example payload.
+    /// everything). Use describe_op(kind) for an example payload. A big
+    /// generated batch can come from `ops_file` (a JSON array of items in a
+    /// file inside the project), applied after the inline `ops`.
     #[tool]
     async fn apply_ops(
         &self,
         Parameters(ApplyOpsArgs {
             ops,
+            ops_file,
             params,
             expect,
             summary,
@@ -969,10 +972,36 @@ Style::default()
                     s.brief_json(text)
                 }
             };
+            // ops_file items come after the inline ones; the expanded items
+            // are what the batch (and so history) records.
+            let mut ops = ops;
+            let inline = ops.len();
+            if let Some(file) = &ops_file {
+                let project = modeler::catalog::project_root();
+                match super::ops_file::read(project.as_deref(), file) {
+                    Ok(items) => ops.extend(items),
+                    Err(msg) => {
+                        let json = serde_json::json!({"ok": false, "error": msg});
+                        return Err((modeler::ModelerError::Invalid(msg), Some(json)));
+                    }
+                }
+            }
+            let from_file = ops.len() - inline;
             let text = match s.apply_values_as(params, ops, full) {
                 Ok(t) => t,
                 Err(e) => {
-                    let json = serde_json::json!({"ok": false, "error": e.to_string()});
+                    let msg = match &ops_file {
+                        Some(file) => {
+                            super::ops_file::locate_error(&e.to_string(), file, inline, from_file)
+                        }
+                        None => e.to_string(),
+                    };
+                    let json = serde_json::json!({"ok": false, "error": msg});
+                    let e = if ops_file.is_some() {
+                        modeler::ModelerError::Invalid(msg)
+                    } else {
+                        e
+                    };
                     return Err((e, Some(json)));
                 }
             };

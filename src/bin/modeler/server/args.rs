@@ -9,6 +9,13 @@ pub(crate) struct ApplyOpsArgs {
     #[schemars(with = "Vec<OpSpec>")]
     #[serde(default)]
     pub(crate) ops: Vec<Value>,
+    /// A JSON file inside the caller's project holding more items (the same
+    /// array `ops` takes), applied after the inline `ops`: for generated
+    /// batches too big to pass inline (hundreds of boxes, a big tri_mesh).
+    /// Relative to the project; paths outside it are refused. History records
+    /// the items, not the path, so undo works and the file can go away.
+    #[serde(default)]
+    pub(crate) ops_file: Option<String>,
     /// Named parameters to set before the ops run, e.g. {"tower_h": 2.0}.
     /// Any value may then be "$tower_h" or an expression "=$tower_h / 2";
     /// changing a parameter later re-derives every op that reads it.
