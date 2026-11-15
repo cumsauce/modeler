@@ -438,6 +438,84 @@ impl<'a> Contacts<'a> {
     }
 }
 
+/// A place where two visible parts meet, framed for a close-up.
+#[derive(Debug, Clone)]
+pub struct JointRegion {
+    pub a: String,
+    pub b: String,
+    /// Centre and half-size of the box to frame (world meters).
+    pub center: Vec3,
+    pub half: Vec3,
+    /// Penetration depth when they share volume (0 = surfaces touching).
+    pub depth: f64,
+    pub overlap: bool,
+}
+
+impl JointRegion {
+    pub fn label(&self) -> String {
+        if self.overlap {
+            format!(
+                "{} x {} overlap {:.1} mm",
+                self.a,
+                self.b,
+                self.depth * 1000.0
+            )
+        } else {
+            format!("{} x {} touch", self.a, self.b)
+        }
+    }
+}
+
+/// Up to `n` contact regions of the visible parts, the most telling first:
+/// overlaps deepest first, then touching pairs, tightest contact patch
+/// first. Each box is padded to show some of both parts around the joint.
+pub fn joint_regions(model: &Model, n: usize) -> Vec<JointRegion> {
+    let c = Contacts::new(model);
+    let mut out: Vec<(f64, JointRegion)> = Vec::new();
+    for (i, j, how, _) in &c.pairs {
+        let (bi, bj) = (&c.bodies[*i], &c.bodies[*j]);
+        let size = |b: &Body| b.bounds.1 - b.bounds.0;
+        let small = size(bi).min(size(bj)).max(Vec3::splat(1e-3));
+        let pad = (small * 0.35).max(Vec3::splat(0.01));
+        let (center, half, depth, overlap) = match how {
+            Contact::Overlap => match overlap_between(bi, bj) {
+                Some(o) => {
+                    let at = Vec3::new(o.at[0] as f32, o.at[1] as f32, o.at[2] as f32);
+                    (at, pad.max(Vec3::splat(o.depth as f32)), o.depth, true)
+                }
+                None => continue,
+            },
+            Contact::Surface(pts) => {
+                let (lo, hi) = pts.iter().fold(
+                    (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                    |(a, b), p| (a.min(*p), b.max(*p)),
+                );
+                ((lo + hi) * 0.5, ((hi - lo) * 0.5).max(pad), 0.0, false)
+            }
+        };
+        // Overlaps rank by depth (always ahead of touches); touches by how
+        // small the patch is next to the parts.
+        let rank = if overlap {
+            1e6 + depth
+        } else {
+            -f64::from(half.max_element() / small.max_element())
+        };
+        out.push((
+            rank,
+            JointRegion {
+                a: bi.part.name.clone(),
+                b: bj.part.name.clone(),
+                center,
+                half,
+                depth,
+                overlap,
+            },
+        ));
+    }
+    out.sort_by(|x, y| y.0.total_cmp(&x.0));
+    out.into_iter().take(n).map(|(_, r)| r).collect()
+}
+
 /// The `grounded` check in one pass: the floating parts, and the parts held
 /// up only by passing more than `deep` of the smaller part into another.
 /// Each solid is built and each pair tested once.
@@ -1199,5 +1277,28 @@ mod place_tests {
             .map(|p| p.bounds().0)
             .unwrap_or_default();
         assert!((lo.y - 0.75).abs() < 1e-5, "{lo:?}");
+    }
+
+    #[test]
+    fn joint_regions_rank_overlaps_first_and_frame_the_contact() {
+        let mut s = crate::commands::Session::default();
+        s.apply_values(
+            None,
+            vec![
+                serde_json::json!({"type": "primitive", "name": "base", "kind": "box",
+                       "size": [1, 0.2, 1], "translation": [0, 0.1, 0]}),
+                serde_json::json!({"type": "primitive", "name": "post", "kind": "box",
+                       "size": [0.1, 0.5, 0.1], "translation": [0.3, 0.43, 0]}),
+                serde_json::json!({"type": "primitive", "name": "cube", "kind": "box",
+                       "size": 0.2, "translation": [-0.3, 0.3, 0]}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let r = crate::contact::joint_regions(&s.model, 4);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].overlap && r[0].depth > 0.01, "{r:?}");
+        assert!(r[0].a == "post" || r[0].b == "post");
+        assert!(!r[1].overlap && (r[1].center.y - 0.2).abs() < 0.02, "{r:?}");
+        assert!(crate::contact::joint_regions(&s.model, 1).len() == 1);
     }
 }

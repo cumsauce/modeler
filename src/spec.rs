@@ -1227,7 +1227,13 @@ pub struct ScatterSpec {
     /// What to strew: "rock", or ["rock_a", "rock_b"] (one picked per copy),
     /// or sets moved as one body: [["oak", "oak_leaves"], "tree1.*"]. An
     /// lsystem's leaves come along with its wood ("oak" = ["oak", "oak_leaves"]).
-    input: ScatterInput,
+    /// Omit it with `decal`.
+    #[serde(default)]
+    input: Option<ScatterInput>,
+    /// Scatter decals instead of parts (cracks, stains, fallen leaves):
+    /// decals name_0.. projected into `on` along its normal at each point.
+    #[serde(default)]
+    decal: Option<ScatterDecalSpec>,
     /// The part whose surface they land on.
     on: String,
     /// Number of copies (fewer when spacing, slope or region leave no room).
@@ -1274,13 +1280,77 @@ pub struct ScatterSpec {
     /// Relative odds per input entry (default equal).
     #[serde(default)]
     weights: Option<Vec<f32>>,
+    /// Only within `near_distance` of these parts' surfaces (clutter along
+    /// wall bases, moss round rocks): a part or a list.
+    #[serde(default)]
+    near: Option<NamesArg>,
+    /// Meters from the `near` parts' surfaces (default 0.5).
+    #[serde(default)]
+    near_distance: Option<f32>,
+    /// 0..1: prefer points near `on`'s borders, creases and corners (0 =
+    /// uniform, 1 = hug them; falloff a tenth of the surface's span).
+    #[serde(default)]
+    edge_bias: Option<f32>,
+    /// Clusters: {"count": 5, "radius": 1.5} picks 5 centres and gathers
+    /// the copies within 1.5 m of them (denser at the centre).
+    #[serde(default)]
+    clump: Option<crate::scatter::Clump>,
+    /// Terrain mask (`on` must be a terrain item): "path" (only on carved
+    /// paths), "pad" (only on flattened pads), "not_path", "not_pad".
+    #[serde(default)]
+    mask: Option<String>,
+    /// Only points with world y in [min, max] (meters).
+    #[serde(default)]
+    height: Option<[f32; 2]>,
+}
+
+/// A part name or a list of them.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum NamesArg {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// The decals a decal scatter strews.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScatterDecalSpec {
+    /// A procedural material of domain "decal" (or "card").
+    pbr: String,
+    /// Param overrides for this use of the material.
+    #[serde(default)]
+    params: Option<std::collections::BTreeMap<String, f64>>,
+    /// Image width, meters: a number or a random [min, max] range.
+    size: RangeArg,
+    /// Image height / width (default 1: square).
+    #[serde(default)]
+    aspect: Option<f32>,
+    /// Box depth along the projection (default half the smaller side).
+    #[serde(default)]
+    depth: Option<f32>,
+    /// "random" (default: each decal turned at random about the normal) or "none".
+    #[serde(default)]
+    roll: Option<String>,
+    /// "clustered" (default) or "forward", as for a decal item.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 impl ScatterSpec {
     fn into_op(self, ctx: &str) -> Result<Op, String> {
         let input: Vec<Vec<String>> = match self.input {
-            ScatterInput::One(s) => vec![vec![s]],
-            ScatterInput::Many(v) => v
+            None if self.decal.is_some() => Vec::new(),
+            None => {
+                return Err(format!(
+                    "{ctx}: input: name the part(s) to scatter, or give `decal` to scatter decals"
+                ));
+            }
+            Some(_) if self.decal.is_some() => {
+                return Err(format!("{ctx}: give input (parts) or decal, not both"));
+            }
+            Some(ScatterInput::One(s)) => vec![vec![s]],
+            Some(ScatterInput::Many(v)) => v
                 .into_iter()
                 .map(|e| match e {
                     ScatterEntry::One(s) => vec![s],
@@ -1288,7 +1358,7 @@ impl ScatterSpec {
                 })
                 .collect(),
         };
-        if input.is_empty() || input.iter().any(Vec::is_empty) {
+        if (self.decal.is_none() && input.is_empty()) || input.iter().any(Vec::is_empty) {
             return Err(format!(
                 "{ctx}: input: name at least one part in every entry"
             ));
@@ -1389,7 +1459,124 @@ impl ScatterSpec {
             if w.iter().any(|x| !(x.is_finite() && *x >= 0.0)) || w.iter().sum::<f32>() <= 0.0 {
                 return Err(format!("{ctx}: weights: >= 0 and not all 0"));
             }
+            if self.decal.is_some() {
+                return Err(format!(
+                    "{ctx}: weights: pick between input entries, not decals"
+                ));
+            }
             def.weights = w;
+        }
+        if let Some(n) = self.near {
+            let names = match n {
+                NamesArg::One(s) => vec![s],
+                NamesArg::Many(v) => v,
+            };
+            if names.is_empty() {
+                return Err(format!("{ctx}: near: name at least one part"));
+            }
+            if names.contains(&self.on) {
+                return Err(format!(
+                    "{ctx}: near: `{}` is `on` itself (every point is near it; edge_bias hugs its borders)",
+                    self.on
+                ));
+            }
+            def.near = names;
+        }
+        if let Some(d) = self.near_distance {
+            if def.near.is_empty() {
+                return Err(format!(
+                    "{ctx}: near_distance goes with `near` (the parts to stay near)"
+                ));
+            }
+            if !(d.is_finite() && d > 0.0) {
+                return Err(format!("{ctx}: near_distance: must be > 0 meters"));
+            }
+            def.near_distance = Some(d);
+        }
+        if let Some(b) = self.edge_bias {
+            if !(0.0..=1.0).contains(&b) {
+                return Err(format!(
+                    "{ctx}: edge_bias: 0 (uniform) .. 1 (hug borders and creases)"
+                ));
+            }
+            def.edge_bias = b;
+        }
+        if let Some(c) = self.clump {
+            if c.count == 0 || c.count > 1000 {
+                return Err(format!("{ctx}: clump: count 1..1000 centres"));
+            }
+            if !(c.radius.is_finite() && c.radius > 0.0) {
+                return Err(format!("{ctx}: clump: radius must be > 0 meters"));
+            }
+            def.clump = Some(c);
+        }
+        if let Some(m) = self.mask {
+            if !matches!(m.as_str(), "path" | "pad" | "not_path" | "not_pad") {
+                return Err(format!(
+                    "{ctx}: mask: `{m}` (one of path, pad, not_path, not_pad)"
+                ));
+            }
+            def.mask = Some(m);
+        }
+        if let Some([a, b]) = self.height {
+            if !(a.is_finite() && b.is_finite()) {
+                return Err(format!("{ctx}: height: [min, max] meters"));
+            }
+            def.height = Some([a.min(b), a.max(b)]);
+        }
+        if let Some(d) = self.decal {
+            let size = match d.size {
+                RangeArg::One(x) => [x, x],
+                RangeArg::Two(v) => v,
+            };
+            if size.iter().any(|x| !(x.is_finite() && *x > 0.0)) {
+                return Err(format!("{ctx}: decal.size: width must be > 0 meters"));
+            }
+            let aspect = d.aspect.unwrap_or(1.0);
+            if !(aspect.is_finite() && aspect > 0.0) {
+                return Err(format!("{ctx}: decal.aspect: height / width must be > 0"));
+            }
+            if d.depth.is_some_and(|x| !(x.is_finite() && x > 0.0)) {
+                return Err(format!("{ctx}: decal.depth: must be > 0 meters"));
+            }
+            let roll = match d.roll.as_deref() {
+                None | Some("random") => true,
+                Some("none") => false,
+                Some(r) => return Err(format!("{ctx}: decal.roll: `{r}` (random or none)")),
+            };
+            let kind = d.kind.unwrap_or_else(|| "clustered".into());
+            if !matches!(kind.as_str(), "clustered" | "forward") {
+                return Err(format!(
+                    "{ctx}: decal.kind: `{kind}`: use clustered or forward"
+                ));
+            }
+            if def.align != 0.0
+                || def.rotate != "random_y"
+                || def.sink != 0.0
+                || def.scale != [1.0, 1.0]
+            {
+                return Err(format!(
+                    "{ctx}: align / rotate / sink / scale move parts; a decal scatter sizes decals with decal.size and turns them with decal.roll"
+                ));
+            }
+            return Ok(Op::DecalScatter {
+                name: self.name,
+                on: self.on,
+                def: Box::new(def),
+                decal: Box::new(crate::scatter::DecalScatterDef {
+                    pbr: crate::material::PbrRef {
+                        material: d.pbr,
+                        params: d.params.unwrap_or_default(),
+                        scale: 1.0,
+                        graph: None,
+                    },
+                    size: [size[0].min(size[1]), size[0].max(size[1])],
+                    aspect,
+                    depth: d.depth,
+                    roll,
+                    kind,
+                }),
+            });
         }
         Ok(Op::Scatter {
             name: self.name,
@@ -4186,7 +4373,7 @@ pub fn example(ty: &str) -> Option<Value> {
             json!({"type": "split", "name": "vase", "input": "vase_raw", "plane": {"normal": [0, 1, 0], "point": [0, 0.15, 0]}, "gap": 0.02})
         }
         "scatter" => {
-            json!({"type": "scatter", "name": "rocks", "input": ["rock_a", "rock_b"], "on": "ground", "count": 40, "seed": 2, "scale": [0.6, 1.4], "rotate": "random", "align": 0.5, "max_slope": 35})
+            json!({"type": "scatter", "name": "rocks", "input": ["rock_a", "rock_b"], "on": "ground", "count": 40, "seed": 2, "scale": [0.6, 1.4], "rotate": "random", "align": 0.5, "max_slope": 35, "edge_bias": 0.3, "clump": {"count": 6, "radius": 3}})
         }
         "round" => {
             json!({"type": "round", "name": "table_top_r", "input": "table_top", "mode": "fillet", "radius": 0.01})

@@ -126,6 +126,64 @@ fn stick(
     Ok(o + dir * t)
 }
 
+/// A decal scatter's decals: each centred on a sampled point of `on`,
+/// projecting into the surface along its normal (on a part: its moves are
+/// already in the points).
+fn scattered(
+    model: &Model,
+    name: &str,
+    on: &str,
+    def: &crate::scatter::ScatterDef,
+    decal: &crate::scatter::DecalScatterDef,
+) -> Result<Vec<Decal>, ModelerError> {
+    let find = |n: &str| {
+        model
+            .parts
+            .iter()
+            .find(|p| p.name == n)
+            .cloned()
+            .ok_or_else(|| ModelerError::from(format!("decal scatter `{name}`: no part `{n}`")))
+    };
+    let on_part = find(on)?;
+    let near = def
+        .near
+        .iter()
+        .map(|n| find(n))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut def = def.clone();
+    if def.mask.is_some() {
+        let terrain = model.ops.iter().rev().find_map(|o| match o {
+            Op::Terrain { name: t, def } if t == on => Some(def.clone()),
+            _ => None,
+        });
+        if terrain.is_none() {
+            return Err(format!(
+                "decal scatter `{name}`: mask: `{on}` is not a terrain item (mask reads a terrain's paths and pads)"
+            )
+            .into());
+        }
+        def.terrain = terrain;
+    }
+    let points = crate::scatter::decal_points(&on_part, &near, &def, decal)
+        .map_err(|e| ModelerError::from(format!("decal scatter `{name}`: {e}")))?;
+    Ok(points
+        .into_iter()
+        .enumerate()
+        .map(|(i, (p, n, w, roll))| {
+            let h = w * decal.aspect;
+            let depth = decal.depth.unwrap_or(w.min(h) * 0.5);
+            Decal {
+                name: format!("{name}_{i}"),
+                pbr: decal.pbr.clone(),
+                size: Vec3::new(w, h, depth),
+                position: p,
+                rotation: orient(-n, roll),
+                kind: decal.kind.clone(),
+            }
+        })
+        .collect())
+}
+
 /// Decals before moves, with the part each rides on.
 fn unmoved(model: &Model, depth: u32) -> Result<Vec<(Decal, Option<String>)>, ModelerError> {
     if depth > 8 {
@@ -171,6 +229,16 @@ fn unmoved(model: &Model, depth: u32) -> Result<Vec<(Decal, Option<String>)>, Mo
                     },
                     attach,
                 ));
+            }
+            Op::DecalScatter {
+                name,
+                on,
+                def,
+                decal,
+            } => {
+                for d in scattered(model, name, on, def, decal)? {
+                    out.push((d, None));
+                }
             }
             Op::Prefab {
                 name,
@@ -325,5 +393,44 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(e.contains("decal"), "{e}");
+    }
+
+    #[test]
+    fn decal_scatter_strews_decals_along_the_surface_normal() {
+        let mut s = with_material("decal");
+        s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "slab", "kind": "box", "size": [6, 0.2, 6],
+                       "translation": [0, 0.1, 0]}),
+                json!({"type": "scatter", "name": "stains", "on": "slab", "count": 12, "seed": 3,
+                       "decal": {"pbr": "sticker", "size": [0.2, 0.4], "aspect": 0.5}}),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let ds = collect(&s.model).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ds.len(), 12);
+        for (i, d) in ds.iter().enumerate() {
+            assert_eq!(d.name, format!("stains_{i}"));
+            assert!((d.position.y - 0.2).abs() < 1e-4, "{:?}", d.position);
+            assert!((d.direction() - Vec3::NEG_Y).length() < 1e-4);
+            assert!(d.size.x >= 0.2 - 1e-5 && d.size.x <= 0.4 + 1e-5);
+            assert!((d.size.y - d.size.x * 0.5).abs() < 1e-5);
+        }
+        // Same seed, same decals; parts and decals are not both allowed.
+        let again = collect(&s.model).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again[3].position, ds[3].position);
+        let e = s
+            .apply_values(
+                None,
+                vec![
+                    json!({"type": "scatter", "name": "x", "on": "slab", "count": 2,
+                            "input": "slab_b", "decal": {"pbr": "sticker", "size": 0.2}}),
+                ],
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("not both"), "{e}");
     }
 }

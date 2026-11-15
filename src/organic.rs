@@ -375,6 +375,102 @@ pub fn curvature_color(k: f32, size: f32) -> [f32; 3] {
     }
 }
 
+/// Local detail per vertex, for `agent_views` style "density": for every
+/// part, each vertex's colour (linear RGB) from how much geometry is near it
+/// (vertices of every part, and how many distinct parts, within a 3 x 3 x 3
+/// block of cells a 24th of the whole scene wide): red where little is
+/// around (a bare wall, an empty floor), white in between, green where it is
+/// busy. Scaled to the scene's own busiest spot.
+pub fn density_colors(parts: &[&Part]) -> Vec<Vec<[f32; 3]>> {
+    use std::collections::HashMap;
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let world: Vec<Vec<Vec3>> = parts
+        .iter()
+        .map(|p| (0..p.verts.len()).map(|i| p.world_vert(i)).collect())
+        .collect();
+    for v in world.iter().flatten() {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    if lo.x > hi.x {
+        return parts
+            .iter()
+            .map(|p| vec![[1.0; 3]; p.verts.len()])
+            .collect();
+    }
+    let cell = ((hi - lo).length() / 24.0).max(1e-4);
+    let key = |v: Vec3| {
+        let q = (v - lo) / cell;
+        (q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32)
+    };
+    // Per cell: vertex count and the parts seen there (a few suffice).
+    let mut cells: HashMap<(i32, i32, i32), (u32, Vec<usize>)> = HashMap::new();
+    for (pi, vs) in world.iter().enumerate() {
+        for v in vs {
+            let e = cells.entry(key(*v)).or_default();
+            e.0 += 1;
+            if e.1.len() < 8 && !e.1.contains(&pi) {
+                e.1.push(pi);
+            }
+        }
+    }
+    let score = |k: (i32, i32, i32)| -> f32 {
+        let (mut n, mut seen) = (0u32, Vec::new());
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some((c, ps)) = cells.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
+                        n += c;
+                        for p in ps {
+                            if !seen.contains(p) {
+                                seen.push(*p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (1.0 + n as f32).ln() + 1.5 * seen.len() as f32
+    };
+    let mut memo: HashMap<(i32, i32, i32), f32> = HashMap::new();
+    let scores: Vec<Vec<f32>> = world
+        .iter()
+        .map(|vs| {
+            vs.iter()
+                .map(|v| {
+                    let k = key(*v);
+                    *memo.entry(k).or_insert_with(|| score(k))
+                })
+                .collect()
+        })
+        .collect();
+    let (mn, mx) = scores
+        .iter()
+        .flatten()
+        .fold((f32::MAX, f32::MIN), |(a, b), s| (a.min(*s), b.max(*s)));
+    let span = (mx - mn).max(1e-6);
+    scores
+        .into_iter()
+        .map(|v| {
+            v.into_iter()
+                .map(|s| density_color((s - mn) / span))
+                .collect()
+        })
+        .collect()
+}
+
+/// Red (sparse, t = 0) -> white (t = 0.5) -> green (busy, t = 1).
+pub fn density_color(t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        let u = t * 2.0;
+        [1.0, 0.1 + 0.9 * u, 0.1 + 0.9 * u]
+    } else {
+        let u = (t - 0.5) * 2.0;
+        [1.0 - 0.85 * u, 1.0 - 0.2 * u, 1.0 - 0.8 * u]
+    }
+}
+
 /// `inspect thickness`: per visible part (matching `parts`, `*` globs),
 /// the thinnest point straight through it, where, and the 5% / median.
 pub fn thickness_report(
@@ -472,5 +568,38 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let t = thickness(&b, 500).unwrap_or_else(|| panic!("no thickness"));
         assert!((t.min - 0.02).abs() < 1e-3, "{t:?}");
+    }
+
+    #[test]
+    fn density_is_red_alone_and_green_in_a_crowd() {
+        let mut s = crate::commands::Session::default();
+        let mut items = vec![
+            serde_json::json!({"type": "primitive", "name": "lone", "kind": "box",
+                                   "size": 0.2, "translation": [-5, 0.1, 0]}),
+        ];
+        for i in 0..12 {
+            items.push(
+                serde_json::json!({"type": "primitive", "name": format!("b{i}"),
+                "kind": "sphere", "size": 0.1, "translation": [5.0 + 0.05 * i as f32, 0.1, 0]}),
+            );
+        }
+        s.apply_values(None, items)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let parts: Vec<&Part> = s.model.parts.iter().map(|p| p.as_ref()).collect();
+        let c = density_colors(&parts);
+        let lone = parts
+            .iter()
+            .position(|p| p.name == "lone")
+            .unwrap_or_else(|| panic!());
+        let busy = parts
+            .iter()
+            .position(|p| p.name == "b5")
+            .unwrap_or_else(|| panic!());
+        assert!(
+            c[lone].iter().all(|k| k[1] < 0.5 && k[0] > 0.9),
+            "{:?}",
+            c[lone][0]
+        );
+        assert!(c[busy].iter().any(|k| k[1] > k[0]), "{:?}", c[busy][0]);
     }
 }

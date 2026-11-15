@@ -238,6 +238,179 @@ pub fn diff(before: &Canvas, after: &Canvas) -> Result<(Canvas, f64, Option<[usi
     Ok((out, n as f64 / (after.w * after.h).max(1) as f64, bb))
 }
 
+/// Decodes a PNG of any colour type and bit depth into RGBA8 (reference
+/// images come from anywhere: greyscale scans, RGB exports, paletted art).
+pub fn decode_image(bytes: &[u8]) -> Result<Canvas, String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png decode: {e}"))?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png: size overflow")?];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("png decode: {e}"))?;
+    buf.truncate(info.buffer_size());
+    let (w, h) = (info.width as usize, info.height as usize);
+    let px: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[0], c[0], c[1]])
+            .collect(),
+        other => return Err(format!("png decode: unsupported colour type {other:?}")),
+    };
+    if px.len() != w * h * 4 {
+        return Err("png decode: unexpected buffer size".into());
+    }
+    Ok(Canvas::from_rgba(w, h, px))
+}
+
+fn luma(c: &[u8; 4]) -> f32 {
+    0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32
+}
+
+/// A `silhouette` render's mask: dark pixels (the parts, flat black on
+/// white) are true.
+pub fn silhouette_mask(c: &Canvas) -> Vec<bool> {
+    c.px.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| luma(p) < 128.0)
+        .collect()
+}
+
+/// A reference image's subject: by alpha when the image has transparency
+/// (opaque = subject), else by luminance against the border's (a dark
+/// subject on a light page, or a light one on a dark page).
+pub fn reference_mask(c: &Canvas) -> Vec<bool> {
+    let px = c.px.as_chunks::<4>().0;
+    let clear = px.iter().filter(|p| p[3] < 128).count();
+    if clear > 0 && clear < px.len() {
+        return px.iter().map(|p| p[3] >= 128).collect();
+    }
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for p in px {
+        let l = luma(p);
+        lo = lo.min(l);
+        hi = hi.max(l);
+    }
+    let mid = (lo + hi) * 0.5;
+    let (mut border, mut n) = (0.0f32, 0.0f32);
+    for y in 0..c.h {
+        for x in 0..c.w {
+            if x == 0 || y == 0 || x + 1 == c.w || y + 1 == c.h {
+                border += luma(&px[y * c.w + x]);
+                n += 1.0;
+            }
+        }
+    }
+    let light_page = n == 0.0 || border / n >= mid;
+    px.iter()
+        .map(|p| (luma(p) < mid) == light_page && hi - lo > 8.0)
+        .collect()
+}
+
+/// The pixel box [x0, y0, x1, y1] (inclusive) of a mask's true pixels.
+pub fn mask_box(m: &[bool], w: usize) -> Option<[usize; 4]> {
+    let mut bb: Option<[usize; 4]> = None;
+    for (i, _) in m.iter().enumerate().filter(|(_, v)| **v) {
+        let (x, y) = (i % w.max(1), i / w.max(1));
+        bb = Some(match bb {
+            None => [x, y, x, y],
+            Some([x0, y0, x1, y1]) => [x0.min(x), y0.min(y), x1.max(x), y1.max(y)],
+        });
+    }
+    bb
+}
+
+/// How a model's silhouette compares with a reference image's.
+pub struct SilhouetteDiff {
+    /// White = neither, dark grey = both, magenta = model only, cyan =
+    /// reference only.
+    pub image: Canvas,
+    /// Intersection over union of the two silhouettes (0..1).
+    pub iou: f64,
+    /// Share of pixels that are model only / reference only.
+    pub model_only: f64,
+    pub reference_only: f64,
+    /// Reference box aspect (w / h) and the model's.
+    pub aspects: (f64, f64),
+}
+
+/// Fits the reference's subject onto the model's silhouette (uniformly
+/// scaled to the same height, centred on the same box centre) and compares
+/// them pixel by pixel over the render (`w` x `h`).
+pub fn compare_silhouettes(
+    model: &[bool],
+    w: usize,
+    h: usize,
+    reference: &Canvas,
+) -> Result<SilhouetteDiff, String> {
+    if model.len() != w * h {
+        return Err("silhouette: mask size does not match the render".into());
+    }
+    let rmask = reference_mask(reference);
+    let mb = mask_box(model, w).ok_or("silhouette: the model covers no pixels in this view")?;
+    let rb = mask_box(&rmask, reference.w)
+        .ok_or("reference: no subject found (no opaque or contrasting pixels)")?;
+    let size = |b: [usize; 4]| ((b[2] - b[0] + 1) as f64, (b[3] - b[1] + 1) as f64);
+    let ((mw, mh), (rw, rh)) = (size(mb), size(rb));
+    // Height sets the scale (a front view's height is the least ambiguous),
+    // unless the subject is much wider than tall.
+    let s = if rw > rh * 1.5 { mw / rw } else { mh / rh };
+    let mc = ((mb[0] + mb[2]) as f64 * 0.5, (mb[1] + mb[3]) as f64 * 0.5);
+    let rc = ((rb[0] + rb[2]) as f64 * 0.5, (rb[1] + rb[3]) as f64 * 0.5);
+    let mut image = Canvas::new(w, h, [255, 255, 255, 255]);
+    let (mut both, mut any, mut mo, mut ro) = (0usize, 0usize, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            let rx = rc.0 + (x as f64 - mc.0) / s;
+            let ry = rc.1 + (y as f64 - mc.1) / s;
+            let r = rx >= 0.0
+                && ry >= 0.0
+                && (rx.round() as usize) < reference.w
+                && (ry.round() as usize) < reference.h
+                && rmask[ry.round() as usize * reference.w + rx.round() as usize];
+            let m = model[y * w + x];
+            let c = match (m, r) {
+                (true, true) => {
+                    both += 1;
+                    [70, 70, 70, 255]
+                }
+                (true, false) => {
+                    mo += 1;
+                    [255, 0, 220, 255]
+                }
+                (false, true) => {
+                    ro += 1;
+                    [0, 220, 255, 255]
+                }
+                (false, false) => continue,
+            };
+            any += 1;
+            image.set(x as i64, y as i64, c);
+        }
+    }
+    let n = (w * h).max(1) as f64;
+    Ok(SilhouetteDiff {
+        image,
+        iou: both as f64 / any.max(1) as f64,
+        model_only: mo as f64 / n,
+        reference_only: ro as f64 / n,
+        aspects: (rw / rh, mw / mh),
+    })
+}
+
 /// Formats a length in metres for labels: "1.25 m", "35 mm", "0.4 mm".
 pub fn fmt_len(m: f64) -> String {
     let a = m.abs();
@@ -336,5 +509,55 @@ mod tests {
                 assert_ne!(c[i], c[j]);
             }
         }
+    }
+
+    #[test]
+    fn silhouettes_fit_and_score_a_scaled_reference() {
+        // Model: a black 20 x 40 rectangle on white in a 100 x 100 render.
+        let mut render = Canvas::new(100, 100, [255, 255, 255, 255]);
+        render.fill_rings(
+            &[vec![(40.0, 30.0), (60.0, 30.0), (60.0, 70.0), (40.0, 70.0)]],
+            [0, 0, 0, 255],
+        );
+        let m = silhouette_mask(&render);
+        // Reference: the same shape at half size elsewhere, dark on light,
+        // as RGB: fits exactly.
+        let mut r = Canvas::new(50, 50, [240, 240, 240, 255]);
+        r.fill_rings(
+            &[vec![(5.0, 5.0), (15.0, 5.0), (15.0, 25.0), (5.0, 25.0)]],
+            [20, 20, 20, 255],
+        );
+        let rgb: Vec<u8> =
+            r.px.as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|c| [c[0], c[1], c[2]])
+                .collect();
+        let mut bytes = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut bytes, 50, 50);
+            e.set_color(png::ColorType::Rgb);
+            e.set_depth(png::BitDepth::Eight);
+            let mut wr = e.write_header().unwrap_or_else(|e| panic!("{e}"));
+            wr.write_image_data(&rgb).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let r = decode_image(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let d = compare_silhouettes(&m, 100, 100, &r).unwrap_or_else(|e| panic!("{e}"));
+        assert!(d.iou > 0.9, "{}", d.iou);
+        // A reference twice as wide scores much lower, cyan on the sides.
+        let mut wide = Canvas::new(50, 50, [255, 255, 255, 0]);
+        wide.fill_rings(
+            &[vec![(5.0, 5.0), (25.0, 5.0), (25.0, 25.0), (5.0, 25.0)]],
+            [0, 0, 0, 255],
+        );
+        let d = compare_silhouettes(&m, 100, 100, &wide).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            d.iou < 0.6 && d.reference_only > 0.05,
+            "{} {}",
+            d.iou,
+            d.reference_only
+        );
+        let i = (50 * 100 + 30) * 4;
+        assert_eq!(&d.image.px[i..i + 4], &[0, 220, 255, 255]);
     }
 }

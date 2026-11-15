@@ -135,7 +135,7 @@ type, so there is no need to memorise field names.
 | `hull` | name, inputs |
 | `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
 | `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
-| `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights] |
+| `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights], [near + near_distance 0.5], [edge_bias 0], [clump {count, radius}], [mask path / pad / not_path / not_pad], [height [min, max]]; or `decal` {pbr, size, [aspect 1], [depth], [roll random / none], [kind], [params]} instead of input |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments], [edges all / top / bottom / vertical / horizontal or a list] (fillet) |
 | `deform` | name, input, mode (displace / bend / twist / taper / material), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
 | `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution] (analytic distance-field modeling) |
@@ -525,6 +525,32 @@ surfaces, not hundreds of scattered copies.
   copy follows (it reads `on` before post-graph moves/places). Exports share
   one mesh between copies (instancing keeps each node's rotation and scale);
   use tile pbr materials on scattered parts (object ones bake per copy).
+  **Smarter placement** (all optional, combine freely): `near: "wall"` (or
+  a list) keeps only points within `near_distance` (default 0.5 m) of
+  those parts' surfaces (clutter along wall bases, moss round a rock);
+  `edge_bias: 0..1` prefers points near `on`'s borders, creases and
+  corners (1 hugs them; the falloff is a tenth of the surface's span), so
+  debris collects at the foot of walls and along kerbs; `clump: {"count":
+  5, "radius": 1.5}` picks 5 centres and gathers the copies within 1.5 m
+  of them, denser at the middle (flower patches, mushroom rings); on a
+  `terrain`, `mask: "path"` / `"pad"` keeps only points on its carved paths
+  / flattened pads and `"not_path"` / `"not_pad"` keeps them off (the same
+  bits as the heights file; `on` must be the terrain item itself, a mask on
+  anything else is an error); `height: [min, max]` keeps world y in range
+  (reeds only in the low ground). `count` stays a target: the result says
+  how many fit.
+  **Decals**: give `decal` instead of `input` to strew decals (cracks,
+  stains, fallen leaves, puddles): `{"type": "scatter", "name": "stains",
+  "on": "floor", "count": 20, "edge_bias": 0.6, "decal": {"pbr": "stain",
+  "size": [0.2, 0.5], "aspect": 1, "roll": "random"}}` makes decals
+  `stains_0..`, each centred on a sampled point and projecting into the
+  surface along its normal (so they work on walls and slopes with `faces:
+  "all"`), `size` the image width (a number or a random [min, max]),
+  `aspect` height / width, `depth` the box depth (default half the smaller
+  side). Every placement field works; `scale` / `rotate` / `align` /
+  `sink` / `weights` don't (they move parts). They are ordinary decals
+  everywhere decals go (preview, agent views, export, maps) and re-sample
+  when `on` changes.
 - **`hull`**: the convex hull of several parts. Two spheres make a pill,
   eight small spheres at a box's corners make a rounded box.
 - **`blob`** melts closed solids together with a smooth fillet instead of
@@ -856,6 +882,27 @@ name: the producer first, then in-place material/visibility/transform edits).
     red convex, blue concave, saturated where the radius of curvature is a
     sixteenth of the part or tighter): lumps, pinches, dents and creases on
     organic surfaces stand out where shading hides them.
+  - `style: "silhouette"`: flat black parts on white, no shading, no
+    decals: compare outlines and proportions at a glance.
+  - `style: "density"`: each surface tinted by how much geometry is near
+    it (vertices and distinct parts within a 24th of the scene): red =
+    sparse (a bare wall, an empty floor), white, green = busy. Finds the
+    empty stretches of a level that need dressing.
+  - `focus: "joints"` (or `joints: N`, 1..9; "joints" = 4): close-ups of
+    up to N places where visible parts meet, deepest overlaps first, then
+    touching pairs with the tightest contact patch, each framed on the
+    contact region (padded to show both parts) and labelled `a x b overlap
+    12.0 mm` / `a x b touch`. Seen from the first view (iso by default);
+    combines with any style. A quick look at every seam a model has.
+  - `reference: {"image": "refs/chair_front.png", "view": "front"}`:
+    renders the silhouette in that orthographic view and compares it with
+    a reference PNG inside the call's project (resolved like `ops_file`;
+    any PNG colour type). The image's subject is its opaque pixels when it
+    has transparency, else the pixels contrasting with its border; it is
+    fitted to the model's silhouette box (same height, same centre; by
+    width when it is much wider than tall). Returns the silhouette and an
+    overlay (magenta = model only, cyan = reference only, grey = both) and
+    the IoU, and says when the aspect ratios differ.
   - `dims: true`: the framed box's width and height and a scale bar, at true
     scale in orthographic views. Perspective views have no single scale:
     they state the model's box size ("not the view") and a scale bar valid
@@ -999,7 +1046,9 @@ where `ModelerDecals.clustered` allows, a `ClusteredDecal`. In a `.bsn`
 map the map's own decals go into its ground glTF; prefab instances keep
 theirs in their own file. The window lists decals in the Model and Map
 panes (a Decals layer toggle in Map) and their materials under "Decal
-materials" in Material mode.
+materials" in Material mode. To strew many decals over a surface
+(cracks, stains, leaves), use a `scatter` with `decal` instead of `input`
+(see `scatter`).
 
 **Game data (colliders, markers):**
 
