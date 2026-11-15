@@ -885,6 +885,13 @@ pub enum Op {
         /// primitive follows when that part moves or turns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame: Option<String>,
+        /// Edge rounding radius in meters (box, cylinder, wedge): the
+        /// primitive is built with its edges/rims rounded, same outer size.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        round: f32,
+        /// Arc segments per rounded edge (0 = default 4).
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        segments: u32,
     },
     /// A 2D footprint extruded straight up (y = 0..height) via Manifold.
     /// `profile` rings are [x, z]; inner rings are holes.
@@ -1111,6 +1118,27 @@ pub enum Op {
         radius: f32,
         #[serde(default)]
         segments: u32,
+        /// Fillet only these edge classes: top, bottom, vertical,
+        /// horizontal (empty = all).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        edges: Vec<String>,
+    },
+    /// Insets a grid of recessed panels (`rows` x `cols`, seams between)
+    /// into one face of a closed solid: walls, hull plating, doors.
+    Panel {
+        name: String,
+        input: String,
+        face: String,
+        #[serde(default)]
+        rows: u32,
+        #[serde(default)]
+        cols: u32,
+        /// Margin from the face's edges to the panel grid (meters).
+        inset: f32,
+        /// How deep each panel is recessed (meters).
+        depth: f32,
+        /// Width of the seams between panels (meters).
+        gap: f32,
     },
     /// Hollows a solid to walls `thickness` thick; each `open` face
     /// (top/bottom/left/right/front/back) is left open. Cabinets, drawers,

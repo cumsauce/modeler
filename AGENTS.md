@@ -124,7 +124,7 @@ type, so there is no need to memorise field names.
 
 | type | fields (optional in []) |
 |---|---|
-| `primitive` | name, kind, size, [translation / position], [rotation], [frame] |
+| `primitive` | name, kind, size, [translation / position], [rotation], [frame], [round] (box / cylinder / wedge), [segments 4] |
 | `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round], [smooth], [samples], [twist], [scale_end] |
@@ -136,13 +136,14 @@ type, so there is no need to memorise field names.
 | `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
 | `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
 | `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights] |
-| `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments] |
+| `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments], [edges all / top / bottom / vertical / horizontal or a list] (fillet) |
 | `deform` | name, input, mode (displace / bend / twist / taper / material), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
 | `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution] (analytic distance-field modeling) |
 | `skin` | name, chains [[[x, y, z, r] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution] (a skeleton with radii as one smooth skin) |
 | `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
 | `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
+| `panel` | name, input, face, [rows 1], [cols 1], [inset / border 0.01], [depth 0.005], [gap / seam 0.01] (recessed panels in a face) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
 | `move` | [name], parts (names / `*` globs; `["*"]` = all), [translation], [rotation] or [axis + degrees], [pivot: point or anchor] |
@@ -628,7 +629,30 @@ A visible part with only a flat colour (no `pbr`) is a warning in
   - `smooth` does subdivision rounding.
 
   Large or concave inputs make fillet/chamfer slower, so round parts before
-  combining them.
+  combining them. `fillet` takes `edges` to round only some edges: `top` /
+  `bottom` (horizontal edges in the upper / lower half of the part's box),
+  `horizontal` (both), `vertical` (edges along y), or a list (`["top",
+  "vertical"]`: a table top rounded on top and at the corners, sharp
+  underneath). Exact for axis-aligned edges (the opening uses a y cylinder
+  for vertical edges, crossed x / z cylinders for horizontal ones, and the
+  halves meet at mid-height); slanted edges round with their half's tool,
+  and top / bottom need the part taller than 2 x radius.
+- **Rounded primitives**: a `box`, `cylinder` or `wedge` primitive with
+  `round: r` is built with every edge (a cylinder's rims) rounded by `r`,
+  same outer size, `segments` arc steps per edge (4): a closed solid, ready
+  for booleans, and far cheaper than a `round` op. Nothing real has knife
+  edges, so give boxes a few mm. A style can make it the default:
+  `"defaults": {"primitive": {"round": "$bevel"}}` (other kinds ignore
+  `round`).
+- **`panel`** recesses a grid of panels into one face of a closed solid
+  (walls, hull plating, doors, crate sides, cabinet fronts): `{"type":
+  "panel", "name": "door", "input": "door_raw", "face": "front", "rows": 2,
+  "cols": 1, "inset": 0.06, "depth": 0.008, "gap": 0.05}`. `rows` run down
+  the face (along y on the sides, z on top / bottom), `cols` across it;
+  `inset` (alias `border`) is the frame left round the grid, `gap` (alias
+  `seam`) the ribs between panels, all at the face. The face is the side of
+  the input's box, so it suits flat faces flush with it. The result keeps
+  the input's material (hide the input).
 - **`group`** merges parts into one mesh without a boolean (they may be
   disjoint), so a set of parts can be arrayed or moved as one. Use it
   instead of chained unions: a union of separate parts warns "no overlap".

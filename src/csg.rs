@@ -816,6 +816,444 @@ pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, M
     Ok(p)
 }
 
+/// Points on a sphere of radius `r` about `c` (`n` arc steps per quarter).
+fn sphere_pts(out: &mut Vec<[f64; 3]>, c: [f64; 3], r: f64, n: u32) {
+    let n = n.max(1);
+    let around = 4 * n;
+    for j in 0..=2 * n {
+        let lat = std::f64::consts::PI * (j as f64 / (2 * n) as f64 - 0.5);
+        for i in 0..around {
+            let lon = std::f64::consts::TAU * i as f64 / around as f64;
+            out.push([
+                c[0] + r * lat.cos() * lon.cos(),
+                c[1] + r * lat.sin(),
+                c[2] + r * lat.cos() * lon.sin(),
+            ]);
+        }
+    }
+}
+
+/// A box, cylinder or wedge with its edges rounded by `r` (same outer size
+/// as the sharp primitive, centred the same way): the convex hull of spheres
+/// (box, wedge) or rim rings (cylinder) inset by `r`. A closed solid.
+pub fn rounded_primitive(
+    name: &str,
+    kind: crate::PrimitiveKind,
+    size: [f32; 3],
+    r: f32,
+    segments: u32,
+) -> Result<Part, ModelerError> {
+    use crate::PrimitiveKind as K;
+    let n = if segments == 0 {
+        4
+    } else {
+        segments.clamp(1, 32)
+    };
+    let rr = f64::from(r);
+    let s = size.map(f64::from);
+    let err = |thin: f64| {
+        ModelerError::Csg(format!(
+            "primitive `{name}`: round {r} must be under half its thinnest size ({thin:.4} m)"
+        ))
+    };
+    let mut pts = Vec::new();
+    match kind {
+        K::Box => {
+            let thin = s[0].min(s[1]).min(s[2]);
+            if rr * 2.0 >= thin {
+                return Err(err(thin));
+            }
+            let h = [s[0] / 2.0 - rr, s[1] / 2.0 - rr, s[2] / 2.0 - rr];
+            for sx in [-1.0, 1.0] {
+                for sy in [-1.0, 1.0] {
+                    for sz in [-1.0, 1.0] {
+                        sphere_pts(&mut pts, [sx * h[0], sy * h[1], sz * h[2]], rr, n);
+                    }
+                }
+            }
+        }
+        K::Cylinder => {
+            let (rad, hh) = (s[0], s[1]);
+            if rr >= rad || rr * 2.0 >= hh {
+                return Err(err((2.0 * rad).min(hh)));
+            }
+            let around = 32.max(8 * n);
+            for i in 0..around {
+                let t = std::f64::consts::TAU * i as f64 / around as f64;
+                for k in 0..=n {
+                    let phi = std::f64::consts::FRAC_PI_2 * k as f64 / n as f64;
+                    let rad_k = rad - rr + rr * phi.cos();
+                    let dy = hh / 2.0 - rr + rr * phi.sin();
+                    for y in [dy, -dy] {
+                        pts.push([rad_k * t.cos(), y, rad_k * t.sin()]);
+                    }
+                }
+            }
+        }
+        K::Wedge => {
+            let (w, h, d) = (s[0], s[1], s[2]);
+            let tri = [
+                [-w / 2.0, -h / 2.0],
+                [w / 2.0, -h / 2.0],
+                [-w / 2.0, h / 2.0],
+            ];
+            // Inradius of the right triangle.
+            let inr = (w + h - (w * w + h * h).sqrt()) / 2.0;
+            if rr >= inr || rr * 2.0 >= d {
+                return Err(err((2.0 * inr).min(d)));
+            }
+            for k in 0..3 {
+                let v = tri[k];
+                let a = tri[(k + 1) % 3];
+                let b = tri[(k + 2) % 3];
+                let unit = |p: [f64; 2]| {
+                    let (x, y) = (p[0] - v[0], p[1] - v[1]);
+                    let l = (x * x + y * y).sqrt();
+                    [x / l, y / l]
+                };
+                let (u1, u2) = (unit(a), unit(b));
+                let bis = [u1[0] + u2[0], u1[1] + u2[1]];
+                let bl = (bis[0] * bis[0] + bis[1] * bis[1]).sqrt();
+                let bis = [bis[0] / bl, bis[1] / bl];
+                let sin_half = (u1[0] * bis[1] - u1[1] * bis[0]).abs();
+                let c = [v[0] + bis[0] * rr / sin_half, v[1] + bis[1] * rr / sin_half];
+                for z in [d / 2.0 - rr, rr - d / 2.0] {
+                    sphere_pts(&mut pts, [c[0], c[1], z], rr, n);
+                }
+            }
+        }
+        other => {
+            return Err(ModelerError::Csg(format!(
+                "primitive `{name}`: round works on box, cylinder and wedge, not {other} \
+                 (spheres, capsules and tori are already round; use a round op for others)"
+            )));
+        }
+    }
+    let m = Manifold::hull_pts(&pts);
+    m.status()
+        .map_err(|e| ModelerError::Csg(format!("primitive `{name}` failed: {e}")))?;
+    let mut p = manifold_to_part(&m, name, crate::Material::default());
+    p.visible = true;
+    crate::uv::ensure_uvs(&mut p, Some("box"))?;
+    Ok(p)
+}
+
+/// Opening (erode, then dilate) by `tool`; errors when nothing survives.
+fn open_by(
+    name: &str,
+    part: &Part,
+    m: &Manifold,
+    tool: &Manifold,
+    r: f32,
+) -> Result<Manifold, ModelerError> {
+    let eroded = m.minkowski_difference(tool);
+    if eroded.is_empty() {
+        let (lo, hi) = part.bounds();
+        let d = hi - lo;
+        return Err(ModelerError::Csg(format!(
+            "round `{name}`: radius {r} is larger than half of `{}`'s thinnest section \
+             (its box is {:.4} x {:.4} x {:.4} m); use a smaller radius",
+            part.name, d.x, d.y, d.z
+        )));
+    }
+    Ok(eroded.minkowski_sum(tool))
+}
+
+/// Fillet only some edge classes of a solid: `top` / `bottom` (horizontal
+/// edges in the upper / lower half of its box), `horizontal` (both),
+/// `vertical` (edges along y). Built from openings with direction-limited
+/// tools (a y cylinder rounds only vertical edges, the intersection of x and
+/// z cylinders only horizontal ones), the upper and lower halves joined at
+/// the box's mid-height. Exact for axis-aligned edges; slanted edges are
+/// rounded by whichever tool their half uses; a top/bottom split needs the
+/// part to be taller than 2 x radius.
+pub fn fillet_edges(
+    name: &str,
+    part: &Part,
+    r: f32,
+    segments: u32,
+    edges: &[String],
+) -> Result<Part, ModelerError> {
+    if r.is_nan() || r <= 0.0 {
+        return Err(ModelerError::Csg(format!(
+            "round `{name}`: radius must be > 0, got {r}"
+        )));
+    }
+    let (mut top, mut bottom, mut vertical) = (false, false, false);
+    for e in edges {
+        match e.as_str() {
+            "all" => (top, bottom, vertical) = (true, true, true),
+            "top" => top = true,
+            "bottom" => bottom = true,
+            "horizontal" => (top, bottom) = (true, true),
+            "vertical" => vertical = true,
+            other => {
+                return Err(ModelerError::Csg(format!(
+                    "round `{name}`: edges: `{other}` is not an edge class; use all, top, bottom, vertical or horizontal"
+                )));
+            }
+        }
+    }
+    let m = part_to_manifold(part)?;
+    let tris = m.num_tri();
+    if tris > 20_000 {
+        return Err(ModelerError::Csg(format!(
+            "round `{name}`: `{}` has {tris} triangles; fillet the simple pieces before booleans",
+            part.name
+        )));
+    }
+    let rf = f64::from(r);
+    let segs = if segments == 0 {
+        16
+    } else {
+        segments.clamp(4, 64)
+    } as i32;
+    let cyl = |axis: char| {
+        let c = Manifold::cylinder(2.0 * rf, rf, rf, segs, true);
+        match axis {
+            'x' => c.rotate(0.0, 90.0, 0.0),
+            'y' => c.rotate(90.0, 0.0, 0.0),
+            _ => c,
+        }
+    };
+    let tool = |horizontal: bool, vert: bool| -> Option<Manifold> {
+        match (horizontal, vert) {
+            (true, true) => Some(Manifold::sphere(rf, segs)),
+            (true, false) => Some(cyl('x').intersection(&cyl('z'))),
+            (false, true) => Some(cyl('y')),
+            (false, false) => None,
+        }
+    };
+    let opened = |t: Option<Manifold>| -> Result<Manifold, ModelerError> {
+        match t {
+            Some(t) => open_by(name, part, &m, &t, r),
+            None => Ok(m.clone()),
+        }
+    };
+    let out = if top == bottom {
+        opened(tool(top, vertical))?
+    } else {
+        let (lo, hi) = part.bounds();
+        let (lo, hi) = (lo.as_dvec3(), hi.as_dvec3());
+        let cy = (lo.y + hi.y) / 2.0;
+        if hi.y - lo.y <= 2.0 * rf {
+            return Err(ModelerError::Csg(format!(
+                "round `{name}`: edges top/bottom needs `{}` taller than 2 x radius ({:.4} m tall)",
+                part.name,
+                hi.y - lo.y
+            )));
+        }
+        let pad = (hi - lo).max_element() + 1.0;
+        let overlap = ((hi.y - lo.y) * 1e-3).min(rf * 0.5);
+        let slab = |y0: f64, y1: f64| {
+            Manifold::cube(
+                hi.x - lo.x + 2.0 * pad,
+                y1 - y0,
+                hi.z - lo.z + 2.0 * pad,
+                false,
+            )
+            .translate(lo.x - pad, y0, lo.z - pad)
+        };
+        let upper = opened(tool(top, vertical))?.intersection(&slab(cy - overlap, hi.y + pad));
+        let lower = opened(tool(bottom, vertical))?.intersection(&slab(lo.y - pad, cy + overlap));
+        upper.union(&lower)
+    };
+    out.status()
+        .map_err(|e| ModelerError::Csg(format!("round `{name}` failed: {e}")))?;
+    if out.is_empty() {
+        return Err(ModelerError::Csg(format!(
+            "round `{name}` produced nothing"
+        )));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
+}
+
+/// Recesses a `rows` x `cols` grid of panels `depth` deep into one face of a
+/// solid's world box (top/bottom/left/right/front/back), `inset` in from
+/// the face's edges with `gap`-wide seams left standing between them. Rows
+/// run down the face (along y on the sides, along z on top/bottom), columns
+/// across it. The face is the box side: flat faces flush with the part's
+/// box work as expected; curved ones get cut where they reach it.
+#[allow(clippy::too_many_arguments)]
+pub fn panel(
+    name: &str,
+    part: &Part,
+    face: &str,
+    rows: u32,
+    cols: u32,
+    inset: f32,
+    depth: f32,
+    gap: f32,
+) -> Result<Part, ModelerError> {
+    // (normal axis, sign, row axis, column axis)
+    let (n, sign, ra, ca) = match face {
+        "top" => (1, 1.0, 2, 0),
+        "bottom" => (1, -1.0, 2, 0),
+        "right" => (0, 1.0, 1, 2),
+        "left" => (0, -1.0, 1, 2),
+        "front" => (2, 1.0, 1, 0),
+        "back" => (2, -1.0, 1, 0),
+        other => {
+            return Err(ModelerError::Csg(format!(
+                "panel `{name}`: face: `{other}` is not a face; use top, bottom, left, right, front or back"
+            )));
+        }
+    };
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    if depth.is_nan() || depth <= 0.0 || inset.is_nan() || inset < 0.0 || gap.is_nan() || gap < 0.0
+    {
+        return Err(ModelerError::Csg(format!(
+            "panel `{name}`: depth must be > 0 and inset, gap >= 0 (got depth {depth}, inset {inset}, gap {gap})"
+        )));
+    }
+    let m = part_to_manifold(part)?;
+    let (lo, hi) = part.bounds();
+    let (lo, hi) = (lo.as_dvec3().to_array(), hi.as_dvec3().to_array());
+    let (inset, depth, gap) = (f64::from(inset), f64::from(depth), f64::from(gap));
+    let thick = hi[n] - lo[n];
+    if depth >= thick {
+        return Err(ModelerError::Csg(format!(
+            "panel `{name}`: depth {depth} cuts through `{}` ({thick:.4} m thick there)",
+            part.name
+        )));
+    }
+    let cell = |axis: usize, count: u32| -> Result<f64, ModelerError> {
+        let span = hi[axis] - lo[axis] - 2.0 * inset - (count - 1) as f64 * gap;
+        let c = span / count as f64;
+        if c <= 0.0 {
+            return Err(ModelerError::Csg(format!(
+                "panel `{name}`: {count} panels with inset {inset} and gap {gap} don't fit on a {:.4} m side",
+                hi[axis] - lo[axis]
+            )));
+        }
+        Ok(c)
+    };
+    let (rc, cc) = (cell(ra, rows)?, cell(ca, cols)?);
+    let plane = if sign > 0.0 { hi[n] } else { lo[n] };
+    let out_pad = depth + 0.01 * thick.max(1e-3);
+    let mut cutters = Vec::new();
+    for i in 0..rows {
+        for j in 0..cols {
+            let mut size = [0.0; 3];
+            let mut at = [0.0; 3];
+            size[ra] = rc;
+            at[ra] = lo[ra] + inset + i as f64 * (rc + gap);
+            size[ca] = cc;
+            at[ca] = lo[ca] + inset + j as f64 * (cc + gap);
+            size[n] = depth + out_pad;
+            at[n] = if sign > 0.0 {
+                plane - depth
+            } else {
+                plane - out_pad
+            };
+            cutters.push(
+                Manifold::cube(size[0], size[1], size[2], false).translate(at[0], at[1], at[2]),
+            );
+        }
+    }
+    let out = m.difference(&Manifold::batch_union(&cutters));
+    out.status()
+        .map_err(|e| ModelerError::Csg(format!("panel `{name}` failed: {e}")))?;
+    if out.is_empty() {
+        return Err(ModelerError::Csg(format!(
+            "panel `{name}` produced nothing"
+        )));
+    }
+    if (out.volume() - m.volume()).abs() < 1e-12 {
+        return Err(ModelerError::Csg(format!(
+            "panel `{name}`: the panels miss `{}`'s {face} face (is it flush with its box?)",
+            part.name
+        )));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
+}
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::*;
+
+    fn closed(p: &Part) -> Manifold {
+        part_to_manifold(p).unwrap_or_else(|e| panic!("not closed: {e}"))
+    }
+
+    fn cube(n: &str, s: [f32; 3]) -> Part {
+        crate::primitives::primitive(crate::PrimitiveKind::Box, s, n)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn rounded_primitives_are_closed_and_keep_their_size() {
+        for (kind, size) in [
+            (crate::PrimitiveKind::Box, [1.0, 0.5, 0.8]),
+            (crate::PrimitiveKind::Cylinder, [0.3, 1.0, 0.0]),
+            (crate::PrimitiveKind::Wedge, [1.0, 0.6, 0.5]),
+        ] {
+            let p = rounded_primitive("p", kind, size, 0.05, 0)
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let m = closed(&p);
+            let sharp_part =
+                crate::primitives::primitive(kind, size, "s").unwrap_or_else(|e| panic!("{e}"));
+            let sharp = closed(&sharp_part);
+            assert!(m.volume() < sharp.volume() && m.volume() > 0.9 * sharp.volume());
+            let (lo, hi) = p.bounds();
+            let (slo, shi) = sharp_part.bounds();
+            assert!((lo - slo).abs().max_element() < 1e-3, "{kind} lo");
+            // The wedge's acute tips round off inside its box.
+            if kind != crate::PrimitiveKind::Wedge {
+                assert!((hi - shi).abs().max_element() < 1e-3, "{kind} hi");
+            }
+            // Booleans accept it.
+            let cut = m.difference(&Manifold::cube(0.1, 0.1, 2.0, true));
+            assert!(cut.status().is_ok() && cut.volume() < m.volume());
+        }
+        assert!(rounded_primitive("p", crate::PrimitiveKind::Box, [0.1; 3], 0.06, 0).is_err());
+        assert!(rounded_primitive("p", crate::PrimitiveKind::Sphere, [0.1; 3], 0.01, 0).is_err());
+    }
+
+    #[test]
+    fn fillet_edges_rounds_only_the_chosen_class() {
+        let b = cube("b", [1.0, 1.0, 1.0]);
+        let full = closed(&b).volume();
+        let r = 0.2_f32;
+        // Rounding one edge of length 1 removes (1 - pi/4) r^2.
+        let per_edge = (1.0 - std::f64::consts::FRAC_PI_4) * f64::from(r * r);
+        let vol = |edges: &[&str]| {
+            let e: Vec<String> = edges.iter().map(|s| s.to_string()).collect();
+            let p = fillet_edges("f", &b, r, 32, &e).unwrap_or_else(|e| panic!("{e}"));
+            full - closed(&p).volume()
+        };
+        let v = vol(&["vertical"]);
+        assert!((v - 4.0 * per_edge).abs() < 0.2 * per_edge, "vertical {v}");
+        let h = vol(&["horizontal"]);
+        // Where an x edge meets a z edge their cuts overlap a little.
+        assert!(h < 8.0 * per_edge && h > 7.0 * per_edge, "horizontal {h}");
+        let t = vol(&["top"]);
+        assert!((t - 4.0 * per_edge).abs() < 0.3 * per_edge, "top {t}");
+        assert!(vol(&["top", "vertical"]) > t + 2.0 * per_edge);
+        assert!(fillet_edges("f", &b, r, 0, &["sides".to_string()]).is_err());
+    }
+
+    #[test]
+    fn panel_recesses_a_grid() {
+        let b = cube("wall", [2.0, 1.0, 0.2]);
+        let p = panel("w", &b, "front", 2, 3, 0.05, 0.01, 0.02).unwrap_or_else(|e| panic!("{e}"));
+        let m = closed(&p);
+        let rc = (1.0 - 0.1 - 0.02) / 2.0;
+        let cc = (2.0 - 0.1 - 0.04) / 3.0;
+        let removed = 0.4 - m.volume();
+        assert!((removed - 6.0 * rc * cc * 0.01).abs() < 1e-4, "{removed}");
+        assert!(p.bounds().1.z > 0.099, "seams and border stay at the face");
+        assert!(panel("w", &b, "front", 2, 3, 0.05, 0.3, 0.02).is_err());
+        assert!(panel("w", &b, "side", 1, 1, 0.05, 0.01, 0.0).is_err());
+        assert!(panel("w", &b, "top", 40, 40, 0.05, 0.01, 0.1).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
