@@ -117,6 +117,10 @@ pub struct Material {
     /// the flat-colour warning.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flat: bool,
+    /// Per-part finish baked over the material (bevelled edges, macro
+    /// variation); gives the part its own atlas bake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<material::finish::Finish>,
 }
 
 impl Material {
@@ -146,6 +150,7 @@ impl Default for Material {
             metalness: 0.0,
             pbr: None,
             flat: false,
+            finish: None,
         }
     }
 }
@@ -1391,6 +1396,9 @@ pub enum Op {
         /// A plain colour on purpose: no flat-colour warning.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         flat: bool,
+        /// Bevel / macro finish baked over the material.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<material::finish::Finish>,
     },
     /// Copies an earlier part in a straight line. The source is copy 0;
     /// copies 1..count are emitted as `{name}_1..{name}_{count-1}`, copy i

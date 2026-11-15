@@ -43,6 +43,7 @@ fn cube_part(name: &str, offset: [f32; 3], color: [f32; 4]) -> Part {
         metalness: 0.1,
         pbr: None,
         flat: false,
+        finish: None,
     };
     p
 }
