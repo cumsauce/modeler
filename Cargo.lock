@@ -3591,6 +3591,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bevy",
+ "bytemuck",
  "gltf",
  "jackdaw_bsn",
  "ktx2",
@@ -3612,6 +3613,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ttf-parser",
+ "wgpu",
  "winit",
 ]
 
