@@ -169,7 +169,6 @@ pub fn bake(parts: &mut [Part], roles: &[Role], ao: &Ao) -> Baked {
         }
     }
     let occ_tris = occ.len();
-    let bvh = Bvh::new(occ);
     // The unwrap over every baked part's world-space triangles.
     let mut offset = vec![0usize; parts.len()];
     let (mut corners, mut pos, mut ok, mut owner) =
@@ -290,32 +289,28 @@ pub fn bake(parts: &mut [Part], roles: &[Role], ao: &Ao) -> Baked {
         }
     }
     let covered = at.iter().filter(|a| a.is_some()).count();
-    // Trace: the fraction of cosine-weighted rays that escape `distance`.
-    let dirs = hemisphere(ao.samples);
+    // The fraction of cosine-weighted directions that escape `distance`:
+    // rasterised on the GPU when there is one, else ray traced.
     let bias = (0.25 / u.density.max(1e-6)).clamp(1e-3, 0.01);
-    let mut val: Vec<f32> = at
-        .par_iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let Some((p, nrm)) = a else { return 1.0 };
-            if *nrm == Vec3::ZERO {
-                return 1.0;
+    let idx: Vec<usize> = (0..len).filter(|&i| at[i].is_some()).collect();
+    let pts: Vec<(Vec3, Vec3)> = idx.iter().filter_map(|&i| at[i]).collect();
+    let tris: Vec<[Vec3; 3]> = occ.iter().map(|o| o.0).collect();
+    let gpu = crate::ao_gpu::occlusion(&tris, &pts, ao.samples, ao.distance, bias);
+    let how = if gpu.is_some() {
+        "rasterised on the GPU"
+    } else {
+        "ray traced on the CPU"
+    };
+    let mut val = match gpu {
+        Some(open) => {
+            let mut val = vec![1.0f32; len];
+            for (k, &i) in idx.iter().enumerate() {
+                val[i] = open[k];
             }
-            let (t1, t2) = nrm.any_orthonormal_pair();
-            let rot = hash(i as u32) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
-            let (s, c) = rot.sin_cos();
-            let o = *p + *nrm * bias;
-            let mut open = 0usize;
-            for d in &dirs {
-                let (x, y) = (d.x * c - d.y * s, d.x * s + d.y * c);
-                let dir = t1 * x + t2 * y + *nrm * d.z;
-                if !bvh.walk(o, dir, ao.distance, &mut |_, _| true) {
-                    open += 1;
-                }
-            }
-            open as f32 / dirs.len() as f32
-        })
-        .collect();
+            val
+        }
+        None => trace(occ, &at, ao, bias),
+    };
     // A 3x3 blur inside each island takes the edge off the ray noise.
     let prev = val.clone();
     for y in 0..n {
@@ -393,7 +388,7 @@ pub fn bake(parts: &mut [Part], roles: &[Role], ao: &Ao) -> Baked {
     let report = format!(
         "ambient occlusion: {n}x{n} atlas, {islands} island(s), {covered} texels baked ({:.0}% of the atlas, mean {:.2} open), \
          {:.0} texels/m ({:.1} cm/texel), {baked_tris} triangle(s) unwrapped, traced against {occ_tris} occluding triangle(s), \
-         {} rays/texel within {} m, {} ms; {plain} part(s) read white (skip, rigged, LOD copies, decals)",
+         {} rays/texel within {} m ({how}), {} ms; {plain} part(s) read white (skip, rigged, LOD copies, decals)",
         100.0 * covered as f32 / len as f32,
         if covered > 0 {
             sum / covered as f32
@@ -412,6 +407,35 @@ pub fn bake(parts: &mut [Part], roles: &[Role], ao: &Ao) -> Baked {
         uv1,
         report,
     }
+}
+
+/// The CPU path: the fraction of cosine-weighted rays from each texel that
+/// escape `distance`.
+fn trace(occ: Vec<([Vec3; 3], u32)>, at: &[Option<(Vec3, Vec3)>], ao: &Ao, bias: f32) -> Vec<f32> {
+    let bvh = Bvh::new(occ);
+    let dirs = hemisphere(ao.samples);
+    at.par_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let Some((p, nrm)) = a else { return 1.0 };
+            if *nrm == Vec3::ZERO {
+                return 1.0;
+            }
+            let (t1, t2) = nrm.any_orthonormal_pair();
+            let rot = hash(i as u32) as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+            let (s, c) = rot.sin_cos();
+            let o = *p + *nrm * bias;
+            let mut open = 0usize;
+            for d in &dirs {
+                let (x, y) = (d.x * c - d.y * s, d.x * s + d.y * c);
+                let dir = t1 * x + t2 * y + *nrm * d.z;
+                if !bvh.walk(o, dir, ao.distance, &mut |_, _| true) {
+                    open += 1;
+                }
+            }
+            open as f32 / dirs.len() as f32
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -597,5 +621,53 @@ mod tests {
             .unwrap_or_default();
         assert_eq!((a.resolution, a.distance, a.samples), (2048, 0.5, 32));
         assert!(Ao::parse(&serde_json::json!({"resolution": 1000})).is_err());
+    }
+
+    #[test]
+    fn gpu_matches_the_cpu_tracer() {
+        let parts = room();
+        let occ: Vec<([Vec3; 3], u32)> =
+            parts.iter().flat_map(world_tris).map(|t| (t, 0)).collect();
+        let tris: Vec<[Vec3; 3]> = occ.iter().map(|o| o.0).collect();
+        // A grid over the floor and the x wall.
+        let mut pts = Vec::new();
+        for i in 0..20 {
+            for j in 0..20 {
+                let (a, b) = (-1.9 + i as f32 * 0.19, -1.9 + j as f32 * 0.19);
+                pts.push((Vec3::new(a, 0.0, b), Vec3::Y));
+                pts.push((Vec3::new(-2.0, 0.05 + j as f32 * 0.09, a), Vec3::X));
+            }
+        }
+        let ao = Ao {
+            samples: 256,
+            ..Ao::default()
+        };
+        let Some(gpu) = crate::ao_gpu::occlusion(&tris, &pts, ao.samples, ao.distance, 0.005)
+        else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let at: Vec<Option<(Vec3, Vec3)>> = pts.iter().copied().map(Some).collect();
+        let cpu = trace(occ, &at, &ao, 0.005);
+        let n = pts.len() as f32;
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / n;
+        let diff = gpu
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
+        let worst = gpu
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        eprintln!(
+            "gpu mean {:.3}, cpu mean {:.3}, mean |diff| {diff:.3}, worst {worst:.3}",
+            mean(&gpu),
+            mean(&cpu)
+        );
+        assert!((mean(&gpu) - mean(&cpu)).abs() < 0.03);
+        assert!(diff < 0.05, "mean diff {diff}");
     }
 }

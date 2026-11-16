@@ -31,6 +31,9 @@ base64 = "0.22"
 thiserror = "2"
 schemars = "1"
 rayon = "1"
+# The GPU ambient occlusion bake (the same wgpu Bevy renders with).
+wgpu = { version = "30", default-features = false, features = ["wgsl", "dx12", "metal", "vulkan"] }
+bytemuck = "1"
 libc = "0.2"
 texture-compressor = { version = "0.2", features = ["parallel"] }
 ruzstd = "0.8.3"
