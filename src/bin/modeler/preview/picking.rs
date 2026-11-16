@@ -1,29 +1,15 @@
 use crate::prelude::*;
 
-/// A pin sphere marking where the human clicked (or where an annotation sits).
-#[derive(Component)]
-pub(crate) struct AnnotationPin;
-
-/// A pin whose comment has been typed in and committed.
-#[derive(Component)]
-pub(crate) struct PinCommitted;
-
 /// A comment box is open: single-letter shortcuts (G, M, O) stay off.
 #[derive(Resource, Default)]
 pub(crate) struct PinTyping {
     pub(crate) open: bool,
 }
 
-/// A click hit to turn into a pin marker, deferred to a spawn system because
-/// `MeshRayCast` already borrows `Assets<Mesh>` immutably.
-#[derive(Resource, Default)]
-pub(crate) struct PendingPinSpawn {
-    pub(crate) point: Option<(Vec3, u32)>,
-}
-
 /// The 3D view's mouse: hovering a part lights it (`Workbench.hover`), a
 /// click selects it (empty space deselects), and while comments are open a
-/// click (or a right-click any time) pins that spot instead: a badge, and a `PendingPin` for the comment box to fill in.
+/// click (or a right-click any time) pins that spot instead and opens the
+/// comment box on it (`CommentTarget::Spot`), drawn by [`place_pins`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn click_in_view(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -31,10 +17,7 @@ pub(crate) fn click_in_view(
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut ray_cast: MeshRayCast,
     parts: Query<(Entity, &Name), With<PreviewPart>>,
-    pins: Query<(Entity, Option<&PinCommitted>), With<AnnotationPin>>,
     mut modeler: ResMut<Modeler>,
-    mut commands: Commands,
-    mut spawn: ResMut<PendingPinSpawn>,
     drag: Res<CameraDrag>,
     mut wb: ResMut<Workbench>,
     mut comment: ResMut<CommentBox>,
@@ -95,187 +78,141 @@ pub(crate) fn click_in_view(
         return;
     }
     let Some((name, hit)) = hit else {
+        // Empty space closes an empty box; typed text stays until Esc / ×.
+        if comment.is_open() && empty_click_cancels(comment.draft()) {
+            comment.cancel();
+        }
         return;
     };
-    // One pin at a time: replace any pin that is still waiting for its comment.
-    for (e, committed) in &pins {
-        if committed.is_none() {
-            commands.entity(e).despawn();
-        }
-    }
-    let id = modeler.session.model.next_annotation_id;
-    // Deferred: MeshRayCast already borrows Assets<Mesh>, so the pin mesh is
-    // spawned by the following system.
-    spawn.point = Some((hit.point, id));
-    comment.request_spot(name.clone());
-    modeler.session.pending_pin = Some(PendingPin {
+    let pin = PendingPin {
         part: name,
         face: hit.triangle_index.map(|i| i as u32),
         vertex: None,
         position: hit.point.to_array(),
-    });
+    };
+    // Agents can still consume the spot with an all-optional
+    // `add_annotation`; the box keeps its own copy.
+    modeler.session.pending_pin = Some(pin.clone());
+    comment.request_spot(pin);
 }
 
-/// While comments are open, every comment on a part shows as a numbered
-/// pin where it was left (rebuilt after each model change, which clears
-/// the scene's pins); closed, only an uncommitted pin stays.
+/// One badge per pin: a small numbered dot on the spot, with a label (the
+/// comment's text) shown only while hovered.
+struct PinBadge {
+    /// `None` for the spot the open comment box is pinned to.
+    id: Option<u32>,
+    at: Vec3,
+    dot: Entity,
+    label: Entity,
+}
+
+/// The pins the window shows, rebuilt only when what they show changes.
+#[derive(Resource, Default)]
+pub(crate) struct Pins {
+    key: Option<PinKey>,
+    badges: Vec<PinBadge>,
+    /// The camera last frame, to tell when it moves.
+    last_cam: Option<Transform>,
+    moving: bool,
+    hovered: Option<usize>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct PinKey {
+    doc: String,
+    /// Bumped by every annotation edit (add, resolve, delete).
+    rev: u64,
+    count: usize,
+    /// The open box's spot, by its bits.
+    spot: Option<[u32; 3]>,
+}
+
+/// Dot diameter, logical px.
+const DOT: f32 = 16.0;
+
+/// A label's text: the first line, cut to `max` characters.
+pub(crate) fn pin_label(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max && !text.trim().contains('\n') {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Rebuilds the pin badges when the comments change (never per frame):
+/// every comment on a part while comments are open, plus the open box's
+/// spot. A model rebuild leaves them alone (they are UI, not scene).
 pub(crate) fn sync_pins(
     modeler: Res<Modeler>,
     wb: Res<Workbench>,
-    pins: Query<(Entity, Option<&PinCommitted>), With<AnnotationPin>>,
+    cb: Res<CommentBox>,
+    mut pins: ResMut<Pins>,
+    assets: Res<AssetServer>,
     mut commands: Commands,
-    mut shown: Local<Option<(u64, usize, usize, String)>>,
 ) {
     if modeler.session.viewer_away() {
         return;
     }
     let model = &modeler.session.model;
-    let want = wb.show_comments.then(|| {
-        (
-            model.version,
-            model.annotations.len(),
-            modeler.session.annotation_rev as usize,
-            model.name.clone(),
-        )
+    let spot = cb.spot().map(|p| p.position.map(f32::to_bits));
+    let key = (wb.show_comments || spot.is_some()).then(|| PinKey {
+        doc: model.name.clone(),
+        rev: modeler.session.annotation_rev,
+        count: model.annotations.len(),
+        spot,
     });
-    let have = pins.iter().any(|(_, c)| c.is_some());
-    if *shown == want && (have || want.is_none() || model.annotations.is_empty()) {
+    if pins.key == key {
         return;
     }
-    *shown = want.clone();
-    for (e, committed) in &pins {
-        if committed.is_some() {
-            commands.entity(e).despawn();
-        }
+    pins.key = key;
+    pins.hovered = None;
+    for b in pins.badges.drain(..) {
+        commands.entity(b.dot).despawn();
     }
-    if want.is_none() {
+    if pins.key.is_none() {
         return;
     }
-    for a in model.annotations.iter().filter(|a| a.material.is_none()) {
-        let pin = spawn_pin(&mut commands, a.id, Vec3::from_array(a.position));
-        commands.entity(pin).insert(PinCommitted);
-        if !a.is_open() {
-            commands.entity(pin).insert(PinResolved);
+    let mut want: Vec<(Option<u32>, Vec3, String, bool)> = Vec::new();
+    if wb.show_comments {
+        for a in model.annotations.iter().filter(|a| a.material.is_none()) {
+            want.push((
+                Some(a.id),
+                Vec3::from_array(a.position),
+                pin_label(&a.text, 60),
+                !a.is_open(),
+            ));
         }
     }
-}
-
-/// Spawns pin markers requested by [`pin_on_click`].
-pub(crate) fn spawn_pin_markers(mut spawn: ResMut<PendingPinSpawn>, mut commands: Commands) {
-    let Some((point, id)) = spawn.point.take() else {
-        return;
-    };
-    spawn_pin(&mut commands, id, point);
-}
-
-/// Spawn a pin marker (sphere + number label) at `point`.
-pub(crate) fn spawn_pin(commands: &mut Commands, id: u32, point: Vec3) -> Entity {
-    // An anchor in the world; `pin_badges` draws it as a flat badge on screen.
-    commands
-        .spawn((
-            Name::new(format!("pin #{id}")),
-            AnnotationPin,
-            PinId(id),
-            Transform::from_translation(point),
-        ))
-        .id()
-}
-
-/// The comment number a pin shows.
-#[derive(Component)]
-pub(crate) struct PinId(pub(crate) u32);
-
-/// A pin whose comment is resolved: drawn greyed out.
-#[derive(Component)]
-pub(crate) struct PinResolved;
-
-/// The on-screen badge drawn for a pin.
-#[derive(Component)]
-pub(crate) struct PinBadge(Entity);
-
-/// Draws every pin as a numbered badge over the 3D view (a circle in the
-/// accent colour with a small tail pointing at the spot; a pin still waiting
-/// for its comment is a hollow ring), kept on its spot as the camera moves
-/// and hidden when the spot is behind the camera or outside the view.
-pub(crate) fn pin_badges(
-    pins: Query<
-        (
-            Entity,
-            &GlobalTransform,
-            &PinId,
-            Has<PinCommitted>,
-            Has<PinResolved>,
-        ),
-        With<AnnotationPin>,
-    >,
-    mut badges: Query<(Entity, &PinBadge, &mut Node, &mut Visibility)>,
-    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    view: Res<View3d>,
-    assets: Res<AssetServer>,
-    mut commands: Commands,
-) {
-    const D: f32 = 22.0;
-    let scale = windows.single().map(|w| w.scale_factor()).unwrap_or(1.0);
-    let cam = cameras.single().ok();
-    let mut have = std::collections::HashSet::new();
-    for (e, badge, mut node, mut vis) in &mut badges {
-        let Ok((_, at, ..)) = pins.get(badge.0) else {
-            commands.entity(e).despawn();
-            continue;
-        };
-        have.insert(badge.0);
-        let spot = cam.and_then(|(c, ct)| c.world_to_viewport(ct, at.translation()).ok());
-        let spot = spot
-            .map(|p| view.rect.min + p / scale)
-            .filter(|p| view.rect.contains(*p));
-        match spot {
-            Some(p) => {
-                node.left = Val::Px(p.x - D / 2.0);
-                node.top = Val::Px(p.y - D - 6.0);
-                if *vis != Visibility::Inherited {
-                    *vis = Visibility::Inherited;
-                }
-            }
-            None => {
-                if *vis != Visibility::Hidden {
-                    *vis = Visibility::Hidden;
-                }
-            }
-        }
+    if let Some(p) = cb.spot() {
+        want.push((
+            None,
+            Vec3::from_array(p.position),
+            "new comment".into(),
+            false,
+        ));
     }
-    for (pin, _, id, committed, resolved) in &pins {
-        if have.contains(&pin) {
-            continue;
-        }
-        let (fill, ink, edge) = match (committed, resolved) {
+    for (id, at, text, resolved) in want {
+        let (fill, ink, edge) = match (id, resolved) {
             (_, true) => (ds::RAISE, ds::DIM, ds::LINE),
-            (true, false) => (ds::ACCENT, ds::ON_ACCENT, ds::FG),
-            (false, _) => (ds::BG.with_alpha(0.85), ds::ACCENT, ds::ACCENT),
+            (Some(_), false) => (ds::ACCENT, ds::ON_ACCENT, ds::BG),
+            (None, _) => (ds::BG.with_alpha(0.85), ds::ACCENT, ds::ACCENT),
         };
-        let badge = commands
+        let dot = commands
             .spawn((
-                Name::new("pin badge"),
-                PinBadge(pin),
+                Name::new("pin"),
                 Node {
                     position_type: PositionType::Absolute,
-                    width: Val::Px(D),
-                    height: Val::Px(D),
+                    width: Val::Px(DOT),
+                    height: Val::Px(DOT),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    border: UiRect::all(Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(D / 2.0)),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(DOT / 2.0)),
                     ..default()
                 },
                 BackgroundColor(fill),
                 BorderColor::all(edge),
-                BoxShadow::new(
-                    Color::BLACK.with_alpha(0.45),
-                    Val::Px(0.0),
-                    Val::Px(2.0),
-                    Val::Px(0.0),
-                    Val::Px(6.0),
-                ),
                 Visibility::Hidden,
                 GlobalZIndex(5),
                 Pickable::IGNORE,
@@ -284,30 +221,143 @@ pub(crate) fn pin_badges(
         commands.spawn((
             ds::text_in(
                 &assets,
-                ds::Type::Small,
-                &if committed {
-                    id.0.to_string()
-                } else {
-                    "+".into()
-                },
+                ds::Type::Meta,
+                id.map_or("+".into(), |i| i.to_string()),
                 ink,
             ),
             Pickable::IGNORE,
-            ChildOf(badge),
+            ChildOf(dot),
         ));
-        // The tail: a short stem from the badge down to the spot.
+        // The label: right of the dot, hidden until hovered.
+        let label = commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(DOT + 4.0),
+                    top: Val::Px(-2.0),
+                    padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(ds::CHIP_BG),
+                Visibility::Hidden,
+                Pickable::IGNORE,
+                ChildOf(dot),
+            ))
+            .id();
         commands.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(D - 2.0),
-                left: Val::Px(D / 2.0 - 1.0),
-                width: Val::Px(2.0),
-                height: Val::Px(7.0),
-                ..default()
-            },
-            BackgroundColor(edge),
+            ds::text_in(&assets, ds::Type::Small, text, ds::FG),
             Pickable::IGNORE,
-            ChildOf(badge),
+            ChildOf(label),
         ));
+        pins.badges.push(PinBadge { id, at, dot, label });
+    }
+}
+
+/// Where a world point lands in the window (logical px), from the camera's
+/// own `Transform` (it has no parent), so it is this frame's camera, not
+/// last frame's `GlobalTransform`: the dots stay glued to their spots while
+/// the camera moves.
+fn project(camera: &Camera, cam: &Transform, rect: Rect, scale: f32, at: Vec3) -> Option<Vec2> {
+    let p = camera
+        .world_to_viewport(&GlobalTransform::from(*cam), at)
+        .ok()?;
+    Some(rect.min + p / scale).filter(|p| rect.contains(*p))
+}
+
+/// Puts every pin dot on its spot each frame, after the camera moved
+/// (`orbit_camera`) and the layout settled (`apply_layout`), so the UI
+/// layout later this frame draws them where the 3D image is. While the
+/// camera moves, the dots dim and labels hide; hovering a dot shows its
+/// label.
+#[allow(clippy::type_complexity)]
+pub(crate) fn place_pins(
+    mut pins: ResMut<Pins>,
+    cameras: Query<(&Camera, &Transform), With<MainCamera>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    view: Res<View3d>,
+    mut nodes: Query<(&mut Node, &mut Visibility, &mut BackgroundColor)>,
+) {
+    if pins.badges.is_empty() {
+        pins.last_cam = None;
+        return;
+    }
+    let Ok((camera, cam)) = cameras.single() else {
+        return;
+    };
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let scale = window.scale_factor();
+    let cursor = window.cursor_position();
+    let moving = pins.last_cam.is_some_and(|t| t != *cam);
+    pins.last_cam = Some(*cam);
+    let moved_state = moving != pins.moving;
+    pins.moving = moving;
+    // The dot under the cursor (nearest within the dot's radius + slack).
+    let mut hovered = None;
+    let mut best = (DOT / 2.0 + 3.0).powi(2);
+    let mut spots = Vec::with_capacity(pins.badges.len());
+    for (i, b) in pins.badges.iter().enumerate() {
+        let s = project(camera, cam, view.rect, scale, b.at);
+        if let (Some(p), Some(c)) = (s, cursor) {
+            let d = p.distance_squared(c);
+            if d < best {
+                best = d;
+                hovered = Some(i);
+            }
+        }
+        spots.push(s);
+    }
+    if moving {
+        hovered = None;
+    }
+    let hover_changed = hovered != pins.hovered;
+    pins.hovered = hovered;
+    for (i, (b, s)) in pins.badges.iter().zip(spots).enumerate() {
+        if let Ok((mut node, mut vis, mut bg)) = nodes.get_mut(b.dot) {
+            match s {
+                Some(p) => {
+                    let (l, t) = (Val::Px(p.x - DOT / 2.0), Val::Px(p.y - DOT / 2.0));
+                    if node.left != l || node.top != t {
+                        node.left = l;
+                        node.top = t;
+                    }
+                    vis.set_if_neq(Visibility::Inherited);
+                }
+                None => {
+                    vis.set_if_neq(Visibility::Hidden);
+                }
+            }
+            if moved_state {
+                let a = if moving { 0.45 } else { 1.0 };
+                let c = bg.0;
+                bg.0 = c.with_alpha(if b.id.is_none() { 0.85 * a } else { a });
+            }
+        }
+        if (hover_changed || moved_state)
+            && let Ok((_, mut vis, _)) = nodes.get_mut(b.label)
+        {
+            vis.set_if_neq(if hovered == Some(i) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pin_label;
+
+    #[test]
+    fn labels_are_one_short_line() {
+        assert_eq!(pin_label("short", 60), "short");
+        assert_eq!(pin_label("first line\nsecond", 60), "first line…");
+        let long = "a".repeat(80);
+        let l = pin_label(&long, 20);
+        assert_eq!(l.chars().count(), 20);
+        assert!(l.ends_with('…'));
     }
 }

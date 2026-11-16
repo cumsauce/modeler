@@ -239,6 +239,7 @@ pub(crate) fn update_mode(
     scroll: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     mut last: Local<(Option<Instant>, Option<(u64, [u32; 6])>)>,
     winit: Option<ResMut<bevy::winit::WinitSettings>>,
+    typing: Res<PinTyping>,
 ) {
     let Some(mut w) = winit else {
         return;
@@ -258,6 +259,8 @@ pub(crate) fn update_mode(
     let active = last.1 != Some(stamp)
         || !orbit.user
         || playback.playing
+        // A comment being typed: the caret and each key show at once.
+        || typing.open
         || !shots.0.is_empty()
         || keys.get_pressed().next().is_some()
         || mouse.get_pressed().next().is_some()

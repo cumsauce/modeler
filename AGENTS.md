@@ -965,7 +965,7 @@ name: the producer first, then in-place material/visibility/transform edits).
   the one orbit camera).
   Render tools time out after 15 s instead of hanging. **Always look at an
   image after building**: the data can be right while the render is wrong.
-- `set_camera(ui: {mode, select, comments, shading, popup, capture})` drives the
+- `set_camera(ui: {mode, select, comments, shading, popup, capture, comment})` drives the
   window's workbench for checking the UI: `mode` model / material /
   animate / map / grid, `select` a part (`""` clears), `comments` open or
   closed, `popup` the document popup open or closed, `shading` lit / clay / parts, and `capture: "window"` makes
@@ -1027,6 +1027,27 @@ batches, bytes):
   share the LOD meshes. In Bevy, put a `VisibilityRange` from those
   numbers on each node (`start_margin: near..near`, `end_margin:
   far..far`, or with a few meters of crossfade).
+- `ao: {resolution: 1024, distance: 1.0, samples: 64, skip: []}` (opt-in;
+  `ao: true` = those defaults): **baked ambient occlusion** for rooms and
+  levels built from big quads with shared tile materials. Every exported
+  primitive gets a second uv set (`TEXCOORD_1`): box-unwrapped islands at
+  one texel density in **one atlas per glTF** (the object-domain unwrap and
+  shelf packing, 3-texel dilated gutter; vertices split at island borders,
+  uv0 unchanged). Each texel traces `samples` cosine-weighted hemisphere
+  rays against all the export's opaque geometry; hits beyond `distance`
+  meters count as open (so walls darken where they meet the floor, floors
+  under a counter), then a 3x3 in-island blur and the gutter dilation. The
+  atlas is one BC4 KTX2 (or PNG with `textures: "png"`) named
+  `<gltf stem>-ao-<hash>` in the shared `textures/` folder, and **every
+  material** gets `occlusionTexture: {index, texCoord: 1}` (replacing the
+  tile AO an `orm` texture carried; Bevy applies it to indirect light only).
+  Instancing is off with `ao` (each copy needs its own patch). `skip`
+  (part-name globs: terrain, huge ground) and rigged parts still occlude but
+  get no islands, reading a white texel, as do LOD copies and decal quads.
+  Parts without a texture get uv0 = uv1 (glTF wants uv sets from 0). A
+  `.bsn` export bakes the map's own geometry as one atlas and each prefab
+  glTF from itself alone. The report gives atlas size, islands, texels,
+  texels/m, triangles, rays and time.
 - Nodes carry `extras {part, material, comments, lod?}` for game-side lookup.
 
 **Lights:** `{"type": "light", "name": "bulb", "kind": "point",
@@ -1670,9 +1691,26 @@ Esc deselects, C toggles comments, G All documents.
 - **Right pane** (`right_pane.rs`): the selection's properties (what made
   it, material, triangles, size; a marker's kind, preview, components) and
   its comments with "Add a comment", or, with nothing selected, every
-  comment numbered like its pin (click selects the part, × deletes). The
-  comment box (`comments.rs`) opens inside it (Enter commits, Esc cancels);
-  right-clicking a left-pane row or a material node comments on that. A right-click on a part in the 3D view pins a comment on that spot any time (comments open or not); the box opens at the top of the pane, wraps long text, and keeps its draft when the pane rebuilds. The app icon is `icons/app-icon.png` (drawn from `icons/app-icon.svg`; `preview/app_icon.rs` sets the Dock icon on macOS, the window icon elsewhere).
+  comment numbered like its pin (click selects the part, × deletes).
+  Right-clicking a left-pane row or a material node comments on that; a
+  right-click on a part in the 3D view pins a comment on that spot any time.
+  The **comment box** (`comments.rs`) floats at the 3D view's top right,
+  outside every pane, so pane rebuilds (any agent edit) never touch it,
+  its focus or its draft: title + ×, a wrapping input with focus, Cancel /
+  Post. Enter posts, Shift+Enter is a new line, Esc / × / Cancel discard,
+  a click on empty space closes an empty box (typed text stays), clicking
+  another spot moves the pin and keeps the draft, closing comments or
+  switching documents cancels. A spot box keeps its own copy of the pin
+  (the session's `pending_pin` is dropped on every model change and agents
+  may consume it). While it is open the loop runs continuously and arrows /
+  Page keys edit text instead of orbiting. **Pins** (`picking.rs`) are UI
+  dots (16 px, numbered; `+` for the open box's spot) rebuilt only when the
+  comments change (`Pins`, keyed by doc + `annotation_rev`), and placed by
+  `place_pins` each frame from the camera's own `Transform` after
+  `orbit_camera` / `apply_layout`, so they track the 3D point in the same
+  frame. A dot's text label shows only on hover; while the camera moves
+  dots dim and labels hide. `set_camera(ui: {comment: {part, spot?, text?,
+  action?: post / cancel}})` drives the box for checking the UI. The app icon is `icons/app-icon.png` (drawn from `icons/app-icon.svg`; `preview/app_icon.rs` sets the Dock icon on macOS, the window icon elsewhere).
   The comments chip ends the 3D view's HUD row.
 - **All documents** tiles are cheap by design: each is its own camera on
   its own render layer rendering into its own image, active only for a few

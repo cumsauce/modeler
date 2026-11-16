@@ -283,7 +283,7 @@ fn main() -> AppExit {
     .init_resource::<PinTyping>()
     .init_resource::<Playback>()
     .init_resource::<CommentBox>()
-    .init_resource::<PendingPinSpawn>()
+    .init_resource::<Pins>()
     .add_systems(
         Update,
         (
@@ -302,12 +302,15 @@ fn main() -> AppExit {
             draw_game_gizmos.run_if(windowed),
             update_mode.run_if(windowed),
             orbit_camera.run_if(windowed).run_if(grid_off),
-            (click_in_view, spawn_pin_markers, sync_pins, pin_badges)
+            (click_in_view, comment_box, sync_pins, place_pins)
                 .chain()
                 .after(rebuild_scene)
+                .after(orbit_camera)
+                .after(apply_layout)
+                .after(tag_input)
                 .run_if(windowed)
                 .run_if(grid_off),
-            (tag_input, comment_box).chain().run_if(windowed),
+            tag_input.run_if(windowed),
             update_typing_hud.run_if(windowed),
             highlight_selected.run_if(windowed),
             update_material_pane.run_if(windowed),

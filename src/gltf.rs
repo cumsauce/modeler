@@ -263,14 +263,30 @@ pub(crate) fn build_with(
     // Decals: a flat textured quad each (a sticker in any viewer), marked
     // with `extras.decal` so a game swaps it for a projected decal.
     let decals = crate::decal::collect(model)?;
+    let first_decal = prepared.parts.len();
     for d in &decals {
         prepared.parts.push(crate::decal::quad_part(d));
         prepared.meshes.push(crate::export_opt::MeshRef::Own);
         prepared.lod.push(None);
     }
+    // Baked AO: uv1 islands in one atlas (splitting vertices at island
+    // borders); textures still bake from the unsplit parts (same cache keys).
+    let ao_baked = match &opts.ao {
+        Some(ao) => {
+            let originals = prepared.parts.clone();
+            let lod = &prepared.lod;
+            let roles = crate::ao::roles(&prepared.parts, ao, |i| {
+                i >= first_decal || lod[i].is_some_and(|l| l.level > 0)
+            });
+            let baked = crate::ao::bake(&mut prepared.parts, &roles, ao);
+            Some((originals, baked))
+        }
+        None => None,
+    };
     let exported = &prepared.parts;
+    let sources: &[Part] = ao_baked.as_ref().map_or(exported, |(o, _)| o);
     crate::material::pbr::prebake(
-        exported
+        sources
             .iter()
             .zip(&prepared.lod)
             .filter(|(_, l)| l.is_none_or(|l| l.level == 0))
@@ -292,6 +308,60 @@ pub(crate) fn build_with(
     // Shared texture files: written, reused (already on disk), per-part
     // (object-domain bakes, unique to one mesh).
     let (mut tex_written, mut tex_reused, mut tex_unique) = (0usize, 0usize, 0usize);
+    // The baked AO atlas: one single-channel texture every material reads
+    // through TEXCOORD_1.
+    let ao_tex: Option<u32> = match &ao_baked {
+        Some((_, a)) => {
+            let name = "ao";
+            let (bytes, ext, mime) = if tex_out.map_or(embed_ktx2, |o| o.ktx2) {
+                (
+                    crate::ktx2::encode_with(&a.rgba, a.n, a.n, crate::ktx2::Kind::Gray, None)?,
+                    "ktx2",
+                    "image/ktx2",
+                )
+            } else {
+                (
+                    crate::raster::encode_png(a.n as u32, a.n as u32, &a.rgba)?,
+                    "png",
+                    "image/png",
+                )
+            };
+            texture_bytes += bytes.len();
+            let file_stem = buffer_uri
+                .as_deref()
+                .map_or("model", |u| u.trim_end_matches(".bin"));
+            if let Some(out) = tex_out {
+                let file = format!(
+                    "{}-ao-{:016x}.{ext}",
+                    file_safe(file_stem),
+                    content_hash(&bytes)
+                );
+                let fp = out.dir.join(&file);
+                if fp.exists() {
+                    tex_reused += 1;
+                } else {
+                    std::fs::create_dir_all(&out.dir)
+                        .map_err(|e| format!("creating {}: {e}", out.dir.display()))?;
+                    let tmp = fp.with_extension("tmp");
+                    std::fs::write(&tmp, &bytes)
+                        .and_then(|_| std::fs::rename(&tmp, &fp))
+                        .map_err(|e| format!("writing {}: {e}", fp.display()))?;
+                    tex_written += 1;
+                }
+                images.push(json!({
+                    "name": name,
+                    "uri": format!("{}{file}", out.uri_prefix),
+                    "mimeType": mime,
+                }));
+            } else {
+                let view = b.view(&bytes, None);
+                images.push(json!({"name": name, "bufferView": view, "mimeType": mime}));
+            }
+            textures.push(json!({"sampler": 0, "source": images.len() - 1}));
+            Some((textures.len() - 1) as u32)
+        }
+        None => None,
+    };
     for (pi, part) in exported.iter().enumerate() {
         // ---- material
         let mut pbr = json!({
@@ -310,7 +380,7 @@ pub(crate) fn build_with(
                 .get(pi)
                 .copied()
                 .flatten()
-                .map_or(part, |l| &exported[l.source]);
+                .map_or(&sources[pi], |l| &sources[l.source]);
             let key = crate::material::pbr::bake_key(r, Some(bake_src));
             if let std::collections::hash_map::Entry::Vacant(slot) = sets.entry(key) {
                 let ch = crate::material::pbr::bake_part(bake_src)?
@@ -482,7 +552,7 @@ pub(crate) fn build_with(
             // A defaulted double-sided cutout stays one-sided on a closed solid.
             if set["double_sided"] == json!(true)
                 && (set["double_sided_default"] != json!(true)
-                    || crate::verify::open_edge_count(part) > 0)
+                    || crate::verify::open_edge_count(&sources[pi]) > 0)
             {
                 material["doubleSided"] = json!(true);
             }
@@ -510,6 +580,10 @@ pub(crate) fn build_with(
                     }
                 }
             }
+        }
+        if let Some(i) = ao_tex {
+            // Replaces any tile AO (ORM R) with the baked atlas.
+            material["occlusionTexture"] = json!({"index": i, "texCoord": 1});
         }
         if part.material.base_color[3] < 0.999 {
             material["alphaMode"] = json!("BLEND");
@@ -565,6 +639,14 @@ pub(crate) fn build_with(
                 if textured || opts.is_none() {
                     attributes["TEXCOORD_0"] =
                         json!(b.accessor(&le_f32s(&part.uvs), n, "VEC2", 5126, false));
+                }
+                if let Some((_, a)) = &ao_baked {
+                    let uv1 = b.accessor(&le_f32s(&a.uv1[pi]), n, "VEC2", 5126, false);
+                    attributes["TEXCOORD_1"] = json!(uv1);
+                    // Uv sets are numbered from 0 with no gaps.
+                    if attributes.get("TEXCOORD_0").is_none() {
+                        attributes["TEXCOORD_0"] = json!(uv1);
+                    }
                 }
                 let idx = if opts.small_indices && n <= u16::MAX as usize {
                     let bytes: Vec<u8> = part
@@ -857,6 +939,12 @@ pub(crate) fn build_with(
     );
     for l in &r.lines {
         report += &format!("\n- {l}");
+    }
+    if let Some((_, a)) = &ao_baked {
+        report += &format!(
+            "\n- {} (every material's occlusionTexture, texCoord 1)",
+            a.report
+        );
     }
     if let Some(r) = rig_report {
         report += &format!("\n- {r}");

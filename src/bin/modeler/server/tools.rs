@@ -683,6 +683,10 @@ Style::default()
     /// "merge_keep": ["door*"]}` for one draw call per material,
     /// `{"emissive_strength": 4}` for bloom, `{"lods": [0.5, 0.2]}` for
     /// simplified `<part>.lod1/.lod2` nodes with distance ranges in extras.lod.
+    /// `{"ao": {"resolution": 2048, "distance": 1.0, "samples": 64, "skip":
+    /// ["ground*"]}}` (or `"ao": true` for 1024 / 1 m / 64) bakes ambient
+    /// occlusion into one atlas per glTF on a second uv set (TEXCOORD_1) that
+    /// every material reads as occlusionTexture texCoord 1 (instancing off).
     /// The result reports before -> after. A path ending in `.bsn` writes a
     /// level scene (jackdaw's format): prefab instances by reference (each
     /// prefab exported once to models/prefabs/), markers, the document's own

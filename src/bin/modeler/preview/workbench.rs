@@ -107,6 +107,8 @@ pub(crate) struct Workbench {
     pub(crate) capture_window: bool,
     /// Logical rects of the slots this frame (zero size when hidden).
     pub(crate) rects: SlotRects,
+    /// A `set_camera ui.comment` request for the comment box.
+    pub(crate) comment_ui: Option<crate::server::CommentUiArg>,
 }
 
 impl Workbench {
