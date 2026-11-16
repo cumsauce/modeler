@@ -5,6 +5,12 @@ use serde_json::Value;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ApplyOpsArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// Items to apply in order, each tagged with its "type".
     #[schemars(with = "Vec<OpSpec>")]
     #[serde(default)]
@@ -36,6 +42,12 @@ pub(crate) struct ApplyOpsArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct InspectArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// Pairs to measure: [["a", "b"], ...] gives the gap, contact or overlap
     /// (volume and depth) between two parts; ["a"] alone gives its height
     /// above the ground.
@@ -127,6 +139,12 @@ pub(crate) struct ExportModelArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SavePrefabArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// Human description of what the model is.
     #[serde(default)]
     pub(crate) description: String,
@@ -193,14 +211,16 @@ pub(crate) struct HistoryIdArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct DocArgs {
-    /// "model" (default) or "material:<name>" for a material's own history.
+    /// "model" (default), "material:<name>" for a material's own history, or
+    /// an open document's name (the call errors if it isn't open).
     #[serde(default)]
     pub(crate) doc: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct UndoArgs {
-    /// "model" (default) or "material:<name>" for a material's own history.
+    /// "model" (default), "material:<name>" for a material's own history, or
+    /// an open document's name (the call errors if it isn't open).
     #[serde(default)]
     pub(crate) doc: Option<String>,
     /// Undo even when the last step was made by another agent sharing this
@@ -450,6 +470,12 @@ pub(crate) struct ReferenceArg {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AgentViewsArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// 1..9 views, each a name ("front", "back", "left", "right", "top",
     /// "bottom" are orthographic and auto-framed; "iso" is perspective) or a
     /// camera {yaw, pitch, dist?, target?, ortho?, fov?}. E.g.

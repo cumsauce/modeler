@@ -307,6 +307,11 @@ pub struct Model {
     /// csgrs backend could take minutes) — that was the daemon hang.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub derived_from_ops: bool,
+    /// Pattern `material` items (`"stone_*"`) as given, keyed by pattern:
+    /// every later batch expands them over the parts it adds, so parts made
+    /// after the pattern was issued get it too.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub material_patterns: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Model {
@@ -338,6 +343,7 @@ impl Model {
             style: self.style.clone(),
             derived_from_ops: self.derived_from_ops,
             project: None,
+            material_patterns: self.material_patterns.clone(),
         }
     }
 

@@ -126,6 +126,10 @@ pub fn anchor_point(words: &str, lo: Vec3, hi: Vec3) -> Result<[f32; 3], String>
 #[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerifySpec {
+    /// Run on this open document instead of your active one (`verify`
+    /// only; errors if it isn't open). Agents sharing a session pass it.
+    #[serde(default)]
+    pub doc: Option<String>,
     /// Exact visible part names (order-insensitive); a trailing `*` matches
     /// a prefix (`"gz.*"`).
     #[serde(default)]
@@ -346,6 +350,14 @@ pub struct Session {
     /// window comes to the front so the human sees the new work.
     pub focus_requested: bool,
 }
+
+type MaterialGlobs = Result<
+    (
+        Vec<(serde_json::Value, Option<String>)>,
+        Vec<(String, serde_json::Value)>,
+    ),
+    String,
+>;
 
 impl Session {
     /// Every client (agent) this server has seen, with its active document.
@@ -820,16 +832,57 @@ impl Session {
             }
         }
         let old = prev.map(|i| self.model.ops[i].clone());
+        // Copies an array no longer makes (it shrank): their in-place edits
+        // (material, visibility, transform) go too, or the graph would read
+        // a part that is gone.
+        let lost: Vec<String> = old
+            .as_ref()
+            .map(|o| {
+                graph::outputs(o)
+                    .into_iter()
+                    .filter(|n| !mine.contains(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ops_before = (!lost.is_empty()).then(|| self.model.ops.clone());
         match prev {
             Some(i) => self.model.ops[i] = op,
             None => self.model.ops.push(op),
         }
+        let mut dropped: Vec<String> = Vec::new();
+        if !lost.is_empty() {
+            self.model.ops.retain(|o| {
+                let n = graph::output(o);
+                let in_place = matches!(graph::kind(o), "material" | "visibility" | "transform")
+                    && graph::inputs(o) == [n];
+                if in_place && lost.iter().any(|l| l == n) {
+                    dropped.push(format!("{} `{n}`", graph::kind(o)));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let note = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nnote: dropped {} edit(s) of copies `{}` no longer makes: {}",
+                dropped.len(),
+                out,
+                dropped.join(", ")
+            )
+        };
         if self.deferred.is_some() {
             self.commit(label);
-            return Ok(format!("{label} ok"));
+            return Ok(format!("{label} ok{note}"));
         }
         if let Err(e) = self.model.refresh() {
             // Never leave the graph in a state that does not evaluate.
+            if let Some(ops) = ops_before {
+                self.model.ops = ops;
+                return Err(e);
+            }
             match (prev, old) {
                 (Some(i), Some(old_op)) => self.model.ops[i] = old_op,
                 (None, _) => {
@@ -840,7 +893,7 @@ impl Session {
             return Err(e);
         }
         self.commit(label);
-        Ok(format!("{label} ok"))
+        Ok(format!("{label} ok{note}"))
     }
 
     /// A primitive as a graph step (upsert by output name).
@@ -1367,12 +1420,15 @@ impl Session {
     /// `material` items whose `name` has a `*` (and no `input`) become one
     /// in-place item per matching part: the model's parts plus every name
     /// this batch makes. Copies of a matched source inherit it anyway.
+    /// Patterns kept from earlier batches expand over the parts this batch
+    /// adds (no error when none match). Also returns this batch's patterns,
+    /// to remember.
     fn expand_material_globs(
         &self,
         items: Vec<(serde_json::Value, Option<String>)>,
         style: &crate::style::Style,
         full: &crate::params::Params,
-    ) -> Result<Vec<(serde_json::Value, Option<String>)>, String> {
+    ) -> MaterialGlobs {
         let mut names: Vec<String> = self.model.parts.iter().map(|p| p.name.clone()).collect();
         for (raw, _) in &items {
             // Moves, places, colliders, lights and markers are named too,
@@ -1496,6 +1552,33 @@ impl Session {
         names.sort();
         names.dedup();
         let mut out = Vec::with_capacity(items.len());
+        let mut given: Vec<(String, serde_json::Value)> = Vec::new();
+        for (raw, _) in &items {
+            if raw.get("type").and_then(|v| v.as_str()) == Some("material")
+                && raw.get("input").is_none()
+                && let Some(p) = raw.get("name").and_then(|v| v.as_str())
+                && p.contains('*')
+            {
+                given.push((p.to_string(), raw.clone()));
+            }
+        }
+        // Patterns from earlier batches cover the parts this batch adds
+        // (first, so this batch's own material items win over them).
+        let old: std::collections::HashSet<&str> =
+            self.model.parts.iter().map(|p| p.name.as_str()).collect();
+        for (pat, raw) in &self.model.material_patterns {
+            if given.iter().any(|(p, _)| p == pat) {
+                continue;
+            }
+            for n in names
+                .iter()
+                .filter(|n| !old.contains(n.as_str()) && crate::name_matches(pat, n))
+            {
+                let mut v = raw.clone();
+                v["name"] = serde_json::Value::String(n.clone());
+                out.push((v, Some(format!("material pattern {pat}"))));
+            }
+        }
         for (raw, from) in items {
             let pat = raw.get("name").and_then(|v| v.as_str()).map(str::to_string);
             let is_glob = raw.get("type").and_then(|v| v.as_str()) == Some("material")
@@ -1518,7 +1601,7 @@ impl Session {
                 out.push((v, from.clone()));
             }
         }
-        Ok(out)
+        Ok((out, given))
     }
 
     fn apply_values_inner(
@@ -1545,7 +1628,7 @@ impl Session {
         let full = style.params_under(&merged);
         let (items, repeat_notes) = crate::spec::expand_repeats_noted(&items, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
-        let items = self
+        let (items, patterns) = self
             .expand_material_globs(items, &style, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
@@ -1653,7 +1736,15 @@ impl Session {
                 }
             }
         }
-        lines.push(self.apply_items(parsed, false)?);
+        let kept = self.model.material_patterns.clone();
+        self.model.material_patterns.extend(patterns);
+        match self.apply_items(parsed, false) {
+            Ok(l) => lines.push(l),
+            Err(e) => {
+                self.model.material_patterns = kept;
+                return Err(e);
+            }
+        }
         if let Some(me) = self.client.clone() {
             for k in keys {
                 self.op_authors.insert((doc.clone(), k), me.clone());
@@ -1914,6 +2005,29 @@ impl Session {
 
     /// The active document was renamed (set_model_name): a window on it
     /// follows the new name.
+    /// A call's `doc` argument: errors unless that document is open.
+    pub fn require_open(&self, doc: &str) -> Result<(), String> {
+        let open = self.doc_names();
+        if open.iter().any(|n| n == doc) {
+            Ok(())
+        } else {
+            Err(format!(
+                "doc `{doc}` is not open (open: {}); open it with scene open, or drop `doc`",
+                open.join(", ")
+            ))
+        }
+    }
+
+    /// The other open document (same project) whose name saves to the
+    /// same catalog entry as `name`, if any.
+    pub fn name_holder(&self, name: &str) -> Option<String> {
+        let want = crate::catalog::sanitize(name);
+        self.others
+            .iter()
+            .find(|m| m.project == self.model.project && crate::catalog::sanitize(&m.name) == want)
+            .map(|m| m.name.clone())
+    }
+
     pub fn renamed_active(&mut self, old: &str) {
         if self.viewer_doc.as_deref() == Some(old) {
             self.viewer_doc = Some(self.model.name.clone());
@@ -2144,7 +2258,7 @@ impl Session {
                     Ok(_) => {
                         self.mark_autosave(true, true, false);
                         if pin.is_some() {
-                            notes.push(format!("switched to `{want}` (--doc)"));
+                            notes.push(format!("switched to `{want}` (pinned by doc)"));
                         } else if !told {
                             notes.push(format!(
                                 "the active document was `{active}` (another agent switched to it); switched back to your `{want}`. \
@@ -2299,6 +2413,12 @@ impl Session {
                 }) {
                     self.saved_state
                         .insert(m.name.clone(), (m.history.nodes.len(), m.history.current));
+                    if let Some(h) = crate::catalog::with_project(m.project.clone(), || {
+                        crate::catalog::prefab_file_hash(&m.name)
+                    }) {
+                        self.catalog_base
+                            .insert(crate::catalog::sanitize(&m.name), h);
+                    }
                 } else {
                     self.unsaved_checked.insert(m.name.clone());
                 }
@@ -2306,12 +2426,22 @@ impl Session {
         }
         let started = self.started;
         let mut closed = Vec::new();
-        let (touched, saved) = (&self.touched, &self.saved_state);
+        let (touched, saved, base) = (&self.touched, &self.saved_state, &self.catalog_base);
         self.others.retain(|m| {
             let last = touched.get(&m.name).copied().unwrap_or(started);
+            // Saved means the catalog file is still the one this document
+            // saved or loaded: if someone overwrote it since, closing would
+            // reopen their version in its place, so it stays open.
+            let file_ours = || {
+                let now = crate::catalog::with_project(m.project.clone(), || {
+                    crate::catalog::prefab_file_hash(&m.name)
+                });
+                now.is_some() && base.get(&crate::catalog::sanitize(&m.name)) == now.as_ref()
+            };
             let unchanged = saved
                 .get(&m.name)
-                .is_some_and(|k| *k == (m.history.nodes.len(), m.history.current));
+                .is_some_and(|k| *k == (m.history.nodes.len(), m.history.current))
+                && file_ours();
             if unchanged && last.elapsed() >= idle {
                 closed.push(m.name.clone());
                 false
@@ -2495,6 +2625,14 @@ impl Session {
         force: bool,
     ) -> Result<(String, bool), ModelerError> {
         let name = crate::catalog::sanitize(&self.model.name);
+        if !force && let Some(other) = self.name_holder(&name) {
+            return Err(format!(
+                "another open document, `{}`, holds the name `{name}`: saving would overwrite its catalog entry. \
+                 set_model_name to save under a new name, or save_prefab with force: true to overwrite",
+                other
+            )
+            .into());
+        }
         let now = crate::catalog::prefab_file_hash(&name);
         if !force
             && let (Some(base), Some(now)) = (self.catalog_base.get(&name), now)
@@ -2709,12 +2847,20 @@ impl Session {
                     if let Some((_, items)) = &mut self.deferred {
                         items.push((i, op.clone(), label.clone()));
                     }
-                    self.apply_op(op, &label)
+                    let said = self
+                        .apply_op(op, &label)
                         .map_err(|e| format!("batch item #{i} (`{label}`) failed: {e}"))?;
-                    match note {
+                    // Keep apply_op's own notes (an array's dropped copy edits).
+                    let extra: String = said
+                        .lines()
+                        .filter(|l| l.starts_with("note:"))
+                        .map(|l| format!("\n{l}"))
+                        .collect();
+                    let head = match note {
                         Some((name, want)) => self.scatter_note(&name, want),
                         None => format!("{label} ok"),
-                    }
+                    };
+                    format!("{head}{extra}")
                 }
                 BatchItem::Delete { name } => {
                     if self.model.ops.iter().any(|o| graph::output(o) == name) {
@@ -5971,6 +6117,55 @@ mod tests {
         };
         s.apply_values_as(None, items, true)
             .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn a_pattern_material_colours_parts_from_later_batches() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "stone_a", "kind": "box", "size": 0.5},
+                {"type": "material", "name": "stone_*", "color": "#808080", "flat": true}
+            ]),
+        );
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "stone_b", "kind": "box", "size": 0.5, "translation": [2, 0, 0]}
+            ]),
+        );
+        let b = s.model.parts.iter().find(|p| p.name == "stone_b");
+        let a = s.model.parts.iter().find(|p| p.name == "stone_a");
+        let (Some(a), Some(b)) = (a, b) else {
+            panic!("parts")
+        };
+        assert_eq!(
+            format!("{:?}", a.material),
+            format!("{:?}", b.material),
+            "stone_b got the pattern's material"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_array_drops_edits_of_its_lost_copies() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "post", "kind": "box", "size": 0.1},
+                {"type": "linear_array", "name": "posts", "input": "post", "count": 4, "offset": [1, 0, 0]},
+                {"type": "hide_part", "part": "posts_3"}
+            ]),
+        );
+        let out = run(
+            &mut s,
+            serde_json::json!([
+                {"type": "linear_array", "name": "posts", "input": "post", "count": 2, "offset": [1, 0, 0]}
+            ]),
+        );
+        assert!(out.contains("dropped"), "{out}");
+        assert!(!s.model.parts.iter().any(|p| p.name == "posts_3"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ server's own home library). Documents remember their project
 (`Model.project`, autosave only), a document of the same name from another
 project is refused rather than taken over, and `new_model` starts a
 document beside another agent's (or another project's) instead of
-replacing it. A new agent's first call brings the window to the front (not once the human has picked a document).
+replacing it. **Subagents of one Claude session share one proxy, so one client id and one active document: pass `doc` (an open document's name) on every `apply_ops`, `verify`, `inspect`, `agent_views`, `save_prefab`, `undo` and `redo`; the call errors if it isn't open.** `save_prefab` also refuses (unless `force`) a name another open document holds. A new agent's first call brings the window to the front (not once the human has picked a document).
 After `cargo build`, restart the
 server with `pkill -f target/debug/modeler` (the daemon respawns it on the
 next call) or stop everything with a `quit` call.
@@ -172,7 +172,9 @@ type, so there is no need to memorise field names.
 
 A `material` item's `name` may be a pattern (`"wall_*"`): it colours every
 matching part in place (parts already in the model plus every name the
-batch makes); a pattern that matches nothing is an error.
+batch makes), and the model keeps the pattern, so parts later batches add
+(`wall_7` in the next call) get it too. A pattern that matches nothing when
+issued is an error; array and scatter prefixes are never matched.
 A `material` item may also carry `pbr` (a procedural material by name, see
 **Procedural materials** below), with `params` overrides and `scale`.
 A visible part with only a flat colour (no `pbr`) is a warning in
@@ -283,6 +285,9 @@ surfaces, not hundreds of scattered copies.
   new copies `name_0..` start at `start_degrees` and the source stays put.
   `axis` "x"/"z" makes horizontal rings (windmill blades).
 - **Linear arrays**: the source is copy 0; outputs `name_1..{count-1}`.
+  Shrinking an array (or any op that makes fewer copies) drops the in-place
+  material / hide / transform edits of the copies it no longer makes, with a
+  `note:` listing them, instead of failing.
   `local: true` rotates `offset` by the source's rotation.
 - **Extrude / revolve** build closed solids from 2D profiles (Manifold),
   ready for booleans. `profile` is one ring `[[a, b], ...]` or a list of
@@ -526,8 +531,9 @@ surfaces, not hundreds of scattered copies.
   one mesh between copies (instancing keeps each node's rotation and scale);
   use tile pbr materials on scattered parts (object ones bake per copy).
   **Smarter placement** (all optional, combine freely): `near: "wall"` (or
-  a list) keeps only points within `near_distance` (default 0.5 m) of
-  those parts' surfaces (clutter along wall bases, moss round a rock);
+  a list) keeps only points within `near_distance` (default 0.5 m, a 3D
+  distance to the nearest point of those parts' surfaces, not a plan
+  distance) of those parts' surfaces (clutter along wall bases, moss round a rock);
   `edge_bias: 0..1` prefers points near `on`'s borders, creases and
   corners (1 hugs them; the falloff is a tenth of the surface's span), so
   debris collects at the foot of walls and along kerbs; `clump: {"count":
@@ -1639,7 +1645,7 @@ mirror-symmetric about x = 0 or its centre plane except for a few parts a
 little off (named), runs of numbered or same-size parts with nearly but not
 quite even spacing, pairs of parts under 2% apart in size, and **boxy**
 (at least 5 and over 70% of visible parts are unrounded axis-aligned boxes:
-round, loft, deform taper, smooth subdiv). Volume checks
+round, loft, deform taper, smooth subdiv); a style number (or param) `lint_boxy: 0` silences it for a deliberately blocky model. Volume checks
 and welds scale with the part, so centimetre-scale models validate
 correctly. Hidden parts are excluded. An empty list means none
 fired.

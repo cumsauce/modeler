@@ -756,6 +756,7 @@ Style::default()
     async fn save_prefab(
         &self,
         Parameters(SavePrefabArgs {
+            doc: _,
             description,
             tags,
             prompt,
@@ -826,7 +827,13 @@ Style::default()
             let mut history = std::mem::take(&mut s.model.history);
             history.record(s.model.clone(), format!("name `{name}`"));
             s.model.history = history;
-            Ok(format!("model renamed to `{name}`"))
+            let mut out = format!("model renamed to `{name}`");
+            if let Some(other) = s.name_holder(&name) {
+                out += &format!(
+                    "\nwarning: another open document, `{other}`, has this name: save_prefab will refuse it (force: true overwrites that document's catalog entry); pick another name"
+                );
+            }
+            Ok(out)
         })
         .await
     }
@@ -1051,6 +1058,7 @@ Style::default()
     async fn apply_ops(
         &self,
         Parameters(ApplyOpsArgs {
+            doc: _,
             ops,
             ops_file,
             params,
@@ -1264,6 +1272,7 @@ Style::default()
     async fn agent_views(
         &self,
         Parameters(AgentViewsArgs {
+            doc: _,
             views,
             width,
             height,
@@ -1563,6 +1572,7 @@ Style::default()
     async fn inspect(
         &self,
         Parameters(InspectArgs {
+            doc: _,
             measure,
             section,
             mass,
@@ -1809,7 +1819,51 @@ impl rmcp::ServerHandler for Tools {
                 .or_else(|| context.meta.get(k).cloned())
                 .and_then(|v| v.as_str().map(String::from))
         };
-        let (client, pin) = (meta("modeler/client"), meta("modeler/doc"));
+        let (client, mut pin) = (meta("modeler/client"), meta("modeler/doc"));
+        // A `doc` argument pins this one call to an open document, the way
+        // `_meta` "modeler/doc" does, but refuses a document that isn't
+        // open: subagents of one session share a client id (one proxy), so
+        // only the argument tells their documents apart.
+        let arg_doc = DOC_TOOLS
+            .contains(&name.as_str())
+            .then(|| {
+                request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("doc"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .flatten()
+            .filter(|d| d != "model" && d != "material" && !d.starts_with("material:"));
+        if let Some(d) = &arg_doc {
+            let (want, (tx, rx)) = (d.clone(), oneshot::channel());
+            let untagged = client.is_none();
+            let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
+                let r = if let Err(e) = s.require_open(&want) {
+                    Err(e)
+                } else if untagged && s.model.name != want {
+                    s.scene("switch", Some(&want))
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    Ok(())
+                };
+                let _ = tx.send(r);
+                Ok(String::new())
+            }));
+            let checked = match self.tx.send(cmd).await {
+                Ok(()) => rx.await.unwrap_or(Ok(())),
+                Err(_) => Ok(()),
+            };
+            if let Err(e) = checked {
+                log_call_full(&name, false, started.elapsed().as_millis(), &args, &e);
+                return Ok(rmcp::model::CallToolResult::error(vec![
+                    rmcp::model::Content::text(e),
+                ]));
+            }
+            pin = arg_doc.clone();
+        }
         // The caller's game project ("" = the shared library): one server
         // serves every project, switching per call.
         let project =
@@ -1889,7 +1943,7 @@ impl rmcp::ServerHandler for Tools {
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Every model gets materials. Shape first, materials after: build and check the geometry, then make the materials (material_ops) and give each visible part a material item in a later apply_ops, preferably a procedural pbr one ({\"type\": \"material\", \"name\": part, \"pbr\": name}; the material must exist when the item is applied); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
-- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite).
+- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on apply_ops, verify, inspect, agent_views, save_prefab, undo and redo; the call errors if that document isn't open, and save_prefab refuses a name another open document holds.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
@@ -1897,14 +1951,14 @@ impl rmcp::ServerHandler for Tools {
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models. grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models (style number lint_boxy: 0 silences that). grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
 - inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not).
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views; style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} compares the silhouette with a PNG (overlay + IoU). Look at an image after building.
-- scatter places clutter where it belongs: near [parts] + near_distance (along wall bases), edge_bias (corners, borders), clump {count, radius}, mask path / pad / not_path / not_pad and height [min, max] on terrain; scatter with decal {pbr, size} instead of input strews decals (cracks, stains, leaves).
+- scatter places clutter where it belongs: near [parts] + near_distance (3D distance to their surfaces; along wall bases), edge_bias (corners, borders), clump {count, radius}, mask path / pad / not_path / not_pad and height [min, max] on terrain; scatter with decal {pbr, size} instead of input strews decals (cracks, stains, leaves).
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - When a call surprises you (an error that didn't say what to do, a field that didn't work as described, a workaround you needed), tell the maintainers in one or two sentences with session_log(feedback: \"...\"): what you tried, what happened, what you expected. Failed and slow calls are logged on their own; notes say why.
-- scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"); a material_ops edit re-applies itself to the parts using it. catalog_describe(name, delete: true) removes a prefab.
+- scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"), which keep matching parts later batches add; shrinking an array drops the edits of its lost copies (a note lists them); a material_ops edit re-applies itself to the parts using it. catalog_describe(name, delete: true) removes a prefab.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
 - Animation: rig after the shape and materials. skeleton (bones {name: {head, tail, parent, radius}}: points or anchors \"leg_l:top\", world-aligned rest, mirror \"x\" makes *_r twins; or from: an lsystem / skin op to auto-rig), bind (rigid with bone, smooth weights, auto = exact for lsystem rigs: bind [\"oak\", \"oak_leaves\"]), clip (tracks per bone: rotate/translate/scale keys [[t, value]] as offsets from rest, or {wave}; mirror {leg_r: {from: leg_l, phase: 0.5}} half-authors a walk), sway (wind: direction, strength, gust, flutter; spring over: a clip for tails and ears; bakes into a looping clip). Judge motion with an agent_views filmstrip (clip + times [0, 0.25, 0.5, 0.75], style bones / weights) and verify animation {clip} (loop, floor, collisions, stretch) plus weights: true; export writes skins and animations, and crates/modeler_bevy runs the sway live in a game.
@@ -1926,13 +1980,25 @@ Full details live in AGENTS.md next to the source.";
 
 /// `doc` on history tools: None/"model" = the model, "material:<name>" (or
 /// "material" for the active one) = a material's own history.
+/// Tools that take a `doc` argument naming an open document.
+const DOC_TOOLS: &[&str] = &[
+    "apply_ops",
+    "verify",
+    "inspect",
+    "agent_views",
+    "save_prefab",
+    "undo",
+    "redo",
+];
+
 fn material_doc(doc: Option<&str>) -> Result<Option<Option<&str>>, String> {
     match doc {
         None | Some("model") => Ok(None),
         Some("material") => Ok(Some(None)),
         Some(d) => match d.strip_prefix("material:") {
             Some(n) => Ok(Some(Some(n))),
-            None => Err(format!("doc `{d}`: use \"model\" or \"material:<name>\"")),
+            // An open document's name: call_tool already switched to it.
+            None => Ok(None),
         },
     }
 }

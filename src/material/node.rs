@@ -274,7 +274,7 @@ macro_rules! node_types {
         /// Parses a node body (without `type`/`name`) of type `ty`.
         pub fn parse_body(ty: &str, body: &Value, ctx: &str) -> Result<Node, String> {
             match ty {
-                $($ty => Ok(Node::$var(de(ctx, body)?)),)*
+                $($ty => Ok(Node::$var(de(ctx, body).map_err(|e| with_schema(e, ty))?)),)*
                 other => Err(format!(
                     "{ctx}: unknown node type `{other}` (one of: {})",
                     NODE_TYPES.join(", ")
@@ -296,6 +296,46 @@ macro_rules! node_types {
             }
         }
     };
+}
+
+/// Appends the node type's field list (name: type, from its schema) to a
+/// field error, so a wrong field shows what the node takes.
+fn with_schema(e: String, ty: &str) -> String {
+    let Some(schema) = schema(ty) else { return e };
+    let v = schema.as_value();
+    let Some(props) = v.get("properties").and_then(Value::as_object) else {
+        return e;
+    };
+    let required: Vec<&str> = v
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let fields: Vec<String> = props
+        .iter()
+        .map(|(k, p)| {
+            let t = p
+                .get("type")
+                .map(|t| match t {
+                    Value::String(s) => s.clone(),
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| *s != "null")
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    _ => String::new(),
+                })
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "value".into());
+            if required.contains(&k.as_str()) {
+                format!("{k}: {t}")
+            } else {
+                format!("[{k}]: {t}")
+            }
+        })
+        .collect();
+    format!("{e}\n  `{ty}` node fields: {}", fields.join(", "))
 }
 
 fn de<T: serde::de::DeserializeOwned>(ctx: &str, body: &Value) -> Result<T, String> {

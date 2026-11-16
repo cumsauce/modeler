@@ -283,3 +283,42 @@ fn a_deferred_batch_names_its_failing_item() {
     assert!(e.contains("#2"), "{e}");
     assert!(s.model.ops.is_empty(), "the batch rolled back");
 }
+
+/// `verify collisions` on ~200 parts whose boxes crowd each other: rounded
+/// slabs and columns in a dense block standing on a terrain that every part
+/// sinks into (the terrain's box covers them all), like a building on a
+/// hillside. Every box-overlapping pair used to run an exact intersection.
+#[test]
+fn collisions_on_200_crowded_parts_stay_fast() {
+    let dir = std::env::temp_dir().join(format!("modeler-perf-coll-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: set before anything in this test reads it; same dir per process.
+    unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &dir) };
+    let mut s = Session::default();
+    apply(
+        &mut s,
+        vec![
+            json!({"type": "terrain", "name": "ground", "size": [40, 40], "resolution": 0.25,
+                   "height": 1.5, "seed": 3}),
+            json!({"type": "repeat", "var": "r", "count": 10, "items": [
+                {"type": "repeat", "var": "c", "count": 10, "items": [
+                    {"type": "primitive", "name": "slab{r}_{c}", "kind": "box",
+                     "size": [1.2, 0.3, 1.2], "round": 0.02,
+                     "translation": ["=$r * 1.0 - 5", 2.0, "=$c * 1.0 - 5"]},
+                    {"type": "revolve", "name": "col{r}_{c}", "segments": 32,
+                     "profile": [[0, 0], [0.12, 0], [0.1, 2.2], [0, 2.2]],
+                     "translation": ["=$r * 1.0 - 4.6", -0.2, "=$c * 1.0 - 4.6"]}
+                ]}
+            ]}),
+        ],
+    );
+    assert!(s.model.parts.len() >= 200);
+    let spec: modeler::commands::VerifySpec =
+        serde_json::from_value(json!({"collisions": true})).unwrap_or_else(|e| panic!("{e}"));
+    let t0 = Instant::now();
+    let checks = s.verify_checks(&spec);
+    let took = t0.elapsed();
+    assert!(checks.iter().any(|(n, _, _)| n == "collisions"));
+    budget("verify collisions, 201 crowded parts", took, 3000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
