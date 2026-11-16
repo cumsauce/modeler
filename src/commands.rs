@@ -915,6 +915,7 @@ impl Session {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             &format!("op primitive `{name}` ({kind})"),
         )
@@ -4850,6 +4851,7 @@ mod tests {
             frame: None,
             round: 0.0,
             segments: 0,
+            facing: None,
         }
     }
 

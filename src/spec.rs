@@ -253,6 +253,13 @@ pub struct PrimitiveSpec {
     /// Arc segments per rounded edge (default 4).
     #[serde(default)]
     segments: u32,
+    /// Plane only: make it ONE-sided, a single quad (2 triangles) whose
+    /// front faces "up", "down", "+x", "-x", "+z" or "-z" (back faces cull).
+    /// size is then [width, height] across the face: [x, z] for up/down,
+    /// [z, y] for +x/-x, [x, y] for +z/-z. Without it a plane is a
+    /// double-sided [x, z] sheet. Floors, ceilings and walls of tiles.
+    #[serde(default)]
+    facing: Option<crate::Facing>,
 }
 
 /// One entry of a profile ring: a point [a, b], or an arc that expands to
@@ -3557,6 +3564,14 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     }
                 },
                 segments: s.segments,
+                facing: match (s.facing, s.kind) {
+                    (Some(_), k) if k != PrimitiveKind::Plane => {
+                        return Err(format!(
+                            "{ctx}: facing: only a plane can be one-sided, not a {k}"
+                        ));
+                    }
+                    (f, _) => f,
+                },
                 frame: match s.frame {
                     Some(f) => {
                         if let Some((p, words)) = f.split_once(':') {
