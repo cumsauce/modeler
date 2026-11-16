@@ -83,7 +83,8 @@ modeler --offscreen
 ## What's inside
 
 - **Primitives**: box, sphere, cylinder, cone, torus, capsule, plane,
-  wedge, disc, washer; raw triangle meshes.
+  wedge, disc, washer (a plane with `facing` is a one-sided quad); raw
+  triangle meshes.
 - **Op graph**: an ordered list of steps (primitive, extrude, revolve, sweep, hull, round, group, transform, boolean,
   radial/linear array, mirror, material) that derive the parts. Ops are
   upserted by output name, so re-issuing one is a parameter tweak, and

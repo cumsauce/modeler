@@ -1810,6 +1810,7 @@ mod tests {
             frame: None,
             round: 0.0,
             segments: 0,
+            facing: None,
         });
         model.refresh().unwrap();
         save_session_state(&model).unwrap();

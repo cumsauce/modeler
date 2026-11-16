@@ -836,6 +836,18 @@ surfaces, not hundreds of scattered copies.
   solid". A failed op rolls back the whole call; the graph never stays broken.
 - **disc/washer/plane** are double-sided sheets in the XY plane (vertical);
   lay one flat with rotation `[-0.707, 0, 0, 0.707]`.
+- **One-sided planes**: `{"type": "primitive", "kind": "plane", "size": [w, h],
+  "facing": "up"}` (`up`/`down`/`+x`/`-x`/`+z`/`-z`) builds ONE quad, 4 verts
+  and 2 triangles, front toward `facing`, back culled. Size is across the
+  face: [x, z] for up/down, [z, y] for ±x, [x, y] for ±z. Still a small
+  parametric op (nothing baked). Its UVs are 0..1 oriented like the matching
+  box face, and tile materials re-project it with the same metric uvs as a box
+  face, so tile textures line up with boxes. The part is marked `sheet`:
+  `validate` doesn't call it open, and export never makes its material
+  `doubleSided` (even a defaulted cutout). Use it for floors, ceilings and
+  walls that are only seen from one side (tile kits) instead of thin boxes:
+  no hidden faces, no coplanar overlaps at seams. `facing` on another kind is
+  an error; not a boolean input (open).
 - **Params**: `params: {"tower_h": 2}` sets named numbers before the items
   run; any value may be `"$tower_h"` or `"=$tower_h / 2 + 0.1"`. The model
   remembers which ops read which params, so a later

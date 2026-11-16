@@ -99,6 +99,55 @@ pub fn primitive(
     Ok(part)
 }
 
+/// A one-sided plane: one quad (4 verts, 2 triangles, counter-clockwise
+/// seen from the front) centred on the origin, its normal along `facing`.
+/// `size` is [width, height] across the face: [x, z] for up/down, [z, y]
+/// for ±x, [x, y] for ±z. UVs are 0..1 over the quad, oriented like a box
+/// face's metric uvs (u to the viewer's right, v down) so a texture reads
+/// the same on it as on the matching face of a box.
+pub fn one_sided_plane(
+    size: [f32; 3],
+    facing: crate::Facing,
+    name: &str,
+) -> Result<Part, crate::ModelerError> {
+    use crate::Facing as F;
+    let (w, h) = (size[0], size[1]);
+    if w <= 0.0 || h <= 0.0 || w.is_nan() || h.is_nan() {
+        return Err(format!("plane size must be positive, got [{w}, {h}]").into());
+    }
+    let n = match facing {
+        F::Up => Vec3::Y,
+        F::Down => Vec3::NEG_Y,
+        F::PosX => Vec3::X,
+        F::NegX => Vec3::NEG_X,
+        F::PosZ => Vec3::Z,
+        F::NegZ => Vec3::NEG_Z,
+    };
+    // Viewer-right (`r`) and image-down (`d`) as metric_uv lays them out.
+    let (r, d) = match facing {
+        F::Up => (Vec3::X, Vec3::Z),
+        F::Down => (Vec3::X, Vec3::NEG_Z),
+        F::PosX => (Vec3::NEG_Z, Vec3::NEG_Y),
+        F::NegX => (Vec3::Z, Vec3::NEG_Y),
+        F::PosZ => (Vec3::X, Vec3::NEG_Y),
+        F::NegZ => (Vec3::NEG_X, Vec3::NEG_Y),
+    };
+    let (hr, hd) = (r * w / 2.0, d * h / 2.0);
+    // top-left, top-right, bottom-right, bottom-left as seen from the front.
+    let corners = [-hr - hd, hr - hd, hr + hd, -hr + hd];
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut part = Part::new(name);
+    part.verts = corners.iter().map(|c| c.to_array()).collect();
+    part.normals = vec![n.to_array(); 4];
+    part.uvs = uvs.to_vec();
+    // r x d = -n for every facing, so (tl, bl, br) is counter-clockwise
+    // seen from the front.
+    debug_assert!(r.cross(d).dot(n) < 0.0);
+    part.indices = vec![0, 3, 2, 0, 2, 1];
+    part.sheet = true;
+    Ok(part)
+}
+
 /// Append a second, reversed copy of the triangle set so the surface renders
 /// from both sides. Triangles are first split into per-triangle verts: the
 /// generated fan/quad sheets share interior edges, and after doubling every
@@ -361,5 +410,166 @@ mod tests {
                 "{kind} reads as open"
             );
         }
+    }
+
+    const FACINGS: [(crate::Facing, [f32; 3]); 6] = [
+        (crate::Facing::Up, [0.0, 1.0, 0.0]),
+        (crate::Facing::Down, [0.0, -1.0, 0.0]),
+        (crate::Facing::PosX, [1.0, 0.0, 0.0]),
+        (crate::Facing::NegX, [-1.0, 0.0, 0.0]),
+        (crate::Facing::PosZ, [0.0, 0.0, 1.0]),
+        (crate::Facing::NegZ, [0.0, 0.0, -1.0]),
+    ];
+
+    #[test]
+    fn one_sided_plane_is_one_quad_facing_its_way() {
+        for (f, n) in FACINGS {
+            let p = one_sided_plane([6.0, 4.0, 0.0], f, "q").unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(p.verts.len(), 4, "{f:?}");
+            assert_eq!(p.tri_count(), 2, "{f:?}");
+            assert!(p.sheet);
+            assert!(p.normals.iter().all(|m| *m == n), "{f:?} normals");
+            let n = Vec3::from(n);
+            for t in p.indices.as_chunks::<3>().0 {
+                let [a, b, c] = t.map(|i| Vec3::from(p.verts[i as usize]));
+                let g = (b - a).cross(c - a);
+                assert!(g.normalize().dot(n) > 0.999, "{f:?} winding");
+                assert!((g.length() - 24.0).abs() < 1e-4, "{f:?} area");
+            }
+            // Flat across the face, the size it was asked for.
+            let ext = |axis: Vec3| {
+                let d: Vec<f32> = p.verts.iter().map(|v| Vec3::from(*v).dot(axis)).collect();
+                d.iter().cloned().fold(f32::MIN, f32::max)
+                    - d.iter().cloned().fold(f32::MAX, f32::min)
+            };
+            assert!(ext(n).abs() < 1e-6, "{f:?} flat");
+            let (w_axis, h_axis) = match f {
+                crate::Facing::Up | crate::Facing::Down => (Vec3::X, Vec3::Z),
+                crate::Facing::PosX | crate::Facing::NegX => (Vec3::Z, Vec3::Y),
+                _ => (Vec3::X, Vec3::Y),
+            };
+            assert!((ext(w_axis) - 6.0).abs() < 1e-5, "{f:?} width");
+            assert!((ext(h_axis) - 4.0).abs() < 1e-5, "{f:?} height");
+            validate_uvs(&p, "one-sided plane");
+        }
+        assert!(one_sided_plane([0.0, 1.0, 0.0], crate::Facing::Up, "q").is_err());
+    }
+
+    /// A one-sided plane laid on a box face gets the same metric (tile) uvs
+    /// as that face, and its own 0..1 uvs run the same way as the face's.
+    #[test]
+    fn one_sided_plane_uvs_match_a_box_face() {
+        for (f, n) in FACINGS {
+            let n = Vec3::from(n);
+            let size = match f {
+                crate::Facing::Up | crate::Facing::Down => [6.0, 4.0],
+                crate::Facing::PosX | crate::Facing::NegX => [4.0, 2.0],
+                _ => [6.0, 2.0],
+            };
+            let mut quad =
+                one_sided_plane([size[0], size[1], 0.0], f, "q").unwrap_or_else(|e| panic!("{e}"));
+            // The box face with normal n is half the box's extent along n.
+            let half = Vec3::new(3.0, 1.0, 2.0);
+            for v in &mut quad.verts {
+                *v = (Vec3::from(*v) + n * half).to_array();
+            }
+            let own: Vec<([f32; 3], [f32; 2])> = quad
+                .verts
+                .iter()
+                .copied()
+                .zip(quad.uvs.iter().copied())
+                .collect();
+            let mut cube = build("box", [6.0, 2.0, 4.0]);
+            crate::uv::metric_box(&mut cube);
+            crate::uv::metric_box(&mut quad);
+            for (k, v) in quad.verts.iter().enumerate() {
+                let Some(j) = cube.verts.iter().enumerate().position(|(j, c)| {
+                    Vec3::from(*c).distance(Vec3::from(*v)) < 1e-5
+                        && Vec3::from(cube.normals[j]).dot(n) > 0.999
+                }) else {
+                    panic!("{f:?}: no box corner at {v:?}");
+                };
+                let (a, b) = (quad.uvs[k], cube.uvs[j]);
+                assert!(
+                    (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5,
+                    "{f:?}: quad uv {a:?} != box uv {b:?}"
+                );
+            }
+            // The quad's own uvs are the metric ones fitted to 0..1.
+            let (lo, hi) = quad
+                .uvs
+                .iter()
+                .fold(([f32::MAX; 2], [f32::MIN; 2]), |(l, h), u| {
+                    (
+                        [l[0].min(u[0]), l[1].min(u[1])],
+                        [h[0].max(u[0]), h[1].max(u[1])],
+                    )
+                });
+            for (p, o) in &own {
+                let Some(k) = quad.verts.iter().position(|v| v == p) else {
+                    panic!("{f:?}: corner lost");
+                };
+                let m = quad.uvs[k];
+                let fit = [
+                    (m[0] - lo[0]) / (hi[0] - lo[0]),
+                    (m[1] - lo[1]) / (hi[1] - lo[1]),
+                ];
+                assert!(
+                    (o[0] - fit[0]).abs() < 1e-5 && (o[1] - fit[1]).abs() < 1e-5,
+                    "{f:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn facing_plane_op_parses_builds_and_validates() {
+        let item = serde_json::json!({"type": "primitive", "name": "floor", "kind": "plane",
+            "size": [6, 4], "facing": "up"});
+        let Ok(crate::commands::BatchItem::Op(op)) = crate::spec::parse_item(0, &item) else {
+            panic!("plane with facing should parse");
+        };
+        assert!(matches!(
+            op,
+            crate::Op::Primitive {
+                facing: Some(crate::Facing::Up),
+                ..
+            }
+        ));
+        let bad = serde_json::json!({"type": "primitive", "name": "b", "kind": "box",
+            "size": 1, "facing": "up"});
+        assert!(crate::spec::parse_item(0, &bad).is_err());
+        let wrong = serde_json::json!({"type": "primitive", "name": "b", "kind": "plane",
+            "size": 1, "facing": "sideways"});
+        assert!(crate::spec::parse_item(0, &wrong).is_err());
+        let mut model = crate::Model::default();
+        model.ops.push(op);
+        model.refresh().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(model.parts[0].verts.len(), 4);
+        assert!(model.parts[0].sheet);
+        let v = crate::verify::validate(&model);
+        assert!(v.contains("manifold, outward-wound"), "{v}");
+        // Saved op stays small and parametric.
+        let saved = serde_json::to_string(&model.ops[0]).unwrap_or_default();
+        assert!(
+            saved.contains("\"facing\":\"up\"") && saved.len() < 200,
+            "{saved}"
+        );
+        let back: crate::Op = serde_json::from_str(&saved).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            back,
+            crate::Op::Primitive {
+                facing: Some(crate::Facing::Up),
+                ..
+            }
+        ));
+        // Exports as one quad whose material is not double-sided.
+        let dir = std::env::temp_dir().join(format!("modeler-sheet-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sheet.gltf");
+        crate::gltf::export_gltf(&model, &path).unwrap_or_else(|e| panic!("{e}"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!text.contains("doubleSided"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
