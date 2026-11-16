@@ -85,70 +85,169 @@ pub fn lints(model: &Model) -> Vec<String> {
         })
         .collect();
     if pair_vis.len() >= 2 && pair_vis.len() <= PAIR_LIMIT {
-        out.extend(capped(near_flush(&pair_vis), "near-flush faces"));
+        out.extend(capped(near_flush(model, &pair_vis), "near-flush faces"));
         out.extend(capped(near_sizes(&pair_vis), "near-equal sizes"));
     }
-    out.extend(near_symmetry(&vis));
+    out.extend(near_symmetry(model, &pair_vis));
     out.extend(capped(uneven_runs(model, &vis), "uneven runs"));
     out.extend(boxiness(&vis));
     out
 }
 
-/// Faces 1-5 mm off coplanar, or a 1-5 mm gap where two parts nearly touch.
-fn near_flush(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
-    let mut out = Vec::new();
+/// What the near-flush test found between two boxes.
+enum Near {
+    /// A gap of this many meters along the axis.
+    Gap(usize, f32),
+    /// The `max` / `min` faces along the axis are this far off flush.
+    Flush(usize, &'static str, f32),
+}
+
+/// Faces 1-5 mm off coplanar, or a 1-5 mm gap, between two boxes.
+fn near_boxes(alo: Vec3, ahi: Vec3, blo: Vec3, bhi: Vec3) -> Option<Near> {
     let band = |d: f32| (MM..=5.0 * MM).contains(&d.abs());
+    // Neighbours only: the boxes come within 5 mm on every axis.
+    if (0..3).any(|k| ax(blo, k) - ax(ahi, k) > 5.0 * MM || ax(alo, k) - ax(bhi, k) > 5.0 * MM) {
+        return None;
+    }
+    for k in 0..3 {
+        let others = [(k + 1) % 3, (k + 2) % 3];
+        let overlap = others
+            .iter()
+            .all(|&j| ax(alo, j) < ax(bhi, j) && ax(blo, j) < ax(ahi, j));
+        // A gap: b just above a's max face (or the other way round).
+        let gaps = [ax(blo, k) - ax(ahi, k), ax(alo, k) - ax(bhi, k)];
+        if overlap && let Some(g) = gaps.iter().copied().find(|&g| g > 0.0 && band(g)) {
+            return Some(Near::Gap(k, g));
+        }
+        let touching = gaps.iter().any(|g| g.abs() < 0.5 * MM);
+        let thick = ax(ahi - alo, k) > 0.01 && ax(bhi - blo, k) > 0.01;
+        if touching || !thick || !overlap {
+            continue;
+        }
+        for (name, d) in [
+            ("max", ax(ahi, k) - ax(bhi, k)),
+            ("min", ax(alo, k) - ax(blo, k)),
+        ] {
+            if band(d) {
+                return Some(Near::Flush(k, name, d.abs()));
+            }
+        }
+    }
+    None
+}
+
+/// The leaf parts a merged part (`group`, recursively) was made of, with
+/// their world boxes shifted by any post-graph move of the merged part.
+/// Empty for a part that is not a merge.
+fn leaves(model: &Model, part: &Part, lo: Vec3) -> Vec<(String, Vec3, Vec3)> {
+    fn collect(model: &Model, name: &str, depth: usize, out: &mut Vec<(String, Vec3, Vec3)>) {
+        let inputs = model.ops.iter().find_map(|op| match op {
+            Op::Group { name: n, inputs } if n == name => Some(inputs),
+            _ => None,
+        });
+        match inputs {
+            Some(inputs) if depth < 8 => {
+                for i in inputs {
+                    collect(model, i, depth + 1, out);
+                }
+            }
+            _ => {
+                if let Some(p) = model.parts.iter().find(|p| p.name == name)
+                    && !p.verts.is_empty()
+                {
+                    let (a, b) = p.bounds();
+                    out.push((name.to_string(), a, b));
+                }
+            }
+        }
+    }
+    let is_group = model
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::Group { name, .. } if *name == part.name));
+    if !is_group {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in model.ops.iter().filter_map(|op| match op {
+        Op::Group { name, inputs } if *name == part.name => Some(inputs),
+        _ => None,
+    }) {
+        for n in i {
+            collect(model, n, 1, &mut out);
+        }
+    }
+    // The group may have moved after the graph: carry the leaves along.
+    if let Some(llo) = out.iter().map(|l| l.1).reduce(Vec3::min) {
+        let d = lo - llo;
+        for l in &mut out {
+            l.1 += d;
+            l.2 += d;
+        }
+    }
+    out
+}
+
+/// Faces 1-5 mm off coplanar, or a 1-5 mm gap where two parts nearly touch.
+/// When a part is a merge (`group`), the leaf inputs responsible are named.
+fn near_flush(model: &Model, vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
+    let mut out = Vec::new();
     for (i, &(a, alo, ahi)) in vis.iter().enumerate() {
         for &(b, blo, bhi) in &vis[i + 1..] {
-            // Neighbours only: the boxes come within 5 mm on every axis.
-            if (0..3)
-                .any(|k| ax(blo, k) - ax(ahi, k) > 5.0 * MM || ax(alo, k) - ax(bhi, k) > 5.0 * MM)
-            {
+            let Some(near) = near_boxes(alo, ahi, blo, bhi) else {
                 continue;
-            }
-            let mut found = None;
-            for (k, axis) in AXES.iter().enumerate() {
-                let others = [(k + 1) % 3, (k + 2) % 3];
-                let overlap = others
-                    .iter()
-                    .all(|&j| ax(alo, j) < ax(bhi, j) && ax(blo, j) < ax(ahi, j));
-                // A gap: b just above a's max face (or the other way round).
-                let gaps = [ax(blo, k) - ax(ahi, k), ax(alo, k) - ax(bhi, k)];
-                if overlap && let Some(g) = gaps.iter().copied().find(|&g| g > 0.0 && band(g)) {
-                    found = Some(format!(
-                        "parts `{}` and `{}` nearly touch: a {:.1} mm gap along {} (close it so they meet, or open it to a clear gap; `place` drops parts exactly onto a surface)",
-                        a.name,
-                        b.name,
-                        g / MM,
-                        axis
-                    ));
-                    break;
-                }
-                let touching = gaps.iter().any(|g| g.abs() < 0.5 * MM);
-                let thick = ax(ahi - alo, k) > 0.01 && ax(bhi - blo, k) > 0.01;
-                if touching || !thick || !overlap {
-                    continue;
-                }
-                for (name, d) in [
-                    ("max", ax(ahi, k) - ax(bhi, k)),
-                    ("min", ax(alo, k) - ax(blo, k)),
-                ] {
-                    if band(d) {
-                        found = Some(format!(
-                            "parts `{}` and `{}`: their {name} {} faces are {:.1} mm off flush (align them exactly, or offset clearly; verify flush checks it)",
-                            a.name,
-                            b.name,
-                            axis,
-                            d.abs() / MM
-                        ));
-                        break;
+            };
+            // Merged parts: find the leaves whose boxes give the same finding.
+            let (la, lb) = (leaves(model, a, alo), leaves(model, b, blo));
+            let mut who = (String::new(), String::new());
+            if !la.is_empty() || !lb.is_empty() {
+                let one = |n: &str, lo, hi| vec![(n.to_string(), lo, hi)];
+                let sa = if la.is_empty() { one("", alo, ahi) } else { la };
+                let sb = if lb.is_empty() { one("", blo, bhi) } else { lb };
+                let mut hits: Vec<(String, String)> = Vec::new();
+                for (na, l1, h1) in &sa {
+                    for (nb, l2, h2) in &sb {
+                        if near_boxes(*l1, *h1, *l2, *h2).is_some() {
+                            hits.push((na.clone(), nb.clone()));
+                        }
                     }
                 }
-                if found.is_some() {
-                    break;
-                }
+                let fmt = |names: Vec<&String>| {
+                    let mut v: Vec<&String> = names.into_iter().filter(|n| !n.is_empty()).collect();
+                    v.sort();
+                    v.dedup();
+                    let more = v.len().saturating_sub(3);
+                    let mut s: Vec<String> = v.iter().take(3).map(|n| n.to_string()).collect();
+                    if more > 0 {
+                        s.push(format!("+{more} more"));
+                    }
+                    if s.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", s.join(", "))
+                    }
+                };
+                who = (
+                    fmt(hits.iter().map(|h| &h.0).collect()),
+                    fmt(hits.iter().map(|h| &h.1).collect()),
+                );
             }
-            out.extend(found);
+            let (an, bn) = (
+                format!("`{}`{}", a.name, who.0),
+                format!("`{}`{}", b.name, who.1),
+            );
+            out.push(match near {
+                Near::Gap(k, g) => format!(
+                    "parts {an} and {bn} nearly touch: a {:.1} mm gap along {} (close it so they meet, or open it to a clear gap; `place` drops parts exactly onto a surface)",
+                    g / MM,
+                    AXES[k]
+                ),
+                Near::Flush(k, name, d) => format!(
+                    "parts {an} and {bn}: their {name} {} faces are {:.1} mm off flush (align them exactly, or offset clearly; verify flush checks it)",
+                    AXES[k],
+                    d / MM
+                ),
+            });
         }
     }
     out
@@ -193,28 +292,81 @@ fn near_sizes(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
     out
 }
 
-/// Per part, the smallest box error of its mirror image about `x = c`
+/// Up to `n` world vertices of a part, evenly strided.
+fn sample_verts(p: &Part, n: usize) -> Vec<Vec3> {
+    let len = p.verts.len();
+    let step = len.div_ceil(n.max(1)).max(1);
+    (0..len).step_by(step).map(|i| p.world_vert(i)).collect()
+}
+
+/// How far a part's mirror image about `x = c` is from another part's
+/// actual shape: the box error, or (when the boxes are close) the largest
+/// distance from a sampled mirrored vertex of `a` to the nearest vertex of
+/// `b`, both ways, so moving one piece of a group changes it and a group
+/// of randomly placed pieces doesn't match its own mirror image.
+fn mirror_error(a: (&Part, Vec3, Vec3), b: (&Part, Vec3, Vec3), c: f32, cut: f32) -> f32 {
+    let (pa, lo, hi) = a;
+    let (pb, blo, bhi) = b;
+    let mlo = Vec3::new(2.0 * c - hi.x, lo.y, lo.z);
+    let mhi = Vec3::new(2.0 * c - lo.x, hi.y, hi.z);
+    let boxed = (blo - mlo)
+        .abs()
+        .max_element()
+        .max((bhi - mhi).abs().max_element());
+    if boxed >= cut {
+        return boxed;
+    }
+    let flip = |v: Vec3| Vec3::new(2.0 * c - v.x, v.y, v.z);
+    let one_way = |from: &[Vec3], to: &[Vec3]| {
+        from.iter()
+            .map(|v| {
+                to.iter()
+                    .map(|w| v.distance_squared(*w))
+                    .fold(f32::MAX, f32::min)
+            })
+            .fold(0.0f32, f32::max)
+            .sqrt()
+    };
+    let am: Vec<Vec3> = sample_verts(pa, 64).into_iter().map(flip).collect();
+    let bs = sample_verts(pb, 64);
+    let a_all: Vec<Vec3> = sample_verts(pa, 20_000).into_iter().map(flip).collect();
+    let b_all = sample_verts(pb, 20_000);
+    boxed.max(one_way(&am, &b_all)).max(one_way(&bs, &a_all))
+}
+
+/// Per part, the smallest shape error of its mirror image about `x = c`
 /// against any part.
-fn mirror_errors(vis: &[(&Part, Vec3, Vec3)], c: f32) -> Vec<f32> {
+fn mirror_errors(vis: &[(&Part, Vec3, Vec3)], c: f32, cut: f32) -> Vec<f32> {
     vis.iter()
-        .map(|&(_, lo, hi)| {
-            let mlo = Vec3::new(2.0 * c - hi.x, lo.y, lo.z);
-            let mhi = Vec3::new(2.0 * c - lo.x, hi.y, hi.z);
+        .map(|&a| {
             vis.iter()
-                .map(|&(_, blo, bhi)| {
-                    (blo - mlo)
-                        .abs()
-                        .max_element()
-                        .max((bhi - mhi).abs().max_element())
-                })
+                .map(|&b| mirror_error(a, b, c, cut))
                 .fold(f32::MAX, f32::min)
         })
         .collect()
 }
 
+/// A merged part (`group`) made of pieces with no mirror twin among
+/// themselves (seeds strewn on a bun): not meant to be symmetric.
+fn unpaired_group(model: &Model, v: (&Part, Vec3, Vec3), c: f32, tol: f32) -> bool {
+    let ls = leaves(model, v.0, v.1);
+    ls.len() >= 2
+        && ls.iter().any(|(_, lo, hi)| {
+            let mlo = Vec3::new(2.0 * c - hi.x, lo.y, lo.z);
+            let mhi = Vec3::new(2.0 * c - lo.x, hi.y, hi.z);
+            !ls.iter().any(|(_, blo, bhi)| {
+                (*blo - mlo)
+                    .abs()
+                    .max_element()
+                    .max((*bhi - mhi).abs().max_element())
+                    < tol
+            })
+        })
+}
+
 /// A model mirror-symmetric about x = 0 (or its centre plane) except for a
 /// few parts a little off.
-fn near_symmetry(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
+fn near_symmetry(model: &Model, vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
     if vis.len() < 4 || vis.len() > PAIR_LIMIT {
         return Vec::new();
     }
@@ -229,7 +381,7 @@ fn near_symmetry(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
     let near_max = (0.02 * size).clamp(0.003, 0.03);
     let mut best: Option<(f32, Vec<f32>, usize)> = None;
     for c in planes {
-        let errs = mirror_errors(vis, c);
+        let errs = mirror_errors(vis, c, 2.0 * near_max);
         let exact = errs.iter().filter(|&&e| e < 0.5 * MM).count();
         if best.as_ref().is_none_or(|b| exact > b.2) {
             best = Some((c, errs, exact));
@@ -242,6 +394,7 @@ fn near_symmetry(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
         .iter()
         .enumerate()
         .filter(|&(_, &e)| (0.5 * MM..near_max).contains(&e))
+        .filter(|&(i, _)| !unpaired_group(model, vis[i], c, near_max))
         .map(|(i, &e)| (i, e))
         .collect();
     let n = vis.len();
@@ -892,6 +1045,68 @@ mod tests {
         assert!(
             l.iter()
                 .any(|w| w.contains("almost the same size") && w.contains("leg_b")),
+            "{l:?}"
+        );
+    }
+
+    #[test]
+    fn near_flush_on_groups_names_the_leaves() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                bx("frame_1", [0.5, 0.5, 0.05], [0.0, 1.0, 0.0]),
+                bx("frame_3", [0.5, 0.5, 0.05], [2.0, 1.0, 0.0]),
+                bx("poster_1", [0.3, 0.3, 0.02], [5.0, 1.0, 0.0]),
+                // 4 mm proud of frame_3's front face... offset in z.
+                bx("poster_3", [0.3, 0.3, 0.05], [2.0, 1.0, 0.004]),
+                {"type": "group", "name": "d_reds", "inputs": ["frame_1", "frame_3"]},
+                {"type": "group", "name": "d_yellow", "inputs": ["poster_1", "poster_3"]},
+                {"type": "hide_part", "part": "frame_*"},
+                {"type": "hide_part", "part": "poster_*"}
+            ]),
+        );
+        let l = s.lints();
+        assert!(
+            l.iter().any(|w| w.contains("off flush")
+                && w.contains("(poster_3)")
+                && w.contains("(frame_3)")),
+            "{l:?}"
+        );
+    }
+
+    #[test]
+    fn near_symmetry_compares_shape_and_skips_random_groups() {
+        let mut s = Session::default();
+        let seeds = [
+            [-0.04, 0.0],
+            [0.01, 0.03],
+            [0.035, -0.02],
+            [-0.01, -0.035],
+            [0.02, 0.01],
+            [-0.03, 0.02],
+            [0.0, -0.01],
+        ];
+        let mut items = vec![
+            bx("bun", [0.2, 0.06, 0.2], [0.0, 0.03, 0.0]),
+            bx("ear_l", [0.05, 0.05, 0.05], [-0.06, 0.085, 0.0]),
+            bx("ear_r", [0.05, 0.05, 0.05], [0.06, 0.085, 0.0]),
+            bx("tag_l", [0.02, 0.02, 0.02], [-0.09, 0.07, 0.08]),
+            bx("tag_r", [0.02, 0.02, 0.02], [0.09, 0.07, 0.08]),
+        ];
+        let mut names = Vec::new();
+        for (i, [x, z]) in seeds.iter().enumerate() {
+            let n = format!("pip{i}");
+            items.push(bx(&n, [0.01, 0.004, 0.006], [*x, 0.062, *z]));
+            names.push(n);
+        }
+        items.push(serde_json::json!({"type": "group", "name": "seeds", "inputs": names}));
+        items.push(serde_json::json!({"type": "hide_part", "part": "pip*"}));
+        run(&mut s, serde_json::Value::Array(items));
+        let l = s.lints();
+        assert!(
+            !l.iter()
+                .any(|w| w.contains("mirror-symmetric") && w.contains("`seeds`")),
             "{l:?}"
         );
     }

@@ -416,6 +416,17 @@ pub struct Textures {
     pub alpha: Alpha,
     /// Both faces drawn (cutout cards).
     pub double_sided: bool,
+    /// `double_sided` came from the default (the output didn't set it), so
+    /// [`double_sided_on`] may turn it off for a closed solid.
+    pub double_sided_default: bool,
+}
+
+/// Whether `t` is drawn double-sided on `part`. An explicit output
+/// `double_sided` wins; by default a cutout is double-sided only on an open
+/// sheet (a leaf card), never on a closed solid: there the back faces would
+/// show their mirrored image through the holes (a sign plate's text).
+pub fn double_sided_on(t: &Textures, part: &crate::Part) -> bool {
+    t.double_sided && !(t.double_sided_default && crate::verify::open_edge_count(part) == 0)
 }
 
 /// A bake's alpha mode (glTF `alphaMode`).
@@ -509,6 +520,7 @@ pub fn textures(ch: &Channels) -> Textures {
             .extras
             .double_sided
             .unwrap_or(matches!(alpha_of(ch), Alpha::Mask(_))),
+        double_sided_default: ch.extras.double_sided.is_none(),
     }
 }
 
@@ -654,6 +666,36 @@ mod alpha_tests {
         forced.extras.alpha = Some("mask".into());
         forced.extras.alpha_cutoff = Some(0.3);
         assert_eq!(alpha_of(&forced), Alpha::Mask(0.3));
+    }
+
+    #[test]
+    fn cutouts_are_one_sided_on_closed_solids() {
+        let cut = ch(vec![0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        let t = textures(&cut);
+        let mut solid = crate::Part::new("plate");
+        solid.verts = vec![
+            [1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [1.0, -1.0, -1.0],
+        ];
+        solid.indices = vec![0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2];
+        let mut card = crate::Part::new("leaf");
+        card.verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        card.indices = vec![0, 1, 2, 0, 2, 3];
+        assert!(double_sided_on(&t, &card), "leaf cards stay double-sided");
+        assert!(
+            !double_sided_on(&t, &solid),
+            "a closed solid culls its back faces"
+        );
+        let mut forced = cut.clone();
+        forced.extras.double_sided = Some(true);
+        assert!(double_sided_on(&textures(&forced), &solid), "explicit wins");
     }
 
     #[test]

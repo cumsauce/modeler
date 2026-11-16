@@ -408,6 +408,7 @@ pub(crate) fn build_with(
                         crate::material::pbr::Alpha::Blend => json!("blend"),
                     },
                     "double_sided": t.double_sided,
+                    "double_sided_default": t.double_sided_default,
                 });
                 if packed.is_some() {
                     set["ao"] = json!(mr);
@@ -478,7 +479,11 @@ pub(crate) fn build_with(
                 material["alphaMode"] = json!("MASK");
                 material["alphaCutoff"] = json!(c);
             }
-            if set["double_sided"] == json!(true) {
+            // A defaulted double-sided cutout stays one-sided on a closed solid.
+            if set["double_sided"] == json!(true)
+                && (set["double_sided_default"] != json!(true)
+                    || crate::verify::open_edge_count(part) > 0)
+            {
                 material["doubleSided"] = json!(true);
             }
             if let Some(ext) = set.get("ext").and_then(|e| e.as_object())

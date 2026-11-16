@@ -57,7 +57,7 @@ pub(crate) fn read(project: Option<&Path>, file: &str) -> Result<Vec<Value>, Str
 
 /// Says which items came from the file in a batch error: "batch item #N"
 /// counts inline items first, then the file's.
-pub(crate) fn locate_error(msg: &str, file: &str, inline: usize, from_file: usize) -> String {
+pub(crate) fn locate_error(msg: &str, file: &str, from_file: usize, inline: usize) -> String {
     if from_file == 0 {
         return msg.to_string();
     }
@@ -65,11 +65,61 @@ pub(crate) fn locate_error(msg: &str, file: &str, inline: usize, from_file: usiz
         format!("every item is from ops_file `{file}` (batch item #N = its item #N)")
     } else {
         format!(
-            "items #{inline}..#{} are from ops_file `{file}` (batch item #N = its item #(N - {inline})); earlier ones are inline",
-            inline + from_file - 1
+            "items #0..#{} are from ops_file `{file}`; later ones are inline (batch item #N = inline item #(N - {from_file}))",
+            from_file - 1
         )
     };
     format!("{msg}\n({note})")
+}
+
+/// Warnings for ops one call upserts more than once (same `type` + `name`):
+/// only the last one survives, which silently undid inline fixes when the
+/// file came last. The batch is file items first, then inline, so the
+/// inline tweak wins; each line names the op and the source that won.
+/// `material` items are left out: in-place materials stack by design.
+pub(crate) fn duplicate_warnings(batch: &[Value], from_file: usize) -> Vec<String> {
+    let source = |i: usize| if i < from_file { "ops_file" } else { "inline" };
+    let mut seen: std::collections::BTreeMap<(String, String), Vec<usize>> = Default::default();
+    let mut order = Vec::new();
+    for (i, v) in batch.iter().enumerate() {
+        let (Some(t), Some(n)) = (
+            v.get("type").and_then(Value::as_str),
+            v.get("name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if t == "material" {
+            continue;
+        }
+        let key = (t.to_string(), n.to_string());
+        let e = seen.entry(key.clone()).or_default();
+        if e.is_empty() {
+            order.push(key);
+        }
+        e.push(i);
+    }
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let at = &seen[&key];
+            let (&last, rest) = at.split_last()?;
+            if rest.is_empty() {
+                return None;
+            }
+            let others: Vec<String> = rest
+                .iter()
+                .map(|&i| format!("#{i} ({})", source(i)))
+                .collect();
+            Some(format!(
+                "warning: {} `{}` is given {} times in this call; item #{last} ({}) won, replacing {}",
+                key.0,
+                key.1,
+                at.len(),
+                source(last),
+                others.join(", ")
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -119,10 +169,25 @@ mod tests {
 
     #[test]
     fn errors_say_which_items_came_from_the_file() {
-        let m = locate_error("batch item #5 failed: no part `x`", "gen/a.json", 2, 10);
-        assert!(m.contains("items #2..#11 are from ops_file `gen/a.json`"));
-        assert!(m.contains("#(N - 2)"));
-        let m = locate_error("batch item #0 failed", "gen/a.json", 0, 3);
+        let m = locate_error("batch item #5 failed: no part `x`", "gen/a.json", 10, 2);
+        assert!(m.contains("items #0..#9 are from ops_file `gen/a.json`"));
+        assert!(m.contains("#(N - 10)"));
+        let m = locate_error("batch item #0 failed", "gen/a.json", 3, 0);
         assert!(m.contains("every item is from ops_file"));
+    }
+
+    #[test]
+    fn duplicate_upserts_warn_and_name_the_winner() {
+        let batch: Vec<Value> = serde_json::from_str(
+            r#"[{"type": "primitive", "name": "a"}, {"type": "primitive", "name": "b"},
+                {"type": "material", "name": "a"}, {"type": "material", "name": "a"},
+                {"type": "primitive", "name": "a"}, {"type": "extrude", "name": "b"}]"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let w = duplicate_warnings(&batch, 2);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("primitive `a`"), "{}", w[0]);
+        assert!(w[0].contains("item #4 (inline) won"), "{}", w[0]);
+        assert!(w[0].contains("#0 (ops_file)"), "{}", w[0]);
     }
 }

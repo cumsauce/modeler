@@ -1543,7 +1543,7 @@ impl Session {
         // number tokens) with the style's tokens expanded.
         let style = self.model.style.clone();
         let full = style.params_under(&merged);
-        let items = crate::spec::expand_repeats(&items, &full)
+        let (items, repeat_notes) = crate::spec::expand_repeats_noted(&items, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let items = self
             .expand_material_globs(items, &style, &full)
@@ -1666,6 +1666,7 @@ impl Session {
                 taken.join(", ")
             ));
         }
+        lines.extend(repeat_notes);
         Ok(lines.join("\n"))
     }
 
@@ -6062,6 +6063,73 @@ mod tests {
             true,
         );
         assert!(bad.is_err_and(|e| e.to_string().contains("upper")));
+    }
+
+    #[test]
+    fn empty_repeats_are_noted_no_ops() {
+        let mut s = Session::default();
+        let text = s
+            .apply_values_as(
+                None,
+                vec![
+                    serde_json::json!({"type": "repeat", "var": "r", "count": 3, "items": []}),
+                    serde_json::json!({"type": "repeat", "var": "r", "values": [], "items": [
+                        {"type": "primitive", "name": "x{r}", "kind": "box", "size": 0.1}]}),
+                    serde_json::json!({"type": "primitive", "name": "keep", "kind": "box", "size": 0.1}),
+                ],
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            text.contains("items is empty, so it made nothing"),
+            "{text}"
+        );
+        assert!(text.contains("no values (count 0)"), "{text}");
+        assert!(s.model.part("keep").is_some());
+    }
+
+    #[test]
+    fn primitive_round_object_is_accepted_with_hints() {
+        let mut s = Session::default();
+        s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "primitive", "name": "b", "kind": "box",
+                "size": 0.2, "round": {"radius": 0.02, "segments": 3}}),
+            ],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let Some(Op::Primitive { round, .. }) = s.model.ops.first() else {
+            panic!("no primitive op");
+        };
+        assert!((round - 0.02).abs() < 1e-6);
+        let bad = s.apply_values_as(
+            None,
+            vec![
+                serde_json::json!({"type": "primitive", "name": "c", "kind": "box",
+                "size": 0.2, "round": {"radius": 0.02, "edges": "top"}}),
+            ],
+            true,
+        );
+        assert!(bad.is_err_and(|e| {
+            let e = e.to_string();
+            e.contains("unknown field `edges`")
+                && e.contains("round: 0.03")
+                && e.contains("mode fillet")
+        }));
+    }
+
+    #[test]
+    fn verify_unknown_field_lists_the_valid_ones() {
+        let e = serde_json::from_value::<VerifySpec>(serde_json::json!({"walkabel": true}))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("unknown field `walkabel`") && e.contains("`walkable`"),
+            "{e}"
+        );
     }
 
     #[test]

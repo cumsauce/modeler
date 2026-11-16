@@ -148,12 +148,16 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerEr
     }
     if !matches!(
         projection,
-        "planar" | "box" | "cylindrical" | "spherical" | "metric"
+        "planar" | "box" | "cylindrical" | "spherical" | "metric" | "face" | "label"
     ) {
         return Err(format!("unknown UV projection `{projection}`").into());
     }
     if projection == "metric" {
         metric_box(part);
+        return Ok(());
+    }
+    if matches!(projection, "face" | "label") {
+        face_box(part);
         return Ok(());
     }
     // Box projection reads the face normals; make sure they exist.
@@ -171,11 +175,20 @@ pub fn project(part: &mut Part, projection: &str) -> Result<(), crate::ModelerEr
     let size = max - min;
     part.uvs = match projection {
         "planar" => {
-            // Project onto the plane perpendicular to the largest-extent axis.
-            let axis = largest_axis(size);
+            // Project along the smallest-extent axis (a flat plate's normal),
+            // oriented as seen from its positive side: u right, v down.
+            let axis = smallest_axis(size);
+            let sign = [1.0, 1.0, 1.0];
             part.verts
                 .iter()
-                .map(|v| planar_uv(v, axis, min, size))
+                .map(|v| {
+                    fit_uv(
+                        metric_uv(axis as u8, sign[axis], Vec3::from(*v)),
+                        axis,
+                        min,
+                        max,
+                    )
+                })
                 .collect()
         }
         "box" => part
@@ -240,6 +253,67 @@ pub fn metric_uv(axis: u8, sign: f32, w: Vec3) -> [f32; 2] {
 /// different axes are split. Negative-facing faces flip u so nothing reads
 /// mirrored from outside.
 pub fn metric_box(part: &mut Part) {
+    metric_box_groups(part);
+}
+
+/// `face` (alias `label`) projection: each triangle mapped by its outward
+/// normal's dominant axis like [`metric_box`] (u viewer-right, v down the
+/// image; side faces upright with world +y, the top with the image top
+/// toward -z, the bottom toward +z), then stretched to 0..1 over that face
+/// group's extent, so one image fills each side of a box and reads upright
+/// and unmirrored from outside every face.
+pub fn face_box(part: &mut Part) {
+    let groups = metric_box_groups(part);
+    let mut lo = [[f32::MAX; 2]; 6];
+    let mut hi = [[f32::MIN; 2]; 6];
+    for (uv, &g) in part.uvs.iter().zip(&groups) {
+        for k in 0..2 {
+            lo[g as usize][k] = lo[g as usize][k].min(uv[k]);
+            hi[g as usize][k] = hi[g as usize][k].max(uv[k]);
+        }
+    }
+    for (uv, &g) in part.uvs.iter_mut().zip(&groups) {
+        for k in 0..2 {
+            uv[k] = remap(
+                uv[k],
+                lo[g as usize][k],
+                hi[g as usize][k] - lo[g as usize][k],
+            );
+        }
+    }
+    if part.normals.len() != part.verts.len() {
+        let uvs = std::mem::take(&mut part.uvs);
+        ensure_normals(part);
+        part.uvs = uvs;
+    }
+}
+
+/// Planar uv of a model-space point already in metric orientation, fitted to
+/// 0..1 over the part's box on the two axes across `axis`.
+fn fit_uv(m: [f32; 2], axis: usize, min: Vec3, max: Vec3) -> [f32; 2] {
+    // Range of each metric coordinate over the box corners.
+    let mut lo = [f32::MAX; 2];
+    let mut hi = [f32::MIN; 2];
+    for c in 0..8 {
+        let p = Vec3::new(
+            if c & 1 == 0 { min.x } else { max.x },
+            if c & 2 == 0 { min.y } else { max.y },
+            if c & 4 == 0 { min.z } else { max.z },
+        );
+        let q = metric_uv(axis as u8, 1.0, p);
+        for k in 0..2 {
+            lo[k] = lo[k].min(q[k]);
+            hi[k] = hi[k].max(q[k]);
+        }
+    }
+    [
+        remap(m[0], lo[0], hi[0] - lo[0]),
+        remap(m[1], lo[1], hi[1] - lo[1]),
+    ]
+}
+
+/// [`metric_box`], returning each new vertex's face group (axis * 2 + negative).
+fn metric_box_groups(part: &mut Part) -> Vec<u8> {
     use std::collections::HashMap;
     let sc = Vec3::from(part.scale);
     let count = part.verts.len();
@@ -253,6 +327,7 @@ pub fn metric_box(part: &mut Part) {
     let (mut verts, mut normals, mut uvs, mut indices) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut remap: HashMap<(usize, u8), u32> = HashMap::new();
+    let mut groups = Vec::new();
     for t in 0..tris {
         let c = [idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2)];
         if c.iter().any(|&k| k >= count) {
@@ -278,6 +353,7 @@ pub fn metric_box(part: &mut Part) {
                     normals.push(part.normals[k]);
                 }
                 uvs.push(uv);
+                groups.push(key.1);
                 (verts.len() - 1) as u32
             });
             indices.push(id);
@@ -287,6 +363,7 @@ pub fn metric_box(part: &mut Part) {
     part.normals = normals;
     part.uvs = uvs;
     part.indices = indices;
+    groups
 }
 
 /// Rewrite a part's triangles for cylinder mapping: where a triangle's u values wrap
@@ -363,6 +440,16 @@ fn planar_uv(v: &[f32; 3], axis: usize, min: Vec3, size: Vec3) -> [f32; 2] {
         [other(0), other(2)]
     } else {
         [other(0), other(1)]
+    }
+}
+
+fn smallest_axis(v: Vec3) -> usize {
+    if v.x <= v.y && v.x <= v.z {
+        0
+    } else if v.y <= v.z {
+        1
+    } else {
+        2
     }
 }
 
@@ -480,12 +567,96 @@ mod tests {
 
     #[test]
     fn projections_stay_in_unit_square() {
-        for proj in ["planar", "box", "cylindrical", "spherical"] {
+        for proj in ["planar", "box", "cylindrical", "spherical", "face", "label"] {
             let mut p = tetrahedron();
             let Ok(()) = project(&mut p, proj) else {
                 panic!("{proj} failed on the tetrahedron");
             };
             validate_uvs(&p, proj);
+        }
+    }
+
+    fn cube() -> Part {
+        let mut p = Part::new("cube");
+        for c in 0..8u32 {
+            p.verts.push([
+                if c & 1 == 0 { -0.5 } else { 0.5 },
+                if c & 2 == 0 { -0.5 } else { 0.5 },
+                if c & 4 == 0 { -0.5 } else { 0.5 },
+            ]);
+        }
+        // Outward-wound quads (a, b, c, d counter-clockwise from outside).
+        for q in [
+            [1, 3, 7, 5],
+            [0, 4, 6, 2],
+            [2, 6, 7, 3],
+            [0, 1, 5, 4],
+            [4, 5, 7, 6],
+            [0, 2, 3, 1],
+        ] {
+            p.indices.extend([q[0], q[1], q[2], q[0], q[2], q[3]]);
+        }
+        p
+    }
+
+    #[test]
+    fn face_projection_reads_upright_from_outside_every_face() {
+        for proj in ["face", "label"] {
+            let mut p = cube();
+            let Ok(()) = project(&mut p, proj) else {
+                panic!("{proj} failed");
+            };
+            validate_uvs(&p, proj);
+            for tri in p.indices.chunks(3) {
+                let v = tri
+                    .iter()
+                    .map(|&i| Vec3::from(p.verts[i as usize]))
+                    .collect::<Vec<_>>();
+                let n = (v[1] - v[0]).cross(v[2] - v[0]).normalize();
+                // Viewer frame from outside: up = +y on sides, -z on top, +z below.
+                let up = if n.y > 0.5 {
+                    Vec3::NEG_Z
+                } else if n.y < -0.5 {
+                    Vec3::Z
+                } else {
+                    Vec3::Y
+                };
+                let right = up.cross(n);
+                for &i in tri {
+                    let w = Vec3::from(p.verts[i as usize]);
+                    let uv = p.uvs[i as usize];
+                    let eu = w.dot(right) + 0.5;
+                    let ev = 0.5 - w.dot(up);
+                    assert!(
+                        (uv[0] - eu).abs() < 1e-5 && (uv[1] - ev).abs() < 1e-5,
+                        "{proj} face {n:?} vert {w:?}: uv {uv:?}, want [{eu}, {ev}]"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn planar_projects_along_the_thin_axis() {
+        // A sign plate: 1 wide (x), 0.5 tall (y), 0.02 thick (z).
+        let mut p = cube();
+        for v in &mut p.verts {
+            v[1] *= 0.5;
+            v[2] *= 0.02;
+        }
+        let Ok(()) = project(&mut p, "planar") else {
+            panic!("planar failed");
+        };
+        validate_uvs(&p, "planar");
+        for (v, uv) in p.verts.iter().zip(&p.uvs) {
+            assert!(
+                (uv[0] - (v[0] + 0.5)).abs() < 1e-5,
+                "u follows x: {v:?} {uv:?}"
+            );
+            assert!(
+                (uv[1] - (0.5 - v[1] * 2.0)).abs() < 1e-5,
+                "v runs down y: {v:?} {uv:?}"
+            );
         }
     }
 
