@@ -419,7 +419,7 @@ pub fn validate(model: &Model) -> String {
     }
     for p in &model.parts {
         // Leaf cards are open sheets by design.
-        if p.verts.is_empty() || p.cards {
+        if p.verts.is_empty() || p.cards || p.sheet {
             continue;
         }
         let open = open_edge_count(p);

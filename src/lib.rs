@@ -191,6 +191,11 @@ pub struct Part {
     /// closed solid, and checks that need one skip it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cards: bool,
+    /// A one-sided sheet on purpose (a `plane` primitive with `facing`): an
+    /// open quad seen only from its front, so `validate` doesn't call it
+    /// torn and export never makes its material double-sided.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sheet: bool,
     /// How a `bind` attached this part to a skeleton (rigid bone or smooth
     /// weights). Derived after the graph; never saved.
     #[serde(skip)]
@@ -821,6 +826,38 @@ wire_enum!(
     }
 );
 
+/// Which way a one-sided `plane` faces (its front, the side it draws from).
+/// `up`/`down` lie flat (size = [x, z]); `+x`/`-x` stand on the y-z plane
+/// (size = [z, y]); `+z`/`-z` stand on the x-y plane (size = [x, y]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum Facing {
+    #[serde(rename = "up", alias = "+y")]
+    Up,
+    #[serde(rename = "down", alias = "-y")]
+    Down,
+    #[serde(rename = "+x", alias = "x")]
+    PosX,
+    #[serde(rename = "-x")]
+    NegX,
+    #[serde(rename = "+z", alias = "z")]
+    PosZ,
+    #[serde(rename = "-z")]
+    NegZ,
+}
+
+impl Facing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::PosX => "+x",
+            Self::NegX => "-x",
+            Self::PosZ => "+z",
+            Self::NegZ => "-z",
+        }
+    }
+}
+
 impl PrimitiveKind {
     /// Open single sheets, built double-sided.
     pub fn is_open_sheet(self) -> bool {
@@ -907,6 +944,10 @@ pub enum Op {
         /// Arc segments per rounded edge (0 = default 4).
         #[serde(default, skip_serializing_if = "is_zero_u32")]
         segments: u32,
+        /// Plane only: build a one-sided quad (4 verts, 2 triangles) whose
+        /// front faces this way, instead of the default double-sided sheet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        facing: Option<Facing>,
     },
     /// A 2D footprint extruded straight up (y = 0..height) via Manifold.
     /// `profile` rings are [x, z]; inner rings are holes.
