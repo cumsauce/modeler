@@ -1526,6 +1526,87 @@ mod tests {
         assert!(s.model.part("b").is_some());
     }
 
+    /// A saved document stays open when someone else overwrote its catalog
+    /// file: closing it would bring their version back in its place.
+    #[test]
+    fn idle_close_keeps_a_document_whose_file_was_overwritten() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_root("idle_overwritten");
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &root) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("kept")));
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "b", "kind": "box", "size": 1})],
+        ));
+        s.save_prefab_checked("x", &[], "x", false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        ok(s.scene("open", Some("other")));
+        // Another server rewrites the file.
+        let path = catalog_dir()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .join("kept.json");
+        let mut text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        text.push('\n');
+        fs::write(&path, text).unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.close_idle(std::time::Duration::ZERO).is_empty());
+        assert!(s.others.iter().any(|m| m.name == "kept"));
+    }
+
+    /// save_prefab refuses (unless forced) a name another open document holds.
+    #[test]
+    fn save_prefab_refuses_a_name_another_open_document_holds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("name_clash")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("dup")));
+        ok(s.scene("open", Some("mine")));
+        s.model.name = "dup".into();
+        assert_eq!(s.name_holder("dup").as_deref(), Some("dup"));
+        let e = s
+            .save_prefab_checked("x", &[], "x", false)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("another open document, `dup`"), "{e}");
+        assert!(s.save_prefab_checked("x", &[], "x", true).is_ok());
+    }
+
+    /// Two subagents sharing one client id keep their edits apart by
+    /// pinning each call to a document; a pin on a closed document errors.
+    #[test]
+    fn a_doc_pin_keeps_one_clients_calls_on_their_documents() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("doc_pin")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let box_ = |n: &str| {
+            vec![serde_json::json!({"type": "primitive", "name": n, "kind": "box", "size": 1})]
+        };
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("d1")));
+        ok(s.scene("open", Some("d2")));
+        assert!(s.require_open("d1").is_ok());
+        assert!(s.require_open("nope").is_err());
+        for (doc, part) in [("d1", "a"), ("d2", "b"), ("d1", "c")] {
+            s.begin_call(Some("same"), Some(doc), None);
+            assert_eq!(s.model.name, doc);
+            ok(s.apply_values(None, box_(part)));
+            s.end_call(Some("same"));
+            // The other subagent moves the shared client elsewhere.
+            ok(s.scene("switch", Some(if doc == "d1" { "d2" } else { "d1" })));
+        }
+        ok(s.scene("switch", Some("d1")));
+        assert!(s.model.part("a").is_some() && s.model.part("c").is_some());
+        assert!(s.model.part("b").is_none());
+        ok(s.scene("switch", Some("d2")));
+        assert!(s.model.part("b").is_some() && s.model.part("a").is_none());
+    }
+
     /// A restart brings back only unsaved documents; an active document that
     /// matches its file leaves an unsaved one (or an empty one) in front.
     #[test]

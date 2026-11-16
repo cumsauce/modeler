@@ -90,7 +90,17 @@ pub fn lints(model: &Model) -> Vec<String> {
     }
     out.extend(near_symmetry(model, &pair_vis));
     out.extend(capped(uneven_runs(model, &vis), "uneven runs"));
-    out.extend(boxiness(&vis));
+    // A style number `lint_boxy: 0` opts the model out (a deliberately
+    // blocky look, a greybox level); a model param of that name works too.
+    let boxy_off = model
+        .params
+        .get("lint_boxy")
+        .copied()
+        .or_else(|| model.style.numbers.get("lint_boxy").copied())
+        .is_some_and(|v| v == 0.0);
+    if !boxy_off {
+        out.extend(boxiness(&vis));
+    }
     out
 }
 
@@ -1158,6 +1168,9 @@ mod tests {
             "{l:?}"
         );
         assert!(l.iter().any(|w| w.starts_with("boxy")), "{l:?}");
+        s.model.style.numbers.insert("lint_boxy".into(), 0.0);
+        assert!(!s.lints().iter().any(|w| w.starts_with("boxy")));
+        s.model.style.numbers.remove("lint_boxy");
         let (ok, t) = check(
             &s,
             serde_json::json!({"equal_spacing": {"parts": "post*"}}),

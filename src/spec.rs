@@ -3250,6 +3250,48 @@ pub fn parse_ops(items: &[Value]) -> Result<Vec<BatchItem>, String> {
         .collect()
 }
 
+const PRIMITIVE_KINDS: &[&str] = &[
+    "box", "sphere", "cylinder", "cone", "capsule", "torus", "plane", "wedge", "disc", "washer",
+];
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// "unknown type `x`" with the closest type, or the primitive item a kind
+/// name ("sphere") was meant to be.
+pub fn unknown_type(other: &str) -> String {
+    let low = other.to_ascii_lowercase();
+    if PRIMITIVE_KINDS.contains(&low.as_str()) {
+        return format!(
+            "unknown type `{other}`: `{low}` is a primitive kind, write {{\"type\": \"primitive\", \"kind\": \"{low}\", ...}}"
+        );
+    }
+    let best = OP_TYPES
+        .iter()
+        .map(|t| (edit_distance(&low, t), *t))
+        .min()
+        .filter(|(d, t)| *d <= 2.max(t.len() / 3) || t.contains(low.as_str()) && low.len() > 2);
+    match best {
+        Some((_, t)) => format!(
+            "unknown type `{other}`; did you mean `{t}`? (one of: {})",
+            OP_TYPES.join(", ")
+        ),
+        None => format!("unknown type `{other}` (one of: {})", OP_TYPES.join(", ")),
+    }
+}
+
 pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
     let Some(obj) = v.as_object() else {
         return Err(format!(
@@ -4389,10 +4431,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             })
         }
         other => {
-            return Err(format!(
-                "op #{i}: unknown type `{other}` (one of: {})",
-                OP_TYPES.join(", ")
-            ));
+            return Err(format!("op #{i}: {}", unknown_type(other)));
         }
     })
 }
@@ -4612,10 +4651,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "uvs" => schemars::schema_for!(UvsSpec),
         "prefab" => schemars::schema_for!(PrefabSpec),
         other => {
-            return Err(format!(
-                "unknown item type `{other}` (one of: {})",
-                OP_TYPES.join(", ")
-            ));
+            return Err(format!("unknown item {}", unknown_type(other)));
         }
     };
     let example = example(ty).unwrap_or(Value::Null);
@@ -4690,6 +4726,14 @@ mod tests {
             panic!("unknown type should fail");
         };
         assert!(e.contains("unknown type `spin`"), "{e}");
+        let Err(e) = one(json!({"type": "sphere", "name": "x"})) else {
+            panic!("a kind as type should fail");
+        };
+        assert!(e.contains("\"kind\": \"sphere\""), "{e}");
+        let Err(e) = one(json!({"type": "extrud", "name": "x"})) else {
+            panic!("typo type should fail");
+        };
+        assert!(e.contains("did you mean `extrude`"), "{e}");
     }
 
     #[test]
