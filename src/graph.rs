@@ -823,8 +823,11 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             frame,
             round,
             segments,
+            facing,
         } => {
-            let mut part = if *round > 0.0 {
+            let mut part = if let (crate::PrimitiveKind::Plane, Some(f)) = (kind, facing) {
+                primitives::one_sided_plane(*size, *f, name).map_err(|e| format!("{name}: {e}"))?
+            } else if *round > 0.0 {
                 crate::csg::rounded_primitive(name, *kind, *size, *round, *segments)?
             } else {
                 primitives::primitive(*kind, *size, name).map_err(|e| format!("{name}: {e}"))?
@@ -2049,8 +2052,10 @@ pub fn describe(ops: &[Op]) -> String {
                 frame,
                 round,
                 segments,
+                facing,
             } => format!(
-                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}{}{}",
+                "#{i} primitive `{name}` ({kind}) size={size:?} at={translation:?}{}{}{}{}",
+                facing.map_or_else(String::new, |f| format!(" facing={} (one-sided)", f.as_str())),
                 rotation.map_or_else(String::new, |r| format!(" rot={r:?}")),
                 frame
                     .as_ref()
@@ -2469,6 +2474,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::Transform {
                 name: "lifted".into(),
@@ -2521,6 +2527,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -2575,6 +2582,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::Primitive {
                 name: "b".into(),
@@ -2585,6 +2593,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::Primitive {
                 name: "a".into(),
@@ -2595,6 +2604,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
         ];
         let parts = evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
@@ -2615,6 +2625,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::RadialArray {
                 name: "ring".into(),
@@ -2650,6 +2661,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::LinearArray {
                 name: "fence".into(),
@@ -2694,6 +2706,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             op,
         ])
@@ -2750,6 +2763,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::Mirror {
                 name: "arm_m".into(),
@@ -2827,6 +2841,7 @@ mod tests {
             frame: None,
             round: 0.0,
             segments: 0,
+            facing: None,
         }
     }
 
@@ -2934,6 +2949,7 @@ mod tests {
                 frame: None,
                 round: 0.0,
                 segments: 0,
+                facing: None,
             },
             Op::Transform {
                 name: "b".into(),

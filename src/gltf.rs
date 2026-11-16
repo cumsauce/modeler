@@ -550,9 +550,10 @@ pub(crate) fn build_with(
                 material["alphaCutoff"] = json!(c);
             }
             // A defaulted double-sided cutout stays one-sided on a closed solid.
+            // A one-sided plane (`facing`) never defaults to double-sided.
             if set["double_sided"] == json!(true)
                 && (set["double_sided_default"] != json!(true)
-                    || crate::verify::open_edge_count(&sources[pi]) > 0)
+                    || (!sources[pi].sheet && crate::verify::open_edge_count(&sources[pi]) > 0))
             {
                 material["doubleSided"] = json!(true);
             }

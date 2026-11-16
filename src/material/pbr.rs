@@ -426,7 +426,8 @@ pub struct Textures {
 /// sheet (a leaf card), never on a closed solid: there the back faces would
 /// show their mirrored image through the holes (a sign plate's text).
 pub fn double_sided_on(t: &Textures, part: &crate::Part) -> bool {
-    t.double_sided && !(t.double_sided_default && crate::verify::open_edge_count(part) == 0)
+    t.double_sided
+        && !(t.double_sided_default && (part.sheet || crate::verify::open_edge_count(part) == 0))
 }
 
 /// A bake's alpha mode (glTF `alphaMode`).
@@ -689,6 +690,12 @@ mod alpha_tests {
         ];
         card.indices = vec![0, 1, 2, 0, 2, 3];
         assert!(double_sided_on(&t, &card), "leaf cards stay double-sided");
+        let mut sheet = card.clone();
+        sheet.sheet = true;
+        assert!(
+            !double_sided_on(&t, &sheet),
+            "a one-sided plane stays one-sided"
+        );
         assert!(
             !double_sided_on(&t, &solid),
             "a closed solid culls its back faces"
