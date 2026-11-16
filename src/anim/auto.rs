@@ -198,9 +198,9 @@ pub fn from_skin(from: &str, def: &crate::sdf::SkinDef) -> Result<(Vec<RawBone>,
                             "`{from}`: chain {ci} names joint `{j}`, not in joints"
                         ));
                     };
-                    node_of(j.clone(), *v, &mut nodes)
+                    node_of(j.clone(), v.xyzr(), &mut nodes)
                 }
-                ChainPt::Point(v) => node_of(format!("c{ci}_{pi}"), *v, &mut nodes),
+                ChainPt::Point(v) => node_of(format!("c{ci}_{pi}"), v.xyzr(), &mut nodes),
             };
             if let Some(a) = prev
                 && a != i

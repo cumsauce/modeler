@@ -1792,7 +1792,8 @@ pub struct SdfShapeSpec {
     /// "capsule" {from, to, radius: r or [r_from, r_to] (a rounded cone)},
     /// "cylinder" {radius, height, round, at, rotation; along y},
     /// "torus" {size: [ring, tube], at, rotation; flat in xz}, "chain"
-    /// {points: [[x, y, z, radius], ...], smooth (default true)}: a tube
+    /// {points: [[x, y, z, radius] or [x, y, z, [rx, ry], roll?], ...],
+    /// smooth (default true)}: a tube
     /// through the points whose radius varies, "part" {part}: a closed
     /// solid of the model sampled as a field, "group" {shapes}: combined on
     /// their own first, then joined as one (subtract a blended group).
@@ -1824,13 +1825,43 @@ pub struct SdfShapeSpec {
     #[serde(default)]
     to: Option<[f32; 3]>,
     #[serde(default)]
-    points: Option<Vec<[f32; 4]>>,
+    points: Option<Vec<crate::sdf::Sect>>,
     #[serde(default)]
     smooth: Option<bool>,
     #[serde(default)]
     part: Option<String>,
     #[serde(default)]
     shapes: Option<Vec<SdfShapeSpec>>,
+    /// silhouette: the side outline [[z, y], ...] (points / arcs, as seen
+    /// from +x); with `top` [[x, z], ...] and optional `front` [[x, y],
+    /// ...] the shape is their intersected extrusions, edges rounded by
+    /// `round`, centred by `at` / turned by `rotation`. `smooth: true` runs
+    /// a Catmull-Rom through the outline points.
+    #[serde(default)]
+    side: Option<ProfileArg>,
+    #[serde(default)]
+    top: Option<ProfileArg>,
+    #[serde(default)]
+    front: Option<ProfileArg>,
+    /// silhouette: {image, view, height | size} (or a list) traced from a
+    /// PNG of the project in place of the profile its view names.
+    #[serde(default)]
+    from_reference: Option<serde_json::Value>,
+}
+
+/// Expands silhouette outline rings: points / arcs, an optional closed
+/// Catmull-Rom through them, an optional corner rounding.
+fn sil_rings(
+    arg: Option<ProfileArg>,
+    smooth: bool,
+    round: f32,
+) -> Result<Option<Vec<Vec<[f32; 2]>>>, String> {
+    let Some(a) = arg else { return Ok(None) };
+    Ok(Some(crate::silhouette::shape_rings(
+        a.rings()?,
+        smooth,
+        round,
+    )))
 }
 
 impl SdfShapeSpec {
@@ -1848,7 +1879,21 @@ impl SdfShapeSpec {
             ),
             None => None,
         };
+        if self.from_reference.is_some() {
+            return Err(format!(
+                "{at}: from_reference: traced by the server from a project image (apply_ops); not available here"
+            ));
+        }
+        let sil = self.shape == "silhouette";
+        let smooth = sil && self.smooth == Some(true);
+        let side = sil_rings(self.side, smooth, 0.0).map_err(|e| format!("{at}: side: {e}"))?;
+        let top = sil_rings(self.top, smooth, 0.0).map_err(|e| format!("{at}: top: {e}"))?;
+        let front = sil_rings(self.front, smooth, 0.0).map_err(|e| format!("{at}: front: {e}"))?;
         Ok(crate::sdf::Shape {
+            side,
+            top,
+            front,
+            smooth: if sil { None } else { self.smooth },
             shape: self.shape,
             op: self.op,
             blend: self.blend,
@@ -1861,7 +1906,6 @@ impl SdfShapeSpec {
             from: self.from,
             to: self.to,
             points: self.points,
-            smooth: self.smooth,
             part: self.part,
             shapes,
         })
@@ -1895,6 +1939,31 @@ pub struct WarpSpec {
     seed: Option<u32>,
     #[serde(default)]
     noise: Option<String>,
+    /// Local sculpt warps (inflate / push / pinch / flatten / smooth): the
+    /// centre, a point [x, y, z] or an anchor: a joint name (skin joints,
+    /// body joints: "head"), "part:top" / "part:joint" (sdf), or anchor
+    /// words on the field's own box ("top-front").
+    #[serde(default)]
+    at: Option<crate::deform::WarpAt>,
+    /// Local warps: radius of influence in meters (no effect outside).
+    #[serde(default)]
+    radius: Option<f32>,
+    /// Local warps: "smooth" (default), "linear" or "sharp".
+    #[serde(default)]
+    falloff: Option<String>,
+    /// push: the direction the surface moves.
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
+    /// flatten: the plane's normal (the plane passes through `at`).
+    #[serde(default)]
+    normal: Option<[f32; 3]>,
+    /// smooth: the blur kernel's reach in meters (default radius / 3).
+    #[serde(default)]
+    size: Option<f32>,
+    /// Local warps on a mirrored field: true (default) acts on both sides,
+    /// false only on the side `at` is on.
+    #[serde(default)]
+    mirror: Option<bool>,
 }
 
 impl WarpSpec {
@@ -1916,6 +1985,13 @@ impl WarpSpec {
             noise: self.noise,
             detail: None,
             pbr: None,
+            at: self.at,
+            radius: self.radius,
+            falloff: self.falloff,
+            direction: self.direction,
+            normal: self.normal,
+            size: self.size,
+            mirror: self.mirror,
         }
     }
 }
@@ -1945,6 +2021,14 @@ pub struct SdfSpec {
     /// thin shapes, about 12M samples at most; explicit up to 27M).
     #[serde(default)]
     resolution: Option<f32>,
+    /// Decimate the result to about this many triangles in the same item
+    /// (replaces an sdf + decimate + hide_part triple; the coarser meshing
+    /// a decimate needs is picked for you).
+    #[serde(default)]
+    tris: Option<u32>,
+    /// With tris: bake the dense surface into normal + height maps.
+    #[serde(default)]
+    bake: Option<bool>,
 }
 
 /// A skin chain point: [x, y, z, radius] or a joint name.
@@ -1952,20 +2036,137 @@ pub struct SdfSpec {
 #[serde(untagged)]
 pub enum ChainPtSpec {
     Joint(String),
-    Point([f32; 4]),
+    Point(crate::sdf::Sect),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BodySpec {
+    name: String,
+    /// biped (a person, 1.75 m), quadruped (a cat, 0.25 m at the
+    /// shoulder), bird (0.25 m), fish (0.4 m long), serpent (2 m long),
+    /// car (4.3 m long). Facing +z, left = +x, standing on y = 0.
+    preset: String,
+    /// Size in meters: standing height (biped, bird), shoulder height
+    /// (quadruped), length (fish, serpent, car).
+    #[serde(default)]
+    height: Option<f32>,
+    /// Head size as a fraction of `height` (biped default 1/7.5; others
+    /// relative to their default: quadruped 0.36, bird 0.2, fish 0.25,
+    /// serpent 0.03, car 0.12 = cabin height).
+    #[serde(default)]
+    head_ratio: Option<f32>,
+    /// Girth: 0.7 slim .. 1 .. 1.5 heavy (car: width).
+    #[serde(default)]
+    build: Option<f32>,
+    /// Leg length factor (car: wheel size), default 1.
+    #[serde(default)]
+    leg_length: Option<f32>,
+    /// Tail length factor, 0 = none (biped default 0, others 1; car: rear
+    /// overhang).
+    #[serde(default)]
+    tail: Option<f32>,
+    /// Snout / muzzle / beak / nose length factor (car: front overhang).
+    #[serde(default)]
+    snout: Option<f32>,
+    /// Per-joint edits {"paw_l": {"scale": 1.2, "offset": [0, 0, 0.01]}}:
+    /// scale sizes the sections at that joint, offset (meters) moves it and
+    /// every joint below it.
+    #[serde(default)]
+    joints: Option<std::collections::BTreeMap<String, crate::body::JointEdit>>,
+    /// Smooth radius where chains meet (default per preset).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// Meshing voxel size in meters (default from the size).
+    #[serde(default)]
+    resolution: Option<f32>,
+    /// Decimate to about this many triangles in the same item.
+    #[serde(default)]
+    tris: Option<u32>,
+    /// With tris: bake the dense surface into normal + height maps.
+    #[serde(default)]
+    bake: Option<bool>,
+    /// false: no automatic `<name>_rig` skeleton (default true).
+    #[serde(default)]
+    rig: Option<bool>,
+    /// false: no automatic smooth `<name>_bind` of the body to its rig
+    /// (default true with the rig; a `bind` item on the rig replaces it).
+    #[serde(default)]
+    bind: Option<bool>,
+    /// Field warps, as on sdf; local sculpt warps may be centred on a joint
+    /// by name ({"mode": "inflate", "at": "chest", "radius": 0.15,
+    /// "amount": 0.02}).
+    #[serde(default)]
+    warps: Option<Vec<WarpSpec>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SilhouetteSpec {
+    name: String,
+    /// Side outline seen from +x (the right): [[z, y], ...] points or arcs
+    /// (front = +z). Or give it with `from_reference`.
+    #[serde(default)]
+    side: Option<ProfileArg>,
+    /// Plan outline: [[x, z], ...].
+    #[serde(default)]
+    top: Option<ProfileArg>,
+    /// Optional front outline seen from +z: [[x, y], ...].
+    #[serde(default)]
+    front: Option<ProfileArg>,
+    /// A closed centripetal Catmull-Rom through each outline's points (a few
+    /// points make a smooth body), default false.
+    #[serde(default)]
+    smooth: Option<bool>,
+    /// Round every outline corner by this radius (meters, in 2D).
+    #[serde(default)]
+    round: f32,
+    /// Smooth radius of the intersection, meters: rounds the solid's edges
+    /// where the outlines meet (default 0 = sharp).
+    #[serde(default)]
+    blend: Option<f32>,
+    /// {image, view, height | size} or a list: trace the subject of a PNG in
+    /// the project (as the agent_views reference compare finds it) into the
+    /// profile its view names (front / back -> front, side / right / left
+    /// -> side, top -> top). `height` scales the outline's vertical extent
+    /// to meters (uniform); `size` [w, h] sets both. Front / side outlines
+    /// stand on y = 0, centred; a side image is seen from the right (image
+    /// right = -z), `left` from the left.
+    #[serde(default)]
+    from_reference: Option<serde_json::Value>,
+    /// Filled by the server from `from_reference` (image, view, content
+    /// hash): the op re-traces when the image changes. Not written by hand.
+    #[serde(default)]
+    references: Vec<crate::silhouette::RefSource>,
+    /// Meshing voxel size in meters (default from the size).
+    #[serde(default)]
+    resolution: Option<f32>,
+    /// Decimate to about this many triangles in the same item.
+    #[serde(default)]
+    tris: Option<u32>,
+    /// With tris: bake the dense surface into normal + height maps.
+    #[serde(default)]
+    bake: Option<bool>,
+    #[serde(default, alias = "position")]
+    translation: [f32; 3],
+    #[serde(default)]
+    rotation: Option<RotationSpec>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkinSpec {
     name: String,
-    /// Chains of points, each [x, y, z, radius] or a joint name: a tube
+    /// Chains of points, each [x, y, z, radius], an elliptical section
+    /// [x, y, z, [rx, ry], roll?] (rx sideways, ry along the tube's up,
+    /// roll degrees about the tangent) or a joint name: a tube
     /// through them whose radius follows the points. Chains sharing a joint
     /// melt together there (a limb into a body, fingers into a palm).
     chains: Vec<Vec<ChainPtSpec>>,
-    /// Named points [x, y, z, radius] chains can share.
+    /// Named points [x, y, z, radius] (or [x, y, z, [rx, ry], roll?])
+    /// chains can share.
     #[serde(default)]
-    joints: Option<std::collections::BTreeMap<String, [f32; 4]>>,
+    joints: Option<std::collections::BTreeMap<String, crate::sdf::Sect>>,
     /// Smooth curves through the points (default true); false = straight
     /// rounded cones between them.
     #[serde(default)]
@@ -1984,6 +2185,14 @@ pub struct SkinSpec {
     /// radius).
     #[serde(default)]
     resolution: Option<f32>,
+    /// Decimate the result to about this many triangles in the same item
+    /// (replaces an sdf + decimate + hide_part triple; the coarser meshing
+    /// a decimate needs is picked for you).
+    #[serde(default)]
+    tris: Option<u32>,
+    /// With tris: bake the dense surface into normal + height maps.
+    #[serde(default)]
+    bake: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2153,9 +2362,10 @@ pub struct PlaceSpec {
     on: String,
     /// Where to slide first, across the travel direction; default: where
     /// they are. Down/up: [x, z] (footprint centre). Back/front: [x, y].
-    /// Left/right: [z, y].
+    /// Left/right: [z, y]. Or an anchor whose cross-axis coordinates are
+    /// taken: a body joint ("cat:paw_l") or a box anchor ("desk:top-front").
     #[serde(default)]
-    at: Option<[f32; 2]>,
+    at: Option<crate::PlaceAt>,
     /// Clearance left from the surface. Default 0 (touching).
     #[serde(default)]
     gap: Option<f32>,
@@ -2834,6 +3044,8 @@ pub enum OpSpec {
     Deform(DeformSpec),
     Sdf(SdfSpec),
     Skin(SkinSpec),
+    Body(BodySpec),
+    Silhouette(SilhouetteSpec),
     Smooth(SmoothSpec),
     Decimate(DecimateSpec),
     Shell(ShellSpec),
@@ -2890,6 +3102,8 @@ pub const OP_TYPES: &[&str] = &[
     "deform",
     "sdf",
     "skin",
+    "body",
+    "silhouette",
     "smooth",
     "decimate",
     "shell",
@@ -3659,6 +3873,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     }
                     (None, _) => None,
                 },
+                ..Default::default()
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Deform {
@@ -3687,6 +3902,8 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map(WarpSpec::into_deform)
                     .collect(),
                 resolution: s.resolution,
+                tris: s.tris,
+                bake: s.bake.unwrap_or(false),
                 target_tris: None,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
@@ -3721,10 +3938,79 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map(WarpSpec::into_deform)
                     .collect(),
                 resolution: s.resolution,
+                tris: s.tris,
+                bake: s.bake.unwrap_or(false),
                 target_tris: None,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Skin {
+                name: s.name,
+                def: Box::new(def),
+            })
+        }
+        "body" => {
+            let s: BodySpec = de(&ctx, &body)?;
+            let def = crate::body::BodyDef {
+                preset: s.preset,
+                height: s.height,
+                head_ratio: s.head_ratio,
+                build: s.build,
+                leg_length: s.leg_length,
+                tail: s.tail,
+                snout: s.snout,
+                joints: s.joints.unwrap_or_default(),
+                blend: s.blend,
+                resolution: s.resolution,
+                tris: s.tris,
+                bake: s.bake.unwrap_or(false),
+                rig: s.rig,
+                bind: s.bind,
+                warps: s
+                    .warps
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(WarpSpec::into_deform)
+                    .collect(),
+                target_tris: None,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Body {
+                name: s.name,
+                def: Box::new(def),
+            })
+        }
+        "silhouette" => {
+            let s: SilhouetteSpec = de(&ctx, &body)?;
+            if s.from_reference.is_some() {
+                return Err(format!(
+                    "{ctx}: from_reference: traced by the server from a project image (apply_ops); give the profiles as points here"
+                ));
+            }
+            let smooth = s.smooth == Some(true);
+            let need = |v: Option<Vec<Vec<[f32; 2]>>>, f: &str| {
+                v.ok_or_else(|| {
+                    format!(
+                        "{ctx}: {f}: required (a closed outline: side [[z, y], ...], top [[x, z], ...]), or from_reference"
+                    )
+                })
+            };
+            let ring =
+                |a, f: &str| sil_rings(a, smooth, s.round).map_err(|e| format!("{ctx}: {f}: {e}"));
+            let def = crate::silhouette::SilhouetteDef {
+                side: need(ring(s.side, "side")?, "side")?,
+                top: need(ring(s.top, "top")?, "top")?,
+                front: ring(s.front, "front")?,
+                blend: s.blend,
+                resolution: s.resolution,
+                tris: s.tris,
+                bake: s.bake.unwrap_or(false),
+                translation: s.translation,
+                rotation: rot(&ctx, &s.rotation)?.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                target_tris: None,
+                references: s.references,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Silhouette {
                 name: s.name,
                 def: Box::new(def),
             })
@@ -4503,6 +4789,17 @@ pub fn example(ty: &str) -> Option<Value> {
                 ["body", [0, 0.42, 0, 0.1]]
             ], "mirror": "x"})
         }
+        "body" => {
+            json!({"type": "body", "name": "cat", "preset": "quadruped", "height": 0.25, "tail": 1.2,
+                "joints": {"head": {"scale": 1.1}}, "tris": 6000})
+        }
+        "silhouette" => {
+            json!({"type": "silhouette", "name": "car_body", "smooth": true, "blend": 0.12,
+                "side": [[2.2, 0.3], [2.25, 0.75], [1.0, 0.85], [0.4, 1.4], [-1.2, 1.4], [-2.2, 0.95], [-2.2, 0.3]],
+                "top": [[-0.9, 2.2], [0.9, 2.2], [0.95, -2.2], [-0.95, -2.2]],
+                "front": [[-0.95, 0.3], [0.95, 0.3], [0.95, 0.9], [0.6, 1.4], [-0.6, 1.4], [-0.95, 0.9]],
+                "tris": 6000})
+        }
         "decimate" => {
             json!({"type": "decimate", "name": "statue", "input": "statue_hi", "ratio": 0.05, "bake": true})
         }
@@ -4623,6 +4920,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "deform" => schemars::schema_for!(DeformSpec),
         "sdf" => schemars::schema_for!(SdfSpec),
         "skin" => schemars::schema_for!(SkinSpec),
+        "body" => schemars::schema_for!(BodySpec),
+        "silhouette" => schemars::schema_for!(SilhouetteSpec),
         "smooth" => schemars::schema_for!(SmoothSpec),
         "decimate" => schemars::schema_for!(DecimateSpec),
         "shell" => schemars::schema_for!(ShellSpec),

@@ -322,3 +322,27 @@ fn collisions_on_200_crowded_parts_stay_fast() {
     budget("verify collisions, 201 crowded parts", took, 3000);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A default `body` biped (skin of ~30 oval joints, meshed at full detail)
+/// derives quickly; with `tris` it is meshed only as finely as it needs.
+#[test]
+fn a_default_body_biped_builds_fast() {
+    let mut s = Session::default();
+    let _ = s.new_model("person");
+    let t = Instant::now();
+    apply(
+        &mut s,
+        vec![json!({"type": "body", "name": "person", "preset": "biped"})],
+    );
+    budget("body biped (full detail)", t.elapsed(), BIPED_MS);
+    let t = Instant::now();
+    apply(
+        &mut s,
+        vec![
+            json!({"type": "body", "name": "light", "preset": "biped", "height": 1.6, "tris": 4000}),
+        ],
+    );
+    budget("body biped, tris 4000", t.elapsed(), BIPED_MS);
+}
+
+const BIPED_MS: u64 = 6000;

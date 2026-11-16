@@ -55,7 +55,14 @@ pub(crate) fn mode_available(model: &Model, mode: Mode) -> Result<(), &'static s
     let has = |f: fn(&Op) -> bool| model.ops.iter().any(f);
     match mode {
         Mode::Model | Mode::Material => Ok(()),
-        Mode::Animate if has(|o| matches!(o, Op::Skeleton { .. })) => Ok(()),
+        Mode::Animate
+            if has(|o| {
+                matches!(o, Op::Skeleton { .. })
+                    || matches!(o, Op::Body { def, .. } if def.rig != Some(false))
+            }) =>
+        {
+            Ok(())
+        }
         Mode::Animate => Err("no skeleton in this document"),
         Mode::Map if has(|o| matches!(o, Op::Terrain { .. } | Op::Marker { .. })) => Ok(()),
         Mode::Map => Err("no terrain or markers in this document"),

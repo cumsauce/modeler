@@ -73,6 +73,12 @@ pub(crate) struct InspectArgs {
     /// call (measure, section, mass, thickness) run on the posed model.
     #[serde(default)]
     pub(crate) pose: Option<PoseArg>,
+    /// Figures with joints (`body` parts): {"parts"?: [...]}. Joint-to-joint
+    /// lengths along each bone chain and ratios (biped: head / height,
+    /// leg / height, arm span / height; quadruped: foreleg, body, tail and
+    /// head against the shoulder height).
+    #[serde(default)]
+    pub(crate) proportions: Option<ThicknessArg>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -457,6 +463,14 @@ pub(crate) enum FocusArg {
     Many(Vec<String>),
 }
 
+/// One reference image, or several (front, side, top) compared in one call.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum ReferencesArg {
+    One(ReferenceArg),
+    Many(Vec<ReferenceArg>),
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReferenceArg {
@@ -504,9 +518,12 @@ pub(crate) struct AgentViewsArgs {
     /// project; the subject is its opaque pixels, or the pixels contrasting
     /// with its border). Fitted to the model's silhouette box (same height,
     /// same centre); returns the overlay (magenta model only, cyan
-    /// reference only, grey both) and the IoU.
+    /// reference only, grey both), the IoU, and where the model is
+    /// wider / narrower (5 horizontal bands) or taller / shorter (5 vertical
+    /// bands) than the reference, in meters and %. A list of {image, view}
+    /// compares several views (front, side, top) in one call.
     #[serde(default)]
-    pub(crate) reference: Option<ReferenceArg>,
+    pub(crate) reference: Option<ReferencesArg>,
     /// Tile all views into ONE labelled image (row-major). Default true when
     /// there is more than one view; false returns one image per view.
     #[serde(default)]

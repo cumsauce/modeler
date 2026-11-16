@@ -62,6 +62,163 @@ pub struct Deform {
     /// the surface (graph embedded when the item is applied).
     #[serde(default, skip_serializing_if = "none")]
     pub pbr: Option<crate::material::pbr::PbrRef>,
+    /// Local sculpt warps (sdf / skin / body only): the centre, a point or
+    /// an anchor (a joint name, or "part:top" / "part:joint").
+    #[serde(default, skip_serializing_if = "none")]
+    pub at: Option<WarpAt>,
+    /// Local warps: the radius of influence, meters (zero effect outside).
+    #[serde(default, skip_serializing_if = "none")]
+    pub radius: Option<f32>,
+    /// Local warps: "smooth" (default), "linear" or "sharp".
+    #[serde(default, skip_serializing_if = "none")]
+    pub falloff: Option<String>,
+    /// push: the direction the surface moves (normalized).
+    #[serde(default, skip_serializing_if = "none")]
+    pub direction: Option<[f32; 3]>,
+    /// flatten: the normal of the plane through `at`.
+    #[serde(default, skip_serializing_if = "none")]
+    pub normal: Option<[f32; 3]>,
+    /// smooth: the blur kernel's reach, meters (default radius / 3).
+    #[serde(default, skip_serializing_if = "none")]
+    pub size: Option<f32>,
+    /// Local warps under the field's `mirror`: true (default) acts on both
+    /// sides (the centre folded onto the mirrored side), false only where
+    /// `at` is (applied before the fold).
+    #[serde(default, skip_serializing_if = "none")]
+    pub mirror: Option<bool>,
+}
+
+/// Where a local warp is centred: a point, or an anchor name resolved when
+/// the field is built.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum WarpAt {
+    Point([f32; 3]),
+    Anchor(String),
+}
+
+/// Field warps that act only near a point (sdf / skin / body `warps`).
+pub const LOCAL_MODES: &[&str] = &["inflate", "push", "pinch", "flatten", "smooth"];
+
+impl Deform {
+    /// Checks a local sculpt warp's fields.
+    pub fn validate_local(&self) -> Result<(), String> {
+        let m = self.mode.as_str();
+        if self.at.is_none() {
+            return Err(format!("at: {m} needs a centre (a point or an anchor)"));
+        }
+        if !self.radius.is_some_and(|r| r.is_finite() && r > 0.0) {
+            return Err(format!("radius: {m} needs a radius > 0 meters"));
+        }
+        if let Some(f) = &self.falloff
+            && !["smooth", "linear", "sharp"].contains(&f.as_str())
+        {
+            return Err(format!("falloff: smooth, linear or sharp, got `{f}`"));
+        }
+        if let Some(a) = self.amount
+            && !a.is_finite()
+        {
+            return Err(format!("amount: must be a number, got {a}"));
+        }
+        match m {
+            "inflate" | "push" if self.amount.is_none() => {
+                return Err(format!("amount: {m} needs an amount in meters"));
+            }
+            "pinch" | "flatten" | "smooth"
+                if self.amount.is_some_and(|a| !(0.0..=1.0).contains(&a)) =>
+            {
+                return Err(format!("amount: {m} takes 0..1"));
+            }
+            _ => {}
+        }
+        let unit = |v: Option<[f32; 3]>, f: &str, need: bool| -> Result<(), String> {
+            match v {
+                Some(d) if Vec3::from(d).length() > 1e-6 && d.iter().all(|x| x.is_finite()) => {
+                    Ok(())
+                }
+                Some(d) => Err(format!("{f}: a non-zero direction, got {d:?}")),
+                None if need => Err(format!("{f}: {m} needs a direction [x, y, z]")),
+                None => Ok(()),
+            }
+        };
+        if let Some(k) = self.size {
+            if m != "smooth" {
+                return Err("size: only for smooth (the blur kernel)".into());
+            }
+            if !(k.is_finite() && k > 0.0) {
+                return Err(format!("size: the kernel reach in meters > 0, got {k}"));
+            }
+        }
+        unit(self.direction, "direction", m == "push")?;
+        unit(self.normal, "normal", m == "flatten")?;
+        if self.direction.is_some() && m != "push" {
+            return Err("direction: only for push".into());
+        }
+        if self.normal.is_some() && m != "flatten" {
+            return Err("normal: only for flatten".into());
+        }
+        for (f, on) in [
+            ("axis", self.axis.is_some()),
+            ("degrees", self.degrees.is_some()),
+            ("toward", self.toward.is_some()),
+            ("scale_end", self.scale_end.is_some()),
+            ("power", self.power.is_some()),
+            ("scale", self.scale.is_some()),
+            ("octaves", self.octaves.is_some()),
+            ("seed", self.seed.is_some()),
+            ("noise", self.noise.is_some()),
+        ] {
+            if on {
+                return Err(format!(
+                    "{f}: does not apply to {m} (fields: at, radius, amount, falloff{})",
+                    match m {
+                        "push" => ", direction",
+                        "flatten" => ", normal",
+                        _ => "",
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The local warp's weight at distance `d` from its centre: 1 at the
+    /// centre, 0 at and beyond `radius`.
+    /// The steepest slope of the falloff, per unit of d / radius.
+    pub fn falloff_slope(&self) -> f32 {
+        match self.falloff.as_deref() {
+            Some("linear") => 1.0,
+            Some("sharp") => 2.0,
+            _ => 1.5,
+        }
+    }
+
+    /// sup over d of w(d) + d |w'(d)| (the radial stretch of a scaling by
+    /// the weight): bounds the gradient of pinch and flatten maps.
+    pub fn falloff_stretch(&self) -> f32 {
+        let r = self.radius.unwrap_or(1.0).max(1e-9);
+        let mut m = 0.0f32;
+        for i in 0..=256 {
+            let d = r * i as f32 / 256.0;
+            let h = r / 4096.0;
+            let slope = (self.local_weight(d) - self.local_weight(d + h)).abs() / h;
+            m = m.max(self.local_weight(d) + d * slope);
+        }
+        m
+    }
+
+    pub fn local_weight(&self, d: f32) -> f32 {
+        let r = self.radius.unwrap_or(1.0).max(1e-9);
+        if d >= r {
+            return 0.0;
+        }
+        let t = 1.0 - d / r;
+        match self.falloff.as_deref() {
+            Some("linear") => t,
+            Some("sharp") => t * t,
+            _ => t * t * (3.0 - 2.0 * t),
+        }
+    }
 }
 
 pub const MODES: &[&str] = &["displace", "bend", "twist", "taper", "material"];
@@ -93,10 +250,31 @@ impl Deform {
 
     /// Checks the fields that don't depend on the input.
     pub fn validate(&self) -> Result<(), String> {
+        if self.size.is_some() || self.mirror.is_some() {
+            return Err(format!(
+                "{}: only for local sculpt warps (sdf / skin / body warps)",
+                if self.size.is_some() {
+                    "size"
+                } else {
+                    "mirror"
+                }
+            ));
+        }
         if !MODES.contains(&self.mode.as_str()) {
             return Err(format!(
                 "mode: must be displace, bend, twist, taper or material, got `{}`",
                 self.mode
+            ));
+        }
+        if self.at.is_some()
+            || self.radius.is_some()
+            || self.falloff.is_some()
+            || self.direction.is_some()
+            || self.normal.is_some()
+        {
+            return Err(format!(
+                "at / radius / falloff / direction / normal: only for the local sculpt warps ({}) of sdf / skin / body",
+                LOCAL_MODES.join(", ")
             ));
         }
         let a = self.axis()?;
@@ -189,6 +367,17 @@ impl Deform {
         f("noise", self.noise.clone());
         f("detail", self.detail.map(|v| v.to_string()));
         f("pbr", self.pbr.as_ref().map(|r| r.material.clone()));
+        f(
+            "at",
+            self.at.as_ref().map(|a| match a {
+                WarpAt::Point(p) => format!("{p:?}"),
+                WarpAt::Anchor(n) => n.clone(),
+            }),
+        );
+        f("radius", self.radius.map(|v| v.to_string()));
+        f("falloff", self.falloff.clone());
+        f("direction", self.direction.map(|v| format!("{v:?}")));
+        f("normal", self.normal.map(|v| format!("{v:?}")));
         s
     }
 }

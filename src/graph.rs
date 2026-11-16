@@ -63,6 +63,11 @@ fn op_key(op: &Op, inputs: &[u64]) -> Result<u64, ModelerError> {
     let mut w = HashWriter(DefaultHasher::new());
     serde_json::to_writer(&mut w, op).map_err(|e| e.to_string())?;
     inputs.hash(&mut w.0);
+    if let Op::Silhouette { def, .. } = op
+        && !def.references.is_empty()
+    {
+        def.live_key().hash(&mut w.0);
+    }
     Ok(std::hash::Hasher::finish(&w.0))
 }
 
@@ -122,6 +127,8 @@ fn with_mesh_hints(ops: &[Op]) -> std::borrow::Cow<'_, [Op]> {
         let (name, res) = match op {
             Op::Sdf { name, def } => (name, def.resolution),
             Op::Skin { name, def } => (name, def.resolution),
+            Op::Body { name, def } => (name, def.resolution),
+            Op::Silhouette { name, def } => (name, def.resolution),
             _ => continue,
         };
         if res.is_some() {
@@ -176,6 +183,8 @@ fn with_mesh_hints(ops: &[Op]) -> std::borrow::Cow<'_, [Op]> {
         match &mut v[i] {
             Op::Sdf { def, .. } => def.target_tris = Some(t),
             Op::Skin { def, .. } => def.target_tris = Some(t),
+            Op::Body { def, .. } => def.target_tris = Some(t),
+            Op::Silhouette { def, .. } => def.target_tris = Some(t),
             _ => {}
         }
     }
@@ -213,6 +222,8 @@ fn slow(op: &Op) -> bool {
         op,
         Op::Sdf { .. }
             | Op::Skin { .. }
+            | Op::Body { .. }
+            | Op::Silhouette { .. }
             | Op::Blob { .. }
             | Op::Decimate { .. }
             | Op::Deform { .. }
@@ -439,7 +450,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 move_name,
                 parts,
                 on,
-                *at,
+                at.as_ref(),
                 gap.unwrap_or(0.0),
                 toward.as_deref().unwrap_or("down"),
                 *each,
@@ -563,7 +574,7 @@ fn place_on(
     move_name: &str,
     patterns: &[String],
     on: &str,
-    at: Option<[f32; 2]>,
+    at: Option<&crate::PlaceAt>,
     gap: f32,
     toward: &str,
     each: bool,
@@ -585,6 +596,15 @@ fn place_on(
     };
     let mut d = Vec3::ZERO;
     d[k] = sign;
+    let at = match at {
+        None => None,
+        Some(crate::PlaceAt::Xy(a)) => Some(*a),
+        Some(crate::PlaceAt::Anchor(a)) => {
+            let p = place_anchor(named, a)
+                .map_err(|e| ModelerError::Invalid(format!("place `{move_name}`: at: {e}")))?;
+            Some([p[u], p[w]])
+        }
+    };
     let hit = |n: &str| n != on && patterns.iter().any(|p| crate::name_matches(p, n));
     let Some(support) = named.iter().find(|(n, _)| n == on).map(|(_, p)| p.clone()) else {
         return Err(format!("place `{move_name}`: no part `{on}` to place on").into());
@@ -609,6 +629,26 @@ fn place_on(
         )?;
     }
     Ok(())
+}
+
+/// A `place` `at` anchor: `part:joint` (a body joint) or `part:words`
+/// (an anchor on the part's world box, as move pivots).
+fn place_anchor(named: &Named, a: &str) -> Result<Vec3, String> {
+    let Some((part, what)) = a.rsplit_once(':') else {
+        return Err(format!(
+            "`{a}` is not an anchor: use [a, b] or \"part:joint\" / \"part:top-front\""
+        ));
+    };
+    let Some(p) = named.iter().find(|(n, _)| n == part).map(|(_, p)| p) else {
+        return Err(format!("no part `{part}` for anchor `{a}`"));
+    };
+    if let Some(j) = p.joint(what) {
+        return Ok(j);
+    }
+    let (lo, hi) = p.bounds();
+    crate::commands::anchor_point(what, lo, hi)
+        .map(Vec3::from)
+        .map_err(|e| format!("`{a}`: not a joint of `{part}` and {e}"))
 }
 
 /// One rigid group of [`place_on`]: slide to `at`, then travel along `d`
@@ -1090,7 +1130,28 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             upsert(named, name, part);
         }
         Op::Skin { name, def } => {
-            let part = crate::sdf::skin(name, def)?;
+            let look = |n: &str| lookup_shared(named, n);
+            let part = crate::sdf::skin(name, def, &look)?;
+            upsert(named, name, part);
+        }
+        Op::Body { name, def } => {
+            let look = |n: &str| lookup_shared(named, n);
+            let part = crate::body::build(name, def, &look)?;
+            upsert(named, name, part);
+        }
+        Op::Silhouette { name, def } => {
+            let def = def.live();
+            def.validate()
+                .map_err(|e| ModelerError::Invalid(format!("silhouette `{name}`: {e}")))?;
+            let none = |n: &str| -> Result<Arc<Part>, ModelerError> {
+                Err(ModelerError::Invalid(format!(
+                    "silhouette reads no parts (`{n}`)"
+                )))
+            };
+            let part = crate::sdf::build(name, &def.to_sdf(), &none).map_err(|e| match e {
+                ModelerError::Csg(m) => ModelerError::Csg(m.replacen("sdf `", "silhouette `", 1)),
+                o => o,
+            })?;
             upsert(named, name, part);
         }
         Op::Smooth { name, input, def } => {
@@ -1583,6 +1644,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Blob { name, .. }
         | Op::Sdf { name, .. }
         | Op::Skin { name, .. }
+        | Op::Body { name, .. }
+        | Op::Silhouette { name, .. }
         | Op::Smooth { name, .. }
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
@@ -1703,6 +1766,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Blob { .. } => "blob",
         Op::Sdf { .. } => "sdf",
         Op::Skin { .. } => "skin",
+        Op::Body { .. } => "body",
+        Op::Silhouette { .. } => "silhouette",
         Op::Smooth { .. } => "smooth",
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
@@ -1771,7 +1836,9 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Round { input, .. } => vec![input],
         Op::Deform { input, .. } => vec![input],
         Op::Sdf { def, .. } => def.reads(),
-        Op::Skin { .. } => Vec::new(),
+        Op::Skin { def, .. } => crate::sdf::warp_reads(&def.warps),
+        Op::Body { def, .. } => crate::sdf::warp_reads(&def.warps),
+        Op::Silhouette { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
         Op::Shell { input, .. } | Op::Split { input, .. } | Op::Panel { input, .. } => {
             vec![input]
@@ -1828,7 +1895,12 @@ fn frame_of(
     let base = lookup(named, frame_part(frame)).map_err(|e| format!("{name}: frame: {e}"))?;
     let r = quat_of(base.rotation);
     let mut origin = Vec3::ZERO;
-    if let Some((_, words)) = frame.split_once(':') {
+    if let Some(j) = frame
+        .split_once(':')
+        .and_then(|(_, w)| base.joints.as_ref()?.iter().find(|(n, _)| n == w))
+    {
+        origin = Vec3::from(j.1) * Vec3::from(base.scale);
+    } else if let Some((_, words)) = frame.split_once(':') {
         let (lo, hi) = base
             .verts
             .iter()
@@ -2269,6 +2341,10 @@ pub fn describe(ops: &[Op]) -> String {
             }
             Op::Sdf { name, def } => format!("#{i} sdf `{name}` {}", def.summary()),
             Op::Skin { name, def } => format!("#{i} skin `{name}` {}", def.summary()),
+            Op::Body { name, def } => format!("#{i} body `{name}` {}", def.summary()),
+            Op::Silhouette { name, def } => {
+                format!("#{i} silhouette `{name}` {}", def.summary())
+            }
             Op::Smooth { name, input, def } => {
                 format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
             }

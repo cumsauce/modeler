@@ -181,92 +181,163 @@ impl Tools {
     }
 
     /// `agent_views reference`: the silhouette in an orthographic view,
-    /// compared with a reference image from the call's project.
+    /// compared with one or more reference images from the call's project.
     async fn reference_view(
         &self,
-        r: ReferenceArg,
+        refs: ReferencesArg,
         width: Option<u32>,
         height: Option<u32>,
         focus: Option<Vec<String>>,
         clip: Option<String>,
         time: Option<f32>,
     ) -> Result<CallToolResult, ErrorData> {
-        let view_name = r.view.unwrap_or_else(|| "front".into());
-        if !matches!(
-            view_name.as_str(),
-            "front" | "back" | "left" | "right" | "top" | "bottom"
-        ) {
+        let refs = match refs {
+            ReferencesArg::One(r) => vec![r],
+            ReferencesArg::Many(v) => v,
+        };
+        if refs.is_empty() || refs.len() > 4 {
             return Err(ErrorData::invalid_params(
-                format!(
-                    "reference.view: `{view_name}`: an orthographic view (front, back, left, right, top, bottom)"
-                ),
+                "reference: one {image, view} or a list of 1..4",
                 None,
             ));
         }
-        let view = parse_agent_view(&view_name).map_err(|e| ErrorData::invalid_params(e, None))?;
-        // Read the file inside the call (its project is set there).
+        // World size of what the views frame (meters per pixel).
         let (tx, rx) = std::sync::mpsc::channel();
-        let file = r.image.clone();
-        self.run(move |_| {
-            let project = modeler::catalog::project_root();
-            let got = super::ops_file::resolve_as(project.as_deref(), &file, "reference.image")
-                .and_then(|p| {
-                    std::fs::read(&p).map_err(|e| format!("reference.image `{file}`: {e}"))
-                });
-            let _ = tx.send(got);
+        let names = focus.clone();
+        self.run(move |s| {
+            let b = match &names {
+                Some(n) => s.model.bounds_of(n),
+                None => s.model.bounds(),
+            };
+            let _ = tx.send(b);
             Ok(String::new())
         })
         .await?;
-        let bytes = rx
-            .try_recv()
-            .map_err(|_| ErrorData::internal_error("reference: read did not finish", None))?
-            .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let reference = modeler::raster::decode_image(&bytes).map_err(|e| {
-            ErrorData::invalid_params(format!("reference.image `{}`: {e}", r.image), None)
-        })?;
+        let bounds = rx.try_recv().ok().flatten();
         let (w0, h0) = (
             width.unwrap_or(800).clamp(64, 2048),
             height.unwrap_or(800).clamp(64, 2048),
         );
-        let (w, h) = fit_budget(w0, h0, 2, 1);
-        let style = ShotStyle {
-            silhouette: true,
-            pose: time.map(|t| (clip.clone(), t)),
-            ..ShotStyle::default()
-        };
-        let (png, _) = self.agent_render(view, w, h, focus, style).await?;
-        let shot = decode_png(&png).map_err(|e| ErrorData::internal_error(e, None))?;
-        let mask = modeler::raster::silhouette_mask(&shot);
-        let d = modeler::raster::compare_silhouettes(&mask, shot.w, shot.h, &reference)
-            .map_err(|e| ErrorData::invalid_params(e, None))?;
-        let overlay = d
-            .image
-            .to_png()
-            .map_err(|e| ErrorData::internal_error(e, None))?;
-        let shots = vec![
-            (png, format!("{view_name} silhouette")),
-            (overlay, format!("vs {}", r.image)),
-        ];
-        let grid = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
-        let mut text = vec![format!(
-            "reference `{}` vs the {view_name} silhouette: IoU {:.1}% (1: the silhouette, 2: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
-            r.image,
-            d.iou * 100.0,
-            d.model_only * 100.0,
-            d.reference_only * 100.0
-        )];
-        let (ra, ma) = d.aspects;
-        if (ra / ma - 1.0).abs() > 0.05 {
+        let (w, h) = fit_budget(w0, h0, 2, refs.len() as u32);
+        let mut shots = Vec::new();
+        let mut text = Vec::new();
+        let mut json = Vec::new();
+        for r in refs {
+            let view_name = r.view.unwrap_or_else(|| "front".into());
+            if !matches!(
+                view_name.as_str(),
+                "front" | "back" | "left" | "right" | "top" | "bottom"
+            ) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "reference.view: `{view_name}`: an orthographic view (front, back, left, right, top, bottom)"
+                    ),
+                    None,
+                ));
+            }
+            let view =
+                parse_agent_view(&view_name).map_err(|e| ErrorData::invalid_params(e, None))?;
+            // Read the file inside the call (its project is set there).
+            let (tx, rx) = std::sync::mpsc::channel();
+            let file = r.image.clone();
+            self.run(move |_| {
+                let project = modeler::catalog::project_root();
+                let got = super::ops_file::resolve_as(project.as_deref(), &file, "reference.image")
+                    .and_then(|p| {
+                        std::fs::read(&p).map_err(|e| format!("reference.image `{file}`: {e}"))
+                    });
+                let _ = tx.send(got);
+                Ok(String::new())
+            })
+            .await?;
+            let bytes = rx
+                .try_recv()
+                .map_err(|_| ErrorData::internal_error("reference: read did not finish", None))?
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+            let reference = modeler::raster::decode_image(&bytes).map_err(|e| {
+                ErrorData::invalid_params(format!("reference.image `{}`: {e}", r.image), None)
+            })?;
+            let style = ShotStyle {
+                silhouette: true,
+                pose: time.map(|t| (clip.clone(), t)),
+                ..ShotStyle::default()
+            };
+            let (png, _) = self.agent_render(view, w, h, focus.clone(), style).await?;
+            let shot = decode_png(&png).map_err(|e| ErrorData::internal_error(e, None))?;
+            let mask = modeler::raster::silhouette_mask(&shot);
+            let d = modeler::raster::compare_silhouettes(&mask, shot.w, shot.h, &reference)
+                .map_err(|e| ErrorData::invalid_params(e, None))?;
+            // Meters per pixel: the model's world extent across the view
+            // over its silhouette's pixel extent (the longer side).
+            let m_per_px = match (bounds, modeler::raster::mask_box(&mask, shot.w)) {
+                (Some((lo, hi)), Some(bb)) => {
+                    let e = hi - lo;
+                    let (ex, ey) = match view_name.as_str() {
+                        "left" | "right" => (e.z, e.y),
+                        "top" | "bottom" => (e.x, e.z),
+                        _ => (e.x, e.y),
+                    };
+                    let (px, py) = ((bb[2] - bb[0] + 1) as f64, (bb[3] - bb[1] + 1) as f64);
+                    if px >= py {
+                        ex as f64 / px
+                    } else {
+                        ey as f64 / py
+                    }
+                }
+                _ => 0.0,
+            };
+            let bands =
+                modeler::raster::band_deviations(&mask, &d.fitted, shot.w, shot.h, m_per_px);
+            let top = modeler::raster::top_deviations(&bands, m_per_px, 3.0, 5);
+            let overlay = d
+                .image
+                .to_png()
+                .map_err(|e| ErrorData::internal_error(e, None))?;
+            let n = shots.len();
+            shots.push((png, format!("{view_name} silhouette")));
+            shots.push((overlay, format!("{view_name} vs {}", r.image)));
             text.push(format!(
-                "the reference's subject is {} than the model (width/height {ra:.2} vs {ma:.2}); fitted by {}",
-                if ra > ma { "wider" } else { "narrower" },
-                if ra > 1.5 { "width" } else { "height" }
+                "{view_name}: reference `{}`: IoU {:.1}% ({}: the silhouette, {}: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
+                r.image,
+                d.iou * 100.0,
+                n + 1,
+                n + 2,
+                d.model_only * 100.0,
+                d.reference_only * 100.0
             ));
+            let (ra, ma) = d.aspects;
+            if (ra / ma - 1.0).abs() > 0.05 {
+                text.push(format!(
+                    "{view_name}: the reference's subject is {} than the model (width/height {ra:.2} vs {ma:.2}); fitted by {}",
+                    if ra > ma { "wider" } else { "narrower" },
+                    if ra > 1.5 { "width" } else { "height" }
+                ));
+            }
+            if top.is_empty() {
+                text.push(format!("{view_name}: no band deviates by 3% or more"));
+            }
+            for t in &top {
+                text.push(format!("{view_name}: {}", t.describe()));
+            }
+            json.push(serde_json::json!({
+                "view": view_name,
+                "image": r.image,
+                "iou": d.iou,
+                "model_only": d.model_only,
+                "reference_only": d.reference_only,
+                "aspects": {"reference": ra, "model": ma},
+                "meters_per_pixel": m_per_px,
+                "deviations": top,
+                "bands": bands,
+            }));
         }
-        Ok(CallToolResult::success(vec![
+        let grid = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
+        let mut res = CallToolResult::success(vec![
             Content::text(text.join("\n")),
             Content::image(B64.encode(grid), "image/png"),
-        ]))
+        ]);
+        res.structured_content = Some(serde_json::json!({ "references": json }));
+        Ok(res)
     }
 
     /// Visible, drawable part names in model order (the `ids` colour order).
@@ -1042,7 +1113,7 @@ Style::default()
     }
 
     /// Build or edit the model: an array of items, each tagged with a "type"
-    /// (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, smooth, decimate, split, round, deform, shell, panel, group, transform,
+    /// (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform,
     /// boolean, radial_array, linear_array, mirror, material, prefab,
     /// hide_part, show_part, rename, delete, tri_mesh, uvs, move, place,
     /// repeat, light, decal, collider, marker). Ops are upserts
@@ -1103,6 +1174,26 @@ Style::default()
             let from_file = batch.len();
             let inline = ops.len();
             batch.extend(ops);
+            // Silhouette outlines traced from project images become plain
+            // profiles before parsing (history records the points).
+            if batch
+                .iter()
+                .any(|v| v.to_string().contains("from_reference"))
+            {
+                let project = modeler::catalog::project_root();
+                let read = |file: &str| -> Result<Vec<u8>, String> {
+                    let p = super::ops_file::resolve_as(
+                        project.as_deref(),
+                        file,
+                        "from_reference.image",
+                    )?;
+                    std::fs::read(&p).map_err(|e| format!("from_reference.image `{file}`: {e}"))
+                };
+                if let Err(msg) = modeler::silhouette::resolve_references(&mut batch, &read) {
+                    let json = serde_json::json!({"ok": false, "error": msg});
+                    return Err((modeler::ModelerError::Invalid(msg), Some(json)));
+                }
+            }
             let dups = super::ops_file::duplicate_warnings(&batch, from_file);
             let text = match s.apply_values_as(params, batch, full) {
                 Ok(t) if dups.is_empty() => t,
@@ -1578,6 +1669,7 @@ Style::default()
             mass,
             thickness,
             pose,
+            proportions,
         }): Parameters<InspectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if measure.is_none()
@@ -1585,9 +1677,10 @@ Style::default()
             && mass.is_none()
             && thickness.is_none()
             && pose.is_none()
+            && proportions.is_none()
         {
             return Err(ErrorData::invalid_params(
-                "give measure, section, mass, thickness and/or pose, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
+                "give measure, section, mass, thickness, proportions and/or pose, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
                 None,
             ));
         }
@@ -1646,6 +1739,12 @@ Style::default()
                     let (t, j) = modeler::organic::thickness_report(model, t.parts.as_deref());
                     text.push(t);
                     json.insert("thickness".into(), j);
+                }
+                if let Some(pr) = proportions {
+                    let (t, j) = modeler::inspect::proportions(model, pr.parts.as_deref())
+                        .map_err(|e| (e.into(), None))?;
+                    text.push(t);
+                    json.insert("proportions".into(), j);
                 }
                 Ok((text.join("\n"), Some(serde_json::Value::Object(json))))
             })
@@ -1936,8 +2035,8 @@ impl rmcp::ServerHandler for Tools {
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
 - The human's comments (annotations) are requests: scene_summary lists the open ones. When you have dealt with one, resolve it with add_annotation {resolve: id, text: what you did}; don't delete it.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
-- Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
+- Don't place things by arithmetic: place {parts, on, at: [x, z] or an anchor \"desk:top-front\"} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Signs and labels: uvs projection \"face\" (alias \"label\") stretches one upright, unmirrored image over each side of a part (planar now maps along the thinnest axis); a card material with an opacity cutout on such a closed plate draws single-sided (open sheets such as leaf cards stay double-sided). ops_file items apply first and inline ops after, so an inline item with the same type + name wins (the result warns about every op given twice). An empty repeat is a noted no-op.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
@@ -1947,13 +2046,14 @@ impl rmcp::ServerHandler for Tools {
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
-- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings; smooth: true makes the path a curve through a few control points, twist / scale_end taper it); loft skins a closed solid through sections that change shape and size ({sections: [{profile, y | at, scale?, rotation?}, ...], smooth: true} for a bottle, circle into square, blade; with a path, sections sit at t along it; scale 0 at an end makes a point); path_array copies a part along a path (name_0.., count or spacing, align: +x along the path, roll_step 90 for chain links; hide the source); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_angle/curl/fold/stalk, wood in name and leaves in name_leaves; leaves are cards by default (flat quads with uvs 0..1, leaf_cross for a crossed pair): give name_leaves a material_ops material with domain \"card\" whose output sets opacity in a leaf shape (an alpha cutout; AGENTS.md has a leaf), or several leaves per image with a bigger leaf_size for dense crowns; leaf_mode \"solid\" models closed blades in leaf_shape instead; terrain makes level ground: a closed noise-heightfield slab at real size (style hills/ridges/dunes/mesa/flat, size, height, scale, seed; flatten pads [{at: [x, z], radius}] level building plots, paths [{points, width, depth}] carve roads and rivers; place things onto it); scatter strews copies over a surface ({input: part | [parts] | [[set]] | \"inst.*\", on, count | density, seed, scale [min, max], rotate random_y/random/none, align 0..1, min_spacing, max_slope, region}: rocks, forests of lsystem trees; copies name_0.. sit on the surface, hide the source); hull = convex hull of parts; blob melts solids together with a smooth fillet (blend meters; op union/subtract/intersect; creatures, mushrooms); split cuts a solid by a plane {normal, point} into capped name_above / name_below (gap pushes them apart); round fillets/chamfers/smooths a solid's edges; deform reshapes a mesh: displace (noise along normals: amount, scale, seed, noise fbm/ridged = rocks, cliffs), twist/bend (degrees along axis, bend toward a direction) and taper (scale_end): horns = taper then bend, material (pbr: a procedural material's height becomes real relief: bark, scales, bricks); sdf models organic solids from analytic shapes (sphere, ellipsoid, box, capsule = rounded cone, cylinder, torus, chain of [x, y, z, r], part, group) joined in order by smooth union/subtract/intersect (blend), mirror: \"x\" to model one side, warps (twist/bend/taper/displace) on the whole field: creatures, mushrooms, bones; skin wraps a skeleton (chains of [x, y, z, radius] or joint names) in one smooth surface: tentacles, roots, hands; smooth relaxes (Taubin, no shrink), remeshes (even triangles of edge m) or subdivides (Catmull-Clark of a coarse cage, crease degrees keep edges); decimate lightens a dense part (ratio or tris; non-destructive: the input stays in the graph, hide it) and with bake: true writes the dense surface into the light part's normal and height maps; check organic parts with verify self_intersections / thickness, inspect thickness and agent_views style \"curvature\"; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
+- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings; smooth: true makes the path a curve through a few control points, twist / scale_end taper it); loft skins a closed solid through sections that change shape and size ({sections: [{profile, y | at, scale?, rotation?}, ...], smooth: true} for a bottle, circle into square, blade; with a path, sections sit at t along it; scale 0 at an end makes a point); path_array copies a part along a path (name_0.., count or spacing, align: +x along the path, roll_step 90 for chain links; hide the source); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_angle/curl/fold/stalk, wood in name and leaves in name_leaves; leaves are cards by default (flat quads with uvs 0..1, leaf_cross for a crossed pair): give name_leaves a material_ops material with domain \"card\" whose output sets opacity in a leaf shape (an alpha cutout; AGENTS.md has a leaf), or several leaves per image with a bigger leaf_size for dense crowns; leaf_mode \"solid\" models closed blades in leaf_shape instead; terrain makes level ground: a closed noise-heightfield slab at real size (style hills/ridges/dunes/mesa/flat, size, height, scale, seed; flatten pads [{at: [x, z], radius}] level building plots, paths [{points, width, depth}] carve roads and rivers; place things onto it); scatter strews copies over a surface ({input: part | [parts] | [[set]] | \"inst.*\", on, count | density, seed, scale [min, max], rotate random_y/random/none, align 0..1, min_spacing, max_slope, region}: rocks, forests of lsystem trees; copies name_0.. sit on the surface, hide the source); hull = convex hull of parts; blob melts solids together with a smooth fillet (blend meters; op union/subtract/intersect; creatures, mushrooms); split cuts a solid by a plane {normal, point} into capped name_above / name_below (gap pushes them apart); round fillets/chamfers/smooths a solid's edges; deform reshapes a mesh: displace (noise along normals: amount, scale, seed, noise fbm/ridged = rocks, cliffs), twist/bend (degrees along axis, bend toward a direction) and taper (scale_end): horns = taper then bend, material (pbr: a procedural material's height becomes real relief: bark, scales, bricks); sdf models organic solids from analytic shapes (sphere, ellipsoid, box, capsule = rounded cone, cylinder, torus, chain of [x, y, z, r], part, group) joined in order by smooth union/subtract/intersect (blend), mirror: \"x\" to model one side, warps (twist/bend/taper/displace) on the whole field, plus local sculpt warps on sdf / skin / body ({mode: inflate (amount m) | push (direction, amount) | pinch (0..1 toward at) | flatten (normal, 0..1 to the plane through at) | smooth (local blur), at: point or anchor (a joint name such as \"head\", \"part:top\"), radius, falloff}; zero effect outside radius; they never fold: push / pinch / flatten are capped (push about 0.53 x radius), so use a larger radius or several warps for more; under the item mirror they are symmetric unless the warp says mirror: false; smooth takes size, the blur reach): creatures, mushrooms, bones; silhouette {side [[z, y]], top [[x, z]], front? [[x, y]], smooth, round, blend} carves a solid from orthographic outlines (intersected extrusions, edges rounded by blend; a car body, a shoe, a gun), also an sdf shape {shape: \"silhouette\", side, top, front, round, at}; from_reference {image, view, height | size, flip?, regions?, holes?} traces an outline from a project PNG (front from +z, side / right from +x with image right = -z, left from -x, top = plan; a changed PNG re-traces on the next re-derive); skin wraps a skeleton (chains of [x, y, z, radius] or joint names) in one smooth surface: tentacles, roots, hands; chain / skin points may be ovals [x, y, z, [rx, ry], roll?] (rx sideways, ry along the tube's up, roll degrees; a sixth entry n makes a superellipse: 2 ellipse, 3-5 rounded box) so torsos, snouts and tails aren't round tubes; sdf / skin / body take tris: N (and bake) to decimate in the same item (no sdf + decimate + hide triple); body starts a creature or vehicle from a preset (biped 1.75 m, quadruped = a cat 0.25 m at the shoulder, bird, fish, serpent, car) sized by height, head_ratio, build, leg_length, tail, snout and per-joint {scale, offset} edits, standing on y = 0 facing +z: it brings a <name>_rig skeleton with the same joint names and an implicit smooth <name>_bind (a bind item on that rig replaces it; bind: false turns it off), and those names are anchors (\"cat:paw_l\") for move pivots, frames and skeleton heads; smooth relaxes (Taubin, no shrink), remeshes (even triangles of edge m) or subdivides (Catmull-Clark of a coarse cage, crease degrees keep edges); decimate lightens a dense part (ratio or tris; non-destructive: the input stays in the graph, hide it) and with bake: true writes the dense surface into the light part's normal and height maps; check organic parts with verify self_intersections / thickness, inspect thickness and agent_views style \"curvature\"; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
 - Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models (style number lint_boxy: 0 silences that). grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
-- inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not).
-- agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views; style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} compares the silhouette with a PNG (overlay + IoU). Look at an image after building.
+- Organic workflow: start from body or silhouette (or sdf / skin with oval sections), compare with agent_views reference in up to 3 views and read the band deviations, fix them with local warps or joint overrides, check style \"curvature\" and inspect proportions, then set tris (+ bake) last.
+- inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not); proportions {parts?} gives a body's bone-chain lengths and ratios (biped head/height ~0.133, leg/height, arm span/height).
+- agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views; style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} (or a list: front, side, top in one call) compares the silhouette with a PNG: overlay, IoU and the biggest band deviations (\"front: top 0-20%: model 14% wider (+3.1 cm)\"). Look at an image after building.
 - scatter places clutter where it belongs: near [parts] + near_distance (3D distance to their surfaces; along wall bases), edge_bias (corners, borders), clump {count, radius}, mask path / pad / not_path / not_pad and height [min, max] on terrain; scatter with decal {pbr, size} instead of input strews decals (cracks, stains, leaves).
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.

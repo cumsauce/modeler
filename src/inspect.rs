@@ -743,3 +743,299 @@ mod tests {
         assert!(!t.contains("`table`"), "{t}");
     }
 }
+
+/// `inspect proportions`: for every visible part with joints (a `body`),
+/// the joint-to-joint lengths along each bone chain and a few ratios that
+/// say whether the figure reads right (biped: head / height, leg / height,
+/// arm span / height; quadruped: leg, body and head against the shoulder
+/// height; others: length / height).
+pub fn proportions(
+    model: &Model,
+    only: Option<&[String]>,
+) -> Result<(String, serde_json::Value), String> {
+    let picked = |p: &Part| only.is_none_or(|o| o.iter().any(|n| crate::name_matches(n, &p.name)));
+    let mut text = Vec::new();
+    let mut rows = Vec::new();
+    for p in visible(model).filter(|p| picked(p) && p.joints.is_some()) {
+        let def = model.ops.iter().rev().find_map(|o| match o {
+            crate::Op::Body { name, def } if name == &p.name => Some(def.as_ref()),
+            _ => None,
+        });
+        let (t, j) = body_proportions(p, def);
+        text.push(t);
+        rows.push(j);
+    }
+    if rows.is_empty() {
+        return Err(match only {
+            Some(o) => format!(
+                "proportions: no visible part with joints matches {o:?} (only `body` parts have joints)"
+            ),
+            None => "proportions: no visible part has joints (make one with a `body` item)".into(),
+        });
+    }
+    Ok((text.join("\n"), serde_json::Value::Array(rows)))
+}
+
+fn body_proportions(p: &Part, def: Option<&crate::body::BodyDef>) -> (String, serde_json::Value) {
+    let names: Vec<String> = p
+        .joints
+        .iter()
+        .flat_map(|j| j.iter().map(|(n, _)| n.clone()))
+        .collect();
+    let at = |n: &str| p.joint(n);
+    let parents: BTreeMap<String, Option<String>> = def
+        .and_then(|d| crate::body::lower(d).ok())
+        .map(|l| l.joints.into_iter().map(|j| (j.name, j.parent)).collect())
+        .unwrap_or_default();
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for i in 0..p.verts.len() {
+        let v = p.world_vert(i);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let size = hi - lo;
+    let preset = def.map_or("body", |d| d.preset.as_str());
+    let height = size.y;
+    let mut text = format!(
+        "`{}` ({preset}): {} wide x {} tall x {} long, {} joints\n",
+        p.name,
+        fmt_len(size.x as f64),
+        fmt_len(size.y as f64),
+        fmt_len(size.z as f64),
+        names.len()
+    );
+    // Chains: runs of joints with one child each, from the root and from
+    // every branching joint.
+    let mut kids: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for n in &names {
+        if let Some(Some(par)) = parents.get(n) {
+            kids.entry(par.as_str()).or_default().push(n.as_str());
+        }
+    }
+    let len = |a: &str, b: &str| match (at(a), at(b)) {
+        (Some(x), Some(y)) => x.distance(y),
+        _ => 0.0,
+    };
+    let mut chains = Vec::new();
+    for n in &names {
+        let par = parents.get(n).cloned().flatten();
+        let one = |j: &str| kids.get(j).is_some_and(|k| k.len() == 1);
+        let start = match &par {
+            None => one(n),
+            Some(pp) => !one(pp),
+        };
+        if !start {
+            continue;
+        }
+        let mut list: Vec<&str> = match &par {
+            Some(pp) => vec![pp.as_str(), n.as_str()],
+            None => vec![n.as_str()],
+        };
+        let mut cur = n.as_str();
+        while let Some(k) = kids.get(cur).filter(|k| k.len() == 1) {
+            cur = k[0];
+            list.push(cur);
+        }
+        if list.len() < 2 {
+            continue;
+        }
+        let segs: Vec<f32> = list.windows(2).map(|w| len(w[0], w[1])).collect();
+        let total: f32 = segs.iter().sum();
+        text += &format!(
+            "- {}: {} (total {})\n",
+            list.join(" > "),
+            segs.iter()
+                .map(|s| fmt_len(*s as f64))
+                .collect::<Vec<_>>()
+                .join(", "),
+            fmt_len(total as f64)
+        );
+        chains.push(serde_json::json!({"joints": list, "lengths": segs, "total": total}));
+    }
+    let path = |js: &[&str]| -> Option<f32> {
+        let mut t = 0.0;
+        for w in js.windows(2) {
+            t += at(w[0])?.distance(at(w[1])?);
+        }
+        Some(t)
+    };
+    let mut ratios = serde_json::Map::new();
+    let mut ratio = |k: &str, v: Option<f32>, of: f32, note: &str| {
+        if let Some(v) = v.filter(|_| of > 1e-6) {
+            let r = v / of;
+            text += &format!("- {k}: {r:.3} ({}){note}\n", fmt_len(v as f64));
+            ratios.insert(k.into(), serde_json::json!(r));
+        }
+    };
+    match preset {
+        "biped" => {
+            // Head: crown down to the chin (the first surface above the
+            // neck straight under the jaw).
+            let chin = match (at("jaw"), at("neck"), at("head")) {
+                (Some(j), Some(n), Some(h)) => {
+                    let o = Vec3::new(j.x, n.y, j.z);
+                    first_hit_up(p, o, h.y).or(Some(j.y))
+                }
+                _ => None,
+            };
+            ratio(
+                "head/height",
+                chin.map(|c| hi.y - c),
+                height,
+                " (1/7.5 = 0.133 is a typical adult)",
+            );
+            let leg = path(&["thigh_l", "knee_l", "ankle_l"])
+                .zip(at("ankle_l"))
+                .map(|(l, a)| l + a.y - lo.y);
+            ratio(
+                "leg/height",
+                leg,
+                height,
+                " (hip joint to the floor; ~0.47-0.5)",
+            );
+            let arm = |s: &str| -> Option<f32> {
+                let j = |b: &str| format!("{b}_{s}");
+                let l = path(&[&j("shoulder"), &j("elbow"), &j("wrist"), &j("hand")])?;
+                let (w, h) = (at(&j("wrist"))?, at(&j("hand"))?);
+                Some(l + reach(p, h, (h - w).normalize_or_zero(), 0.1 * height))
+            };
+            let span = at("shoulder_l")
+                .zip(at("shoulder_r"))
+                .and_then(|(a, b)| Some(a.distance(b) + arm("l")? + arm("r")?));
+            ratio(
+                "arm span/height",
+                span,
+                height,
+                " (fingertip to fingertip, arms out; ~1.0)",
+            );
+        }
+        "quadruped" => {
+            // Shoulder height: the back's top over the chest joint (the
+            // overall height includes the raised head and tail).
+            let height = at("chest")
+                .map(|c| {
+                    let r = 0.03 * size.max_element();
+                    (0..p.verts.len())
+                        .map(|i| p.world_vert(i))
+                        .filter(|v| v.x.abs() < r && (v.z - c.z).abs() < r)
+                        .map(|v| v.y)
+                        .fold(c.y, f32::max)
+                        - lo.y
+                })
+                .unwrap_or(height);
+            ratio("shoulder height (m)", Some(height), 1.0, "");
+            let leg = path(&["shoulder_l", "elbow_l", "wrist_l", "paw_l"]);
+            ratio("foreleg/shoulder height", leg, height, "");
+            let body = at("hip").zip(at("chest")).map(|(a, b)| a.distance(b));
+            ratio("body (hip-chest)/shoulder height", body, height, "");
+            let tail = path(&["tail_1", "tail_2", "tail_3", "tail_4"]);
+            ratio("tail/shoulder height", tail, height, "");
+            let head = at("head").zip(at("snout")).map(|(a, b)| a.distance(b));
+            ratio("head (head-snout)/shoulder height", head, height, "");
+        }
+        _ => {
+            ratio("length/height", Some(size.z), height, "");
+            ratio("width/height", Some(size.x), height, "");
+        }
+    }
+    (
+        text.trim_end().to_string(),
+        serde_json::json!({"part": p.name, "preset": preset, "size": size.to_array(),
+            "chains": chains, "ratios": ratios}),
+    )
+}
+
+/// The lowest surface crossing straight up from `o`, below `max_y`.
+fn first_hit_up(p: &Part, o: Vec3, max_y: f32) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for t in p.indices.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|i| p.world_vert(i as usize));
+        // Barycentric test in xz, then the height there.
+        let d = (b.x - a.x) * (c.z - a.z) - (c.x - a.x) * (b.z - a.z);
+        if d.abs() < 1e-14 {
+            continue;
+        }
+        let u = ((o.x - a.x) * (c.z - a.z) - (c.x - a.x) * (o.z - a.z)) / d;
+        let v = ((b.x - a.x) * (o.z - a.z) - (o.x - a.x) * (b.z - a.z)) / d;
+        if u < 0.0 || v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let y = a.y + u * (b.y - a.y) + v * (c.y - a.y);
+        if y > o.y && y < max_y && best.is_none_or(|b| y < b) {
+            best = Some(y);
+        }
+    }
+    best
+}
+
+/// How far the surface reaches past `from` along `dir`, within `r`.
+fn reach(p: &Part, from: Vec3, dir: Vec3, r: f32) -> f32 {
+    (0..p.verts.len())
+        .map(|i| p.world_vert(i))
+        .filter(|v| v.distance(from) < r)
+        .map(|v| (v - from).dot(dir))
+        .fold(0.0, f32::max)
+}
+
+#[cfg(test)]
+mod proportion_tests {
+    #[test]
+    fn a_default_biped_has_a_head_of_about_one_in_seven_and_a_half() {
+        let ops = vec![crate::Op::Body {
+            name: "guy".into(),
+            def: Box::new(crate::body::BodyDef {
+                preset: "biped".into(),
+                ..Default::default()
+            }),
+        }];
+        let parts = crate::graph::evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
+        let model = crate::Model {
+            ops,
+            parts,
+            ..crate::Model::default()
+        };
+        let (t, j) = super::proportions(&model, None).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{t}");
+        let r = j[0]["ratios"]["head/height"].as_f64().unwrap_or(0.0);
+        assert!((r - 1.0 / 7.5).abs() < 0.02, "head/height {r}\n{t}");
+        assert!(
+            j[0]["chains"].as_array().is_some_and(|c| c.len() >= 5),
+            "{t}"
+        );
+        let span = j[0]["ratios"]["arm span/height"].as_f64().unwrap_or(0.0);
+        assert!((span - 1.0).abs() < 0.04, "arm span/height {span}\n{t}");
+    }
+
+    #[test]
+    fn a_default_quadruped_has_cat_proportions() {
+        let ops = vec![crate::Op::Body {
+            name: "cat".into(),
+            def: Box::new(crate::body::BodyDef {
+                preset: "quadruped".into(),
+                tris: Some(4000),
+                ..Default::default()
+            }),
+        }];
+        let parts = crate::graph::evaluate(&ops).unwrap_or_else(|e| panic!("{e}"));
+        let model = crate::Model {
+            ops,
+            parts,
+            ..crate::Model::default()
+        };
+        let (t, j) = super::proportions(&model, None).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{t}");
+        let r = |k: &str| j[0]["ratios"][k].as_f64().unwrap_or(-1.0);
+        // A domestic cat: forelegs about 0.85-0.95 of the shoulder height,
+        // hip to chest about 0.9, tail a little longer than the shoulder
+        // height, a short head.
+        for (k, lo, hi) in [
+            ("foreleg/shoulder height", 0.7, 1.0),
+            ("body (hip-chest)/shoulder height", 0.75, 1.1),
+            ("tail/shoulder height", 0.9, 1.5),
+            ("head (head-snout)/shoulder height", 0.12, 0.3),
+        ] {
+            let v = r(k);
+            assert!(v >= lo && v <= hi, "{k} {v} not in {lo}..{hi}\n{t}");
+        }
+    }
+}
