@@ -167,7 +167,7 @@ type, so there is no need to memorise field names.
 | `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
 | `clip` | name, skeleton, duration, tracks {bone: {rotate / translate / scale: keys or wave}}, [mirror {bone: {from, phase}}], [loop true], [interp smooth] |
 | `sway` | name, skeleton, [kind wind / spring], [over clip], [bones], [duration 4], [fps 30], wind: [direction], [strength], [gust], [flutter], [frequency], [seed]; spring: [stiffness], [damping], [gravity] |
-| `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters) |
+| `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters / face = one upright image per side, alias label; planar maps along the thinnest axis) |
 | `repeat` | var, count or values, items (a loop, expanded before anything else) |
 
 A `material` item's `name` may be a pattern (`"wall_*"`): it colours every
@@ -687,7 +687,8 @@ surfaces, not hundreds of scattered copies.
 - **Rounded primitives**: a `box`, `cylinder` or `wedge` primitive with
   `round: r` is built with every edge (a cylinder's rims) rounded by `r`,
   same outer size, `segments` arc steps per edge (4): a closed solid, ready
-  for booleans, and far cheaper than a `round` op. Nothing real has knife
+  for booleans, and far cheaper than a `round` op. `round: {"radius": r,
+  "segments"?: n}` works too; edge selection needs a `round` item. Nothing real has knife
   edges, so give boxes a few mm. A style can make it the default:
   `"defaults": {"primitive": {"round": "$bevel"}}` (other kinds ignore
   `round`).
@@ -728,11 +729,18 @@ surfaces, not hundreds of scattered copies.
   loop). Each copy is an ordinary item with its own template, so a later
   param change re-derives it. Two copies making the same part (same type and
   name) are an error naming the variable; an error inside a copy says which
-  value it came from (`[from repeat r=2]`).
+  value it came from (`[from repeat r=2]`). A repeat with empty `items`,
+  `count` 0 or empty `values` makes nothing (a `note:` in the result, not
+  an error).
 - **Prefabs as parts**: `{"type": "prefab", "name": "lamp1", "prefab": "lamp"}`
   instances a saved catalog model; its visible parts become `lamp1.pole`,
   `lamp1.shade`, ... and feed later ops like any part. The part list is
   captured when the item is applied; re-issue it after re-saving the prefab.
+- **`ops_file`**: a JSON array of items in a project file, applied
+  *before* the inline `ops`: the file is the base, inline items are tweaks,
+  so an inline item with the same type + name wins. Every op a call gives
+  more than once (same type + name, `material` items aside: they stack) is
+  a warning naming the op and the source (inline / ops_file) that won.
 - **Batches are atomic**: if any item fails, the whole call rolls back
   (the error says so) and the model is exactly as before. Items may read
   parts made later in the same batch.
@@ -1492,7 +1500,9 @@ work, and every material has its own history tree.
   shadows, needs no sorting), `"blend"` (see-through: glass, smoke, ghosts)
   or `"opaque"`. Default: mask when the opacity is nearly all 0 or 1, else
   blend. `double_sided` (default on for mask) draws both faces, so a card
-  shows from behind. Exports write glTF `alphaMode` MASK / BLEND,
+  shows from behind; on a closed solid (a sign plate with `uvs` `face`)
+  a mask cutout stays single-sided, so the back doesn't show through.
+  Exports write glTF `alphaMode` MASK / BLEND,
   `alphaCutoff` and `doubleSided`; a mask texture's mipmaps keep its
   coverage, so foliage doesn't thin out and vanish at a distance.
 - **Layers**: `output` takes `over: [{"output": "dirt_out", "mask":

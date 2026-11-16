@@ -1041,7 +1041,8 @@ Style::default()
     /// summary (parts added/changed/removed + warnings; summary: "full" for
     /// everything). Use describe_op(kind) for an example payload. A big
     /// generated batch can come from `ops_file` (a JSON array of items in a
-    /// file inside the project), applied after the inline `ops`.
+    /// file inside the project), applied before the inline `ops`: the file
+    /// is the base and inline items are tweaks that win over it.
     #[tool]
     async fn apply_ops(
         &self,
@@ -1073,27 +1074,31 @@ Style::default()
                     s.brief_json(text)
                 }
             };
-            // ops_file items come after the inline ones; the expanded items
-            // are what the batch (and so history) records.
-            let mut ops = ops;
-            let inline = ops.len();
+            // ops_file items come first and the inline ones after them, so
+            // an inline item with the same type + name (a fix) wins over the
+            // file's; the expanded items are what history records.
+            let mut batch = Vec::new();
             if let Some(file) = &ops_file {
                 let project = modeler::catalog::project_root();
                 match super::ops_file::read(project.as_deref(), file) {
-                    Ok(items) => ops.extend(items),
+                    Ok(items) => batch = items,
                     Err(msg) => {
                         let json = serde_json::json!({"ok": false, "error": msg});
                         return Err((modeler::ModelerError::Invalid(msg), Some(json)));
                     }
                 }
             }
-            let from_file = ops.len() - inline;
-            let text = match s.apply_values_as(params, ops, full) {
-                Ok(t) => t,
+            let from_file = batch.len();
+            let inline = ops.len();
+            batch.extend(ops);
+            let dups = super::ops_file::duplicate_warnings(&batch, from_file);
+            let text = match s.apply_values_as(params, batch, full) {
+                Ok(t) if dups.is_empty() => t,
+                Ok(t) => format!("{}\n{t}", dups.join("\n")),
                 Err(e) => {
                     let msg = match &ops_file {
                         Some(file) => {
-                            super::ops_file::locate_error(&e.to_string(), file, inline, from_file)
+                            super::ops_file::locate_error(&e.to_string(), file, from_file, inline)
                         }
                         None => e.to_string(),
                     };
@@ -1875,6 +1880,7 @@ impl rmcp::ServerHandler for Tools {
 - The human's comments (annotations) are requests: scene_summary lists the open ones. When you have dealt with one, resolve it with add_annotation {resolve: id, text: what you did}; don't delete it.
 - Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
 - Don't place things by arithmetic: place {parts, on, at: [x, z]} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
+- Signs and labels: uvs projection \"face\" (alias \"label\") stretches one upright, unmirrored image over each side of a part (planar now maps along the thinnest axis); a card material with an opacity cutout on such a closed plate draws single-sided (open sheets such as leaf cards stay double-sided). ops_file items apply first and inline ops after, so an inline item with the same type + name wins (the result warns about every op given twice). An empty repeat is a noted no-op.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Every model gets materials. Shape first, materials after: build and check the geometry, then make the materials (material_ops) and give each visible part a material item in a later apply_ops, preferably a procedural pbr one ({\"type\": \"material\", \"name\": part, \"pbr\": name}; the material must exist when the item is applied); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.

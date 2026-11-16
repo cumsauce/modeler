@@ -10,8 +10,10 @@ pub(crate) struct ApplyOpsArgs {
     #[serde(default)]
     pub(crate) ops: Vec<Value>,
     /// A JSON file inside the caller's project holding more items (the same
-    /// array `ops` takes), applied after the inline `ops`: for generated
+    /// array `ops` takes), applied before the inline `ops`: for generated
     /// batches too big to pass inline (hundreds of boxes, a big tri_mesh).
+    /// The file is the base: an inline item with the same type + name wins
+    /// over the file's (the result warns about every op given twice).
     /// Relative to the project; paths outside it are refused. History records
     /// the items, not the path, so undo works and the file can go away.
     #[serde(default)]

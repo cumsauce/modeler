@@ -588,6 +588,8 @@ fn pbr_material(
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         modeler::material::pbr::bake_key(r, Some(part)).hash(&mut h);
+        // Cutouts are one-sided on closed solids, double on open cards.
+        (modeler::verify::open_edge_count(part) == 0).hash(&mut h);
         let m = &part.material;
         for x in m.base_color.iter().chain([&m.roughness, &m.metalness]) {
             x.to_bits().hash(&mut h);
@@ -634,7 +636,7 @@ fn pbr_material(
         modeler::material::pbr::Alpha::Mask(c) => m.alpha_mode = AlphaMode::Mask(c),
         modeler::material::pbr::Alpha::Blend => m.alpha_mode = AlphaMode::Blend,
     }
-    if t.double_sided {
+    if modeler::material::pbr::double_sided_on(&t, part) {
         m.double_sided = true;
         m.cull_mode = None;
     }

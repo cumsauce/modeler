@@ -2313,7 +2313,7 @@ pub struct TriMeshSpec {
 #[serde(deny_unknown_fields)]
 pub struct UvsSpec {
     part: String,
-    /// box, planar, cylindrical, spherical or metric (box at real scale: uv in meters).
+    /// box, planar (along the thinnest axis), cylindrical, spherical, metric (box at real scale: uv in meters) or face / label (one image per face, upright and unmirrored from outside).
     projection: String,
 }
 
@@ -3000,11 +3000,23 @@ pub fn expand_repeats(
     items: &[Value],
     params: &crate::params::Params,
 ) -> Result<Vec<(Value, Option<String>)>, String> {
+    expand_repeats_noted(items, params).map(|(out, _)| out)
+}
+
+/// [`expand_repeats`] plus a note per repeat that made nothing (empty
+/// `items`, `count` 0 or empty `values`): those are no-ops, not errors, so
+/// generated templates with nothing to repeat still apply.
+pub fn expand_repeats_noted(
+    items: &[Value],
+    params: &crate::params::Params,
+) -> Result<(Vec<(Value, Option<String>)>, Vec<String>), String> {
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        expand_one(item, &format!("op #{i} (repeat)"), None, params, &mut out)?;
+        let ctx = format!("op #{i} (repeat)");
+        expand_one(item, &ctx, None, params, &mut out, &mut notes)?;
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 fn expand_one(
@@ -3013,6 +3025,7 @@ fn expand_one(
     note: Option<&str>,
     params: &crate::params::Params,
     out: &mut Vec<(Value, Option<String>)>,
+    notes: &mut Vec<String>,
 ) -> Result<(), String> {
     if item.get("type").and_then(Value::as_str) != Some("repeat") {
         out.push((item.clone(), note.map(str::to_string)));
@@ -3041,8 +3054,14 @@ fn expand_one(
         (Some(_), Some(_)) => return Err(format!("{ctx}: give count or values, not both")),
         (None, None) => return Err(format!("{ctx}: needs count or values")),
     };
-    if r.items.is_empty() {
-        return Err(format!("{ctx}: items is empty"));
+    if r.items.is_empty() || values.is_empty() {
+        let why = if r.items.is_empty() {
+            "items is empty"
+        } else {
+            "no values (count 0)"
+        };
+        notes.push(format!("note: {ctx}: {why}, so it made nothing"));
+        return Ok(());
     }
     let mut seen: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
@@ -3072,6 +3091,7 @@ fn expand_one(
                 Some(&note),
                 params,
                 out,
+                notes,
             )?;
             for (made, _) in &out[before..] {
                 let (Some(t), Some(n)) = (
@@ -3160,6 +3180,54 @@ fn de<T: DeserializeOwned>(ctx: &str, body: &Value) -> Result<T, String> {
     })
 }
 
+const PRIMITIVE_ROUND_HINT: &str = "primitive round is a number (meters), e.g. round: 0.03, \
+or {\"radius\": 0.03, \"segments\"?: 4}; for edge selection use a `round` item with mode fillet";
+
+/// A primitive's `round` given as an object (`{"radius": r, "segments"?: n}`,
+/// the shape agents borrow from the `round` op) becomes the plain `round` +
+/// `segments` fields; anything else there gets a hint instead of serde's bare
+/// "unknown field".
+fn primitive_round_object(ctx: &str, body: Value) -> Result<Value, String> {
+    let Value::Object(mut o) = body else {
+        return Ok(body);
+    };
+    match o.get("round") {
+        None | Some(Value::Number(_)) => return Ok(Value::Object(o)),
+        Some(Value::Object(r)) => {
+            if let Some(k) = r
+                .keys()
+                .find(|k| !matches!(k.as_str(), "radius" | "segments"))
+            {
+                return Err(format!(
+                    "{ctx}: round: unknown field `{k}`: {PRIMITIVE_ROUND_HINT}"
+                ));
+            }
+            let r = r.clone();
+            let Some(radius) = r.get("radius").cloned() else {
+                return Err(format!(
+                    "{ctx}: round: needs radius: {PRIMITIVE_ROUND_HINT}"
+                ));
+            };
+            if let Some(seg) = r.get("segments") {
+                if o.contains_key("segments") {
+                    return Err(format!(
+                        "{ctx}: segments given both in round and on the primitive: give it once"
+                    ));
+                }
+                o.insert("segments".into(), seg.clone());
+            }
+            o.insert("round".into(), radius);
+        }
+        Some(other) => {
+            return Err(format!(
+                "{ctx}: round: got {}: {PRIMITIVE_ROUND_HINT}",
+                describe_json(other)
+            ));
+        }
+    }
+    Ok(Value::Object(o))
+}
+
 fn describe_json(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -3208,6 +3276,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
     let body = Value::Object(body);
     Ok(match ty {
         "primitive" => {
+            let body = primitive_round_object(&ctx, body)?;
             let s: PrimitiveSpec = de(&ctx, &body)?;
             let size = resolve_size(s.kind, &s.size.0).map_err(|e| format!("{ctx}: size: {e}"))?;
             BatchItem::Op(Op::Primitive {
