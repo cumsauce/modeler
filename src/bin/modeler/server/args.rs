@@ -342,7 +342,9 @@ pub(crate) struct SetCameraArgs {
     /// "material" | "animate" | "map" | "grid", "select"?: part ("" clears),
     /// "comments"?: bool, "shading"?: "lit" | "clay" | "parts", "capture"?:
     /// "window" (`screenshot` then shows the whole window, panes included)
-    /// or "view" (the 3D view only, the default)}.
+    /// or "view" (the 3D view only, the default), "popup"?: bool,
+    /// "comment"?: {part?, spot?: [x, y, z], text?, action?: "post" |
+    /// "cancel"} (open, type into, post or cancel the comment box)}.
     #[serde(default)]
     pub(crate) ui: Option<UiArg>,
 }
@@ -363,6 +365,24 @@ pub(crate) struct UiArg {
     /// Open (true) or close the document popup (⌘K).
     #[serde(default)]
     pub(crate) popup: Option<bool>,
+    /// Drive the comment box as the human would (for checking the UI):
+    /// {"part"?: open it on a part, "spot"?: [x, y, z] pin it on that point
+    /// of `part`, "text"?: type into it, "action"?: "post" | "cancel"}.
+    #[serde(default)]
+    pub(crate) comment: Option<CommentUiArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommentUiArg {
+    #[serde(default)]
+    pub(crate) part: Option<String>,
+    #[serde(default)]
+    pub(crate) spot: Option<[f32; 3]>,
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    #[serde(default)]
+    pub(crate) action: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

@@ -398,6 +398,27 @@ fn apply_ui(
             if p { "open" } else { "closed" }
         ));
     }
+    if let Some(c) = &u.comment {
+        if let Some(a) = c.action.as_deref()
+            && a != "post"
+            && a != "cancel"
+        {
+            return Err(format!("ui.comment.action: `{a}` is not post / cancel"));
+        }
+        if let Some(p) = &c.part
+            && !super::workbench::selectable(model, p)
+        {
+            return Err(format!(
+                "ui.comment.part: `{p}` is not a part of `{}`",
+                model.name
+            ));
+        }
+        if c.spot.is_some() && c.part.is_none() {
+            return Err("ui.comment.spot needs a part".into());
+        }
+        wb.comment_ui = Some(c.clone());
+        said.push("comment box request queued".into());
+    }
     if let Some(c) = u.comments {
         wb.show_comments = c;
         said.push(format!("comments {}", if c { "open" } else { "closed" }));
@@ -426,7 +447,6 @@ pub(crate) fn rebuild_scene(
     mut orbit: ResMut<Orbit>,
     mut built: ResMut<SceneBuilt>,
     existing: Query<Entity, With<PreviewPart>>,
-    pins: Query<Entity, With<AnnotationPin>>,
     lights: Query<Entity, Or<(With<SceneLight>, With<super::decals::SceneDecal>)>>,
     layers: Option<Res<LayerVisibility>>,
     mut built_layers: Local<Option<LayerVisibility>>,
@@ -444,7 +464,7 @@ pub(crate) fn rebuild_scene(
     built.doc = Some(modeler.session.model.name.clone());
     *built_layers = Some(layers);
     pbr_cache.tick();
-    for e in existing.iter().chain(&pins).chain(&lights) {
+    for e in existing.iter().chain(&lights) {
         commands.entity(e).despawn();
     }
     if layers.lights {

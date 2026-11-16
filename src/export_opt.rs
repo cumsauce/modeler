@@ -53,6 +53,8 @@ pub struct Options {
     /// How baked textures are written; `None` = the format's default
     /// (.gltf: shared KTX2 files, .glb: KTX2 in the buffer).
     pub textures: Option<TextureMode>,
+    /// Baked ambient occlusion into one atlas on a second uv set; `None` = off.
+    pub ao: Option<crate::ao::Ao>,
 }
 
 /// How an export writes baked textures.
@@ -87,6 +89,7 @@ impl Options {
             lod_distances: Vec::new(),
             lod_min_tris: 300,
             textures: None,
+            ao: None,
         }
     }
 
@@ -150,6 +153,7 @@ impl Options {
                         }
                     })
                 }
+                "ao" => o.ao = crate::ao::Ao::parse(x)?,
                 "dedup_materials" => o.dedup_materials = flag(x)?,
                 "cull_contacts" => o.cull_contacts = flag(x)?,
                 "instance" => o.instance = flag(x)?,
@@ -232,7 +236,7 @@ impl Options {
                 }
                 other => {
                     return Err(format!(
-                        "optimize: unknown field `{other}` (preset, dedup_materials, cull_contacts, visible_from, view_samples, instance, merge, merge_keep, weld, small_indices, orm, emissive_strength)"
+                        "optimize: unknown field `{other}` (preset, dedup_materials, cull_contacts, visible_from, view_samples, instance, merge, merge_keep, weld, small_indices, orm, emissive_strength, lods, lod_distances, lod_min_tris, textures, ao)"
                     ));
                 }
             }
@@ -286,7 +290,7 @@ fn vert_count(parts: &[Part]) -> usize {
     parts.iter().map(|p| p.verts.len()).sum()
 }
 
-fn glob(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob(pattern: &str, name: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == name;
@@ -382,7 +386,13 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
             parts.len()
         ));
     }
-    let mut meshes = if o.instance && !o.merge {
+    if o.instance && o.ao.is_some() {
+        report.lines.push(
+            "instancing off: baked AO gives every copy its own mesh (its own patch of the atlas)"
+                .into(),
+        );
+    }
+    let mut meshes = if o.instance && !o.merge && o.ao.is_none() {
         let m = find_instances(&parts);
         let copies = m.iter().filter(|r| **r != MeshRef::Own).count();
         report.lines.push(format!(
@@ -519,7 +529,7 @@ enum Keep {
 }
 
 /// A bounding volume hierarchy over triangles (median split, 4 per leaf).
-struct Bvh {
+pub(crate) struct Bvh {
     tris: Vec<[Vec3; 3]>,
     nodes: Vec<BvhNode>,
 }
@@ -533,7 +543,7 @@ struct BvhNode {
 }
 
 impl Bvh {
-    fn new(mut items: Vec<([Vec3; 3], u32)>) -> Self {
+    pub(crate) fn new(mut items: Vec<([Vec3; 3], u32)>) -> Self {
         let mut nodes = Vec::new();
         if !items.is_empty() {
             nodes.push(BvhNode {
@@ -610,7 +620,13 @@ impl Bvh {
 
     /// Calls `f(triangle index, distance)` for every hit with 0 < t < tmax;
     /// stops when `f` returns true (and returns true).
-    fn walk(&self, o: Vec3, d: Vec3, tmax: f32, f: &mut dyn FnMut(usize, f32) -> bool) -> bool {
+    pub(crate) fn walk(
+        &self,
+        o: Vec3,
+        d: Vec3,
+        tmax: f32,
+        f: &mut dyn FnMut(usize, f32) -> bool,
+    ) -> bool {
         if self.nodes.is_empty() {
             return false;
         }
@@ -669,7 +685,7 @@ fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
     (dist > 1e-7).then_some(dist)
 }
 
-fn world_tris(p: &Part) -> Vec<[Vec3; 3]> {
+pub(crate) fn world_tris(p: &Part) -> Vec<[Vec3; 3]> {
     let w: Vec<Vec3> = (0..p.verts.len()).map(|i| p.world_vert(i)).collect();
     p.indices
         .as_chunks::<3>()

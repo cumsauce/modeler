@@ -681,3 +681,95 @@ fn sway_tree_exports_runtime_settings() {
     let skinned = doc.nodes().filter(|n| n.skin().is_some()).count();
     assert_eq!(skinned, 2);
 }
+
+/// `optimize: {ao}`: a floor, two walls in a corner and a box share one
+/// tiling material (with tile AO in ORM) plus a flat part; every primitive
+/// gets TEXCOORD_1 into one baked atlas and every material reads it.
+#[test]
+fn baked_ao_export_writes_one_atlas_on_uv1() {
+    let mut s = modeler::commands::Session::default();
+    let nodes = serde_json::json!([
+        {"type": "tile_grid", "name": "g", "size": [0.25, 0.0625], "stagger": 0.5},
+        {"type": "math", "name": "m", "op": "step", "a": "g.edge", "b": 0.005},
+        {"type": "math", "name": "h", "op": "mul", "a": "m", "b": 0.004},
+        {"type": "ao_from_height", "name": "ao", "height": "h", "radius": 0.01},
+        {"type": "output", "name": "out", "base_color": "m", "height": "h", "ao": "ao"}
+    ]);
+    s.materials
+        .ops(
+            "plaster",
+            nodes.as_array().unwrap().clone(),
+            None,
+            None,
+            None,
+            Some(64),
+            None,
+        )
+        .unwrap();
+    let items = serde_json::json!([
+        {"type": "primitive", "name": "floor", "kind": "box", "size": [4, 0.1, 4], "translation": [0, -0.05, 0]},
+        {"type": "primitive", "name": "wall_x", "kind": "box", "size": [0.1, 2, 4], "translation": [-2.05, 1, 0]},
+        {"type": "primitive", "name": "wall_z", "kind": "box", "size": [4, 2, 0.1], "translation": [0, 1, -2.05]},
+        {"type": "primitive", "name": "crate", "kind": "box", "size": [0.6, 0.6, 0.6], "translation": [0.8, 0.3, 0.8]},
+        {"type": "material", "name": "floor", "pbr": "plaster"},
+        {"type": "material", "name": "wall_x", "pbr": "plaster"},
+        {"type": "material", "name": "wall_z", "pbr": "plaster"},
+        {"type": "material", "name": "crate", "color": [0.6, 0.4, 0.2], "flat": true}
+    ]);
+    s.apply_values_as(None, items.as_array().unwrap().clone(), false)
+        .unwrap();
+    let dir = std::env::var("MODELER_AO_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| temp_dir("ao"));
+    let path = dir.join("assets/models/room.gltf");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let opts = modeler::export_opt::Options::parse(&serde_json::json!({
+        "preset": "game", "ao": {"resolution": 512, "distance": 1.0, "samples": 32}
+    }))
+    .unwrap();
+    let report = modeler::gltf::export_gltf_with(&s.model, &path, &opts).unwrap();
+    println!("{report}");
+    assert!(report.contains("ambient occlusion: 512x512"), "{report}");
+    let (doc, _buffers, _images) = gltf::import(&path)
+        .or_else(|_| gltf::Gltf::open(&path).map(|g| (g.document, vec![], vec![])))
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let ao_images: Vec<&str> = json["images"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["name"] == "ao")
+        .map(|i| i["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(ao_images.len(), 1, "{}", json["images"]);
+    assert!(ao_images[0].starts_with("../textures/room-ao-") && ao_images[0].ends_with(".ktx2"));
+    assert!(dir.join("assets/models").join(ao_images[0]).exists());
+    for m in doc.materials() {
+        let o = m.occlusion_texture().expect("occlusionTexture");
+        assert_eq!(o.tex_coord(), 1, "{:?}", m.name());
+    }
+    for mesh in doc.meshes() {
+        for p in mesh.primitives() {
+            let n = p.get(&gltf::Semantic::Positions).unwrap().count();
+            assert_eq!(p.get(&gltf::Semantic::TexCoords(1)).unwrap().count(), n);
+            assert!(p.get(&gltf::Semantic::TexCoords(0)).is_some());
+        }
+    }
+    // PNG mode writes the same atlas as a PNG.
+    let mut png = opts.clone();
+    png.textures = Some(modeler::export_opt::TextureMode::Png);
+    modeler::gltf::export_gltf_with(&s.model, &dir.join("assets/models/room_png.gltf"), &png)
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("assets/models/room_png.gltf")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        j["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["name"] == "ao" && i["uri"].as_str().unwrap().ends_with(".png"))
+    );
+}

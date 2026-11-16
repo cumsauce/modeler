@@ -565,11 +565,14 @@ pub fn export_scene(
                     if let Some(d) = file.parent() {
                         std::fs::create_dir_all(d).map_err(|e| ModelerError::Io(e.to_string()))?;
                     }
-                    crate::gltf::export_gltf_with(src, &file, &opts.optimize)?;
+                    let r = crate::gltf::export_gltf_with(src, &file, &opts.optimize)?;
                     report.push(format!(
                         "exported prefab `{prefab}` -> {}",
                         rel(&root, &file)
                     ));
+                    if let Some(l) = r.lines().find(|l| l.starts_with("- ambient occlusion")) {
+                        report.push(format!("  {l}"));
+                    }
                 }
                 let r = rel(&root, &file);
                 exported.insert(prefab.clone(), r.clone());
@@ -649,6 +652,9 @@ pub fn export_scene(
             rel(&root, &file),
             r.lines().next().unwrap_or("")
         ));
+        if let Some(l) = r.lines().find(|l| l.starts_with("- ambient occlusion")) {
+            report.push(format!("  {l}"));
+        }
         entities.push(Entity {
             name: format!("{stem}_ground"),
             kind: None,

@@ -15,7 +15,7 @@ use crate::Part;
 use crate::uv::metric_uv;
 
 /// Gutter around each island, in texels.
-const GUTTER: f32 = 3.0;
+pub(crate) const GUTTER: f32 = 3.0;
 
 fn tri_count(p: &Part) -> usize {
     if p.indices.is_empty() {
@@ -46,9 +46,8 @@ pub fn box_atlas(part: &mut Part, n: usize) {
     let sc = Vec3::from(part.scale);
     let count = part.verts.len();
     let tris = tri_count(part);
-    // Chart key and projected corners (meters) per triangle.
-    let mut chart = vec![0u8; tris];
-    let mut proj = vec![[[0.0f32; 2]; 3]; tris];
+    let mut corners = vec![[0usize; 3]; tris];
+    let mut pos = vec![[Vec3::ZERO; 3]; tris];
     let mut ok = vec![false; tris];
     for t in 0..tris {
         let c = [
@@ -59,7 +58,62 @@ pub fn box_atlas(part: &mut Part, n: usize) {
         if c.iter().any(|&k| k >= count) {
             continue;
         }
-        let p = c.map(|k| Vec3::from(part.verts[k]) * sc);
+        corners[t] = c;
+        pos[t] = c.map(|k| Vec3::from(part.verts[k]) * sc);
+        ok[t] = true;
+    }
+    let u = unwrap(&corners, &pos, &ok, n);
+    let nf = n as f32;
+    // Rewrite the mesh: a vertex per (original vertex, island).
+    let has_n = part.normals.len() == count;
+    let (mut verts, mut normals, mut uvs, mut indices) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut remap: HashMap<(usize, usize), u32> = HashMap::new();
+    for t in 0..tris {
+        if !ok[t] {
+            continue;
+        }
+        let isl = u.island[t];
+        for (k, px) in u.px[t].into_iter().enumerate() {
+            let v = corners[t][k];
+            let id = *remap.entry((v, isl)).or_insert_with(|| {
+                verts.push(part.verts[v]);
+                if has_n {
+                    normals.push(part.normals[v]);
+                }
+                uvs.push([px[0] / nf, px[1] / nf]);
+                (verts.len() - 1) as u32
+            });
+            indices.push(id);
+        }
+    }
+    part.verts = verts;
+    part.normals = normals;
+    part.uvs = uvs;
+    part.indices = indices;
+}
+
+/// The islands of a box unwrap: per triangle its island and its corners'
+/// atlas positions in texels (0..n); `density` is texels per meter.
+pub(crate) struct Unwrap {
+    pub island: Vec<usize>,
+    pub px: Vec<[[f32; 2]; 3]>,
+    pub density: f32,
+}
+
+/// The box unwrap behind [`box_atlas`], over any triangle soup: `corners`
+/// are vertex ids (triangles of one chart sharing an id join one island),
+/// `pos` the corners in meters, `ok` false for triangles to skip.
+pub(crate) fn unwrap(corners: &[[usize; 3]], pos: &[[Vec3; 3]], ok: &[bool], n: usize) -> Unwrap {
+    let tris = corners.len();
+    // Chart key and projected corners (meters) per triangle.
+    let mut chart = vec![0u8; tris];
+    let mut proj = vec![[[0.0f32; 2]; 3]; tris];
+    for t in 0..tris {
+        if !ok[t] {
+            continue;
+        }
+        let p = pos[t];
         let nn = (p[1] - p[0]).cross(p[2] - p[0]);
         let a = nn.abs();
         let (axis, sign) = if a.x >= a.y && a.x >= a.z {
@@ -71,7 +125,6 @@ pub fn box_atlas(part: &mut Part, n: usize) {
         };
         chart[t] = axis * 2 + u8::from(sign < 0.0);
         proj[t] = p.map(|w| metric_uv(axis, sign, w));
-        ok[t] = true;
     }
     // Islands: triangles of one chart sharing a vertex.
     let mut parent: Vec<usize> = (0..tris).collect();
@@ -80,8 +133,7 @@ pub fn box_atlas(part: &mut Part, n: usize) {
         if !ok[t] {
             continue;
         }
-        for k in 0..3 {
-            let v = corner(part, t * 3 + k);
+        for &v in &corners[t] {
             match first.get(&(v, chart[t])) {
                 Some(&o) => {
                     let (a, b) = (find(&mut parent, t), find(&mut parent, o));
@@ -154,38 +206,26 @@ pub fn box_atlas(part: &mut Part, n: usize) {
         }
         d *= 0.92;
     }
-    // Rewrite the mesh: a vertex per (original vertex, island).
-    let has_n = part.normals.len() == count;
-    let (mut verts, mut normals, mut uvs, mut indices) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut remap: HashMap<(usize, usize), u32> = HashMap::new();
-    for t in 0..tris {
-        if !ok[t] {
-            continue;
-        }
-        let isl = tri_island[t];
-        for (k, q) in proj[t].into_iter().enumerate() {
-            let v = corner(part, t * 3 + k);
-            let id = *remap.entry((v, isl)).or_insert_with(|| {
-                let b = boxes[isl].0;
-                let px = [
+    let px = (0..tris)
+        .map(|t| {
+            if !ok[t] {
+                return [[0.0; 2]; 3];
+            }
+            let isl = tri_island[t];
+            let b = boxes[isl].0;
+            proj[t].map(|q| {
+                [
                     offs[isl][0] + (q[0] - b[0]) * d,
                     offs[isl][1] + (q[1] - b[1]) * d,
-                ];
-                verts.push(part.verts[v]);
-                if has_n {
-                    normals.push(part.normals[v]);
-                }
-                uvs.push([px[0] / nf, px[1] / nf]);
-                (verts.len() - 1) as u32
-            });
-            indices.push(id);
-        }
+                ]
+            })
+        })
+        .collect();
+    Unwrap {
+        island: tri_island,
+        px,
+        density: d,
     }
-    part.verts = verts;
-    part.normals = normals;
-    part.uvs = uvs;
-    part.indices = indices;
 }
 
 /// The sample set of a part's atlas (its uvs, 0..1, on an `n` × `n` grid):

@@ -88,7 +88,7 @@ fn update_right_pane(
     mut root: Query<(Entity, &mut Visibility, &mut ScrollPosition), With<RightRoot>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     scroll: Res<AccumulatedMouseScroll>,
-    mut cb: ResMut<CommentBox>,
+    cb: Res<CommentBox>,
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
@@ -131,7 +131,6 @@ fn update_right_pane(
     }
     pane.shown = Some(key);
     commands.entity(root).despawn_children();
-    cb.set_host(None);
     if material || !wb.right_open() {
         return;
     }
@@ -146,11 +145,6 @@ fn update_right_pane(
         .collect();
     if let Some(sel) = &wb.selected {
         b.header(&mut commands, sel, PaneButton::Deselect);
-        // An open comment box goes first, where the eye is.
-        if cb.is_open() {
-            let host = b.host(&mut commands);
-            cb.set_host(Some(host));
-        }
         let rows = properties(model, sel);
         let list = b.section(&mut commands);
         for (k, v) in rows {
@@ -175,7 +169,6 @@ fn update_right_pane(
         b.comments(&mut commands, list, &mine);
         if !cb.is_open() {
             let host = b.host(&mut commands);
-            cb.set_host(Some(host));
             b.button(&mut commands, host, "Add a comment", PaneButton::AddComment);
         }
     } else {
@@ -187,10 +180,6 @@ fn update_right_pane(
             ),
             PaneButton::CloseComments,
         );
-        if cb.is_open() {
-            let host = b.host(&mut commands);
-            cb.set_host(Some(host));
-        }
         let list = b.section(&mut commands);
         if notes.is_empty() {
             b.hint(&mut commands, list, "No comments yet.");
@@ -198,7 +187,6 @@ fn update_right_pane(
         b.comments(&mut commands, list, &notes);
         if !cb.is_open() {
             let host = b.host(&mut commands);
-            cb.set_host(Some(host));
             b.hint(
                 &mut commands,
                 host,

@@ -61,6 +61,7 @@ pub fn compact_names(names: &[String]) -> Vec<String> {
 }
 
 pub mod anim;
+pub mod ao;
 pub mod blob;
 pub mod catalog;
 pub mod commands;
