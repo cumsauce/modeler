@@ -234,6 +234,13 @@ fn anchor(a: &str, parts: &[(String, std::sync::Arc<Part>)]) -> Result<Vec3, Str
             "`{a}`: an anchor names a part and words, like \"leg_l:top\""
         ));
     };
+    if let Some(j) = parts
+        .iter()
+        .find(|(n, _)| n == target)
+        .and_then(|(_, p)| p.joint(words))
+    {
+        return Ok(j);
+    }
     let mut bx: Option<(Vec3, Vec3)> = None;
     for (n, p) in parts {
         if crate::name_matches(target, n) && !p.verts.is_empty() {
@@ -285,7 +292,34 @@ pub fn build(
             Op::Skin { name: n, def } if n == from => Some(def),
             _ => None,
         });
-        if let Some(sd) = skin {
+        let body = ops.iter().find_map(|o| match o {
+            Op::Body { name: n, def } if n == from => Some(def),
+            _ => None,
+        });
+        if let Some(bd) = body {
+            let low = crate::body::lower(bd).map_err(|e| format!("{ctx}: from `{from}`: {e}"))?;
+            // Follow the body part's own transform (a move, a transform).
+            let part = parts
+                .iter()
+                .find(|(n, _)| n == from)
+                .map(|(_, p)| p.clone());
+            let world = |v: Vec3| match &part {
+                Some(p) => {
+                    crate::quat_of(p.rotation) * (v * Vec3::from(p.scale))
+                        + Vec3::from(p.translation)
+                }
+                None => v,
+            };
+            raw.extend(low.joints.iter().map(|j| {
+                (
+                    j.name.clone(),
+                    j.parent.clone(),
+                    world(j.at),
+                    None,
+                    Some(j.radius.max(1e-3)),
+                )
+            }));
+        } else if let Some(sd) = skin {
             let (bones, mirrored) =
                 auto::from_skin(from, sd).map_err(|e| format!("{ctx}: from {e}"))?;
             raw.extend(bones);
@@ -813,12 +847,86 @@ pub fn skeletons(model: &Model) -> Result<Vec<Skeleton>, ModelerError> {
         .map(|p| (p.name.clone(), p.clone()))
         .collect();
     let mut out = Vec::new();
-    for op in &model.ops {
-        if let Op::Skeleton { name, def } = op {
-            out.push(build(name, def, &named, &model.ops)?);
-        }
+    for (name, def) in skeleton_defs(&model.ops) {
+        out.push(build(&name, &def, &named, &model.ops)?);
     }
     Ok(out)
+}
+
+/// Every skeleton the ops declare: `skeleton` items, plus `<body>_rig`
+/// (from the body) for each `body` item unless it says `rig: false` or a
+/// skeleton item already has that name.
+pub fn skeleton_defs(ops: &[Op]) -> Vec<(String, SkeletonDef)> {
+    let mut out: Vec<(String, SkeletonDef)> = ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::Skeleton { name, def } => Some((name.clone(), def.clone())),
+            _ => None,
+        })
+        .collect();
+    for o in ops {
+        if let Op::Body { name, def } = o
+            && def.rig != Some(false)
+        {
+            let rig = format!("{name}_rig");
+            if !out.iter().any(|(n, _)| *n == rig) {
+                out.push((
+                    rig,
+                    SkeletonDef {
+                        from: Some(name.clone()),
+                        ..SkeletonDef::default()
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every bind the ops declare: first each body's automatic smooth bind
+/// (`<body>_bind` onto `<body>_rig`, unless `bind: false`, `rig: false` or
+/// a `bind` item already targets that rig), then the `bind` items in order
+/// (so an item wins over the automatic one).
+pub fn bind_defs(ops: &[Op]) -> Vec<(String, BindDef)> {
+    let mut out = Vec::new();
+    for o in ops {
+        if let Op::Body { name, def } = o
+            && def.rig != Some(false)
+            && def.bind != Some(false)
+        {
+            let rig = format!("{name}_rig");
+            if !ops
+                .iter()
+                .any(|o| matches!(o, Op::Bind { def, .. } if def.skeleton == rig))
+            {
+                out.push((
+                    format!("{name}_bind"),
+                    BindDef {
+                        skeleton: rig,
+                        parts: vec![name.clone()],
+                        bone: None,
+                        mode: "smooth".into(),
+                        blend: crate::body::bind_blend(def),
+                        paint: Vec::new(),
+                    },
+                ));
+            }
+        }
+    }
+    for o in ops {
+        if let Op::Bind { name, def } = o {
+            out.push((name.clone(), def.clone()));
+        }
+    }
+    out
+}
+
+/// Whether the ops make any skeleton (items or a body's rig).
+pub fn has_skeleton(ops: &[Op]) -> bool {
+    ops.iter().any(|o| {
+        matches!(o, Op::Skeleton { .. })
+            || matches!(o, Op::Body { def, .. } if def.rig != Some(false))
+    })
 }
 
 /// Every clip of the model with its skeleton.
@@ -936,19 +1044,17 @@ pub fn apply_binds(
             o,
             Op::Bind { .. } | Op::Skeleton { .. } | Op::Clip { .. } | Op::Sway { .. }
         )
-    }) {
+    }) && !has_skeleton(ops)
+    {
         return Ok(());
     }
     let mut skels: Vec<Skeleton> = Vec::new();
-    for op in ops {
-        if let Op::Skeleton { name, def } = op {
-            skels.push(build(name, def, named, ops)?);
-        }
+    for (name, def) in skeleton_defs(ops) {
+        skels.push(build(&name, &def, named, ops)?);
     }
     // Clips are checked here so a bad track fails (and rolls back) the batch.
     build_all(ops, &skels)?;
-    for op in ops {
-        let Op::Bind { name, def } = op else { continue };
+    for (name, def) in &bind_defs(ops) {
         let ctx = format!("bind `{name}`");
         let Some(skel) = skels.iter().find(|s| s.name == def.skeleton) else {
             return Err(format!("{ctx}: no skeleton `{}`", def.skeleton).into());
@@ -986,7 +1092,11 @@ pub fn apply_binds(
             };
             std::sync::Arc::make_mut(part).rig = Some(std::sync::Arc::new(binding));
         }
-        if hit == 0 {
+        // A body's automatic bind quietly skips a renamed or deleted body.
+        let item = ops
+            .iter()
+            .any(|o| matches!(o, Op::Bind { name: n, .. } if n == name));
+        if hit == 0 && item {
             return Err(format!("{ctx}: no part matches {:?}", def.parts).into());
         }
     }

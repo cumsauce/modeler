@@ -10,11 +10,11 @@ pub fn summary(model: &Model) -> Option<String> {
     let mut lines = Vec::new();
     let skels = super::skeletons(model).ok()?;
     for s in &skels {
-        let binds: Vec<String> = model
-            .ops
+        let all = super::bind_defs(&model.ops);
+        let binds: Vec<String> = all
             .iter()
-            .filter_map(|o| match o {
-                Op::Bind { name, def } if def.skeleton == s.name => {
+            .filter_map(|(name, def)| match () {
+                () if def.skeleton == s.name => {
                     let n = model
                         .parts
                         .iter()
@@ -80,10 +80,9 @@ pub fn lints(model: &Model) -> Vec<String> {
         return out;
     };
     for s in &skels {
-        if !model
-            .ops
+        if !super::bind_defs(&model.ops)
             .iter()
-            .any(|o| matches!(o, Op::Bind { def, .. } if def.skeleton == s.name))
+            .any(|(_, def)| def.skeleton == s.name)
         {
             out.push(format!(
                 "skeleton `{}` has no bind: nothing moves with it (add a `bind` item)",

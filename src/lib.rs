@@ -64,6 +64,7 @@ pub mod anim;
 pub mod ao;
 pub mod ao_gpu;
 pub mod blob;
+pub mod body;
 pub mod catalog;
 pub mod commands;
 pub mod contact;
@@ -92,6 +93,7 @@ pub mod raster;
 pub mod scatter;
 pub mod scene;
 pub mod sdf;
+pub mod silhouette;
 pub mod simplify;
 pub mod smooth;
 pub mod spec;
@@ -199,6 +201,10 @@ pub struct Part {
     /// leaves), for auto-rigs. Derived by the op; never saved.
     #[serde(skip)]
     pub branches: Option<std::sync::Arc<crate::lsystem::Branches>>,
+    /// Named points in the part's own coordinates (a `body`'s joints),
+    /// usable as anchors (`cat:paw_l`). Derived by the op; never saved.
+    #[serde(skip)]
+    pub joints: Option<std::sync::Arc<Vec<(String, [f32; 3])>>>,
 }
 
 fn one() -> f32 {
@@ -223,6 +229,16 @@ impl Part {
             visible: true,
             ..Default::default()
         }
+    }
+
+    /// The world position of a named joint (a `body`'s), if it has one.
+    pub fn joint(&self, name: &str) -> Option<Vec3> {
+        let j = self.joints.as_ref()?;
+        let p = j.iter().find(|(n, _)| n == name)?.1;
+        Some(
+            quat_of(self.rotation) * (Vec3::from(p) * Vec3::from(self.scale))
+                + Vec3::from(self.translation),
+        )
     }
 
     pub fn tri_count(&self) -> u32 {
@@ -1084,6 +1100,20 @@ pub enum Op {
         #[serde(flatten)]
         def: Box<crate::sdf::SkinDef>,
     },
+    /// A solid carved from side / top / front outlines (intersected
+    /// extrusions, smooth edges), meshed like an sdf.
+    Silhouette {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::silhouette::SilhouetteDef>,
+    },
+    /// A parametric archetype (biped, quadruped, bird, fish, serpent, car)
+    /// lowered to skin chains with elliptical sections, plus its joints.
+    Body {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::body::BodyDef>,
+    },
     /// A lighter copy of a dense mesh (quadric edge collapse), optionally
     /// baking the input's surface into its normal and height maps.
     Decimate {
@@ -1209,9 +1239,9 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<String>,
         /// `place`: first slide the parts so their footprint centre is at
-        /// this [x, z].
+        /// this [x, z] (the cross axes of `toward`), or at an anchor's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        at: Option<[f32; 2]>,
+        at: Option<PlaceAt>,
         /// `place`: clearance left above the surface (default 0).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gap: Option<f32>,
@@ -1690,4 +1720,14 @@ mod tests {
             "{c:?}"
         );
     }
+}
+
+/// Where a `place` slides first: two cross-axis coordinates, or an anchor
+/// (`"cat:paw_l"`, a body joint, or `"desk:top-front"`, a box anchor) whose
+/// cross-axis coordinates are taken (read before this place moves anything).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PlaceAt {
+    Xy([f32; 2]),
+    Anchor(String),
 }

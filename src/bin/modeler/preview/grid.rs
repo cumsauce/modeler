@@ -347,7 +347,7 @@ fn kind_of(m: &Model) -> &'static str {
         .any(|o| matches!(o, Op::Terrain { .. } | Op::Marker { .. }))
     {
         "map"
-    } else if m.ops.iter().any(|o| matches!(o, Op::Skeleton { .. })) {
+    } else if modeler::anim::has_skeleton(&m.ops) {
         "rig"
     } else {
         "model"

@@ -49,7 +49,7 @@ pub enum BatchItem {
         rotation: Option<[f32; 4]>,
         pivot: Option<PivotSpec>,
         on: Option<String>,
-        at: Option<[f32; 2]>,
+        at: Option<crate::PlaceAt>,
         gap: Option<f32>,
         toward: Option<String>,
         each: bool,
@@ -2948,7 +2948,7 @@ impl Session {
         pivot: Option<PivotSpec>,
         (on, at, gap, toward, each): (
             Option<String>,
-            Option<[f32; 2]>,
+            Option<crate::PlaceAt>,
             Option<f32>,
             Option<String>,
             bool,
@@ -3009,6 +3009,20 @@ impl Session {
         };
         let pivot = match pivot {
             Some(PivotSpec::Point(p)) => p,
+            Some(PivotSpec::Anchor(a))
+                if a.split_once(':').is_some_and(|(t, w)| {
+                    parts_now
+                        .iter()
+                        .any(|p| p.name == t && p.joint(w).is_some())
+                }) =>
+            {
+                let (t, w) = a.split_once(':').unwrap_or_default();
+                parts_now
+                    .iter()
+                    .find_map(|p| if p.name == t { p.joint(w) } else { None })
+                    .map(|v| v.to_array())
+                    .unwrap_or_default()
+            }
             Some(PivotSpec::Anchor(a)) => {
                 let (target, words) = match a.split_once(':') {
                     Some((t, w)) => (Some(t.to_string()), w.to_string()),

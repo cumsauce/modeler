@@ -302,8 +302,13 @@ pub(crate) fn agent_view_projection(
                 AgentView::Bottom => (-Vec3::Y, Vec3::Z, (half.x, half.z)),
                 AgentView::Iso | AgentView::Custom(_) => unreachable!(),
             };
-            hw = hw.max(1e-3) * margin;
-            hh = hh.max(1e-3) * margin;
+            // A view straight along the model's longest axis (the plan of a
+            // standing person, the end of a pole) would otherwise fill the
+            // frame with a tiny footprint and read as a close-up blob: keep the
+            // framed span at least half the model's largest extent.
+            let floor = (half.max_element() * 0.5).max(1e-3);
+            hw = hw.max(floor) * margin;
+            hh = hh.max(floor) * margin;
             // Fit the world span into the requested pixel aspect.
             if hw / hh < aspect {
                 hw = hh * aspect;
@@ -1040,4 +1045,33 @@ fn bone_mesh(head: Vec3, tail: Vec3, radius: f32) -> Mesh {
     mesh.duplicate_vertices();
     mesh.compute_flat_normals();
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(view: AgentView, min: Vec3, max: Vec3) -> (f32, f32) {
+        let (eye, target, _, proj) = agent_view_projection(view, Some((min, max)), 4.0 / 3.0);
+        let Projection::Orthographic(o) = proj else {
+            panic!("not ortho")
+        };
+        let ScalingMode::Fixed { width, height } = o.scaling_mode else {
+            panic!("not fixed")
+        };
+        // The camera sits outside the model, looking at its centre.
+        assert!((eye - target).length() > (max - min).length());
+        (width, height)
+    }
+
+    #[test]
+    fn plan_of_a_tall_model_is_not_a_close_up() {
+        let (min, max) = (Vec3::new(-0.25, 0.0, -0.12), Vec3::new(0.25, 1.75, 0.21));
+        for v in [AgentView::Top, AgentView::Bottom] {
+            let (_, h) = span(v, min, max);
+            assert!(h >= 0.875, "{v}: plan frames only {h} m");
+        }
+        let (_, h) = span(AgentView::Front, min, max);
+        assert!((h - 1.75 * 1.2).abs() < 1e-3);
+    }
 }

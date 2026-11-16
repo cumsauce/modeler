@@ -66,9 +66,9 @@ pub struct Shape {
     pub from: Option<[f32; 3]>,
     #[serde(default, skip_serializing_if = "none")]
     pub to: Option<[f32; 3]>,
-    /// chain points [x, y, z, radius].
+    /// chain points [x, y, z, radius] or [x, y, z, [rx, ry], roll?].
     #[serde(default, skip_serializing_if = "none")]
-    pub points: Option<Vec<[f32; 4]>>,
+    pub points: Option<Vec<Sect>>,
     /// chain: a smooth curve through the points (default true).
     #[serde(default, skip_serializing_if = "none")]
     pub smooth: Option<bool>,
@@ -78,6 +78,15 @@ pub struct Shape {
     /// group: shapes combined on their own first, then joined as one.
     #[serde(default, skip_serializing_if = "none")]
     pub shapes: Option<Vec<Shape>>,
+    /// silhouette: the side outline, rings of [z, y] (seen from +x).
+    #[serde(default, skip_serializing_if = "none")]
+    pub side: Option<Vec<Vec<[f32; 2]>>>,
+    /// silhouette: the plan outline, rings of [x, z].
+    #[serde(default, skip_serializing_if = "none")]
+    pub top: Option<Vec<Vec<[f32; 2]>>>,
+    /// silhouette: the front outline, rings of [x, y] (optional).
+    #[serde(default, skip_serializing_if = "none")]
+    pub front: Option<Vec<Vec<[f32; 2]>>>,
 }
 
 pub const SHAPES: &[&str] = &[
@@ -90,6 +99,7 @@ pub const SHAPES: &[&str] = &[
     "chain",
     "part",
     "group",
+    "silhouette",
 ];
 
 /// The parameters of an `sdf` op.
@@ -107,6 +117,14 @@ pub struct SdfDef {
     pub warps: Vec<Deform>,
     #[serde(default, skip_serializing_if = "none")]
     pub resolution: Option<f32>,
+    /// Decimate the meshed field to about this many triangles (the dense
+    /// mesh is never kept): one item instead of sdf + decimate + hide.
+    #[serde(default, skip_serializing_if = "none")]
+    pub tris: Option<u32>,
+    /// With `tris`: bake the dense surface into the light mesh's normal and
+    /// height maps (as decimate's `bake`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bake: bool,
     /// Set by the graph (never read from input or saved) when the result
     /// only feeds decimates: the most triangles any consumer keeps,
     /// so the default resolution meshes only as finely as that needs.
@@ -114,12 +132,91 @@ pub struct SdfDef {
     pub target_tris: Option<u32>,
 }
 
-/// A chain point: `[x, y, z, radius]` or the name of a joint.
+/// A chain section: `[x, y, z, radius]` (round) or `[x, y, z, [rx, ry],
+/// roll?]` (an ellipse: `rx` across the tube sideways, `ry` along the
+/// tube's up, rolled `roll` degrees about the tangent), or `[x, y, z,
+/// [rx, ry], roll, n]`: a superellipse `|u/rx|^n + |v/ry|^n = 1` (2 = the
+/// ellipse, 3-5 a rounded box, higher boxier).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Sect {
+    Round([f32; 4]),
+    Oval(f32, f32, f32, [f32; 2]),
+    Rolled(f32, f32, f32, [f32; 2], f32),
+    Super(f32, f32, f32, [f32; 2], f32, f32),
+}
+
+impl Sect {
+    pub fn pos(&self) -> Vec3 {
+        match *self {
+            Sect::Round(q) => Vec3::new(q[0], q[1], q[2]),
+            Sect::Oval(x, y, z, _)
+            | Sect::Rolled(x, y, z, _, _)
+            | Sect::Super(x, y, z, _, _, _) => Vec3::new(x, y, z),
+        }
+    }
+    /// (sideways, up) radii.
+    pub fn radii(&self) -> [f32; 2] {
+        match *self {
+            Sect::Round(q) => [q[3], q[3]],
+            Sect::Oval(_, _, _, r)
+            | Sect::Rolled(_, _, _, r, _)
+            | Sect::Super(_, _, _, r, _, _) => r,
+        }
+    }
+    /// The superellipse exponent (2 = an ellipse).
+    pub fn n(&self) -> f32 {
+        match *self {
+            Sect::Super(_, _, _, _, _, n) => n,
+            _ => 2.0,
+        }
+    }
+    pub fn roll(&self) -> f32 {
+        match *self {
+            Sect::Rolled(_, _, _, _, a) | Sect::Super(_, _, _, _, a, _) => a,
+            _ => 0.0,
+        }
+    }
+    pub fn round(&self) -> bool {
+        matches!(self, Sect::Round(_))
+    }
+    /// One radius standing for the section (the mean of the two).
+    pub fn r(&self) -> f32 {
+        let [a, b] = self.radii();
+        0.5 * (a + b)
+    }
+    /// `[x, y, z, mean radius]`.
+    pub fn xyzr(&self) -> [f32; 4] {
+        let p = self.pos();
+        [p.x, p.y, p.z, self.r()]
+    }
+    pub fn valid(&self) -> bool {
+        let [a, b] = self.radii();
+        finite_pos(a)
+            && finite_pos(b)
+            && self.pos().is_finite()
+            && self.roll().is_finite()
+            && (1.0..=40.0).contains(&self.n())
+    }
+    pub fn moved(&self, d: Vec3, k: f32) -> Sect {
+        let p = self.pos() + d;
+        let [a, b] = self.radii();
+        if self.round() {
+            Sect::Round([p.x, p.y, p.z, a * k])
+        } else if self.n() != 2.0 {
+            Sect::Super(p.x, p.y, p.z, [a * k, b * k], self.roll(), self.n())
+        } else {
+            Sect::Rolled(p.x, p.y, p.z, [a * k, b * k], self.roll())
+        }
+    }
+}
+
+/// A chain point: a section or the name of a joint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ChainPt {
     Joint(String),
-    Point([f32; 4]),
+    Point(Sect),
 }
 
 /// The parameters of a `skin` op.
@@ -127,7 +224,7 @@ pub enum ChainPt {
 pub struct SkinDef {
     pub chains: Vec<Vec<ChainPt>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub joints: BTreeMap<String, [f32; 4]>,
+    pub joints: BTreeMap<String, Sect>,
     /// Smooth curves through the chain points (default true).
     #[serde(default, skip_serializing_if = "none")]
     pub smooth: Option<bool>,
@@ -139,6 +236,14 @@ pub struct SkinDef {
     pub warps: Vec<Deform>,
     #[serde(default, skip_serializing_if = "none")]
     pub resolution: Option<f32>,
+    /// Decimate the meshed field to about this many triangles (the dense
+    /// mesh is never kept): one item instead of sdf + decimate + hide.
+    #[serde(default, skip_serializing_if = "none")]
+    pub tris: Option<u32>,
+    /// With `tris`: bake the dense surface into the light mesh's normal and
+    /// height maps (as decimate's `bake`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bake: bool,
     /// Set by the graph (never read from input or saved) when the result
     /// only feeds decimates: the most triangles any consumer keeps,
     /// so the default resolution meshes only as finely as that needs.
@@ -184,6 +289,7 @@ impl Shape {
             "torus" => &["size", "at", "rotation"],
             "chain" => &["points", "smooth"],
             "part" => &["part"],
+            "silhouette" => &["side", "top", "front", "round", "at", "rotation"],
             _ => &["shapes"],
         };
         let set = [
@@ -199,6 +305,9 @@ impl Shape {
             ("smooth", self.smooth.is_some()),
             ("part", self.part.is_some()),
             ("shapes", self.shapes.is_some()),
+            ("side", self.side.is_some()),
+            ("top", self.top.is_some()),
+            ("front", self.front.is_some()),
         ];
         for (f, on) in set {
             if on && !allowed.contains(&f) {
@@ -257,7 +366,7 @@ impl Shape {
             }
             "chain" => match &self.points {
                 Some(p) if !p.is_empty() => {
-                    if let Some(q) = p.iter().find(|q| !finite_pos(q[3])) {
+                    if let Some(q) = p.iter().find(|q| !q.valid()) {
                         return e(format!(
                             "points: every radius (4th value) must be > 0, got {q:?}"
                         ));
@@ -268,6 +377,24 @@ impl Shape {
             "part" => {
                 if self.part.as_deref().is_none_or(str::is_empty) {
                     return e("part: the name of a closed solid".into());
+                }
+            }
+            "silhouette" => {
+                for (f, v, need) in [
+                    ("side", &self.side, true),
+                    ("top", &self.top, true),
+                    ("front", &self.front, false),
+                ] {
+                    match v {
+                        None if need => {
+                            return e(format!(
+                                "{f}: required (a closed outline; side is [z, y], top [x, z], front [x, y])"
+                            ));
+                        }
+                        None => {}
+                        Some(r) => crate::silhouette::check_rings(r)
+                            .map_err(|m| format!("{at} (silhouette): {f}: {m}"))?,
+                    }
                 }
             }
             _ => match &self.shapes {
@@ -300,9 +427,24 @@ fn check_mirror(m: &Option<String>) -> Result<(), String> {
     }
 }
 
-fn check_warps(w: &[Deform]) -> Result<(), String> {
+pub(crate) fn check_warps(w: &[Deform]) -> Result<(), String> {
     for (i, d) in w.iter().enumerate() {
-        d.validate().map_err(|e| format!("warps[{i}]: {e}"))?;
+        if crate::deform::LOCAL_MODES.contains(&d.mode.as_str()) {
+            d.validate_local()
+                .map_err(|e| format!("warps[{i}] ({}): {e}", d.mode))?;
+            continue;
+        }
+        d.validate().map_err(|e| {
+            if e.starts_with("mode:") {
+                format!(
+                    "warps[{i}]: mode: twist, bend, taper, displace or a local sculpt warp ({}), got `{}`",
+                    crate::deform::LOCAL_MODES.join(", "),
+                    d.mode
+                )
+            } else {
+                format!("warps[{i}]: {e}")
+            }
+        })?;
         if d.detail.is_some() {
             return Err(format!(
                 "warps[{i}]: detail: does not apply to a field warp"
@@ -315,6 +457,14 @@ fn check_warps(w: &[Deform]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_tris(tris: Option<u32>, bake: bool) -> Result<(), String> {
+    match tris {
+        Some(t) if t < 4 => Err(format!("tris: at least 4 triangles, got {t}")),
+        None if bake => Err("bake: needs `tris` (the light mesh to bake onto)".into()),
+        _ => Ok(()),
+    }
 }
 
 fn check_res(r: Option<f32>) -> Result<(), String> {
@@ -337,6 +487,7 @@ impl SdfDef {
         }
         check_mirror(&self.mirror)?;
         check_warps(&self.warps)?;
+        check_tris(self.tris, self.bake)?;
         check_res(self.resolution)
     }
 
@@ -345,6 +496,7 @@ impl SdfDef {
         for s in &self.shapes {
             s.reads(&mut v);
         }
+        v.extend(warp_reads(&self.warps));
         v
     }
 
@@ -380,7 +532,7 @@ impl SkinDef {
             return Err("chains: at least one chain of points".into());
         }
         for (k, v) in &self.joints {
-            if !finite_pos(v[3]) {
+            if !v.valid() {
                 return Err(format!("joints.{k}: radius (4th value) must be > 0"));
             }
         }
@@ -401,7 +553,7 @@ impl SkinDef {
                             }
                         ));
                     }
-                    ChainPt::Point(q) if !finite_pos(q[3]) => {
+                    ChainPt::Point(q) if !q.valid() => {
                         return Err(format!(
                             "chains[{i}][{j}]: radius (4th value) must be > 0, got {q:?}"
                         ));
@@ -415,6 +567,7 @@ impl SkinDef {
         }
         check_mirror(&self.mirror)?;
         check_warps(&self.warps)?;
+        check_tris(self.tris, self.bake)?;
         check_res(self.resolution)
     }
 
@@ -454,7 +607,9 @@ impl SkinDef {
                     c.iter()
                         .map(|p| match p {
                             ChainPt::Point(q) => *q,
-                            ChainPt::Joint(n) => self.joints.get(n).copied().unwrap_or([0.0; 4]),
+                            ChainPt::Joint(n) => {
+                                self.joints.get(n).copied().unwrap_or(Sect::Round([0.0; 4]))
+                            }
                         })
                         .collect(),
                 ),
@@ -468,8 +623,8 @@ impl SkinDef {
             .iter()
             .flatten()
             .map(|p| match p {
-                ChainPt::Point(q) => q[3],
-                ChainPt::Joint(n) => self.joints.get(n).map_or(0.0, |q| q[3]),
+                ChainPt::Point(q) => q.r(),
+                ChainPt::Joint(n) => self.joints.get(n).map_or(0.0, Sect::r),
             })
             .collect();
         radii.sort_by(f32::total_cmp);
@@ -478,11 +633,46 @@ impl SkinDef {
             shapes,
             blend: Some(self.blend.unwrap_or(0.5 * median)),
             mirror: self.mirror.clone(),
-            warps: self.warps.clone(),
+            warps: resolve_joint_anchors(&self.warps, |n| {
+                self.joints.get(n).map(|q| q.pos().to_array())
+            }),
             resolution: self.resolution,
+            tris: self.tris,
+            bake: self.bake,
             target_tris: self.target_tris,
         }
     }
+}
+
+/// Parts local warps read through "part:anchor" centres (sdf, skin and
+/// body all resolve them at build time, so they are graph dependencies).
+pub fn warp_reads(warps: &[Deform]) -> Vec<&str> {
+    warps
+        .iter()
+        .filter_map(|w| match &w.at {
+            Some(crate::deform::WarpAt::Anchor(a)) => a.split_once(':').map(|(p, _)| p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Local warps centred on a joint name get that joint's point.
+pub fn resolve_joint_anchors(
+    warps: &[Deform],
+    joint: impl Fn(&str) -> Option<[f32; 3]>,
+) -> Vec<Deform> {
+    warps
+        .iter()
+        .map(|w| {
+            let mut w = w.clone();
+            if let Some(crate::deform::WarpAt::Anchor(a)) = &w.at
+                && let Some(p) = joint(a)
+            {
+                w.at = Some(crate::deform::WarpAt::Point(p));
+            }
+            w
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- evaluation
@@ -500,10 +690,15 @@ enum Prim {
     Box(Vec3, f32),
     /// Rounded cone between two world points.
     Cone(Vec3, Vec3, f32, f32),
+    /// Elliptical rounded cone (a chain with oval sections).
+    ECone(Box<ECone>),
     Cylinder(f32, f32, f32),
     Torus(f32, f32),
     Grid(Arc<crate::blob::Grid>),
     Group(Vec<Node>),
+    /// Intersected extrusions of 2D outlines (side [z, y], top [x, z],
+    /// front [x, y]) with a smooth radius.
+    Silhouette(Box<crate::silhouette::Sil>),
 }
 
 struct Node {
@@ -525,9 +720,17 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
     if k <= 0.0 {
         return a.min(b);
     }
-    let h = (k - (a - b).abs()).max(0.0) / k;
-    a.min(b) - h * h * k * 0.25
+    // Cubic polynomial smooth-min (C2): the quadratic one is only C1, so
+    // its curvature jumps where the blend ends, which shades as a faint
+    // ridge round every join (a cat's shoulders and hips). Its width is
+    // 1.5 k, so the fillet is as deep as the quadratic's (k / 4).
+    let w = SMIN_WIDTH * k;
+    let h = (w - (a - b).abs()).max(0.0) / w;
+    a.min(b) - h * h * h * w / 6.0
 }
+
+/// How far (in units of the blend `k`) a smooth join reaches.
+const SMIN_WIDTH: f32 = 1.5;
 
 fn smax(a: f32, b: f32, k: f32) -> f32 {
     -smin(-a, -b, k)
@@ -573,6 +776,20 @@ fn round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
 }
 
 impl Node {
+    /// A cheap lower bound of `eval` for oval chain segments (the distance
+    /// to the axis less the largest reach), to skip far segments.
+    fn lower(&self, p: Vec3) -> f32 {
+        let Prim::ECone(e) = &self.prim else {
+            return f32::MIN;
+        };
+        let ba = e.b - e.a;
+        let l2 = ba.length_squared().max(1e-12);
+        let h = ((p - e.a).dot(ba) / l2).clamp(0.0, 1.0);
+        let reach = e.ra.max_element().max(e.rb.max_element()) * 1.3 + e.ext_a.max(e.ext_b);
+        // The ellipse estimate is not a true distance: scale it down.
+        ((p - e.a - ba * h).length() - reach) * 0.8
+    }
+
     fn eval(&self, p: Vec3, band: f32) -> f32 {
         let l = || self.inv * (p - self.at);
         match &self.prim {
@@ -592,6 +809,7 @@ impl Node {
                 q.max(Vec3::ZERO).length() + q.max_element().min(0.0) - round
             }
             Prim::Cone(a, b, r1, r2) => round_cone(p, *a, *b, *r1, *r2),
+            Prim::ECone(e) => e.eval(p),
             Prim::Cylinder(r, hh, round) => {
                 let q = l();
                 let d = bevy::math::Vec2::new(
@@ -607,6 +825,7 @@ impl Node {
             }
             Prim::Grid(g) => g.sample(p),
             Prim::Group(children) => eval_list(children, p, band),
+            Prim::Silhouette(sil) => sil.eval(l()),
         }
     }
 }
@@ -623,7 +842,7 @@ fn eval_list(nodes: &[Node], p: Vec3, band: f32) -> f32 {
                 }
                 chain = (n.chain, band, n.k);
             }
-            if inside_box(p, n, band) {
+            if inside_box(p, n, band) && n.lower(p) < chain.1 {
                 chain.1 = chain.1.min(n.eval(p, band));
             }
             continue;
@@ -643,6 +862,33 @@ fn eval_list(nodes: &[Node], p: Vec3, band: f32) -> f32 {
         d = smin(d, chain.1, chain.2);
     }
     d.clamp(-band * 4.0, band)
+}
+
+/// The nearest surface of one chain's segments (`idx` into `nodes`): the
+/// segment with the smallest lower bound first, then only those whose
+/// bound beats the best so far.
+fn chain_min(nodes: &[Node], idx: &[u32], p: Vec3, band: f32) -> f32 {
+    let mut first = None;
+    let mut lb_min = f32::MAX;
+    for &k in idx {
+        let n = &nodes[k as usize];
+        if inside_box(p, n, band) {
+            let lb = n.lower(p);
+            if lb < lb_min {
+                lb_min = lb;
+                first = Some(k);
+            }
+        }
+    }
+    let Some(f) = first else { return band };
+    let mut best = nodes[f as usize].eval(p, band);
+    for &k in idx {
+        let n = &nodes[k as usize];
+        if k != f && inside_box(p, n, band) && n.lower(p) < best {
+            best = best.min(n.eval(p, band));
+        }
+    }
+    best.min(band)
 }
 
 fn inside_box(p: Vec3, n: &Node, band: f32) -> bool {
@@ -780,12 +1026,77 @@ impl Builder<'_> {
                     chain_samples(s.points.as_deref().unwrap_or(&[]), s.smooth.unwrap_or(true));
                 self.chains += 1;
                 let id = self.chains;
-                let seg = |a: Vec4, b: Vec4| {
-                    let (pa, pb) = (a.truncate(), b.truncate());
-                    let lo = (pa - Vec3::splat(a.w)).min(pb - Vec3::splat(b.w));
-                    let hi = (pa + Vec3::splat(a.w)).max(pb + Vec3::splat(b.w));
+                let round = s.points.iter().flatten().all(Sect::round);
+                let frames = chain_frames(&pts);
+                // Straight run past an inner end: the radius times the
+                // tangent of the bend to the neighbouring segment, plus a
+                // little.
+                let ext = |i: usize, j: usize, k: usize| -> f32 {
+                    let Some(q) = pts.get(k) else { return 0.0 };
+                    let d0 = (pts[j].p - pts[i].p).normalize_or_zero();
+                    let d1 = if k > j {
+                        (q.p - pts[j].p).normalize_or_zero()
+                    } else {
+                        (pts[i].p - q.p).normalize_or_zero()
+                    };
+                    let c = d0.dot(d1).clamp(0.2, 1.0);
+                    let tan = (1.0 - c * c).sqrt() / c;
+                    let at = if k > j { pts[j].r } else { pts[i].r };
+                    at[0].max(at[1]) * (tan + 0.01)
+                };
+                // Radius slope per meter at sample i (central difference).
+                let slope = |i: usize| -> bevy::math::Vec2 {
+                    let a = i.saturating_sub(1);
+                    let b = (i + 1).min(pts.len() - 1);
+                    let l = pts[a].p.distance(pts[i].p) + pts[i].p.distance(pts[b].p);
+                    if l < 1e-9 {
+                        bevy::math::Vec2::ZERO
+                    } else {
+                        (bevy::math::Vec2::from(pts[b].r) - bevy::math::Vec2::from(pts[a].r)) / l
+                    }
+                };
+                let seg = |i: usize, j: usize| {
+                    let (ea, eb) = (ext(i, j, i.wrapping_sub(1)), ext(i, j, j + 1));
+                    let (a, b) = (&pts[i], &pts[j]);
+                    let (ma, mb) = (a.r[0].max(a.r[1]), b.r[0].max(b.r[1]));
+                    let lo = (a.p - Vec3::splat(ma)).min(b.p - Vec3::splat(mb));
+                    let hi = (a.p + Vec3::splat(ma)).max(b.p + Vec3::splat(mb));
+                    let prim = if round {
+                        Prim::Cone(a.p, b.p, a.r[0], b.r[0])
+                    } else {
+                        Prim::ECone(Box::new(ECone {
+                            a: a.p,
+                            b: b.p,
+                            sa: frames[i].0,
+                            ua: frames[i].1,
+                            sb: frames[j].0,
+                            ub: frames[j].1,
+                            ra: a.r.into(),
+                            rb: b.r.into(),
+                            cap_a: i == 0,
+                            cap_b: j + 1 == pts.len(),
+                            ext_a: ea,
+                            ext_b: eb,
+                            // A capped end is flat (zero radius slope),
+                            // so the half-ellipsoid cap meets the tube
+                            // tangentially: a sloped end left a crease
+                            // ring where a limb starts inside a torso.
+                            da: if i == 0 {
+                                bevy::math::Vec2::ZERO
+                            } else {
+                                slope(i)
+                            },
+                            db: if j + 1 == pts.len() {
+                                bevy::math::Vec2::ZERO
+                            } else {
+                                slope(j)
+                            },
+                            na: a.n,
+                            nb: b.n,
+                        }))
+                    };
                     Node {
-                        prim: Prim::Cone(pa, pb, a.w, b.w),
+                        prim,
                         at: Vec3::ZERO,
                         inv: Quat::IDENTITY,
                         join: Join::Union,
@@ -793,14 +1104,14 @@ impl Builder<'_> {
                         chain: id,
                         lo,
                         hi,
-                        thin: 2.0 * a.w.min(b.w),
+                        thin: 2.0 * a.r[0].min(a.r[1]).min(b.r[0]).min(b.r[1]),
                     }
                 };
                 if pts.len() == 1 {
-                    out.push(seg(pts[0], pts[0]));
+                    out.push(seg(0, 0));
                 }
-                for w in pts.windows(2) {
-                    out.push(seg(w[0], w[1]));
+                for i in 1..pts.len() {
+                    out.push(seg(i - 1, i));
                 }
             }
             "part" => {
@@ -819,6 +1130,20 @@ impl Builder<'_> {
                     hi,
                     thin: (hi - lo).min_element(),
                 });
+            }
+            "silhouette" => {
+                let none = Vec::new();
+                let sil = crate::silhouette::Sil::new(
+                    s.side.as_ref().unwrap_or(&none),
+                    s.top.as_ref().unwrap_or(&none),
+                    s.front.as_ref(),
+                    s.round.unwrap_or(0.0),
+                    if self.res > 0.0 { self.res * 0.5 } else { 0.0 },
+                    self.band,
+                );
+                let (lo, hi) = sil.bounds();
+                let thin = (hi - lo).min_element();
+                out.push(node(Prim::Silhouette(Box::new(sil)), lo, hi, thin));
             }
             _ => {
                 let mut kids = Vec::new();
@@ -855,20 +1180,58 @@ fn union_box(nodes: &[Node]) -> (Vec3, Vec3) {
     (lo, hi)
 }
 
-/// Chain samples as (x, y, z, r): the points, or a centripetal Catmull-Rom
-/// through them (about one sample per 5 degrees of bend, and at most a
-/// radius apart), radii interpolated along with the position.
-fn chain_samples(pts: &[[f32; 4]], smooth: bool) -> Vec<Vec4> {
-    let p: Vec<Vec4> = pts.iter().map(|q| Vec4::from(*q)).collect();
+/// One sample along a chain: position, (sideways, up) radii, roll degrees.
+#[derive(Clone, Copy)]
+struct Samp {
+    p: Vec3,
+    r: [f32; 2],
+    roll: f32,
+    /// Superellipse exponent.
+    n: f32,
+}
+
+/// Chain samples: the points, or a centripetal Catmull-Rom through them
+/// (about one sample per 5 degrees of bend, and at most a radius apart),
+/// radii and roll interpolated along with the position.
+fn chain_samples(pts: &[Sect], smooth: bool) -> Vec<Samp> {
+    // Oval sections join segments by straight runs, so they sample finer
+    // (about 1.5 degrees of bend and half a radius apart).
+    let fine = pts.iter().any(|q| !q.round());
+    let (step_deg, step_r) = if fine { (1.0, 0.75) } else { (5.0, 1.0) };
+    let samp = |a: Vec4, b: Vec4| Samp {
+        p: a.truncate(),
+        r: [a.w, b.x],
+        roll: b.y,
+        n: b.z.max(1.0),
+    };
+    let p: Vec<(Vec4, Vec4)> = pts
+        .iter()
+        .map(|q| {
+            let [rx, ry] = q.radii();
+            (q.pos().extend(rx), Vec4::new(ry, q.roll(), q.n(), 0.0))
+        })
+        .collect();
     if !smooth || p.len() < 3 {
-        return p;
+        return p.iter().map(|&(a, b)| samp(a, b)).collect();
     }
     let n = p.len();
-    let at = |i: isize| -> Vec4 {
+    // Phantom end points carry the position on straight but mirror the
+    // radii (the neighbour's again), so the radius levels off into a capped
+    // end: the half-ellipsoid
+    // cap then meets the tube tangentially instead of leaving a crease ring
+    // where a tapering limb starts (a cat's shoulders and hips).
+    let flat = |e: (Vec4, Vec4), o: (Vec4, Vec4)| -> (Vec4, Vec4) {
+        let mut a = 2.0 * e.0 - o.0;
+        let mut b = 2.0 * e.1 - o.1;
+        a.w = o.0.w;
+        b.x = o.1.x;
+        (a, b)
+    };
+    let at = |i: isize| -> (Vec4, Vec4) {
         if i < 0 {
-            2.0 * p[0] - p[1]
+            flat(p[0], p[1])
         } else if i as usize >= n {
-            2.0 * p[n - 1] - p[n - 2]
+            flat(p[n - 1], p[n - 2])
         } else {
             p[i as usize]
         }
@@ -877,30 +1240,310 @@ fn chain_samples(pts: &[[f32; 4]], smooth: bool) -> Vec<Vec4> {
     for s in 0..n - 1 {
         let i = s as isize;
         let q = [at(i - 1), at(i), at(i + 1), at(i + 2)];
-        let pos = q.map(Vec4::truncate);
-        let t1 = (pos[2] - pos[0]).normalize_or_zero();
-        let t2 = (pos[3] - pos[1]).normalize_or_zero();
-        let deg = t1.dot(t2).clamp(-1.0, 1.0).acos().to_degrees();
+        let qa = q.map(|v| v.0);
+        let qb = q.map(|v| v.1);
+        let pos = qa.map(Vec4::truncate);
         let len = pos[1].distance(pos[2]);
-        let rmin = q[1].w.min(q[2].w).max(1e-4);
-        let k = ((deg / 5.0).ceil() as usize)
-            .max((len / rmin).ceil() as usize)
-            .clamp(1, 64);
+        let rmin = qa[1].w.min(qa[2].w).min(qb[1].x).min(qb[2].x).max(1e-4);
+        let rmean = (0.25 * (qa[1].w + qa[2].w + qb[1].x + qb[2].x)).max(1e-4);
         let knot = |a: Vec3, b: Vec3| (a - b).length().sqrt().max(1e-6);
         let t0 = 0.0;
         let tk1 = t0 + knot(pos[0], pos[1]);
         let tk2 = tk1 + knot(pos[1], pos[2]);
         let tk3 = tk2 + knot(pos[2], pos[3]);
-        for j in 0..k {
-            let u = j as f32 / k as f32;
-            let mut v = crate::loft::barry_goldman(q, [t0, tk1, tk2, tk3], tk1 + (tk2 - tk1) * u);
+        let ks = [t0, tk1, tk2, tk3];
+        let at_t = |t: f32| {
+            let mut v = crate::loft::barry_goldman(qa, ks, t);
+            let mut w = crate::loft::barry_goldman(qb, ks, t);
             // Overshoot must not pinch the tube to nothing.
-            v.w = v.w.max(0.5 * q[1].w.min(q[2].w));
-            out.push(v);
+            v.w = v.w.max(0.5 * qa[1].w.min(qa[2].w));
+            w.x = w.x.max(0.5 * qb[1].x.min(qb[2].x));
+            samp(v, w)
+        };
+        if fine {
+            // Adaptive: walk a fine pass and keep a sample whenever the
+            // curve has turned `step_deg` or run `step_r` radii since the
+            // last, so a bend concentrated near a joint is sampled densely.
+            const F: usize = 160;
+            let tf = |j: usize| tk1 + (tk2 - tk1) * j as f32 / F as f32;
+            let fp: Vec<Vec3> = (0..=F)
+                .map(|j| crate::loft::barry_goldman(qa, ks, tf(j)).truncate())
+                .collect();
+            out.push(at_t(tk1));
+            let (mut turn, mut run) = (0.0f32, 0.0f32);
+            for j in 1..F {
+                let (d0, d1) = (fp[j] - fp[j - 1], fp[j + 1] - fp[j]);
+                turn += d0
+                    .normalize_or_zero()
+                    .dot(d1.normalize_or_zero())
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees();
+                run += d0.length();
+                if turn >= step_deg || run >= step_r * rmean {
+                    out.push(at_t(tf(j)));
+                    turn = 0.0;
+                    run = 0.0;
+                }
+            }
+            continue;
+        }
+        let t1 = (pos[2] - pos[0]).normalize_or_zero();
+        let t2 = (pos[3] - pos[1]).normalize_or_zero();
+        let deg = t1.dot(t2).clamp(-1.0, 1.0).acos().to_degrees();
+        let k = ((deg / step_deg).ceil() as usize)
+            .max((len / (step_r * rmin)).ceil() as usize)
+            .clamp(1, 128);
+        for j in 0..k {
+            out.push(at_t(tk1 + (tk2 - tk1) * j as f32 / k as f32));
         }
     }
-    out.push(p[n - 1]);
+    let (a, b) = p[n - 1];
+    out.push(samp(a, b));
     out
+}
+
+/// A rotation-minimising (side, up) frame per sample, rolled by each
+/// sample's roll: up starts as world up (or +z on a vertical start) and is
+/// carried along the curve, so the sections stay continuous.
+fn chain_frames(pts: &[Samp]) -> Vec<(Vec3, Vec3)> {
+    let n = pts.len();
+    let tan = |i: usize| -> Vec3 {
+        let a = pts[i.saturating_sub(1)].p;
+        let b = pts[(i + 1).min(n - 1)].p;
+        let t = (b - a).normalize_or_zero();
+        if t == Vec3::ZERO { Vec3::Z } else { t }
+    };
+    let mut out = Vec::with_capacity(n);
+    let mut prev_t = Vec3::ZERO;
+    let mut up = Vec3::Y;
+    for (i, pt) in pts.iter().enumerate() {
+        let t = tan(i);
+        if i == 0 {
+            up = if t.y.abs() > 0.9 { Vec3::Z } else { Vec3::Y };
+        } else {
+            up = Quat::from_rotation_arc(prev_t, t) * up;
+        }
+        up = (up - t * up.dot(t)).normalize_or_zero();
+        if up == Vec3::ZERO {
+            up = t.any_orthonormal_vector();
+        }
+        prev_t = t;
+        let side = up.cross(t);
+        let (sn, cs) = pt.roll.to_radians().sin_cos();
+        out.push((side * cs + up * sn, up * cs - side * sn));
+    }
+    out
+}
+
+/// The lowest and highest projection onto `dir` of a chain's surface
+/// (ellipse supports at every sample, half-ellipsoid caps at the ends): how
+/// far the tube reaches along `dir`, without meshing it.
+pub fn chain_extent(points: &[Sect], smooth: bool, dir: Vec3) -> (f32, f32) {
+    let pts = chain_samples(points, smooth);
+    if pts.is_empty() {
+        return (0.0, 0.0);
+    }
+    let frames = chain_frames(&pts);
+    let n = pts.len();
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for (i, (p, (s, u))) in pts.iter().zip(&frames).enumerate() {
+        let t = u.cross(*s).normalize_or_zero();
+        let rz = if i == 0 || i + 1 == n {
+            p.r[0].min(p.r[1])
+        } else {
+            0.0
+        };
+        // Support of a superellipse: the dual norm (exponent n / (n - 1)).
+        let (a, b) = ((p.r[0] * s.dot(dir)).abs(), (p.r[1] * u.dot(dir)).abs());
+        let m = if p.n > 1.01 { p.n / (p.n - 1.0) } else { 100.0 };
+        let cross = if (p.n - 2.0).abs() < 1e-4 {
+            (a * a + b * b).sqrt()
+        } else {
+            let c = a.max(b);
+            if c < 1e-12 {
+                0.0
+            } else {
+                c * ((a / c).powf(m) + (b / c).powf(m)).powf(1.0 / m)
+            }
+        };
+        let e = (cross * cross + (rz * t.dot(dir)).powi(2)).sqrt();
+        let c = p.p.dot(dir);
+        lo = lo.min(c - e);
+        hi = hi.max(c + e);
+    }
+    (lo, hi)
+}
+
+/// Approximate signed distance to an ellipse of radii `r` (Quilez's
+/// gradient-scaled form: exact on the curve, good near it).
+fn ellipse(q: bevy::math::Vec2, r: bevy::math::Vec2) -> f32 {
+    let k0 = (q / r).length();
+    let k1 = (q / (r * r)).length();
+    if k1 < 1e-12 {
+        -r.min_element()
+    } else {
+        k0 * (k0 - 1.0) / k1
+    }
+}
+
+/// Approximate signed distance to a superellipse `|x/rx|^n + |y/ry|^n = 1`
+/// (gradient-scaled like `ellipse`, which it equals at n = 2).
+fn superellipse(q: bevy::math::Vec2, r: bevy::math::Vec2, n: f32) -> f32 {
+    if (n - 2.0).abs() < 1e-4 {
+        return ellipse(q, r);
+    }
+    let g = (q / r).abs();
+    let c = g.max_element();
+    if c < 1e-9 {
+        return -r.min_element();
+    }
+    let h = g / c;
+    let sum = h.x.powf(n) + h.y.powf(n);
+    let f = c * sum.powf(1.0 / n);
+    // d f / d g_i = (g_i / f)^(n-1); then / r_i.
+    let gx = (g.x / f).powf(n - 1.0) / r.x;
+    let gy = (g.y / f).powf(n - 1.0) / r.y;
+    let gl = (gx * gx + gy * gy).sqrt();
+    if gl < 1e-12 {
+        -r.min_element()
+    } else {
+        (f - 1.0) / gl
+    }
+}
+
+/// A superellipse-section (in-plane) by ellipse (along `z`) solid: the
+/// cross-section is a superellipse of radii `r.xy`, rounded off by an
+/// ellipse of radius `r.z` along the tangent (the caps).
+fn super_cap(q: Vec3, r: Vec3, n: f32) -> f32 {
+    if (n - 2.0).abs() < 1e-4 {
+        let k0 = (q / r).length();
+        let k1 = (q / (r * r)).length();
+        return if k1 < 1e-12 {
+            -r.min_element()
+        } else {
+            k0 * (k0 - 1.0) / k1
+        };
+    }
+    let g = bevy::math::Vec2::new(q.x / r.x, q.y / r.y).abs();
+    let c = g.max_element();
+    let s = if c < 1e-9 {
+        0.0
+    } else {
+        let h = g / c;
+        c * (h.x.powf(n) + h.y.powf(n)).powf(1.0 / n)
+    };
+    let w = q.z / r.z;
+    let f = (s * s + w * w).sqrt();
+    if f < 1e-9 {
+        return -r.min_element();
+    }
+    let (gx, gy) = if s < 1e-9 {
+        (0.0, 0.0)
+    } else {
+        ((g.x / s).powf(n - 1.0) / r.x, (g.y / s).powf(n - 1.0) / r.y)
+    };
+    let k = s / f;
+    let grad = Vec3::new(k * gx, k * gy, w / (f * r.z));
+    let gl = grad.length();
+    if gl < 1e-12 {
+        -r.min_element()
+    } else {
+        (f - 1.0) / gl
+    }
+}
+
+/// An elliptical (or superelliptical) rounded cone between two chain
+/// samples.
+struct ECone {
+    a: Vec3,
+    b: Vec3,
+    sa: Vec3,
+    ua: Vec3,
+    sb: Vec3,
+    ub: Vec3,
+    ra: bevy::math::Vec2,
+    rb: bevy::math::Vec2,
+    /// Rounded caps at the chain's own ends; between segments the ends
+    /// are cut flat (the neighbour carries on), so a taper has no bumps.
+    cap_a: bool,
+    cap_b: bool,
+    /// How far an uncapped end carries on straight (meters): enough to
+    /// close the wedge on the outside of a bend with the next segment.
+    ext_a: f32,
+    ext_b: f32,
+    /// Radius slopes (per meter along the chain) at `a` and `b`, from the
+    /// neighbouring samples: radii follow a Hermite curve across the
+    /// samples, so a taper has no kinks however the samples are spaced.
+    da: bevy::math::Vec2,
+    db: bevy::math::Vec2,
+    /// Superellipse exponents at `a` and `b` (2 = ellipse).
+    na: f32,
+    nb: f32,
+}
+
+impl ECone {
+    /// Ellipse distance in the (interpolated) frame across the segment,
+    /// capped by a half-ellipsoid past the ends.
+    fn eval(&self, p: Vec3) -> f32 {
+        let ba = self.b - self.a;
+        let l2 = ba.length_squared();
+        let (h, t) = if l2 < 1e-12 {
+            (0.0, self.ua.cross(self.sa).normalize_or_zero())
+        } else {
+            ((p - self.a).dot(ba) / l2, ba / l2.sqrt())
+        };
+        let len = l2.sqrt().max(1e-9);
+        let lo = if self.cap_a { 0.0 } else { -self.ext_a / len };
+        let hi = if self.cap_b {
+            1.0
+        } else {
+            1.0 + self.ext_b / len
+        };
+        let hc = h.clamp(lo, hi);
+        let c = self.a + ba * hc;
+        let hf = hc.clamp(0.0, 1.0);
+        let mut u = self.ua.lerp(self.ub, hf);
+        u = (u - t * u.dot(t)).normalize_or_zero();
+        let s = self.sa.lerp(self.sb, hf);
+        let s = (s - t * s.dot(t) - u * s.dot(u)).normalize_or_zero();
+        // Radii: a Hermite curve across the samples inside, carried on
+        // along its end slope past the ends.
+        let r = if hc < 0.0 {
+            self.ra + self.da * (hc * len)
+        } else if hc > 1.0 {
+            self.rb + self.db * ((hc - 1.0) * len)
+        } else {
+            let x = hc;
+            let (x2, x3) = (x * x, x * x * x);
+            self.ra * (2.0 * x3 - 3.0 * x2 + 1.0)
+                + self.da * (len * (x3 - 2.0 * x2 + x))
+                + self.rb * (3.0 * x2 - 2.0 * x3)
+                + self.db * (len * (x3 - x2))
+        };
+        let r = r.max(0.3 * self.ra.min(self.rb));
+        let n = self.na + (self.nb - self.na) * hf;
+        let d = p - c;
+        let q = Vec3::new(d.dot(s), d.dot(u), d.dot(t));
+        // Past an inner end's run the tube closes over another run's
+        // length instead of stopping flat, so nothing leaves a ledge.
+        let over = if h < lo && !self.cap_a {
+            (lo - h) * len / self.ext_a.max(1e-6)
+        } else if h > hi && !self.cap_b {
+            (h - hi) * len / self.ext_b.max(1e-6)
+        } else {
+            -1.0
+        };
+        if over >= 0.0 {
+            if over >= 1.0 {
+                return q.length().max(1e-5);
+            }
+            let rs = (r * (1.0 - over)).max(bevy::math::Vec2::splat(1e-5));
+            return superellipse(bevy::math::Vec2::new(q.x, q.y), rs, n);
+        }
+        let rr = Vec3::new(r.x, r.y, r.x.min(r.y)).max(Vec3::splat(1e-5));
+        super_cap(q, rr, n)
+    }
 }
 
 /// The coarse grid of node lists (indices into the top-level nodes, in
@@ -987,9 +1630,118 @@ struct Stage {
     w: Deform,
     lo: Vec3,
     hi: Vec3,
+    /// Local warps: the resolved centre.
+    at: Vec3,
+}
+
+/// The largest gradient a push / pinch / flatten may give its displacement:
+/// below 1 the warp cannot fold space.
+const LIP: f32 = 0.8;
+
+fn is_local(w: &Deform) -> bool {
+    crate::deform::LOCAL_MODES.contains(&w.mode.as_str())
 }
 
 impl Stage {
+    /// A local warp's weight at `q` (0 outside its radius).
+    fn weight(&self, q: Vec3) -> f32 {
+        self.w.local_weight(q.distance(self.at))
+    }
+
+    /// Where `q` came from before a local space warp (push / pinch /
+    /// flatten); identity outside the radius.
+    ///
+    /// The forward map is p + u(p) with the weight read at the source point,
+    /// and its strength is clamped so |grad u| <= `LIP` (`lip`): the map is
+    /// then a bijection (no folds, however large the amount), and the inverse
+    /// is the fixed point of p = q - u(p), a contraction iterated to
+    /// convergence.
+    fn local_inverse(&self, q: Vec3) -> Vec3 {
+        let r = self.w.radius.unwrap_or(0.1);
+        if q.distance(self.at) >= r + self.reach() {
+            return q;
+        }
+        let mut p = q;
+        for _ in 0..64 {
+            let next = q - self.local_offset(p);
+            let step = next.distance(p);
+            p = next;
+            if step < 1e-7 * r.max(1e-3) {
+                break;
+            }
+        }
+        p
+    }
+
+    /// The forward displacement u(p) of push / pinch / flatten.
+    fn local_offset(&self, p: Vec3) -> Vec3 {
+        let wt = self.weight(p);
+        if wt <= 0.0 {
+            return Vec3::ZERO;
+        }
+        let a = self.strength();
+        match self.w.mode.as_str() {
+            "push" => {
+                let d = Vec3::from(self.w.direction.unwrap_or([0.0, 1.0, 0.0])).normalize_or_zero();
+                d * a * wt
+            }
+            "pinch" => (self.at - p) * a * wt,
+            "flatten" => {
+                let n = Vec3::from(self.w.normal.unwrap_or([0.0, 1.0, 0.0])).normalize_or_zero();
+                -n * (p - self.at).dot(n) * a * wt
+            }
+            _ => Vec3::ZERO,
+        }
+    }
+
+    /// The warp's amount, clamped so the map's gradient stays <= `LIP`.
+    fn strength(&self) -> f32 {
+        let r = self.w.radius.unwrap_or(0.1).max(1e-9);
+        match self.w.mode.as_str() {
+            "push" => {
+                let a = self.w.amount.unwrap_or(0.0);
+                let cap = LIP * r / self.w.falloff_slope();
+                a.clamp(-cap, cap)
+            }
+            "pinch" | "flatten" => {
+                let a = self.w.amount.unwrap_or(0.5);
+                a.min(LIP / self.w.falloff_stretch().max(1e-6))
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// How far the warp can move a point (so points that far outside the
+    /// radius may still come from inside it).
+    fn reach(&self) -> f32 {
+        let r = self.w.radius.unwrap_or(0.1);
+        match self.w.mode.as_str() {
+            "push" => self.strength().abs(),
+            "pinch" | "flatten" => self.strength() * r,
+            _ => 0.0,
+        }
+    }
+
+    /// The Lipschitz bound of the inverse map near `q` minus one, so the
+    /// warped distance divided by (1 + lip) stays a lower bound (the mesher
+    /// and smooth booleans trust it). Smoothly 0 outside the radius.
+    fn lip(&self, q: Vec3) -> f32 {
+        let r = self.w.radius.unwrap_or(0.1);
+        let d = q.distance(self.at);
+        let outer = r + self.reach();
+        if d >= outer {
+            return 0.0;
+        }
+        let t = 1.0 - d / outer;
+        let s = t * t * (3.0 - 2.0 * t);
+        // |grad u| <= LIP gives |grad u^-1| <= 1 / (1 - LIP).
+        let l = match self.w.mode.as_str() {
+            "push" => self.strength().abs() * self.w.falloff_slope() / r.max(1e-9),
+            _ => self.strength() * self.w.falloff_stretch(),
+        };
+        s * l / (1.0 - l).max(1e-3)
+    }
+
     fn axis(&self) -> usize {
         self.w
             .axis
@@ -1101,6 +1853,71 @@ impl Stage {
     }
 }
 
+/// The field at `q` through the space and local warps (last one outermost).
+///
+/// A smooth warp blurs with six samples of the field below it; samples taken
+/// for a blur skip the smooth warps further in (`blurring`), so stacked
+/// smooths cost 1 + 6 per smooth instead of 7^n.
+fn through(stages: &[&Stage], q: Vec3, base: &dyn Fn(Vec3) -> f32) -> f32 {
+    through_at(stages, q, base, false)
+}
+
+fn through_at(stages: &[&Stage], q: Vec3, base: &dyn Fn(Vec3) -> f32, blurring: bool) -> f32 {
+    let Some((last, rest)) = stages.split_last() else {
+        return base(q);
+    };
+    let through =
+        |s: &[&Stage], q: Vec3, base: &dyn Fn(Vec3) -> f32| through_at(s, q, base, blurring);
+    match last.w.mode.as_str() {
+        "inflate" => through(rest, q, base) - last.w.amount.unwrap_or(0.0) * last.weight(q),
+        "smooth" if blurring => through(rest, q, base),
+        "smooth" => {
+            let d = through(rest, q, base);
+            let wt = last.w.amount.unwrap_or(0.5) * last.weight(q);
+            if wt <= 0.0 {
+                return d;
+            }
+            // A local blur of the field: the mean of six samples a third of
+            // the radius away (the Laplacian pulls ridges in, fills dents).
+            let h = last.w.size.unwrap_or(last.w.radius.unwrap_or(0.1) / 3.0);
+            let mut sum = 0.0;
+            for dir in [
+                Vec3::X,
+                Vec3::NEG_X,
+                Vec3::Y,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ] {
+                sum += through_at(rest, q + dir * h, base, true);
+            }
+            d + (sum / 6.0 - d) * wt
+        }
+        "push" | "pinch" | "flatten" => {
+            through(rest, last.local_inverse(q), base) / (1.0 + last.lip(q))
+        }
+        _ => through(rest, last.inverse(q), base),
+    }
+}
+
+/// A local warp's anchor: "part:words" (a joint of that part, else words
+/// on its box), or words on the field's own box ("top-front").
+fn resolve_anchor(a: &str, lo: Vec3, hi: Vec3, lookup: &Lookup) -> Result<Vec3, String> {
+    if let Some((p, words)) = a.split_once(':') {
+        let part = lookup(p).map_err(|e| format!("`{a}`: {e}"))?;
+        if let Some(j) = part.joint(words) {
+            return Ok(j);
+        }
+        let (plo, phi) = part.bounds();
+        return crate::commands::anchor_point(words, plo, phi)
+            .map(Vec3::from)
+            .map_err(|e| format!("`{a}`: {e}"));
+    }
+    crate::commands::anchor_point(a, lo, hi)
+        .map(Vec3::from)
+        .map_err(|e| format!("`{a}` is not a joint or an anchor on the field's box ({e})"))
+}
+
 fn fold(mut p: Vec3, mirror: Option<&str>) -> Vec3 {
     match mirror {
         Some("x") => p.x = p.x.abs(),
@@ -1168,13 +1985,41 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
     let mut stages = Vec::new();
     let (mut lo, mut hi) = (size_lo - Vec3::splat(k), size_hi + Vec3::splat(k));
     let mut disp = 0.0f32;
-    for w in &def.warps {
+    for (i, w) in def.warps.iter().enumerate() {
+        let at = match &w.at {
+            None => Vec3::ZERO,
+            Some(crate::deform::WarpAt::Point(p)) => Vec3::from(*p),
+            Some(crate::deform::WarpAt::Anchor(a)) => resolve_anchor(a, size_lo, size_hi, lookup)
+                .map_err(|m| {
+                ModelerError::Invalid(format!("sdf `{name}`: warps[{i}]: at: {m}"))
+            })?,
+        };
+        // Under a mirror, a symmetric local warp (the default) is folded
+        // onto the side the field is evaluated on, so one at x < 0 acts on
+        // both sides; `mirror: false` keeps it where it is (pre-fold).
+        let at = if is_local(w) && w.mirror != Some(false) {
+            fold(at, def.mirror.as_deref())
+        } else {
+            at
+        };
         let st = Stage {
             w: w.clone(),
             lo,
             hi,
+            at,
         };
-        if w.mode == "displace" {
+        if is_local(w) {
+            let grow = match w.mode.as_str() {
+                "inflate" => w.amount.unwrap_or(0.0).abs(),
+                "push" => st.reach(),
+                _ => 0.0,
+            };
+            if w.mode == "inflate" {
+                disp += grow;
+            }
+            lo -= Vec3::splat(grow);
+            hi += Vec3::splat(grow);
+        } else if w.mode == "displace" {
             let size = (hi - lo).max(Vec3::splat(1e-6));
             let a = w.amount.unwrap_or(0.12 * size.min_element()).abs();
             disp += a;
@@ -1219,7 +2064,8 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
         }
         None => {
             let mut r = (size / 120.0).min(thin / 3.0).max(1e-4);
-            if let Some(t) = def.target_tris {
+            let hint = def.target_tris.or(def.tris.filter(|_| !def.bake));
+            if let Some(t) = hint {
                 // Mesh about 40x the kept triangles (at least 6000): enough
                 // for the decimate to pick a faithful light mesh. Surface
                 // area is guessed from the box (an ellipsoid's is ~0.55 of
@@ -1236,7 +2082,7 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
             r
         }
     };
-    let band = k + disp + 4.0 * res;
+    let band = SMIN_WIDTH * k + disp + 4.0 * res;
     b.res = res;
     b.band = band;
     let mut nodes = Vec::new();
@@ -1244,37 +2090,30 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
         b.compile(s, k, &mut nodes)?;
     }
     let buckets = Buckets::new(&nodes, band);
+
     let mirror = def.mirror.as_deref();
     let disp_stages: Vec<&Stage> = stages.iter().filter(|s| s.w.mode == "displace").collect();
-    let space_stages: Vec<&Stage> = stages.iter().filter(|s| s.w.mode != "displace").collect();
-    let field = |p: Vec3| -> f32 {
-        let mut q = fold(p, mirror);
-        let mut off = 0.0;
-        for s in &disp_stages {
-            off += noise_at(&s.w, q, (s.hi - s.lo).max(Vec3::splat(1e-6)));
-        }
-        for s in space_stages.iter().rev() {
-            q = s.inverse(q);
-        }
+    // One-sided local warps run before the fold, in world space.
+    let one_sided = |s: &Stage| mirror.is_some() && is_local(&s.w) && s.w.mirror == Some(false);
+    let pre_stages: Vec<&Stage> = stages.iter().filter(|s| one_sided(s)).collect();
+    let space_stages: Vec<&Stage> = stages
+        .iter()
+        .filter(|s| s.w.mode != "displace" && !one_sided(s))
+        .collect();
+    let base = |q: Vec3| -> f32 {
+        let list = buckets.get(q);
         let mut d = band;
-        let mut chain = (0u32, band, 0.0f32);
-        for &i in buckets.get(q) {
-            let n = &nodes[i as usize];
+        let mut i = 0;
+        while i < list.len() {
+            let n = &nodes[list[i] as usize];
             if n.chain != 0 {
-                if n.chain != chain.0 {
-                    if chain.0 != 0 {
-                        d = smin(d, chain.1, chain.2);
-                    }
-                    chain = (n.chain, band, n.k);
+                let mut j = i + 1;
+                while j < list.len() && nodes[list[j] as usize].chain == n.chain {
+                    j += 1;
                 }
-                if inside_box(q, n, band) {
-                    chain.1 = chain.1.min(n.eval(q, band));
-                }
+                d = smin(d, chain_min(&nodes, &list[i..j], q, band), n.k);
+                i = j;
                 continue;
-            }
-            if chain.0 != 0 {
-                d = smin(d, chain.1, chain.2);
-                chain.0 = 0;
             }
             let e = if n.join == Join::Intersect || inside_box(q, n, band) {
                 n.eval(q, band).min(band)
@@ -1282,11 +2121,24 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
                 band
             };
             d = join(d, e, n.join, n.k);
+            i += 1;
         }
-        if chain.0 != 0 {
-            d = smin(d, chain.1, chain.2);
+        d.clamp(-4.0 * band, band)
+    };
+    let folded = |p: Vec3| -> f32 {
+        let q = fold(p, mirror);
+        let mut off = 0.0;
+        for s in &disp_stages {
+            off += noise_at(&s.w, q, (s.hi - s.lo).max(Vec3::splat(1e-6)));
         }
-        d.clamp(-4.0 * band, band) - off
+        through(&space_stages, q, &base) - off
+    };
+    let field = |p: Vec3| -> f32 {
+        if pre_stages.is_empty() {
+            folded(p)
+        } else {
+            through(&pre_stages, p, &folded)
+        }
     };
     let pad = Vec3::splat(2.0 * res);
     let (blo, bhi) = (lo - pad, hi + pad);
@@ -1310,6 +2162,14 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
     let mut out = crate::csg::manifold_to_part(&m, name, crate::Material::default());
     crate::uv::crease_normals(&mut out, 60.0);
     out.visible = true;
+    if let Some(t) = def.tris {
+        let d = crate::decimate::Decimate {
+            tris: Some(t),
+            bake: def.bake,
+            ..Default::default()
+        };
+        out = crate::decimate::decimate(name, &out, &d).map_err(err)?;
+    }
     Ok(out)
 }
 
@@ -1379,15 +2239,10 @@ fn warped_box(st: &Stage, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
 }
 
 /// Meshes a `skin` item.
-pub fn skin(name: &str, def: &SkinDef) -> Result<Part, ModelerError> {
+pub fn skin(name: &str, def: &SkinDef, lookup: &Lookup) -> Result<Part, ModelerError> {
     def.validate()
         .map_err(|e| ModelerError::Invalid(format!("skin `{name}`: {e}")))?;
-    let none = |n: &str| -> Result<Arc<Part>, ModelerError> {
-        Err(ModelerError::Invalid(format!(
-            "skin reads no parts (`{n}`)"
-        )))
-    };
-    build(name, &def.to_sdf(), &none).map_err(|e| match e {
+    build(name, &def.to_sdf(), lookup).map_err(|e| match e {
         ModelerError::Csg(m) => ModelerError::Csg(m.replacen("sdf `", "skin `", 1)),
         o => o,
     })
@@ -1396,6 +2251,229 @@ pub fn skin(name: &str, def: &SkinDef) -> Result<Part, ModelerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_warps_move_the_surface_only_within_their_radius() {
+        let sphere = |warps: Vec<Deform>| SdfDef {
+            shapes: vec![Shape {
+                shape: "sphere".into(),
+                radius: Some(vec![0.2]),
+                ..Shape::default()
+            }],
+            warps,
+            resolution: Some(0.006),
+            ..SdfDef::default()
+        };
+        let at = Vec3::new(0.2, 0.0, 0.0);
+        let r = 0.1;
+        let warp = |mode: &str| Deform {
+            mode: mode.into(),
+            at: Some(crate::deform::WarpAt::Point(at.to_array())),
+            radius: Some(r),
+            amount: Some(if mode == "pinch" || mode == "flatten" {
+                0.6
+            } else {
+                0.03
+            }),
+            direction: (mode == "push").then_some([1.0, 0.0, 0.0]),
+            normal: (mode == "flatten").then_some([1.0, 0.0, 0.0]),
+            ..Deform::default()
+        };
+        for mode in ["inflate", "push", "pinch", "flatten", "smooth"] {
+            let def = sphere(vec![warp(mode)]);
+            def.validate().unwrap_or_else(|e| panic!("{mode}: {e}"));
+            let p = build("s", &def, &no_parts).unwrap_or_else(|e| panic!("{mode}: {e}"));
+            let mut moved_out = 0.0f32;
+            let mut moved_in = 0.0f32;
+            for v in &p.verts {
+                let v = Vec3::from(*v);
+                let off = v.length() - 0.2;
+                if v.distance(at) > r + 0.02 {
+                    assert!(
+                        off.abs() < 0.004,
+                        "{mode}: {v} moved {off} outside the radius"
+                    );
+                } else {
+                    moved_out = moved_out.max(off);
+                    moved_in = moved_in.min(off);
+                }
+            }
+            match mode {
+                "inflate" | "push" => assert!(moved_out > 0.02, "{mode}: grew {moved_out}"),
+                // The cap's sides rise toward the plane x = 0.2 through `at`.
+                "flatten" => assert!(moved_out > 0.001, "{mode}: {moved_out} {moved_in}"),
+                _ => {}
+            }
+        }
+        // A body warp centred on a joint by name.
+        let mut d = crate::body::BodyDef {
+            preset: "biped".into(),
+            resolution: Some(0.012),
+            ..Default::default()
+        };
+        d.warps = vec![Deform {
+            mode: "inflate".into(),
+            at: Some(crate::deform::WarpAt::Anchor("head".into())),
+            radius: Some(0.12),
+            amount: Some(0.03),
+            ..Deform::default()
+        }];
+        d.validate().unwrap_or_else(|e| panic!("{e}"));
+        let low = crate::body::lower(&d).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            low.sdf.warps[0].at,
+            Some(crate::deform::WarpAt::Point(_))
+        ));
+        // A typo is an error naming the fields.
+        let mut bad = warp("inflate");
+        bad.degrees = Some(3.0);
+        assert!(check_warps(&[bad]).is_err());
+    }
+
+    fn ball(warps: Vec<Deform>, mirror: Option<&str>) -> SdfDef {
+        SdfDef {
+            shapes: vec![Shape {
+                shape: "sphere".into(),
+                radius: Some(vec![0.2]),
+                ..Shape::default()
+            }],
+            warps,
+            mirror: mirror.map(Into::into),
+            resolution: Some(0.008),
+            ..SdfDef::default()
+        }
+    }
+
+    fn local(mode: &str, at: [f32; 3], amount: f32) -> Deform {
+        Deform {
+            mode: mode.into(),
+            at: Some(crate::deform::WarpAt::Point(at)),
+            radius: Some(0.1),
+            amount: Some(amount),
+            direction: (mode == "push").then_some([1.0, 0.0, 0.0]),
+            normal: (mode == "flatten").then_some([1.0, 0.0, 0.0]),
+            ..Deform::default()
+        }
+    }
+
+    #[test]
+    fn large_local_warps_do_not_fold() {
+        for (mode, amount) in [("push", 2.0), ("pinch", 1.0), ("flatten", 1.0)] {
+            let def = ball(vec![local(mode, [0.2, 0.0, 0.0], amount)], None);
+            let p = build("s", &def, &no_parts).unwrap_or_else(|e| panic!("{mode}: {e}"));
+            let (n, _) = crate::organic::self_intersections(&p);
+            assert_eq!(n, 0, "{mode}: {n} self-intersections");
+            // One closed sphere-like shell: no detached pockets from a fold.
+            let chi = p.verts.len() as i64 - p.indices.len() as i64 / 6;
+            assert_eq!(chi, 2, "{mode}: euler characteristic {chi}");
+            // The inverse really inverts the (clamped) forward map.
+            let st = Stage {
+                w: def.warps[0].clone(),
+                lo: Vec3::splat(-1.0),
+                hi: Vec3::splat(1.0),
+                at: Vec3::new(0.2, 0.0, 0.0),
+            };
+            for q in [Vec3::new(0.25, 0.03, 0.0), Vec3::new(0.15, -0.02, 0.04)] {
+                let p = st.local_inverse(q);
+                assert!((p + st.local_offset(p)).distance(q) < 1e-5, "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_warps_under_mirror_act_where_placed() {
+        let bump_at = |p: &Part, x: f32| {
+            p.verts
+                .iter()
+                .map(|v| Vec3::from(*v))
+                .filter(|v| (v.x - x).abs() < 0.12 && v.y.abs() < 0.12)
+                .map(|v| v.length())
+                .fold(0.0f32, f32::max)
+        };
+        // Symmetric (default): a warp at x < 0 bumps both sides.
+        let sym = ball(vec![local("inflate", [-0.2, 0.0, 0.0], 0.04)], Some("x"));
+        let p = build("s", &sym, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        assert!(bump_at(&p, -0.2) > 0.225 && bump_at(&p, 0.2) > 0.225);
+        // One-sided: only where it is.
+        let mut w = local("inflate", [-0.2, 0.0, 0.0], 0.04);
+        w.mirror = Some(false);
+        let one = ball(vec![w], Some("x"));
+        let p = build("s", &one, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        assert!(bump_at(&p, -0.2) > 0.225, "{}", bump_at(&p, -0.2));
+        assert!(bump_at(&p, 0.2) < 0.21, "{}", bump_at(&p, 0.2));
+    }
+
+    #[test]
+    fn stacked_smooth_warps_stay_linear() {
+        let mut ws = Vec::new();
+        for _ in 0..6 {
+            let mut w = local("smooth", [0.2, 0.0, 0.0], 0.5);
+            w.size = Some(0.02);
+            ws.push(w);
+        }
+        let def = ball(ws, None);
+        def.validate().unwrap_or_else(|e| panic!("{e}"));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let stages: Vec<Stage> = def
+            .warps
+            .iter()
+            .map(|w| Stage {
+                w: w.clone(),
+                lo: Vec3::splat(-1.0),
+                hi: Vec3::splat(1.0),
+                at: Vec3::new(0.2, 0.0, 0.0),
+            })
+            .collect();
+        let refs: Vec<&Stage> = stages.iter().collect();
+        let base = |q: Vec3| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            q.length() - 0.2
+        };
+        through(&refs, Vec3::new(0.2, 0.0, 0.0), &base);
+        assert_eq!(calls.into_inner(), 1 + 6 * 6);
+        let mut bad = local("inflate", [0.0; 3], 0.1);
+        bad.size = Some(0.1);
+        assert!(check_warps(&[bad]).is_err());
+    }
+
+    #[test]
+    fn skin_and_body_warps_read_part_anchors() {
+        let w = local("inflate", [0.0; 3], 0.02);
+        let w = Deform {
+            at: Some(crate::deform::WarpAt::Anchor("knob:top".into())),
+            ..w
+        };
+        let knob = Part {
+            name: "knob".into(),
+            verts: vec![[0.0, 0.0, 0.0], [0.0, 0.1, 0.0]],
+            indices: vec![0, 1, 1],
+            ..Part::default()
+        };
+        let knob = Arc::new(knob);
+        let look = |n: &str| {
+            if n == "knob" {
+                Ok(knob.clone())
+            } else {
+                no_parts(n)
+            }
+        };
+        let def = SkinDef {
+            chains: vec![vec![
+                ChainPt::Point(Sect::Round([0.0, 0.0, 0.0, 0.05])),
+                ChainPt::Point(Sect::Round([0.0, 0.2, 0.0, 0.05])),
+            ]],
+            warps: vec![w.clone()],
+            resolution: Some(0.01),
+            ..SkinDef::default()
+        };
+        skin("t", &def, &look).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(warp_reads(&def.warps), vec!["knob"]);
+        let op = crate::Op::Skin {
+            name: "t".into(),
+            def: Box::new(def),
+        };
+        assert!(crate::graph::inputs(&op).contains(&"knob"));
+    }
 
     fn no_parts(n: &str) -> Result<Arc<Part>, ModelerError> {
         Err(ModelerError::Invalid(format!("no part {n}")))
@@ -1515,13 +2593,13 @@ mod tests {
             ]
         }))
         .unwrap_or_else(|e| panic!("{e}"));
-        let p = skin("guy", &def).unwrap_or_else(|e| panic!("{e}"));
+        let p = skin("guy", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
         closed(&p);
         let (lo, hi) = p.bounds();
         assert!(lo.y < 0.0 && hi.y > 1.05, "{lo} {hi}");
         let bad: SkinDef = serde_json::from_value(serde_json::json!({"chains": [["knee"]]}))
             .unwrap_or_else(|e| panic!("{e}"));
-        let e = skin("x", &bad)
+        let e = skin("x", &bad, &no_parts)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
@@ -1541,5 +2619,89 @@ mod tests {
             e.contains("shapes[0] (sphere): `height` does not apply"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn elliptical_sections_measure_their_width_and_depth() {
+        let chain = |pts: serde_json::Value| SdfDef {
+            shapes: vec![shape(serde_json::json!({"shape": "chain", "points": pts}))],
+            blend: Some(0.0),
+            resolution: Some(0.004),
+            ..SdfDef::default()
+        };
+        // Along z: rx 0.1 sideways (x), ry 0.05 up (y).
+        let p = build(
+            "e",
+            &chain(serde_json::json!([
+                [0.0, 0.2, -0.3, [0.1, 0.05]],
+                [0.0, 0.2, 0.0, [0.1, 0.05]],
+                [0.0, 0.2, 0.3, [0.1, 0.05]]
+            ])),
+            &no_parts,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        closed(&p);
+        let (lo, hi) = p.bounds();
+        let (w, h) = (hi.x - lo.x, hi.y - lo.y);
+        assert!(
+            (w - 0.2).abs() < 0.01 && (h - 0.1).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // Rolled 90 degrees: the wide axis turns up.
+        let p = build(
+            "r",
+            &chain(serde_json::json!([
+                [0.0, 0.2, -0.3, [0.1, 0.05], 90.0],
+                [0.0, 0.2, 0.3, [0.1, 0.05], 90.0]
+            ])),
+            &no_parts,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        closed(&p);
+        let (lo, hi) = p.bounds();
+        let (w, h) = (hi.x - lo.x, hi.y - lo.y);
+        assert!(
+            (w - 0.1).abs() < 0.01 && (h - 0.2).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // A vertical chain: rx is x, ry is z (depth).
+        let p = build(
+            "v",
+            &chain(serde_json::json!([
+                [0.0, 0.0, 0.0, [0.08, 0.03]],
+                [0.0, 0.5, 0.0, [0.08, 0.03]]
+            ])),
+            &no_parts,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (lo, hi) = p.bounds();
+        let (w, d) = (hi.x - lo.x, hi.z - lo.z);
+        assert!(
+            (w - 0.16).abs() < 0.01 && (d - 0.06).abs() < 0.01,
+            "{w} x {d}"
+        );
+    }
+
+    #[test]
+    fn tris_decimates_within_ten_percent() {
+        let def: SkinDef = serde_json::from_value(serde_json::json!({
+            "joints": {"hip": [0.0, 0.5, 0.0, 0.08]},
+            "chains": [
+                ["hip", [0.0, 0.8, 0.0, [0.1, 0.06]], [0.0, 1.0, 0.05, 0.07]],
+                ["hip", [0.15, 0.3, 0.0, 0.04], [0.2, 0.02, 0.05, 0.03]]
+            ],
+            "tris": 2000
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let p = skin("t", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        closed(&p);
+        let n = p.tri_count() as f32;
+        assert!((n - 2000.0).abs() / 2000.0 < 0.1, "{n} triangles");
+        let bad = SkinDef {
+            bake: true,
+            ..def.clone()
+        };
+        let bad = SkinDef { tris: None, ..bad };
+        assert!(bad.validate().is_err());
     }
 }

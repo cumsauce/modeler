@@ -345,6 +345,9 @@ pub struct SilhouetteDiff {
     pub reference_only: f64,
     /// Reference box aspect (w / h) and the model's.
     pub aspects: (f64, f64),
+    /// The reference's subject fitted into the render's pixels (`w` x `h`),
+    /// for `band_deviations`.
+    pub fitted: Vec<bool>,
 }
 
 /// Fits the reference's subject onto the model's silhouette (uniformly
@@ -371,6 +374,7 @@ pub fn compare_silhouettes(
     let mc = ((mb[0] + mb[2]) as f64 * 0.5, (mb[1] + mb[3]) as f64 * 0.5);
     let rc = ((rb[0] + rb[2]) as f64 * 0.5, (rb[1] + rb[3]) as f64 * 0.5);
     let mut image = Canvas::new(w, h, [255, 255, 255, 255]);
+    let mut fitted = vec![false; w * h];
     let (mut both, mut any, mut mo, mut ro) = (0usize, 0usize, 0usize, 0usize);
     for y in 0..h {
         for x in 0..w {
@@ -382,6 +386,7 @@ pub fn compare_silhouettes(
                 && (ry.round() as usize) < reference.h
                 && rmask[ry.round() as usize * reference.w + rx.round() as usize];
             let m = model[y * w + x];
+            fitted[y * w + x] = r;
             let c = match (m, r) {
                 (true, true) => {
                     both += 1;
@@ -408,7 +413,139 @@ pub fn compare_silhouettes(
         model_only: mo as f64 / n,
         reference_only: ro as f64 / n,
         aspects: (rw / rh, mw / mh),
+        fitted,
     })
+}
+
+/// Where a model's silhouette is wider / narrower (a horizontal band) or
+/// taller / shorter (a vertical band) than the fitted reference.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BandDeviation {
+    /// "rows" (horizontal band: compares widths) or "columns" (vertical
+    /// band: compares heights).
+    pub axis: &'static str,
+    /// top / upper / middle / lower / bottom, or left / center-left /
+    /// center / center-right / right.
+    pub label: &'static str,
+    /// The band's span, % of the combined box from the top (rows) or left.
+    pub from_pct: f64,
+    pub to_pct: f64,
+    /// Mean extent across the band (meters): the model's and the reference's.
+    pub model_m: f64,
+    pub reference_m: f64,
+    /// model - reference, meters and % of the reference.
+    pub delta_m: f64,
+    pub delta_pct: f64,
+}
+
+impl BandDeviation {
+    /// "top 0-20%: model 14% wider (+3.1 cm)".
+    pub fn describe(&self) -> String {
+        let word = match (self.axis, self.delta_m >= 0.0) {
+            ("rows", true) => "wider",
+            ("rows", false) => "narrower",
+            (_, true) => "taller",
+            (_, false) => "shorter",
+        };
+        let cm = self.delta_m * 100.0;
+        let len = if cm.abs() >= 100.0 {
+            format!("{:+.2} m", self.delta_m)
+        } else {
+            format!("{cm:+.1} cm")
+        };
+        format!(
+            "{} {:.0}-{:.0}%: model {:.0}% {word} ({len})",
+            self.label,
+            self.from_pct,
+            self.to_pct,
+            self.delta_pct.abs()
+        )
+    }
+}
+
+/// Splits the box holding both masks into 5 horizontal bands (each
+/// comparing the mean row width) and 5 vertical bands (mean column height),
+/// `m_per_px` meters per pixel. Every band, in band order.
+pub fn band_deviations(
+    model: &[bool],
+    fitted: &[bool],
+    w: usize,
+    h: usize,
+    m_per_px: f64,
+) -> Vec<BandDeviation> {
+    const ROWS: [&str; 5] = ["top", "upper", "middle", "lower", "bottom"];
+    const COLS: [&str; 5] = ["left", "center-left", "center", "center-right", "right"];
+    let (Some(a), Some(b)) = (mask_box(model, w), mask_box(fitted, w)) else {
+        return Vec::new();
+    };
+    let bb = [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ];
+    // Extent of a mask along one line (first to last set pixel).
+    let extent = |m: &[bool], line: usize, rows: bool| -> f64 {
+        let (n, at): (usize, Box<dyn Fn(usize) -> usize>) = if rows {
+            (w, Box::new(move |i| line * w + i))
+        } else {
+            (h, Box::new(move |i| i * w + line))
+        };
+        let first = (0..n).find(|&i| m[at(i)]);
+        let last = (0..n).rev().find(|&i| m[at(i)]);
+        match (first, last) {
+            (Some(f), Some(l)) => (l - f + 1) as f64,
+            _ => 0.0,
+        }
+    };
+    let mut out = Vec::new();
+    for (rows, labels, lo, hi) in [(true, ROWS, bb[1], bb[3]), (false, COLS, bb[0], bb[2])] {
+        let span = (hi - lo + 1) as f64;
+        for (k, label) in labels.iter().enumerate() {
+            let s = lo + (span * k as f64 / 5.0).round() as usize;
+            let e = (lo + (span * (k + 1) as f64 / 5.0).round() as usize).min(hi + 1);
+            if e <= s {
+                continue;
+            }
+            let (mut sm, mut sr) = (0.0, 0.0);
+            for line in s..e {
+                sm += extent(model, line, rows);
+                sr += extent(fitted, line, rows);
+            }
+            let n = (e - s) as f64;
+            let (mm, rm) = (sm / n * m_per_px, sr / n * m_per_px);
+            let d = mm - rm;
+            out.push(BandDeviation {
+                axis: if rows { "rows" } else { "columns" },
+                label,
+                from_pct: k as f64 * 20.0,
+                to_pct: (k + 1) as f64 * 20.0,
+                model_m: mm,
+                reference_m: rm,
+                delta_m: d,
+                delta_pct: if rm > 0.0 { d / rm * 100.0 } else { 100.0 },
+            });
+        }
+    }
+    out
+}
+
+/// The biggest deviations worth naming: at least `min_pct` % and 2 px off,
+/// largest |meters| first, at most `n`.
+pub fn top_deviations(
+    bands: &[BandDeviation],
+    m_per_px: f64,
+    min_pct: f64,
+    n: usize,
+) -> Vec<BandDeviation> {
+    let mut v: Vec<_> = bands
+        .iter()
+        .filter(|b| b.delta_pct.abs() >= min_pct && b.delta_m.abs() >= 2.0 * m_per_px)
+        .cloned()
+        .collect();
+    v.sort_by(|a, b| b.delta_m.abs().total_cmp(&a.delta_m.abs()));
+    v.truncate(n);
+    v
 }
 
 /// Formats a length in metres for labels: "1.25 m", "35 mm", "0.4 mm".
@@ -559,5 +696,45 @@ mod tests {
         );
         let i = (50 * 100 + 30) * 4;
         assert_eq!(&d.image.px[i..i + 4], &[0, 220, 255, 255]);
+    }
+
+    #[test]
+    fn bands_name_a_wider_head() {
+        // A 20 x 50 px body; the model's top 10 rows are 30 px wide, the
+        // reference's 20. At 1 cm a pixel the top band is 10 cm wider.
+        let (w, h) = (100, 100);
+        let mut model = vec![false; w * h];
+        let mut fitted = vec![false; w * h];
+        for y in 25..75 {
+            for x in 40..60 {
+                model[y * w + x] = true;
+                fitted[y * w + x] = true;
+            }
+            if y < 35 {
+                for x in 35..65 {
+                    model[y * w + x] = true;
+                }
+            }
+        }
+        let bands = band_deviations(&model, &fitted, w, h, 0.01);
+        let top = top_deviations(&bands, 0.01, 3.0, 5);
+        let first = top.first().unwrap_or_else(|| panic!("no deviation"));
+        assert_eq!((first.axis, first.label), ("rows", "top"));
+        assert!((first.delta_m - 0.10).abs() < 1e-6, "{first:?}");
+        assert!((first.delta_pct - 50.0).abs() < 1e-6, "{first:?}");
+        assert!(
+            first
+                .describe()
+                .starts_with("top 0-20%: model 50% wider (+10.0 cm)"),
+            "{}",
+            first.describe()
+        );
+        // The other row bands match.
+        assert!(top.iter().all(|b| b.axis != "rows" || b.label == "top"));
+        // The extra head sticks out at the left and right columns: taller there.
+        assert!(
+            top.iter().any(|b| b.label == "left" && b.delta_m > 0.0),
+            "{top:?}"
+        );
     }
 }

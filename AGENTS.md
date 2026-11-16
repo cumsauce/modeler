@@ -138,8 +138,10 @@ type, so there is no need to memorise field names.
 | `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights], [near + near_distance 0.5], [edge_bias 0], [clump {count, radius}], [mask path / pad / not_path / not_pad], [height [min, max]]; or `decal` {pbr, size, [aspect 1], [depth], [roll random / none], [kind], [params]} instead of input |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments], [edges all / top / bottom / vertical / horizontal or a list] (fillet) |
 | `deform` | name, input, mode (displace / bend / twist / taper / material), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
-| `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution] (analytic distance-field modeling) |
-| `skin` | name, chains [[[x, y, z, r] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution] (a skeleton with radii as one smooth skin) |
+| `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution], [tris], [bake] (analytic distance-field modeling) |
+| `skin` | name, chains [[[x, y, z, r] or [x, y, z, [rx, ry], roll?] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution], [tris], [bake] (a skeleton with radii as one smooth skin) |
+| `body` | name, preset (biped / quadruped / bird / fish / serpent / car), [height], [head_ratio], [build], [leg_length], [tail], [snout], [joints {name: {scale, offset}}], [blend], [resolution], [tris], [bake], [rig true], [warps] (a parametric creature or car with a `<name>_rig` skeleton) |
+| `silhouette` | name, side [[z, y]...], top [[x, z]...], [front [[x, y]...]], [smooth], [round], [blend], [from_reference {image, view, height / size}], [resolution], [tris], [bake], [translation], [rotation] (a solid carved from orthographic outlines) |
 | `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
 | `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
@@ -253,7 +255,9 @@ surfaces, not hundreds of scattered copies.
   lower the desk with a param and the mug follows. `toward` sets the travel
   direction: `down` (default), `up` (under a shelf), or `back` / `front` /
   `left` / `right` to mount against a wall; `at` then names the two cross
-  axes: back/front `[x, y]`, left/right `[z, y]`. A frame on the left wall:
+  axes: back/front `[x, y]`, left/right `[z, y]`. `at` may also be an
+  anchor (`"cat:paw_l"`, `"desk:top-front"`): its cross-axis coordinates
+  are used, read before this place moves anything. A frame on the left wall:
   `{"type": "place", "name": "hang", "parts": ["frame"], "on": "wall_left",
   "toward": "left", "at": [-0.4, 1.5]}`. A place runs after any move/place
   that moves the part it lands on (a pot on a sill mounted on a wall),
@@ -596,7 +600,30 @@ surfaces, not hundreds of scattered copies.
   themselves; `"z"`, `"xz"` for four-fold). `warps` act on the whole field
   in order, with the deform fields: `twist` / `bend` / `taper` warp space
   over the field's box at that point of the list, `displace` adds noise to
-  the surface (amount, scale, octaves, seed, noise). `resolution` (voxel
+  the surface (amount, scale, octaves, seed, noise). **Local sculpt
+  warps** (sdf, skin and body `warps`) act only within `radius` meters of
+  `at` (a point; an anchor: a skin / body joint name such as `"head"`,
+  `"part:top"` or `"part:joint"` on an sdf, which then reads that part, or
+  anchor words on the field's own box, `"top-front"`), fading by
+  `falloff` (`smooth` default, `linear`, `sharp`), with zero effect
+  outside: `inflate` (`amount` meters, + grows, - shrinks), `push`
+  (`direction` + `amount` meters: a brow pushed forward), `pinch`
+  (`amount` 0..1, space pulled toward `at`: a waist, a crease), `flatten`
+  (`normal` + `amount` 0..1 toward the plane through `at`: a cheek, the
+  sole of a foot), `smooth` (`amount` 0..1, a local blur of the field:
+  softens a lump or a sharp blend; `size` is the blur reach, default
+  `radius / 3`, and each stacked smooth costs one blur). They run in list
+  order with the space warps. They never fold the surface: push, pinch
+  and flatten are capped (a push moves at most about 0.53 x `radius` with
+  the smooth falloff, 0.8 x linear, 0.4 x sharp), so for a bigger change
+  use a larger `radius` or several warps. Under the item's `mirror` a
+  local warp is symmetric by default (placed at x < 0 it acts on both
+  sides); `"mirror": false` on the warp keeps it one-sided. An `at` of
+  `"part:anchor"` works on sdf, skin and body and makes that part a
+  dependency. A fuller chest:
+  `{"type": "body", "name": "guy", "preset": "biped", "warps": [{"mode":
+  "inflate", "at": "chest", "radius": 0.15, "amount": 0.015}]}`.
+  `resolution` (voxel
   meters) defaults to 1/120 of the size, finer for thin shapes, at most
   about 12M samples; an explicit one may go to 27M. Evaluation is
   bucketed, so hundreds of shapes stay fast. A critter:
@@ -619,6 +646,95 @@ surfaces, not hundreds of scattered copies.
   [["body", [0.14, 0.1, 0.05, 0.045], [0.3, 0.03, 0.12, 0.028], [0.42,
   0.06, 0.26, 0.012]], ["body", [0, 0.45, -0.03, 0.11]]]}` (with `xz` one
   arm makes four).
+- **Oval sections**: every `chain` (sdf) and `skin` point may be
+  `[x, y, z, [rx, ry], roll?]` instead of `[x, y, z, r]`: an ellipse
+  across the tube, `rx` sideways and `ry` along the tube's up (world up
+  on a level tube, so `[0.15, 0.1]` on a chain along z is 0.3 wide and
+  0.2 tall; on a vertical tube `rx` is x and `ry` is z), turned `roll`
+  degrees about the tangent. The frame is carried along the curve
+  without twisting, and sections, radii and roll interpolate smoothly, so
+  torsos, snouts, necks, tails, fins and fenders need not be round. A
+  chain with any oval point samples finer (about 1 degree of bend).
+- **Superellipse sections**: a sixth entry, `[x, y, z, [rx, ry], roll,
+  n]`, makes the section a superellipse of exponent `n` (2 = the ellipse,
+  3-5 a rounded box, 1..40): car bodies, boxy torsos, planks.
+- **`tris` / `bake` on `sdf`, `skin`, `body`**: `"tris": 4000` meshes
+  the field only as finely as a 4000-triangle result needs and
+  decimates it in the same item (the dense mesh is never a part), so one
+  item replaces the sdf + decimate + hide_part triple; `"bake": true`
+  also bakes the dense surface into the light part's normal and height
+  maps (as `decimate`'s bake, meshed at full detail).
+- **`body`** starts a creature or vehicle from a parametric preset, a
+  skin of named joints with oval sections, standing on y = 0, facing +z
+  (left = +x):
+  - presets: `biped` (a person, `height` = standing height, default
+    1.75, head 1/7.5 of it), `quadruped` (a cat: `height` = shoulder
+    height, 0.25), `bird` (standing height 0.25), `fish` (length 0.4),
+    `serpent` (length 2), `car` (length 4.3; build = width, leg_length =
+    wheel size, snout / tail = front / rear overhang, head_ratio = cabin
+    height).
+  - proportions: `head_ratio` (biped: head height / height; others
+    relative to their default: quadruped 0.36, bird 0.2, fish 0.25,
+    serpent 0.03, car 0.12), `build` (girth: 0.7 slim .. 1.5 heavy),
+    `leg_length`, `tail` (0 = none; biped default 0, others 1), `snout`
+    (muzzle, beak, nose).
+  - `joints: {"paw_l": {"scale": 1.2, "offset": [0, 0, 0.01]}}`: scale
+    sizes the sections at that joint, offset (meters) moves it with every
+    joint below it; the body is grounded again afterwards. An unknown
+    name lists the preset's joints (biped: hip, spine, chest, neck, head,
+    jaw, shoulder/elbow/wrist/hand, thigh/knee/ankle/ball/toe `_l`/`_r`;
+    quadruped: hip, spine, chest, neck, head, snout, ear, shoulder,
+    elbow, wrist, paw, thigh, knee, hock, foot, tail_1..4; ...).
+  - it brings a skeleton `<name>_rig` with exactly those joints (unless
+    `rig: false` or a skeleton item has that name) and, with `bind`
+    (default true with the rig), an implicit smooth bind `<name>_bind` of
+    the part to it, so clips work at once; a `bind` item on that rig
+    replaces it, `bind: false` turns it off.
+  - the car is a boxy superellipse body with a rounder cabin; the biped's
+    face has brow, cheeks, eye sockets, ears, lips and chin, and its arm
+    span is about its height. The default voxel is 1/135 of the size.
+  - the joint names are anchors on the part: `"cat:paw_l"` works as a
+    move / rotation pivot, a primitive `frame` and a skeleton head or
+    tail, and follows moves of the part.
+  - `tris` keeps it light: `{"type": "body", "name": "cat", "preset":
+    "quadruped", "tris": 6000}`.
+- **`silhouette`** carves a solid from two or three orthographic
+  outlines, the way a modeler blocks out a car, shoe, gun or plane from
+  blueprints: `side` (`[[z, y], ...]`, seen from +x, front = +z), `top`
+  (`[[x, z], ...]`, the plan) and optional `front` (`[[x, y], ...]`). Each
+  outline is a closed profile (points or arcs, several rings = holes,
+  `round` fillets its corners in 2D, `smooth: true` runs a closed
+  Catmull-Rom through the points so a few points make a curved body),
+  extruded through the third axis as a 2D distance field; the solid is
+  their intersection, smooth by `blend` meters (rounds the edges where
+  outlines meet; default 0 = sharp), meshed like `sdf` (`resolution`,
+  `tris`, `bake`), then moved by `translation` / `rotation`. A car body:
+  `{"type": "silhouette", "name": "car_body", "smooth": true, "blend":
+  0.12, "side": [[2.2, 0.3], [2.25, 0.75], [1.0, 0.85], [0.4, 1.4], [-1.2,
+  1.4], [-2.2, 0.95], [-2.2, 0.3]], "top": [[-0.9, 2.2], [0.9, 2.2], [0.95,
+  -2.2], [-0.95, -2.2]], "front": [[-0.95, 0.3], [0.95, 0.3], [0.95, 0.9],
+  [0.6, 1.4], [-0.6, 1.4], [-0.95, 0.9]], "tris": 6000}`; cut wheel arches
+  with a boolean or an sdf. It is also an sdf shape, `{"shape":
+  "silhouette", "side", "top", "front"?, "round" (= the edge blend),
+  "smooth"?, "at"?, "rotation"?}`, so it blends with spheres and chains
+  (a fuselage plus wings). `from_reference: {"image":
+  "refs/car_side.png", "view": "side", "height": 1.4}` (or a list, one per
+  view; fields `{image, view, height | size, flip?, regions?, holes?}`)
+  in place of a profile traces the subject of a PNG in the project
+  (opaque pixels, or those contrasting with the border: the same
+  extraction as the `agent_views` reference compare), simplified to about
+  a pixel. Views: `front` (seen from +z, image right = +x) and `back`
+  (from -z, right = -x) fill `front`; `side` / `right` (from +x, right =
+  -z, so a drawing facing left faces +z) and `left` (from -x, right = +z)
+  fill `side`; `top` is the plan (right +x, down +z). `flip: true`
+  mirrors the image left-right. Holes are kept (`holes: false` drops
+  them); `regions: true` (or a share, 0..1) keeps separate regions at
+  least that share of the largest, else only the largest. `height` scales
+  the outline's vertical extent to meters (uniform); `size: [w, h]` sets
+  both. Front / side outlines stand on y = 0 centred, a top outline is
+  centred. The op stores the image path, view and a hash of its content:
+  a changed PNG re-traces on the next re-derive (an sdf `silhouette`
+  shape re-traces only when the item is re-applied).
 - **`smooth`** fairs or rebuilds a mesh (model space; hide the input):
   - `relax`: Taubin smoothing, `iterations` (10) rounds of `strength`
     (0.5): evens out lumps, pinches and noise without the shrink of plain
@@ -886,7 +1002,9 @@ name: the producer first, then in-place material/visibility/transform edits).
     90 = from +x/right).
   - Several views come back tiled into ONE labelled image (`grid: false` for
     separate images), so `["front", "right", "top", "iso"]` is one read.
-  - The top view is a plan: +x right, -z up.
+  - The top view is a plan: +x right, -z up. Orthographic top / bottom
+    views frame at least half the model's largest extent, so a tall
+    model's plan is not a close-up.
   - `focus: [parts]` frames just those (`*` globs work: `"bike.*"`), and framing works at any scale.
   - A shadowed key light makes openings read even in orthographic views.
   - Both the window and agent cameras are lit by a procedural photo
@@ -933,7 +1051,16 @@ name: the producer first, then in-place material/visibility/transform edits).
     fitted to the model's silhouette box (same height, same centre; by
     width when it is much wider than tall). Returns the silhouette and an
     overlay (magenta = model only, cyan = reference only, grey = both) and
-    the IoU, and says when the aspect ratios differ.
+    the IoU, and says when the aspect ratios differ. It also splits the
+    fitted silhouettes into 5 horizontal bands (top / upper / middle /
+    lower / bottom, comparing mean widths) and 5 vertical bands (left /
+    center-left / center / center-right / right, comparing heights) and
+    names the biggest 5 deviations of 3% or more, in meters and %
+    (`front: top 0-20%: model 14% wider (+3.1 cm)`); structured clients
+    get every band as JSON (`references[].bands`, `deviations`).
+    `reference` may be a list of `{image, view}` (front, side and top
+    references in one call, at most 4), each a silhouette + overlay pair
+    in one grid.
   - `dims: true`: the framed box's width and height and a scale bar, at true
     scale in orthographic views. Perspective views have no single scale:
     they state the model's box size ("not the view") and a scale bar valid
@@ -941,8 +1068,16 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `diff: true`: compares with the previous render of the same view, size,
     focus and style: magenta where something now is, cyan where something
     was, the rest greyed, plus the changed share and pixel box.
-- `inspect(measure?, section?, mass?, thickness?)`: numeric senses, any
+- `inspect(measure?, section?, mass?, thickness?, proportions?)`: numeric senses, any
   combination per call.
+  - `proportions: {parts?}`: for parts with joints (`body`): every bone
+    chain's joint-to-joint lengths (`hip > spine > chest: 152 mm, 183
+    mm`) and named ratios: biped head / height (crown to chin; 1/7.5 =
+    0.133 for an adult), leg / height (hip joint to the floor), arm span /
+    height (fingertip to fingertip); quadruped foreleg, hip-chest body,
+    tail and head-snout against the shoulder height (the back's top over
+    the chest, printed); other presets length
+    and width / height. JSON under `proportions`.
   - `thickness: {parts?}`: per visible part, the thinnest point straight
     through it along the inward normal (and where), the 5% and median
     thickness, and whether its surface passes through itself: a limb
@@ -1408,6 +1543,34 @@ appends only the new nodes, and rewrites a file only after undo branches
 or pruning, so the autosave stays small however long the session runs and
 however often agents switch documents. `save_prefab` only
 names and indexes it.
+
+## Organic workflow
+
+Creatures, characters, vehicles and other sculpted forms (the per-op
+details are in the `body`, `sdf`, `skin` and oval-section bullets above):
+
+1. **Start from a preset or outlines**: `body` (biped / quadruped / bird /
+   fish / serpent / car, tuned with `height`, `build`, `head_ratio`,
+   per-joint `{scale, offset}`), or `silhouette` (side / top / front
+   outlines, `smooth: true`; also an sdf shape, so arches, sockets and
+   extra limbs join by smooth booleans; `from_reference` traces a PNG), or
+   `sdf` / `skin` with oval sections when neither fits.
+2. **Compare with references**: `agent_views` with `reference: [{image,
+   view: "front"}, {..."right"}, {..."top"}]` (up to 3 views in practice)
+   and read the IoU and the **band deviations** (`front: top 0-20%: model
+   14% wider (+3.1 cm)`): each names where and by how much to change.
+3. **Fix locally with warps** on the same item (`warps: [{mode: inflate /
+   push / pinch / flatten / smooth, at: a joint name or point, radius,
+   amount}]`) or joint overrides, not by adding shapes; re-check the bands.
+4. **Check the surface and proportions**: `agent_views style:
+   "curvature"` (lumps, pinches, creases), `inspect proportions` (bone-chain
+   ratios: biped head / height ~0.133), `verify self_intersections` /
+   `thickness`.
+5. **Make it light last**: `tris: N` on the item (plus `bake: true` to keep
+   the dense detail in normal / height maps), then rig and animate.
+
+`examples/creature.rs` (body + warps + tris) and `examples/car_body.rs`
+(silhouette shape + arch subtractions + wheels) run this end to end.
 
 ## Style tokens
 
