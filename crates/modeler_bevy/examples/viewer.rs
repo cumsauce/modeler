@@ -6,14 +6,17 @@
 //!
 //! Keys: Space plays the next animation clip (and pauses the live sway),
 //! W toggles the live wind, Up / Down change its strength, Left / Right turn
-//! it. Drag with the mouse to orbit.
+//! it, V cycles the cosmetic variants (`KHR_materials_variants`, through
+//! `ModelerVariant`). Drag with the mouse to orbit.
+//!
+//! `VIEWER_VARIANT=red_team` starts in that variant.
 //!
 //! `VIEWER_SHOT=out.png` saves a screenshot after a few seconds, prints how
 //! many sway rigs and moving joints it found, and quits (a smoke test).
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use modeler_bevy::{ModelerPlugin, Sway, Wind};
+use modeler_bevy::{ModelerPlugin, ModelerVariant, Sway, Wind};
 
 #[derive(Resource)]
 struct Model {
@@ -21,6 +24,8 @@ struct Model {
     spawned: bool,
     clip: Option<usize>,
     graph: Option<(Handle<AnimationGraph>, Vec<AnimationNodeIndex>, Vec<String>)>,
+    /// The scene root (where `ModelerVariant` goes).
+    root: Option<Entity>,
 }
 
 #[derive(Component)]
@@ -57,6 +62,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, file: Res<FileName>) 
         spawned: false,
         clip: None,
         graph: None,
+        root: None,
     });
     commands.spawn((
         Camera3d::default(),
@@ -77,7 +83,9 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, file: Res<FileName>) 
         Transform::from_xyz(4.0, 8.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
-        Text::new("Space: next clip  W: wind on/off  Up/Down: strength  Left/Right: direction"),
+        Text::new(
+            "Space: next clip  V: next variant  W: wind on/off  Up/Down: strength  Left/Right: direction",
+        ),
         Node {
             position_type: PositionType::Absolute,
             left: Val::Px(12.0),
@@ -106,7 +114,11 @@ fn spawn_scene(
     else {
         return;
     };
-    commands.spawn(WorldAssetRoot(scene));
+    let root = commands.spawn(WorldAssetRoot(scene)).id();
+    model.root = Some(root);
+    if let Ok(v) = std::env::var("VIEWER_VARIANT") {
+        commands.entity(root).insert(ModelerVariant::new(v));
+    }
     let mut names: Vec<String> = g.named_animations.keys().map(|k| k.to_string()).collect();
     names.sort();
     let clips: Vec<Handle<AnimationClip>> = names
@@ -134,12 +146,16 @@ fn hook_player(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn keys(
     input: Res<ButtonInput<KeyCode>>,
     mut model: ResMut<Model>,
     mut wind: ResMut<Wind>,
     mut players: Query<&mut AnimationPlayer>,
     mut sways: Query<&mut Sway>,
+    mut commands: Commands,
+    variant: Query<&ModelerVariant>,
+    parts: Query<&modeler_bevy::ModelerVariants>,
 ) {
     if input.just_pressed(KeyCode::Space)
         && let Some((_, nodes, names)) = &model.graph
@@ -156,6 +172,26 @@ fn keys(
         }
         println!("playing `{}`", names[next]);
         model.clip = Some(next);
+    }
+    if input.just_pressed(KeyCode::KeyV)
+        && let Some(root) = model.root
+    {
+        // Every variant the parts know ("default" first).
+        let mut names: Vec<String> = parts
+            .iter()
+            .flat_map(|p| p.0.keys().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|n| n != "default")
+            .collect();
+        names.insert(0, "default".into());
+        let cur = variant
+            .get(root)
+            .map_or("default".to_string(), |v| v.name.clone());
+        let i = names.iter().position(|v| *v == cur).unwrap_or(0);
+        let next = names[(i + 1) % names.len()].clone();
+        println!("variant `{next}` (of {names:?})");
+        commands.entity(root).insert(ModelerVariant::new(next));
     }
     if input.just_pressed(KeyCode::KeyW) {
         wind.enabled = !wind.enabled;

@@ -2492,6 +2492,51 @@ pub struct MaterialSpec {
     macro_: Option<crate::material::finish::Macro>,
 }
 
+/// One look of a `variant`: the fields of a `material` item, minus name
+/// and input (the map key names the parts).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VariantLookSpec {
+    #[serde(default, alias = "color")]
+    base_color: Option<ColorArg>,
+    #[serde(default)]
+    roughness: Option<f32>,
+    #[serde(default)]
+    metalness: Option<f32>,
+    /// A procedural material (material_ops / material_catalog name).
+    #[serde(default)]
+    pbr: Option<String>,
+    #[serde(default)]
+    params: Option<std::collections::BTreeMap<String, f64>>,
+    #[serde(default)]
+    scale: Option<f32>,
+    /// A plain colour on purpose (drops the base look's pbr).
+    #[serde(default)]
+    flat: bool,
+    #[serde(default)]
+    bevel: Option<f32>,
+    #[serde(default, rename = "macro")]
+    macro_: Option<crate::material::finish::Macro>,
+}
+
+/// A cosmetic variant ("skin"): alternate materials for some parts and/or a
+/// style token patch; geometry never changes. The base look is "default".
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VariantSpec {
+    /// The variant's name ("red_team"; not "default").
+    name: String,
+    /// Part name or `*` glob -> the look those parts wear in this variant
+    /// (material item fields). Globs apply first, then exact names.
+    #[serde(default)]
+    materials: std::collections::BTreeMap<String, VariantLookSpec>,
+    /// Style token patch for this variant ({"colors": {"primary": "#c33"}}):
+    /// items reading tokens re-resolve, like a prefab's style patch.
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    style: Option<serde_json::Value>,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartSpec {
@@ -2559,6 +2604,10 @@ pub struct PrefabSpec {
     #[serde(default)]
     #[schemars(with = "Option<serde_json::Value>")]
     components: serde_json::Map<String, Value>,
+    /// One of the prefab's cosmetic variants ("red_team"); omitted: its
+    /// default look. A .bsn export writes it for game code.
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3062,6 +3111,7 @@ pub enum OpSpec {
     Decal(DecalSpec),
     Collider(ColliderSpec),
     Marker(MarkerSpec),
+    Variant(VariantSpec),
     Skeleton(SkeletonSpec),
     Bind(BindSpec),
     Clip(ClipSpec),
@@ -3087,6 +3137,7 @@ pub const OP_TYPES: &[&str] = &[
     "decal",
     "collider",
     "marker",
+    "variant",
     "skeleton",
     "bind",
     "clip",
@@ -4383,6 +4434,63 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 },
             })
         }
+        "variant" => {
+            let s: VariantSpec = de(&ctx, &body)?;
+            if s.name.is_empty() || s.name == crate::variant::DEFAULT {
+                return Err(format!(
+                    "{ctx}: name: `{}` is the base look; name the variant (\"red_team\")",
+                    s.name
+                ));
+            }
+            if s.materials.is_empty() && s.style.is_none() {
+                return Err(format!(
+                    "{ctx}: give `materials` ({{\"body*\": {{\"color\": \"#c33\"}}}}) and/or `style`"
+                ));
+            }
+            if let Some(v) = &s.style
+                && !v.is_object()
+            {
+                return Err(format!("{ctx}: style: a token object, got {v}"));
+            }
+            let mut materials = Vec::new();
+            for (parts, l) in s.materials {
+                let at = format!("{ctx}: materials.{parts}");
+                if l.pbr.is_none() && (l.params.is_some() || l.scale.is_some()) {
+                    return Err(format!(
+                        "{at}: params / scale apply to a pbr material; add \"pbr\": \"<material>\""
+                    ));
+                }
+                if let Some(k) = l.scale
+                    && !(k > 0.0 && k.is_finite())
+                {
+                    return Err(format!("{at}: scale: {k}: give a factor > 0"));
+                }
+                let finish = crate::material::finish::Finish {
+                    bevel: l.bevel,
+                    macro_: l.macro_,
+                };
+                finish.validate().map_err(|e| format!("{at}: {e}"))?;
+                materials.push(crate::variant::Look {
+                    parts,
+                    base_color: l.base_color.map(|c| c.0),
+                    roughness: l.roughness,
+                    metalness: l.metalness,
+                    pbr: l.pbr.map(|m| crate::material::PbrRef {
+                        material: m,
+                        params: l.params.unwrap_or_default(),
+                        scale: l.scale.unwrap_or(1.0),
+                        graph: None,
+                    }),
+                    flat: l.flat,
+                    finish: (!finish.is_empty()).then_some(finish),
+                });
+            }
+            BatchItem::Op(Op::Variant {
+                name: s.name,
+                materials,
+                style: s.style,
+            })
+        }
         "marker" => {
             let s: MarkerSpec = de(&ctx, &body)?;
             if s.kind.trim().is_empty() {
@@ -4694,6 +4802,16 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             if parts.is_empty() {
                 return Err(format!("{ctx}: prefab `{}` has no visible parts", s.prefab));
             }
+            if let Some(v) = &s.variant
+                && v != crate::variant::DEFAULT
+                && crate::variant::find(&model, v).is_none()
+            {
+                return Err(format!(
+                    "{ctx}: variant: prefab `{}`: {}",
+                    s.prefab,
+                    crate::variant::unknown(&model, v)
+                ));
+            }
             let digest = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4724,6 +4842,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     }
                 },
                 restyle: None,
+                variant: s.variant.filter(|v| v != crate::variant::DEFAULT),
                 components: {
                     crate::scene::check_components(&s.components)
                         .map_err(|e| format!("{ctx}: {e}"))?;
@@ -4876,6 +4995,10 @@ pub fn example(ty: &str) -> Option<Value> {
             "mirror": {"leg_r": {"from": "leg_l", "phase": 0.5}}}),
         "sway" => json!({"type": "sway", "name": "wind", "skeleton": "oak_rig", "kind": "wind",
             "direction": [1, 0, 0.3], "strength": 0.6, "gust": 0.4, "flutter": 0.5, "duration": 4}),
+        "variant" => json!({"type": "variant", "name": "red_team",
+            "materials": {"body*": {"pbr": "paint", "params": {"hue": 0.0}},
+                          "trim": {"color": "#c33", "flat": true}},
+            "style": {"colors": {"primary": "#c33"}}}),
         "marker" => json!({"type": "marker", "name": "spawn_1", "kind": "spawn",
             "translation": [0, 0, 2], "yaw": 180, "data": {"team": 1}}),
         "decal" => json!({"type": "decal", "name": "tag", "pbr": "graffiti",
@@ -4948,6 +5071,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "decal" => schemars::schema_for!(DecalSpec),
         "collider" => schemars::schema_for!(ColliderSpec),
         "marker" => schemars::schema_for!(MarkerSpec),
+        "variant" => schemars::schema_for!(VariantSpec),
         "skeleton" => schemars::schema_for!(SkeletonSpec),
         "bind" => schemars::schema_for!(BindSpec),
         "clip" => schemars::schema_for!(ClipSpec),

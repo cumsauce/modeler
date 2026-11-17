@@ -43,6 +43,10 @@ const FIRST_LAYER: usize = 10;
 /// Frames a tile camera stays active after a change (pipelines and the
 /// deferred passes settle within these).
 const SETTLE_FRAMES: u32 = 12;
+/// Part entity spawn attempts per frame across all tiles.
+const TILE_SPAWN_BUDGET: usize = 300;
+/// A proxy never goes below this many triangles (a part smaller keeps all).
+const PROXY_MIN_TRIS: usize = 48;
 const GAP: f32 = 12.0;
 const MIN_TILE_W: f32 = 250.0;
 const INFO_H: f32 = 48.0;
@@ -68,8 +72,22 @@ pub(crate) struct Grid {
     confirm_close: Option<String>,
     filter: GridFilter,
     query: String,
-    scroll: f32,
+    pub(crate) scroll: f32,
     ui: Option<GridUi>,
+    /// The last finished render of each document's tile, kept when the
+    /// tile is despawned (scrolled out, grid closed), so a tile coming back
+    /// with its document unchanged shows it at once instead of spawning
+    /// and re-rendering every part.
+    shots: std::collections::HashMap<String, Shot>,
+}
+
+#[derive(Clone)]
+struct Shot {
+    built: (u64, usize),
+    size: UVec2,
+    image: Handle<Image>,
+    parts_n: usize,
+    view: Transform,
 }
 
 struct GridUi {
@@ -100,6 +118,7 @@ pub(crate) struct Recency {
 }
 
 pub(crate) fn track_recency(modeler: Res<Modeler>, mut r: ResMut<Recency>) {
+    let _profile = crate::preview::profile::span("track_recency");
     let s = &modeler.session;
     // The active document, then the others most recently switched away
     // from first: the starting order before any change is seen.
@@ -167,6 +186,7 @@ impl Grid {
             query: String::new(),
             scroll: 0.0,
             ui: None,
+            shots: Default::default(),
         }
     }
 }
@@ -189,6 +209,15 @@ struct Tile {
     parts: Vec<Entity>,
     frames_left: u32,
     parts_n: usize,
+    /// The image holds a finished render of `built` (parts released).
+    rendered: bool,
+    /// What the image shows (an older version while a new one streams in).
+    shown: Option<(u64, usize)>,
+    /// Parts (with their proxy triangle budget) whose entities aren't
+    /// spawned yet: the camera waits for them, the image keeps what it had.
+    waiting: Vec<(Arc<Part>, u32)>,
+    /// An ops-only document's parts, derived off the main thread.
+    derive: Option<bevy::tasks::Task<Model>>,
     /// Where the tile camera should be (applied once the camera exists:
     /// it is spawned by deferred commands).
     view: Transform,
@@ -399,11 +428,12 @@ pub(crate) fn update_grid(
         Option<Res<InputFocus>>,
     ),
     assets: Res<AssetServer>,
-    (mut meshes, mut materials, mut images, mut pbr_cache): (
+    (mut meshes, mut materials, mut images, mut pbr_cache, mut streams): (
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
         ResMut<Assets<Image>>,
         ResMut<PbrCache>,
+        ResMut<crate::preview::stream::Streams>,
     ),
     mut main_cam: Query<
         (&mut Camera, Option<&bevy::light::EnvironmentMapLight>),
@@ -427,6 +457,7 @@ pub(crate) fn update_grid(
     recency: Res<Recency>,
     mut label_tick: Local<Option<Instant>>,
 ) {
+    let _profile = crate::preview::profile::span("update_grid");
     let Ok((mut main, env)) = main_cam.single_mut() else {
         return;
     };
@@ -438,8 +469,11 @@ pub(crate) fn update_grid(
         return;
     };
     if !grid.on {
+        streams.pending_grid = 0;
         if !grid.tiles.is_empty() {
-            for t in grid.tiles.drain(..) {
+            let tiles = std::mem::take(&mut grid.tiles);
+            for t in tiles {
+                keep_shot(&mut grid.shots, &t);
                 despawn_tile(&mut commands, &t);
             }
         }
@@ -644,10 +678,13 @@ pub(crate) fn update_grid(
         if visible.iter().any(|(m, _, _)| m.name == t.doc) {
             kept.push(t);
         } else {
+            keep_shot(&mut grid.shots, &t);
             despawn_tile(&mut commands, &t);
         }
     }
     grid.tiles = kept;
+    // Shots of closed documents go.
+    grid.shots.retain(|n, _| model_of(n).is_some());
     // Tile cameras borrow the window camera's filtered studio light; wait
     // for it (a few frames after startup).
     let Some(env) = env else {
@@ -658,6 +695,9 @@ pub(crate) fn update_grid(
         *label_tick = Some(Instant::now());
     }
     let content = ui.content;
+    // Entity spawn attempts per frame, across tiles.
+    let mut budget = TILE_SPAWN_BUDGET;
+    let mut loading = 0;
     for (model, left, top) in visible {
         let name = &model.name;
         let size = UVec2::new(
@@ -672,8 +712,14 @@ pub(crate) fn update_grid(
                 else {
                     continue;
                 };
-                let image = images.add(view_target(size.x, size.y));
-                let tile = spawn_tile(
+                // The last image of this document, even an older version:
+                // it shows until the new render is ready.
+                let shot = grid.shots.remove(name).filter(|sh| sh.size == size);
+                let image = shot
+                    .as_ref()
+                    .map(|sh| sh.image.clone())
+                    .unwrap_or_else(|| images.add(view_target(size.x, size.y)));
+                let mut tile = spawn_tile(
                     &mut commands,
                     &assets,
                     &env,
@@ -683,6 +729,16 @@ pub(crate) fn update_grid(
                     size,
                     content,
                 );
+                if let Some(sh) = shot.filter(|sh| sh.built == model_key(model)) {
+                    // Unchanged since its last render: show that, spawn
+                    // nothing.
+                    tile.built = Some(sh.built);
+                    tile.shown = Some(sh.built);
+                    tile.parts_n = sh.parts_n;
+                    tile.view = sh.view;
+                    tile.frames_left = 0;
+                    tile.rendered = true;
+                }
                 grid.tiles.push(tile);
                 grid.tiles.len() - 1
             }
@@ -708,6 +764,8 @@ pub(crate) fn update_grid(
             if let Ok((_, _, mut target)) = tile_cams.get_mut(tile.camera) {
                 *target = RenderTarget::Image(tile.image.clone().into());
             }
+            // Its parts may be released already: spawn them again.
+            tile.built = None;
             tile.frames_left = SETTLE_FRAMES;
         }
         if let Ok(mut v) = vis.get_mut(tile.confirm) {
@@ -718,86 +776,84 @@ pub(crate) fn update_grid(
             });
         }
         // Rebuild the tile's parts when its document changed.
-        let key = (model.version, model.history.nodes.len());
+        let key = model_key(model);
         if tile.built != Some(key) {
             tile.built = Some(key);
+            tile.rendered = false;
             for e in tile.parts.drain(..) {
                 commands.entity(e).despawn();
             }
             pbr_cache.tick();
+            tile.waiting.clear();
+            tile.derive = None;
+            tile.frames_left = 0;
             // An inactive document restored from the autosave may hold
-            // only its ops: derive its parts on a copy.
-            let derived;
-            let model = if model.parts.is_empty() && !model.ops.is_empty() {
+            // only its ops: derive its parts on a copy, off the main thread.
+            if model.parts.is_empty() && !model.ops.is_empty() {
                 let mut m = model.clone_without_history();
-                let _ = m.refresh();
-                derived = m;
-                &derived
+                tile.derive = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                    let _ = m.refresh();
+                    m
+                }));
             } else {
-                model
-            };
-            let drawn = crate::preview::app::drawn(model);
-            let parts: Vec<&modeler::Part> = model
-                .parts
-                .iter()
-                .map(|p| &**p)
-                .filter(|p| !p.verts.is_empty() && !p.indices.is_empty() && drawn(p))
-                .collect();
-            modeler::material::pbr::prebake(parts.iter().copied());
-            tile.parts_n = parts.len();
-            for part in &parts {
-                let e = commands
-                    .spawn((
-                        part_bundle(
-                            part,
-                            &mut meshes,
-                            &mut materials,
-                            &mut images,
-                            &mut pbr_cache,
-                        ),
-                        RenderLayers::layer(tile.layer),
-                    ))
-                    .id();
-                tile.parts.push(e);
+                start_tile(
+                    tile,
+                    model,
+                    (cw / thumb_h.max(1.0)).max(0.2),
+                    &mut commands,
+                    (&mut meshes, &mut materials, &mut images, &mut pbr_cache),
+                );
             }
-            for (at, parts) in crate::preview::app::marker_previews(model) {
-                let root = commands
-                    .spawn((at, Visibility::default(), RenderLayers::layer(tile.layer)))
-                    .id();
-                for part in &parts {
-                    let child = commands
-                        .spawn((
-                            part_bundle(
-                                part,
-                                &mut meshes,
-                                &mut materials,
-                                &mut images,
-                                &mut pbr_cache,
-                            ),
-                            RenderLayers::layer(tile.layer),
-                        ))
-                        .id();
-                    commands.entity(root).add_child(child);
+        }
+        if let Some(task) = tile.derive.as_mut()
+            && let Some(m) = bevy::tasks::futures::check_ready(task)
+        {
+            tile.derive = None;
+            start_tile(
+                tile,
+                &m,
+                (cw / thumb_h.max(1.0)).max(0.2),
+                &mut commands,
+                (&mut meshes, &mut materials, &mut images, &mut pbr_cache),
+            );
+        }
+        // Stream the tile's parts in, a budget per frame across tiles, so
+        // opening the grid never spikes; the camera renders once all are in.
+        if tile.derive.is_none() && !tile.waiting.is_empty() {
+            let _spawn_span = crate::preview::profile::span("grid: spawn parts");
+            let mut i = 0;
+            while i < tile.waiting.len() && budget > 0 {
+                budget -= 1;
+                let (part, target) = &tile.waiting[i];
+                match crate::preview::stream::try_bundle(
+                    part,
+                    crate::preview::stream::Detail::Proxy(*target),
+                    &mut streams,
+                    &mut pbr_cache,
+                    &mut materials,
+                ) {
+                    Some(b) if b.final_material => {
+                        let e = commands
+                            .spawn((
+                                Name::new(part.name.clone()),
+                                Mesh3d(b.mesh),
+                                MeshMaterial3d(b.material),
+                                crate::preview::app::part_transform(part),
+                                RenderLayers::layer(tile.layer),
+                            ))
+                            .id();
+                        tile.parts.push(e);
+                        tile.waiting.swap_remove(i);
+                    }
+                    _ => i += 1,
                 }
-                tile.parts.push(root);
             }
-            // Frame a three-quarter view on the document's bounds.
-            if let Some((lo, hi)) = model.bounds() {
-                let c = (lo + hi) * 0.5;
-                let radius = ((hi - lo).length() * 0.5).max(0.01);
-                let aspect = (cw / thumb_h.max(1.0)).max(0.2);
-                // Fit the bounding sphere in the narrower field of view.
-                let half_v = 0.5 * std::f32::consts::FRAC_PI_4;
-                let half = if aspect < 1.0 {
-                    (half_v.tan() * aspect).atan()
-                } else {
-                    half_v
-                };
-                let dist = radius / half.sin() * 1.05;
-                let dir = Quat::from_euler(EulerRot::YXZ, 0.62, -0.42, 0.0) * Vec3::Z;
-                tile.view = Transform::from_translation(c + dir * dist).looking_at(c, Vec3::Y);
+            if tile.waiting.is_empty() {
+                tile.frames_left = SETTLE_FRAMES;
             }
-            tile.frames_left = SETTLE_FRAMES;
+        }
+        if !tile.rendered {
+            loading += 1;
         }
         if refresh_labels || fresh {
             let author = author_of(model);
@@ -850,14 +906,121 @@ pub(crate) fn update_grid(
         if let Ok((mut cam, mut tf, _)) = tile_cams.get_mut(tile.camera) {
             if *tf != tile.view {
                 *tf = tile.view;
-                tile.frames_left = tile.frames_left.max(SETTLE_FRAMES);
+                if !tile.rendered && tile.waiting.is_empty() && tile.derive.is_none() {
+                    tile.frames_left = tile.frames_left.max(SETTLE_FRAMES);
+                }
             }
             let on = tile.frames_left > 0;
             if cam.is_active != on {
                 cam.is_active = on;
             }
         }
+        if tile.frames_left == 0
+            && !tile.rendered
+            && tile.waiting.is_empty()
+            && tile.derive.is_none()
+        {
+            // Settled (the camera went inactive last frame, after its final
+            // render): the image holds it, so the parts go (no per-frame
+            // extraction of thousands of idle tile entities). Despawning on
+            // the last active frame would flush before extraction and leave
+            // the final render empty.
+            tile.rendered = true;
+            tile.shown = tile.built;
+            for e in tile.parts.drain(..) {
+                commands.entity(e).despawn();
+            }
+        }
         tile.frames_left = tile.frames_left.saturating_sub(1);
+    }
+    streams.pending_grid = loading;
+}
+
+/// Starts streaming a tile's parts (decimated proxies within the tile's
+/// triangle budget) and frames its camera on `model`.
+fn start_tile(
+    tile: &mut Tile,
+    model: &Model,
+    aspect: f32,
+    commands: &mut Commands,
+    (meshes, materials, images, pbr_cache): (
+        &mut Assets<Mesh>,
+        &mut Assets<StandardMaterial>,
+        &mut Assets<Image>,
+        &mut PbrCache,
+    ),
+) {
+    use crate::preview::stream::{PROXY_PART_TRIS, PROXY_TILE_TRIS};
+    let drawn = crate::preview::app::drawn(model);
+    let parts: Vec<&Arc<Part>> = model
+        .parts
+        .iter()
+        .filter(|p| !p.verts.is_empty() && !p.indices.is_empty() && drawn(p))
+        .collect();
+    let total: usize = parts.iter().map(|p| p.tri_count() as usize).sum();
+    // Each part's share of the tile budget, never over the part cap.
+    let scale = (PROXY_TILE_TRIS as f64 / total.max(1) as f64).min(1.0);
+    tile.parts_n = parts.len();
+    tile.waiting = parts
+        .into_iter()
+        .map(|p| {
+            let t = p.tri_count() as usize;
+            let share = ((t as f64 * scale) as usize).max(PROXY_MIN_TRIS.min(t));
+            (Arc::clone(p), share.min(PROXY_PART_TRIS) as u32)
+        })
+        .collect();
+    for (at, parts) in crate::preview::app::marker_previews(model) {
+        let root = commands
+            .spawn((at, Visibility::default(), RenderLayers::layer(tile.layer)))
+            .id();
+        for part in &parts {
+            let child = commands
+                .spawn((
+                    part_bundle(part, meshes, materials, images, pbr_cache),
+                    RenderLayers::layer(tile.layer),
+                ))
+                .id();
+            commands.entity(root).add_child(child);
+        }
+        tile.parts.push(root);
+    }
+    // Frame a three-quarter view on the document's bounds.
+    if let Some((lo, hi)) = model.bounds() {
+        let c = (lo + hi) * 0.5;
+        let radius = ((hi - lo).length() * 0.5).max(0.01);
+        // Fit the bounding sphere in the narrower field of view.
+        let half_v = 0.5 * std::f32::consts::FRAC_PI_4;
+        let half = if aspect < 1.0 {
+            (half_v.tan() * aspect).atan()
+        } else {
+            half_v
+        };
+        let dist = radius / half.sin() * 1.05;
+        let dir = Quat::from_euler(EulerRot::YXZ, 0.62, -0.42, 0.0) * Vec3::Z;
+        tile.view = Transform::from_translation(c + dir * dist).looking_at(c, Vec3::Y);
+    }
+    if tile.waiting.is_empty() {
+        tile.frames_left = SETTLE_FRAMES;
+    }
+}
+
+/// What a tile's render depends on in its document.
+fn model_key(m: &Model) -> (u64, usize) {
+    (m.version, m.history.nodes.len())
+}
+
+fn keep_shot(shots: &mut std::collections::HashMap<String, Shot>, t: &Tile) {
+    if let Some(built) = t.shown {
+        shots.insert(
+            t.doc.clone(),
+            Shot {
+                built,
+                size: t.size,
+                image: t.image.clone(),
+                parts_n: t.parts_n,
+                view: t.view,
+            },
+        );
     }
 }
 
@@ -1416,6 +1579,10 @@ fn spawn_tile(
         parts: Vec::new(),
         frames_left: SETTLE_FRAMES,
         parts_n: 0,
+        rendered: false,
+        shown: None,
+        waiting: Vec::new(),
+        derive: None,
         view: Transform::default(),
     }
 }

@@ -101,6 +101,7 @@ pub mod style;
 pub mod terrain;
 pub mod text;
 pub mod uv;
+pub mod variant;
 pub mod verify;
 pub mod walk;
 
@@ -333,6 +334,10 @@ pub struct Model {
     /// after the pattern was issued get it too.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub material_patterns: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The cosmetic variant the window shows for this document (None: the
+    /// default look). View state only, never saved.
+    #[serde(skip)]
+    pub active_variant: Option<String>,
 }
 
 impl Model {
@@ -365,6 +370,7 @@ impl Model {
             derived_from_ops: self.derived_from_ops,
             project: None,
             material_patterns: self.material_patterns.clone(),
+            active_variant: self.active_variant.clone(),
         }
     }
 
@@ -1557,6 +1563,20 @@ pub enum Op {
         /// written on this entity by a `.bsn` scene export.
         #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
         components: serde_json::Map<String, serde_json::Value>,
+        /// The prefab's cosmetic variant this instance wears (None: its
+        /// default look); a `.bsn` export writes it for game code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<String>,
+    },
+    /// A cosmetic variant ("skin"): material overrides on parts (names or
+    /// globs) and an optional style token patch, applied over the derived
+    /// parts (see [`crate::variant`]). Writes no part.
+    Variant {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        materials: Vec<crate::variant::Look>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<serde_json::Value>,
     },
 }
 

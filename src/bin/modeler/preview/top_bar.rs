@@ -114,6 +114,7 @@ fn sync_top_bar(
     icons_res: ResMut<ds::Icons>,
     mut images: ResMut<Assets<Image>>,
 ) {
+    let _profile = crate::preview::profile::span("sync_top_bar");
     if modeler.session.viewer_away() {
         return;
     }

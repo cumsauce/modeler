@@ -14,6 +14,23 @@ pub(crate) struct Tools {
     pub(crate) tx: crate::server::CmdSender,
     /// The latest render per (view, size, focus, style), for `diff`.
     last_shots: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    /// Per document: held from a slow call's off-thread work to its commit.
+    doc_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// A tool closure's reply: text (or error) plus optional structured JSON.
+type RawReply =
+    Result<(String, Option<serde_json::Value>), (modeler::ModelerError, Option<serde_json::Value>)>;
+
+/// A raw reply as the tool result (structured JSON alongside the text).
+fn finish(reply: RawReply) -> CallToolResult {
+    let (mut r, json) = match reply {
+        Ok((text, json)) => (ok_result(text), json),
+        Err((e, json)) => (err_result(e.to_string()), json),
+    };
+    r.structured_content = json;
+    r
 }
 
 /// The image budget a model sees at full detail: larger images are
@@ -39,6 +56,7 @@ impl Tools {
         Self {
             tx: crate::server::CmdSender(tx),
             last_shots: Default::default(),
+            doc_locks: Default::default(),
         }
     }
 
@@ -55,29 +73,22 @@ impl Tools {
     /// and on failure), so clients need not parse the prose.
     async fn run_json(
         &self,
-        f: impl FnOnce(
-            &mut Session,
-        ) -> Result<
-            (String, Option<serde_json::Value>),
-            (modeler::ModelerError, Option<serde_json::Value>),
-        > + Send
-        + 'static,
+        f: impl FnOnce(&mut Session) -> RawReply + Send + 'static,
     ) -> Result<CallToolResult, ErrorData> {
-        let (json_tx, json_rx) = std::sync::mpsc::channel();
+        Ok(finish(self.exec_json(f).await?))
+    }
+
+    /// Runs `f` on the app thread (marking the autosave when it changed
+    /// anything) and hands back its raw reply.
+    async fn exec_json(
+        &self,
+        f: impl FnOnce(&mut Session) -> RawReply + Send + 'static,
+    ) -> Result<RawReply, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = Cmd::Exec(Box::new(move |session: &mut Session| {
             let before = session.persist_fingerprint();
             let mats_before = session.materials.fingerprint();
-            let reply = match f(session) {
-                Ok((text, json)) => {
-                    let _ = json_tx.send(json);
-                    Ok(text)
-                }
-                Err((e, json)) => {
-                    let _ = json_tx.send(json);
-                    Err(e)
-                }
-            };
+            let reply = f(session);
             // Autosave after every mutation so unnamed WIP survives a restart
             // (also when a batch fails midway: its earlier items stay applied);
             // read-only calls leave the fingerprint alone and skip the write.
@@ -85,27 +96,71 @@ impl Tools {
             let model = session.persist_fingerprint() != before;
             let mats = session.materials.fingerprint() != mats_before;
             session.mark_autosave(model, false, mats);
-            let _ = reply_tx.send(reply.clone());
-            reply
+            let text = match &reply {
+                Ok((t, _)) => Ok(t.clone()),
+                Err((e, _)) => Err(e.clone()),
+            };
+            let _ = reply_tx.send(reply);
+            text
         }));
         self.tx
             .send(cmd)
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
-        let reply = reply_rx.await;
-        let json = json_rx.try_recv().ok().flatten();
-        let with_json = |mut r: CallToolResult| {
-            r.structured_content = json.clone();
-            r
-        };
-        match reply {
-            Ok(Ok(text)) => Ok(with_json(ok_result(text))),
-            Ok(Err(message)) => Ok(with_json(err_result(message.to_string()))),
-            Err(_) => Err(ErrorData::internal_error(
-                "preview app dropped the reply",
-                None,
-            )),
-        }
+        reply_rx
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app dropped the reply", None))
+    }
+
+    /// A detached copy of the session ([`Session::snapshot`]) taken on the
+    /// app thread, after `prep` ran there (reading project files needs the
+    /// call's project, which begin_call sets on the app thread), plus the
+    /// active document's name.
+    async fn snapshot_with<T: Send + 'static>(
+        &self,
+        prep: impl FnOnce(&mut Session) -> T + Send + 'static,
+    ) -> Result<(Box<Session>, String, T), ErrorData> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
+            let t = prep(s);
+            let _ = tx.send((Box::new(s.snapshot()), s.model.name.clone(), t));
+            Ok(String::new())
+        }));
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
+        rx.await
+            .map_err(|_| ErrorData::internal_error("preview app dropped the reply", None))
+    }
+
+    /// Runs a read-only `f` on a snapshot of the session on a worker
+    /// thread, so a slow check (verify, inspect) never stalls the window.
+    async fn run_detached_json(
+        &self,
+        f: impl FnOnce(&Session) -> RawReply + Send + 'static,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(finish(self.detached_json(f).await?))
+    }
+
+    async fn detached_json(
+        &self,
+        f: impl FnOnce(&Session) -> RawReply + Send + 'static,
+    ) -> Result<RawReply, ErrorData> {
+        let (snap, _, ()) = self.snapshot_with(|_| ()).await?;
+        tokio::task::spawn_blocking(move || f(&snap))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("worker failed: {e}"), None))
+    }
+
+    /// The per-document lock that keeps a document's slow calls in order
+    /// while their heavy part runs off the app thread.
+    fn doc_lock(&self, doc: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut g = self
+            .doc_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(g.entry(doc.to_string()).or_default())
     }
 
     /// Waits for a Bevy-side reply with a hard timeout: a stuck frame (or any
@@ -168,6 +223,20 @@ impl Tools {
 }
 
 impl Tools {
+    /// The active model's cosmetic variant names ("default" first).
+    async fn variant_names(&self) -> Vec<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = self
+            .run(move |s| {
+                let _ = tx.send(modeler::variant::names(&s.model));
+                Ok(String::new())
+            })
+            .await;
+        let mut v = vec![modeler::variant::DEFAULT.to_string()];
+        v.extend(rx.try_recv().unwrap_or_default());
+        v
+    }
+
     /// The model's contact regions, most telling first (`agent_views` joints).
     async fn joint_regions(&self, n: usize) -> Option<Vec<modeler::contact::JointRegion>> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -432,6 +501,7 @@ impl Tools {
             tile,
             resolution,
             expect,
+            ..
         }): Parameters<MaterialOpsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
@@ -619,6 +689,7 @@ impl Tools {
             description,
             tags,
             prompt,
+            ..
         }): Parameters<StyleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (png_tx, png_rx) = std::sync::mpsc::channel();
@@ -737,7 +808,10 @@ Style::default()
     /// Show the whole model: name, version, parts, triangle counts, bounds and materials.
     /// Call this first (and after any confusing result) to ground yourself in the model.
     #[tool]
-    async fn scene_summary(&self) -> Result<CallToolResult, ErrorData> {
+    async fn scene_summary(
+        &self,
+        Parameters(_): Parameters<DocOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.run_json(|s| Ok((s.summary(), Some(s.summary_json()))))
             .await
     }
@@ -770,6 +844,7 @@ Style::default()
             path,
             format,
             optimize,
+            ..
         }): Parameters<ExportModelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let format = format.unwrap_or_else(|| {
@@ -802,8 +877,17 @@ Style::default()
                     }
                     modeler::scene::export_scene(&s.model, &path, &so)?
                 }
-                "glb" => gltf::export_glb_with(&s.model, &path, &opts)?,
-                "gltf" => gltf::export_gltf_with(&s.model, &path, &opts)?,
+                "glb" | "gltf" => {
+                    let variants = modeler::variant::names(&s.model)
+                        .into_iter()
+                        .map(|n| s.variant_model(&n).map(|m| (n, m)))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    if format == "glb" {
+                        gltf::export_glb_variants(&s.model, Some(&variants), &path, &opts)?
+                    } else {
+                        gltf::export_gltf_variants(&s.model, Some(&variants), &path, &opts)?
+                    }
+                }
                 other => {
                     return Err(format!(
                         "unknown format `{other}` (use \"gltf\", \"glb\" or \"bsn\")"
@@ -890,7 +974,7 @@ Style::default()
     #[tool]
     async fn set_model_name(
         &self,
-        Parameters(NameArgs { name }): Parameters<NameArgs>,
+        Parameters(RenameModelArgs { name, .. }): Parameters<RenameModelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| {
             let old = std::mem::replace(&mut s.model.name, name.clone());
@@ -952,7 +1036,10 @@ Style::default()
     /// `set_camera(ui: {capture: "window"})` it captures
     /// the whole window instead. Fails in --headless mode.
     #[tool]
-    async fn screenshot(&self) -> Result<CallToolResult, ErrorData> {
+    async fn screenshot(
+        &self,
+        Parameters(_): Parameters<DocOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.grab_screenshot().await
     }
 
@@ -1008,7 +1095,7 @@ Style::default()
     #[tool]
     async fn history_prune(
         &self,
-        Parameters(HistoryPruneArgs { keep }): Parameters<HistoryPruneArgs>,
+        Parameters(HistoryPruneArgs { keep, .. }): Parameters<HistoryPruneArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.history_prune(keep)).await
     }
@@ -1030,7 +1117,10 @@ Style::default()
 
     /// List the procedural graph: one line per op with its inputs.
     #[tool]
-    async fn ops(&self) -> Result<CallToolResult, ErrorData> {
+    async fn ops(
+        &self,
+        Parameters(_): Parameters<DocOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.run(|s| Ok(s.describe_ops())).await
     }
 
@@ -1040,7 +1130,7 @@ Style::default()
     #[tool]
     async fn op_get(
         &self,
-        Parameters(OpNameArgs { name }): Parameters<OpNameArgs>,
+        Parameters(OpNameArgs { name, .. }): Parameters<OpNameArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.describe_op(&name)).await
     }
@@ -1051,7 +1141,7 @@ Style::default()
     #[tool]
     async fn diff(
         &self,
-        Parameters(DiffArgs { from, to }): Parameters<DiffArgs>,
+        Parameters(DiffArgs { from, to, .. }): Parameters<DiffArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.diff(from, to)).await
     }
@@ -1062,7 +1152,7 @@ Style::default()
     #[tool]
     async fn cherry_pick(
         &self,
-        Parameters(CherryPickArgs { from, ops }): Parameters<CherryPickArgs>,
+        Parameters(CherryPickArgs { from, ops, .. }): Parameters<CherryPickArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.cherry_pick(from, ops)).await
     }
@@ -1080,9 +1170,10 @@ Style::default()
         })
     }
 
-    /// Replace the session with a fresh empty model. The old model stays one
-    /// undo away (recorded in the history tree), so this is the clean way to
-    /// start the next model without restarting the server.
+    /// Start a fresh empty model. It never displaces work: when the current
+    /// document has any ops or parts it stays open and the new one starts
+    /// beside it (reach either with `doc`); only an empty document is
+    /// replaced. A name that is already open is refused (scene switch to it).
     #[tool]
     async fn new_model(
         &self,
@@ -1147,95 +1238,141 @@ Style::default()
                 ));
             }
         };
-        self.run_json(move |s| {
-            // Structured content is what many clients show instead of the
-            // text: keep it brief unless asked for the full scene.
-            let summary = |s: &Session, text: &str| {
-                if full {
-                    s.summary_json()
-                } else {
-                    s.brief_json(text)
+        // ops_file items come first and the inline ones after them, so an
+        // inline item with the same type + name (a fix) wins over the
+        // file's; the expanded items are what history records. Read on the
+        // app thread, where begin_call has set the call's project.
+        let file = ops_file.clone();
+        let prep =
+            move |_: &mut Session| -> Result<(Vec<serde_json::Value>, usize, usize), String> {
+                let mut batch = Vec::new();
+                if let Some(file) = &file {
+                    let project = modeler::catalog::project_root();
+                    batch = super::ops_file::read(project.as_deref(), file)?;
                 }
+                let from_file = batch.len();
+                let inline = ops.len();
+                batch.extend(ops);
+                // Silhouette outlines traced from project images become plain
+                // profiles before parsing (history records the points).
+                if batch
+                    .iter()
+                    .any(|v| v.to_string().contains("from_reference"))
+                {
+                    let project = modeler::catalog::project_root();
+                    let read = |file: &str| -> Result<Vec<u8>, String> {
+                        let p = super::ops_file::resolve_as(
+                            project.as_deref(),
+                            file,
+                            "from_reference.image",
+                        )?;
+                        std::fs::read(&p).map_err(|e| format!("from_reference.image `{file}`: {e}"))
+                    };
+                    modeler::silhouette::resolve_references(&mut batch, &read)?;
+                }
+                Ok((batch, from_file, inline))
             };
-            // ops_file items come first and the inline ones after them, so
-            // an inline item with the same type + name (a fix) wins over the
-            // file's; the expanded items are what history records.
-            let mut batch = Vec::new();
-            if let Some(file) = &ops_file {
-                let project = modeler::catalog::project_root();
-                match super::ops_file::read(project.as_deref(), file) {
-                    Ok(items) => batch = items,
-                    Err(msg) => {
-                        let json = serde_json::json!({"ok": false, "error": msg});
-                        return Err((modeler::ModelerError::Invalid(msg), Some(json)));
-                    }
-                }
+        let (mut snap, doc, prepped) = self.snapshot_with(prep).await?;
+        let (batch, from_file, inline) = match prepped {
+            Ok(b) => b,
+            Err(msg) => {
+                let json = serde_json::json!({"ok": false, "error": msg});
+                return Ok(finish(Err((
+                    modeler::ModelerError::Invalid(msg),
+                    Some(json),
+                ))));
             }
-            let from_file = batch.len();
-            let inline = ops.len();
-            batch.extend(ops);
-            // Silhouette outlines traced from project images become plain
-            // profiles before parsing (history records the points).
-            if batch
-                .iter()
-                .any(|v| v.to_string().contains("from_reference"))
-            {
-                let project = modeler::catalog::project_root();
-                let read = |file: &str| -> Result<Vec<u8>, String> {
-                    let p = super::ops_file::resolve_as(
-                        project.as_deref(),
-                        file,
-                        "from_reference.image",
-                    )?;
-                    std::fs::read(&p).map_err(|e| format!("from_reference.image `{file}`: {e}"))
-                };
-                if let Err(msg) = modeler::silhouette::resolve_references(&mut batch, &read) {
-                    let json = serde_json::json!({"ok": false, "error": msg});
-                    return Err((modeler::ModelerError::Invalid(msg), Some(json)));
-                }
-            }
-            let dups = super::ops_file::duplicate_warnings(&batch, from_file);
-            let text = match s.apply_values_as(params, batch, full) {
-                Ok(t) if dups.is_empty() => t,
-                Ok(t) => format!("{}\n{t}", dups.join("\n")),
-                Err(e) => {
-                    let msg = match &ops_file {
-                        Some(file) => {
-                            super::ops_file::locate_error(&e.to_string(), file, from_file, inline)
-                        }
-                        None => e.to_string(),
-                    };
-                    let json = serde_json::json!({"ok": false, "error": msg});
-                    let e = if ops_file.is_some() {
-                        modeler::ModelerError::Invalid(msg)
-                    } else {
-                        e
-                    };
+        };
+        // One slow call per document at a time, in order: the off-thread
+        // pass and the commit below happen under this lock.
+        let lock = self.doc_lock(&doc);
+        let _held = lock.lock().await;
+        // The heavy part off the app thread: the same batch applied to a
+        // detached copy fills the op cache (sdf meshing, booleans,
+        // decimate, ...), so the real apply below re-derives from cache hits
+        // in milliseconds and the window keeps drawing meanwhile. Its result
+        // is thrown away: atomicity, history, authorship and rollback all
+        // come from the real apply, exactly as before. A copy that went
+        // stale (another edit landed in between) only costs cache misses.
+        {
+            let (b, p) = (batch.clone(), params.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = snap.apply_values_as(p, b, false);
+            })
+            .await;
+        }
+        let file = ops_file;
+        let committed = self
+            .exec_json(move |s| {
+                if let Err(e) = s.ensure_active(&doc) {
+                    let json = serde_json::json!({"ok": false, "error": e.to_string()});
                     return Err((e, Some(json)));
                 }
-            };
-            let Some(spec) = expect else {
-                let json = serde_json::json!({"ok": true, "summary": summary(s, &text)});
-                return Ok((text, Some(json)));
-            };
-            let checks = s.verify_checks(&spec);
-            let ok = checks.iter().all(|c| c.1);
-            let json = serde_json::json!({
-                "ok": ok,
-                "checks": Session::checks_json(&checks),
-                "summary": summary(s, &text),
-            });
-            let (_, report) = s.verify(&spec);
-            if ok {
-                Ok((format!("{text}\nexpect: all passed\n{report}"), Some(json)))
-            } else {
-                Err((
-                    format!("expect FAILED (the batch was applied)\n{report}\n\n{text}").into(),
-                    Some(json),
-                ))
-            }
-        })
-        .await
+                let dups = super::ops_file::duplicate_warnings(&batch, from_file);
+                let text = match s.apply_values_as(params, batch, full) {
+                    Ok(t) if dups.is_empty() => t,
+                    Ok(t) => format!("{}\n{t}", dups.join("\n")),
+                    Err(e) => {
+                        let msg = match &file {
+                            Some(file) => super::ops_file::locate_error(
+                                &e.to_string(),
+                                file,
+                                from_file,
+                                inline,
+                            ),
+                            None => e.to_string(),
+                        };
+                        let json = serde_json::json!({"ok": false, "error": msg});
+                        let e = if file.is_some() {
+                            modeler::ModelerError::Invalid(msg)
+                        } else {
+                            e
+                        };
+                        return Err((e, Some(json)));
+                    }
+                };
+                // Structured content is what many clients show instead of
+                // the text: keep it brief unless asked for the full scene.
+                let summary = if full {
+                    s.summary_json()
+                } else {
+                    s.brief_json(&text)
+                };
+                Ok((text, Some(summary)))
+            })
+            .await?;
+        let (text, summary) = match committed {
+            Ok((t, j)) => (t, j.unwrap_or_default()),
+            Err(e) => return Ok(finish(Err(e))),
+        };
+        let Some(spec) = expect else {
+            let json = serde_json::json!({"ok": true, "summary": summary});
+            return Ok(finish(Ok((text, Some(json)))));
+        };
+        // The checks read the committed model, on a worker (still under
+        // the document's lock, so no later call of this document lands
+        // first).
+        let checked = self
+            .detached_json(move |s| {
+                let checks = s.verify_checks(&spec);
+                let ok = checks.iter().all(|c| c.1);
+                let json = serde_json::json!({
+                    "ok": ok,
+                    "checks": Session::checks_json(&checks),
+                    "summary": summary,
+                });
+                let (_, report) = s.verify(&spec);
+                if ok {
+                    Ok((format!("{text}\nexpect: all passed\n{report}"), Some(json)))
+                } else {
+                    Err((
+                        format!("expect FAILED (the batch was applied)\n{report}\n\n{text}").into(),
+                        Some(json),
+                    ))
+                }
+            })
+            .await?;
+        Ok(finish(checked))
     }
 
     /// Deterministic checks in one call: `parts` (exact visible part names;
@@ -1250,7 +1387,8 @@ Style::default()
         &self,
         Parameters(spec): Parameters<modeler::commands::VerifySpec>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run_json(move |s| {
+        // Read-only: on a snapshot, off the app thread.
+        self.run_detached_json(move |s| {
             let checks = s.verify_checks(&spec);
             let ok = checks.iter().all(|c| c.1);
             let json = serde_json::json!({"ok": ok, "checks": Session::checks_json(&checks)});
@@ -1279,8 +1417,25 @@ Style::default()
             dist,
             play,
             ui,
+            variant,
+            ..
         }): Parameters<SetCameraArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let mut variant_note = None;
+        if let Some(v) = variant {
+            let v = (!v.is_empty()).then_some(v);
+            match self.run(move |s| s.set_window_variant(v.as_deref())).await {
+                Ok(r) if r.is_error == Some(true) => return Ok(r),
+                Ok(r) => variant_note = Some(r),
+                Err(e) => return Err(e),
+            }
+            if yaw.is_none() && pitch.is_none() && dist.is_none() && play.is_none() && ui.is_none()
+            {
+                return Ok(variant_note.unwrap_or_else(|| {
+                    CallToolResult::success(vec![Content::text("variant set")])
+                }));
+            }
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         let play = play.map(|p| crate::preview::PlayRequest {
             clip: p.clip,
@@ -1316,8 +1471,15 @@ Style::default()
         if !msg.is_empty() {
             parts.push(msg);
         }
+        if let Some(r) = variant_note {
+            for c in r.content {
+                if let Some(t) = c.as_text() {
+                    parts.push(t.text.clone());
+                }
+            }
+        }
         if parts.is_empty() {
-            parts.push("nothing to do: give yaw / pitch / dist, play and/or ui".into());
+            parts.push("nothing to do: give yaw / pitch / dist, play, ui and/or variant".into());
         }
         Ok(CallToolResult::success(vec![Content::text(
             parts.join("\n"),
@@ -1335,6 +1497,7 @@ Style::default()
             origin,
             dir,
             all_hits,
+            ..
         }): Parameters<ProbeRayArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // CPU ray cast on the model itself: works headless too.
@@ -1379,8 +1542,24 @@ Style::default()
             bone,
             joints,
             reference,
+            variant,
+            variants,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let vlist: Vec<Option<String>> = match variants {
+            None | Some(VariantsArg::All(false)) => vec![variant.clone()],
+            Some(VariantsArg::All(true)) => {
+                self.variant_names().await.into_iter().map(Some).collect()
+            }
+            Some(VariantsArg::Names(v)) if v.is_empty() => {
+                return Err(ErrorData::invalid_params(
+                    "variants: list at least one variant name",
+                    None,
+                ));
+            }
+            Some(VariantsArg::Names(v)) => v.into_iter().map(Some).collect(),
+        };
+
         let (focus, joints) = match focus {
             Some(FocusArg::One(f)) if f == "joints" => (None, Some(joints.unwrap_or(4))),
             Some(FocusArg::One(f)) => (Some(vec![f]), joints),
@@ -1471,6 +1650,7 @@ Style::default()
             }
         };
         let shot_style = ShotStyle {
+            variant: None,
             pose: None,
             bones,
             weights: if weights { bone.clone() } else { None },
@@ -1533,6 +1713,24 @@ Style::default()
                 .flat_map(|t| parsed.iter().map(move |v| (*v, *t, None, None)))
                 .collect(),
         };
+        if parsed.len() * vlist.len() > 9 {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{} images x {} variants is more than 9: drop views or variants",
+                    parsed.len(),
+                    vlist.len()
+                ),
+                None,
+            ));
+        }
+        let parsed: Vec<_> = vlist
+            .iter()
+            .flat_map(|var| {
+                parsed
+                    .iter()
+                    .map(move |(v, t, f, j)| (*v, *t, *f, j.clone(), var.clone()))
+            })
+            .collect();
         let n = parsed.len() as u32;
         let grid = grid.unwrap_or(n > 1);
         let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
@@ -1559,17 +1757,22 @@ Style::default()
             if dims { "+dims" } else { "" }
         );
         let mut shots = Vec::with_capacity(parsed.len());
-        for (view, t, frame, joint) in &parsed {
+        for (view, t, frame, joint, var) in &parsed {
             let mut st = shot_style.clone();
             st.pose = t.map(|t| (clip.clone(), t));
             st.frame = *frame;
+            st.variant = var.clone().filter(|v| v != modeler::variant::DEFAULT);
             let (png, _) = self
                 .agent_render(*view, width, height, focus.clone(), st)
                 .await?;
             let tl = t.map(|t| format!(" t={t}")).unwrap_or_default();
             let key = format!(
-                "{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}|{frame:?}"
+                "{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}|{frame:?}|{var:?}"
             );
+            let tl = match var {
+                Some(v) => format!("{tl} [{v}]"),
+                None => tl,
+            };
             let prev = self
                 .last_shots
                 .lock()
@@ -1686,7 +1889,7 @@ Style::default()
         }
         let (png_tx, png_rx) = std::sync::mpsc::channel();
         let result = self
-            .run_json(move |s| {
+            .run_detached_json(move |s| {
                 let mut text = Vec::new();
                 let mut json = serde_json::Map::new();
                 let posed;
@@ -1781,6 +1984,7 @@ Style::default()
             position,
             resolve,
             reopen,
+            ..
         }): Parameters<AddAnnotationArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(id) = resolve {
@@ -1801,7 +2005,10 @@ Style::default()
     /// Read every annotation on the model: one line per comment with its id, part,
     /// text and the face/vertex it is pinned to.
     #[tool]
-    async fn list_annotations(&self) -> Result<CallToolResult, ErrorData> {
+    async fn list_annotations(
+        &self,
+        Parameters(_): Parameters<DocOnlyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.run(|s| Ok(s.list_annotations())).await
     }
 
@@ -1809,7 +2016,7 @@ Style::default()
     #[tool]
     async fn delete_annotation(
         &self,
-        Parameters(AnnotationIdArgs { id }): Parameters<AnnotationIdArgs>,
+        Parameters(AnnotationIdArgs { id, .. }): Parameters<AnnotationIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(move |s| s.delete_annotation(id)).await
     }
@@ -2035,14 +2242,15 @@ impl rmcp::ServerHandler for Tools {
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
 - The human's comments (annotations) are requests: scene_summary lists the open ones. When you have dealt with one, resolve it with add_annotation {resolve: id, text: what you did}; don't delete it.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, variant, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
 - Don't place things by arithmetic: place {parts, on, at: [x, z] or an anchor \"desk:top-front\"} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Signs and labels: uvs projection \"face\" (alias \"label\") stretches one upright, unmirrored image over each side of a part (planar now maps along the thinnest axis); a card material with an opacity cutout on such a closed plate draws single-sided (open sheets such as leaf cards stay double-sided). ops_file items apply first and inline ops after, so an inline item with the same type + name wins (the result warns about every op given twice). An empty repeat is a noted no-op.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
 - Parse errors name the item and field and nothing is applied. Sizes may be a number, a short array or {radius, height}; colours [r,g,b], [r,g,b,a], 0..255 or \"#rgb\" / \"#rrggbb\"; material input defaults to its name (in place).
 - Every model gets materials. Shape first, materials after: build and check the geometry, then make the materials (material_ops) and give each visible part a material item in a later apply_ops, preferably a procedural pbr one ({\"type\": \"material\", \"name\": part, \"pbr\": name}; the material must exist when the item is applied); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
-- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on apply_ops, verify, inspect, agent_views, save_prefab, undo and redo; the call errors if that document isn't open, and save_prefab refuses a name another open document holds.
+- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on every tool that reads or changes a document (apply_ops, verify, inspect, agent_views, scene_summary, ops, op_get, probe_ray, screenshot, set_camera, style, material_ops, annotations, history, undo, redo, jump, diff, cherry_pick, history_prune, set_model_name, save_prefab, export_model); the call errors if that document isn't open, and save_prefab refuses a name another open document holds. new_model never displaces work: unless the current document is empty it starts beside it (both stay open), and a name that is already open is refused.
+- Working efficiently: verify numerically between steps and render once per model at the end with one tiled agent_views (e.g. [\"front\", \"right\", \"top\", \"iso\"]), not after every step. For many identical props in a map (hundreds of desk fans), model one prefab (the fan, with its rotor clip) and place prefab instances, or bake a set into one prefab with arrays: never hundreds of separate items. Prefab instances export by reference in a .bsn.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
@@ -2059,6 +2267,7 @@ impl rmcp::ServerHandler for Tools {
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.
 - When a call surprises you (an error that didn't say what to do, a field that didn't work as described, a workaround you needed), tell the maintainers in one or two sentences with session_log(feedback: \"...\"): what you tried, what happened, what you expected. Failed and slow calls are logged on their own; notes say why.
 - scene_summary, apply_ops and verify also return structuredContent JSON (apply_ops: the result text plus counts; summary \"full\" for every part). material items take name patterns (\"wall_*\"), which keep matching parts later batches add; shrinking an array drops the edits of its lost copies (a note lists them); a material_ops edit re-applies itself to the parts using it. catalog_describe(name, delete: true) removes a prefab.
+- Cosmetic variants (skins: red/blue team, clean/rusty): {\"type\": \"variant\", \"name\": \"red_team\", \"materials\": {\"body*\": {\"pbr\": \"paint\", \"params\": {..}}, \"trim\": {\"color\": \"#c33\", \"flat\": true}}, \"style\"?: {token patch}} overrides only the matched parts' materials (geometry never changes; the base look is \"default\"). See them with agent_views variant / variants: true, set_camera variant (window); verify materials checks every variant; exports write KHR_materials_variants plus node extras.variants (modeler_bevy's ModelerVariant swaps them in game); a prefab item takes variant.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
 - Animation: rig after the shape and materials. skeleton (bones {name: {head, tail, parent, radius}}: points or anchors \"leg_l:top\", world-aligned rest, mirror \"x\" makes *_r twins; or from: an lsystem / skin op to auto-rig), bind (rigid with bone, smooth weights, auto = exact for lsystem rigs: bind [\"oak\", \"oak_leaves\"]), clip (tracks per bone: rotate/translate/scale keys [[t, value]] as offsets from rest, or {wave}; mirror {leg_r: {from: leg_l, phase: 0.5}} half-authors a walk), sway (wind: direction, strength, gust, flutter; spring over: a clip for tails and ears; bakes into a looping clip). Judge motion with an agent_views filmstrip (clip + times [0, 0.25, 0.5, 0.75], style bones / weights) and verify animation {clip} (loop, floor, collisions, stretch) plus weights: true; export writes skins and animations, and crates/modeler_bevy runs the sway live in a game.
@@ -2089,6 +2298,24 @@ const DOC_TOOLS: &[&str] = &[
     "save_prefab",
     "undo",
     "redo",
+    "export_model",
+    "history_prune",
+    "scene_summary",
+    "ops",
+    "op_get",
+    "history",
+    "jump",
+    "diff",
+    "cherry_pick",
+    "screenshot",
+    "set_camera",
+    "material_ops",
+    "set_model_name",
+    "style",
+    "add_annotation",
+    "list_annotations",
+    "delete_annotation",
+    "probe_ray",
 ];
 
 fn material_doc(doc: Option<&str>) -> Result<Option<Option<&str>>, String> {

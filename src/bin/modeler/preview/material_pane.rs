@@ -221,6 +221,7 @@ pub(crate) fn update_material_pane(
     mut commands: Commands,
     (assets, mut comment): (Res<AssetServer>, ResMut<CommentBox>),
 ) {
+    let _profile = crate::preview::profile::span("update_material_pane");
     pane.visible = wb.mode == Mode::Material && !grid.on;
     let want_vis = if pane.visible {
         Visibility::Inherited

@@ -317,6 +317,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 | Op::DecalScatter { .. }
                 | Op::Collider { .. }
                 | Op::Marker { .. }
+                | Op::Variant { .. }
                 | Op::Skeleton { .. }
                 | Op::Bind { .. }
                 | Op::Clip { .. }
@@ -410,7 +411,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             });
         }
         if part.material.pbr.is_some() {
-            crate::material::pbr::map_part(Arc::make_mut(part))?;
+            *part = mapped_part(part)?;
         }
     }
     // Parent transforms, applied to the finished parts in list order,
@@ -850,6 +851,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
+        | Op::Variant { .. }
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
@@ -1495,6 +1497,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             scale,
             parts,
             restyle,
+            variant,
             ..
         } => {
             let mut model = load_prefab_guarded(prefab)?;
@@ -1504,6 +1507,12 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 s.set_style(st.clone())
                     .map_err(|e| format!("{name}: restyling prefab `{prefab}`: {e}"))?;
                 model = Arc::new(s.model);
+            }
+            if let Some(v) = variant {
+                model = Arc::new(
+                    crate::variant::derive(&model, v)
+                        .map_err(|e| format!("{name}: prefab `{prefab}`: {e}"))?,
+                );
             }
             let (it, ir) = (
                 Vec3::from(*translation),
@@ -1632,6 +1641,7 @@ pub fn output(op: &Op) -> &str {
         | Op::DecalScatter { name, .. }
         | Op::Collider { name, .. }
         | Op::Marker { name, .. }
+        | Op::Variant { name, .. }
         | Op::Skeleton { name, .. }
         | Op::Bind { name, .. }
         | Op::Clip { name, .. }
@@ -1684,6 +1694,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
         | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
+        | Op::Variant { .. }
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
@@ -1754,6 +1765,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::DecalScatter { .. } => "decal_scatter",
         Op::Collider { .. } => "collider",
         Op::Marker { .. } => "marker",
+        Op::Variant { .. } => "variant",
         Op::Skeleton { .. } => "skeleton",
         Op::Bind { .. } => "bind",
         Op::Clip { .. } => "clip",
@@ -1803,6 +1815,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::DecalScatter { .. }
         | Op::Collider { .. }
         | Op::Marker { .. }
+        | Op::Variant { .. }
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
@@ -1990,6 +2003,29 @@ pub fn describe(ops: &[Op]) -> String {
                             .join(",")
                     )
                 }
+            ),
+            Op::Variant {
+                name,
+                materials,
+                style,
+            } => format!(
+                "#{i} variant `{name}` looks=[{}]{}",
+                materials
+                    .iter()
+                    .map(|l| format!(
+                        "{}: {}",
+                        l.parts,
+                        l.pbr.as_ref().map_or_else(
+                            || l.base_color.map_or("factors".into(), |c| format!("{c:?}")),
+                            |r| format!("pbr {}", r.material)
+                        )
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                style
+                    .as_ref()
+                    .map(|v| format!(" style={v}"))
+                    .unwrap_or_default()
             ),
             Op::Collider {
                 name,
@@ -2532,6 +2568,39 @@ pub fn describe_one(ops: &[Op], name: &str) -> Option<String> {
         })
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// `part` with its material's uv mapping, memoized by the unmapped part's
+/// shared copy: an unchanged part (the eval cache hands back the same
+/// `Arc`) maps once, not on every evaluation (box-unwrapping 800 scattered
+/// copies took most of a second per edit), and keeps one mapped `Arc`, so
+/// the preview can tell it is unchanged. The `Weak` guards against a reused
+/// address (`Arc::make_mut` moves a value that has weak references).
+fn mapped_part(part: &Arc<Part>) -> Result<Arc<Part>, String> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    type Memo = HashMap<usize, (Weak<Part>, Arc<Part>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let ptr = Arc::as_ptr(part) as usize;
+    if let Ok(m) = memo.lock()
+        && let Some((w, out)) = m.get(&ptr)
+        && w.upgrade().is_some_and(|a| Arc::ptr_eq(&a, part))
+    {
+        return Ok(Arc::clone(out));
+    }
+    let mut p = (**part).clone();
+    crate::material::pbr::map_part(&mut p)?;
+    let out = Arc::new(p);
+    if let Ok(mut m) = memo.lock() {
+        if m.len() > 20_000 {
+            m.retain(|_, (w, _)| w.strong_count() > 0);
+            if m.len() > 20_000 {
+                m.clear();
+            }
+        }
+        m.insert(ptr, (Arc::downgrade(part), Arc::clone(&out)));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

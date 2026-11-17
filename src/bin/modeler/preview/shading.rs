@@ -1,7 +1,9 @@
 //! The HUD row at the 3D view's top right ([`HudRow`], in the Centre slot)
 //! and what this file puts in it: the View menu (`Workbench.shading`: Lit
 //! as exported, Clay one grey, By part flat colours) and, in Map mode, the
-//! Fly / Orbit segment (F toggles; `camera.rs` reads [`CameraNav`]). Other
+//! Fly / Orbit segment (F toggles; `camera.rs` reads [`CameraNav`]), and
+//! the Skin chip when the document has cosmetic variants (a click cycles
+//! the variant the window shows). Other
 //! panes add their chips to the row after these (the comments chip sits at
 //! the far right).
 //!
@@ -32,7 +34,12 @@ enum HudButton {
     View,
     Pick(Shading),
     Nav(bool),
+    /// Cycles the document's cosmetic variant.
+    Variant,
 }
+
+#[derive(Component)]
+struct VariantLabel;
 
 #[derive(Component)]
 struct ViewMenu;
@@ -150,6 +157,33 @@ fn setup_hud(
             ChildOf(b),
         ));
     }
+    // The Skin chip (documents with variants only).
+    let skin = commands
+        .spawn((
+            ds::piece(ds::Kind::Chip),
+            HudButton::Variant,
+            BlocksCamera,
+            ChildOf(row),
+        ))
+        .insert(Node {
+            display: Display::None,
+            ..default()
+        })
+        .observe(on_hud_click)
+        .id();
+    commands.spawn((
+        ds::icon(&mut icons, &mut images, ds::Icon::Swatch, 13.0, ds::DIM),
+        ds::Ink::Icon,
+        Pickable::IGNORE,
+        ChildOf(skin),
+    ));
+    commands.spawn((
+        VariantLabel,
+        ds::text(&assets, ds::Type::Small, "default"),
+        ds::Ink::Main,
+        Pickable::IGNORE,
+        ChildOf(skin),
+    ));
     // The View chip and its menu.
     let view = commands
         .spawn((
@@ -236,6 +270,7 @@ fn on_hud_click(
     mut wb: ResMut<Workbench>,
     mut open: ResMut<MenuOpen>,
     mut nav: ResMut<CameraNav>,
+    mut modeler: ResMut<crate::preview::app::Modeler>,
 ) {
     if click.button != PointerButton::Primary {
         return;
@@ -250,6 +285,18 @@ fn on_hud_click(
             open.0 = false;
         }
         HudButton::Nav(fly) => nav.fly = fly,
+        HudButton::Variant => {
+            let m = &modeler.session.model;
+            let mut all = vec![modeler::variant::DEFAULT.to_string()];
+            all.extend(modeler::variant::names(m));
+            let cur = m
+                .active_variant
+                .clone()
+                .unwrap_or_else(|| modeler::variant::DEFAULT.into());
+            let i = all.iter().position(|v| *v == cur).unwrap_or(0);
+            let next = all[(i + 1) % all.len()].clone();
+            let _ = modeler.session.set_window_variant(Some(&next));
+        }
     }
 }
 
@@ -272,11 +319,44 @@ fn sync_hud(
     nav: Res<CameraNav>,
     mut open: ResMut<MenuOpen>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut label: Query<&mut Text, With<ViewLabel>>,
+    mut label: Query<&mut Text, (With<ViewLabel>, Without<VariantLabel>)>,
     mut menu: Query<&mut Visibility, With<ViewMenu>>,
     mut seg: Query<&mut Node, With<NavSegment>>,
     mut items: Query<(&HudButton, &mut ds::Ui)>,
+    modeler: Res<crate::preview::app::Modeler>,
+    mut skin: Query<(&HudButton, &mut Node), Without<NavSegment>>,
+    mut skin_label: Query<&mut Text, (With<VariantLabel>, Without<ViewLabel>)>,
 ) {
+    let has_variants = modeler
+        .session
+        .model
+        .ops
+        .iter()
+        .any(|o| matches!(o, modeler::Op::Variant { .. }));
+    for (b, mut n) in &mut skin {
+        if *b != HudButton::Variant {
+            continue;
+        }
+        let want = if has_variants && wb.mode != Mode::Material {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if n.display != want {
+            n.display = want;
+        }
+    }
+    if let Ok(mut t) = skin_label.single_mut() {
+        let want = modeler
+            .session
+            .model
+            .active_variant
+            .clone()
+            .unwrap_or_else(|| modeler::variant::DEFAULT.into());
+        if t.0 != want {
+            t.0 = want;
+        }
+    }
     // A click in the 3D view closes the menu.
     if open.0 && mouse.just_pressed(MouseButton::Left) && !wb.ui_hover {
         open.0 = false;
@@ -312,7 +392,7 @@ fn sync_hud(
         let on = match *b {
             HudButton::Pick(s) => s == wb.shading,
             HudButton::Nav(fly) => fly == nav.fly,
-            HudButton::View => continue,
+            HudButton::View | HudButton::Variant => continue,
         };
         if bg.on != on {
             bg.on = on;
@@ -331,6 +411,7 @@ fn record_lit(
     children: Query<&Children>,
     mats: Query<&MeshMaterial3d<StandardMaterial>>,
 ) {
+    let _profile = crate::preview::profile::span("record_lit");
     for (e, m) in &new {
         commands.entity(e).insert(LitMaterial(m.0.clone()));
     }
@@ -362,6 +443,7 @@ fn apply_shading(
         With<PreviewPart>,
     >,
 ) {
+    let _profile = crate::preview::profile::span("apply_shading");
     let want = wb.shading;
     for (e, name, mut mat, lit, shaded, highlighted) in &mut parts {
         let now = shaded.map_or(Shading::Lit, |s| s.0);

@@ -20,6 +20,13 @@
 //!   for `kind: "clustered"` where [`ModelerDecals::clustered`] allows, a
 //!   [`ClusteredDecal`] (needs bindless textures: not on Metal / WebGL).
 //!   Without the plugin the quad still draws as a flat sticker.
+//! - `extras.variants` (cosmetic variants, `variant` items) on every part
+//!   node: a [`ModelerVariants`] component ({variant: glTF material
+//!   index}). Insert [`ModelerVariant`] (`ModelerVariant::new("red_team")`)
+//!   on the scene root, or any ancestor, and the plugin swaps each part's
+//!   `MeshMaterial3d<StandardMaterial>` to that variant's material from the
+//!   same glTF (Bevy's loader ignores `KHR_materials_variants`); change it
+//!   to switch looks at runtime. A `.bsn` map writes it on prefab instances.
 
 use bevy::app::AnimationSystems;
 use bevy::gltf::GltfExtras;
@@ -35,7 +42,8 @@ impl Plugin for ModelerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Wind>()
             .init_resource::<ModelerDecals>()
-            .add_systems(Update, make_decals)
+            .register_type::<ModelerVariant>()
+            .add_systems(Update, (make_decals, apply_variants))
             .add_systems(
                 PostUpdate,
                 (read_extras, run_sway)
@@ -323,6 +331,106 @@ pub fn marker_of(v: &serde_json::Value) -> Option<ModelerMarker> {
     })
 }
 
+/// A part's cosmetic variants: variant name -> glTF material index (from
+/// `extras.variants`; "default" is the base look).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct ModelerVariants(pub std::collections::BTreeMap<String, usize>);
+
+impl ModelerVariants {
+    /// The material index for `variant`, falling back to "default".
+    pub fn material(&self, variant: &str) -> Option<usize> {
+        self.0
+            .get(variant)
+            .or_else(|| self.0.get("default"))
+            .copied()
+    }
+}
+
+/// The cosmetic variant an exported model wears. Put it on the scene root
+/// (or any ancestor of the parts); every part below switches to that
+/// variant's material, and changing it switches again.
+#[derive(Component, Clone, Debug, Default, PartialEq, Reflect)]
+#[reflect(Component, Default)]
+pub struct ModelerVariant {
+    pub name: String,
+}
+
+impl ModelerVariant {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+/// `extras.variants` as a component.
+pub fn variants_of(v: &serde_json::Value) -> Option<ModelerVariants> {
+    let m = v.get("variants")?.as_object()?;
+    Some(ModelerVariants(
+        m.iter()
+            .filter_map(|(k, i)| Some((k.clone(), i.as_u64()? as usize)))
+            .collect(),
+    ))
+}
+
+/// The label of glTF material `index`'s `StandardMaterial` (Bevy's loader
+/// adds one per material, used by a primitive or not).
+pub fn variant_material_label(index: usize) -> String {
+    format!("Material{index}/std")
+}
+
+/// Swaps part materials to the chosen variant: for parts under a changed
+/// [`ModelerVariant`], and for parts that just spawned under one.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn apply_variants(
+    assets: Res<AssetServer>,
+    changed: Query<(Entity, &ModelerVariant), Changed<ModelerVariant>>,
+    added: Query<Entity, Added<ModelerVariants>>,
+    chosen: Query<&ModelerVariant>,
+    parts: Query<&ModelerVariants>,
+    parents: Query<&ChildOf>,
+    children: Query<&Children>,
+    mut mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
+) {
+    let mut todo: Vec<(Entity, String)> = Vec::new();
+    for (root, v) in &changed {
+        for e in std::iter::once(root).chain(children.iter_descendants(root)) {
+            if parts.contains(e) {
+                todo.push((e, v.name.clone()));
+            }
+        }
+    }
+    for e in &added {
+        if let Some(v) = std::iter::once(e)
+            .chain(parents.iter_ancestors(e))
+            .find_map(|a| chosen.get(a).ok())
+        {
+            todo.push((e, v.name.clone()));
+        }
+    }
+    for (node, variant) in todo {
+        let Some(index) = parts.get(node).ok().and_then(|p| p.material(&variant)) else {
+            continue;
+        };
+        // The node's own mesh, or its primitives (children).
+        let targets =
+            std::iter::once(node).chain(children.get(node).into_iter().flatten().copied());
+        for t in targets {
+            let Ok(mut m) = mats.get_mut(t) else {
+                continue;
+            };
+            let Some(path) = assets.get_path(m.0.id()) else {
+                continue;
+            };
+            let want = path
+                .without_label()
+                .clone_owned()
+                .with_label(variant_material_label(index));
+            if assets.get_path(m.0.id()).as_ref() != Some(&want) {
+                m.0 = assets.load(want);
+            }
+        }
+    }
+}
+
 /// A per-instance clock offset from the entity, in 0..17 s.
 fn phase_of(e: Entity) -> f32 {
     let mut x = e.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -348,6 +456,9 @@ fn read_extras(
         }
         if let Some(d) = decal_of(&v) {
             commands.entity(e).insert(d);
+        }
+        if let Some(vs) = variants_of(&v) {
+            commands.entity(e).insert(vs);
         }
         let Some(rig) = v
             .get("sway")
@@ -440,5 +551,22 @@ fn run_sway(
                 sway.written[i] = Some(q);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    #[test]
+    fn variants_come_from_extras_and_fall_back_to_default() {
+        let v = serde_json::json!({"part": "body", "variants": {"default": 0, "red_team": 3}});
+        let Some(vs) = variants_of(&v) else {
+            panic!("no variants read")
+        };
+        assert_eq!(vs.material("red_team"), Some(3));
+        assert_eq!(vs.material("blue_team"), Some(0));
+        assert!(variants_of(&serde_json::json!({"part": "x"})).is_none());
+        assert_eq!(variant_material_label(3), "Material3/std");
     }
 }

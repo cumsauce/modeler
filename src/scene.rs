@@ -51,6 +51,8 @@ use crate::{Model, ModelerError, Op};
 /// jackdaw's version stamp (its loader migrates older text by it).
 pub const STAMP: &str = "// jackdaw 0.20.2 | bevy 0.20";
 const GLTF_SOURCE: &str = "jackdaw_scene_types::types::GltfSource";
+/// The cosmetic variant a prefab instance wears (`crates/modeler_bevy`).
+const VARIANT: &str = "modeler_bevy::ModelerVariant";
 const NODE_ID: &str = "jackdaw_scene_types::node_id::SceneNodeId";
 const TRANSFORM: &str = "bevy_transform::components::transform::Transform";
 const CHILDREN: &str = "bevy_ecs::hierarchy::Children";
@@ -310,6 +312,8 @@ pub struct Entity {
     pub gltf: Option<String>,
     /// (type path, BSN field lines or empty for a unit component).
     pub components: Vec<(String, Vec<(String, String)>)>,
+    /// A prefab instance's cosmetic variant (None: its default look).
+    pub variant: Option<String>,
 }
 
 fn transform_text(t: &Affine3A) -> String {
@@ -533,6 +537,7 @@ pub fn export_scene(
             rotation,
             scale,
             components,
+            variant,
             ..
         } = op
         else {
@@ -591,8 +596,18 @@ pub fn export_scene(
             raw: components.clone(),
             transform: instance_transform(model, name, source.as_deref(), fallback),
             gltf: Some(gltf),
-            components: resolve_components(vocab.as_ref(), components)
-                .map_err(|e| format!("instance `{name}`: {e}"))?,
+            components: {
+                let mut c = resolve_components(vocab.as_ref(), components)
+                    .map_err(|e| format!("instance `{name}`: {e}"))?;
+                if let Some(v) = variant {
+                    c.push((
+                        VARIANT.to_string(),
+                        vec![("name".into(), serde_json::to_string(v).unwrap_or_default())],
+                    ));
+                }
+                c
+            },
+            variant: variant.clone(),
         });
     }
     // Markers.
@@ -620,6 +635,7 @@ pub fn export_scene(
             gltf: None,
             components: resolve_components(vocab.as_ref(), &comps)
                 .map_err(|e| format!("marker `{}`: {e}", m.name))?,
+            variant: None,
         });
     }
     // The document's own geometry as one glTF.
@@ -663,6 +679,7 @@ pub fn export_scene(
             transform: Affine3A::IDENTITY,
             gltf: Some(rel(&root, &file)),
             components: Vec::new(),
+            variant: None,
         });
     }
     check_refs(vocab.as_ref(), &entities)?;
@@ -774,6 +791,9 @@ pub struct MapEntity {
     /// By vocabulary name, values as written on the item.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub components: serde_json::Map<String, serde_json::Value>,
+    /// A prefab instance's cosmetic variant (`ModelerVariant` in the scene).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -804,6 +824,7 @@ fn map_file(stem: &str, entities: &[Entity], terrains: Vec<MapTerrain>) -> MapFi
                     size: e.size,
                     gltf: e.gltf.clone(),
                     components: e.raw.clone(),
+                    variant: e.variant.clone(),
                 }
             })
             .collect(),

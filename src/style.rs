@@ -474,6 +474,17 @@ pub fn expand(raw: &Value, style: &Style) -> Result<Value, String> {
         if ty == "prefab" {
             return Ok(v);
         }
+        // A variant's `style` is a token patch for that variant, applied
+        // when the variant is derived; its looks resolve against this style.
+        if ty == "variant"
+            && let Some(patch) = m.remove("style")
+        {
+            let mut out = expand(&v, style)?;
+            if let Value::Object(o) = &mut out {
+                o.insert("style".into(), patch);
+            }
+            return Ok(out);
+        }
         // A terrain's `style` is its shape (hills / ridges / dunes / ...).
         if ty == "terrain" && m.get("style").is_some_and(|s| s.is_string()) {
             return Ok(v);

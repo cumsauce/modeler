@@ -94,6 +94,11 @@ pub(crate) struct SceneBuilt {
     pub(crate) doc: Option<String>,
     /// The model the camera was last framed for.
     pub(crate) framed: Option<String>,
+    /// Parts still streaming in (no finished entity yet).
+    pub(crate) pending: usize,
+    /// Some part shows a distance LOD copy when the camera is far: the
+    /// window's entities aren't the full-detail model at every distance.
+    pub(crate) lods: bool,
 }
 
 /// Exits headless mode once the MCP server has hung up; windowed mode stays open so
@@ -144,6 +149,7 @@ pub(crate) fn drain_commands(
     (mut wb, mut grid): (Option<ResMut<Workbench>>, Option<ResMut<Grid>>),
     mut agent_cam: Local<AgentCam>,
 ) {
+    let _profile = crate::preview::profile::span("drain_commands");
     let bridge = Arc::clone(&modeler.bridge);
     let Ok(mut rx) = bridge.rx.lock() else {
         return;
@@ -157,6 +163,12 @@ pub(crate) fn drain_commands(
             Cmd::Screenshot(reply) => {
                 if headless.0 {
                     let _ = reply.send(Err("headless: no renderer, no screenshot".into()));
+                } else if offscreen.0
+                    && (grid.as_ref().is_some_and(|g| g.on)
+                        || wb.as_ref().is_some_and(|w| w.capture_window))
+                {
+                    // Offscreen window capture: the UI canvas.
+                    pending.0.push(Mutex::new(Some(reply)));
                 } else if offscreen.0 || !wb.as_ref().is_some_and(|w| w.capture_window) {
                     // Offscreen: the window camera's view (the orbit that
                     // set_camera and auto-framing steer). Windowed: the
@@ -189,6 +201,7 @@ pub(crate) fn drain_commands(
                         // The window's own pose when it is playing a clip.
                         ShotStyle {
                             pose: playback.clip.clone().map(|c| (Some(c), playback.time)),
+                            variant: modeler.session.model.active_variant.clone(),
                             ..default()
                         },
                         reply,
@@ -391,6 +404,10 @@ fn apply_ui(
             format!("selected {p}")
         });
     }
+    if let Some(y) = u.scroll {
+        grid.scroll = y.max(0.0);
+        said.push(format!("grid scrolled to {y:.0} px"));
+    }
     if let Some(p) = u.popup {
         wb.doc_popup = p;
         said.push(format!(
@@ -434,119 +451,258 @@ fn apply_ui(
     Ok(format!("ui: {}", said.join(", ")))
 }
 
-/// Rebuilds one entity per part whenever the model version moves, and re-frames the
-/// orbit camera around the model's bounds.
+/// One drawn part of the window's scene.
+pub(crate) struct WindowSlot {
+    part: std::sync::Arc<Part>,
+    /// What shows now: the finished entity, or a flat placeholder while the
+    /// bake runs.
+    entity: Option<Entity>,
+    /// The entity of the part this one replaced (same name), kept on screen
+    /// until this one's finished entity exists.
+    old: Option<Entity>,
+    finished: bool,
+    /// Distance LODs attached (or none needed).
+    lods_done: bool,
+    has_lods: bool,
+}
+
+impl WindowSlot {
+    fn despawn(&self, commands: &mut Commands) {
+        for e in self.entity.iter().chain(&self.old) {
+            commands.entity(*e).despawn();
+        }
+    }
+}
+
+/// Rebuilds the window's part entities whenever the model version moves,
+/// and re-frames the orbit camera around the model's bounds. Meshes and
+/// bakes stream in ([`super::stream`]): until a changed part's entity is
+/// ready, the old one stays (or a flat placeholder shows).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rebuild_scene(
     mut commands: Commands,
     mut modeler: ResMut<Modeler>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut pbr_cache: ResMut<PbrCache>,
+    (mut pbr_cache, mut streams): (ResMut<PbrCache>, ResMut<super::stream::Streams>),
     mut decal_mats: ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
     mut orbit: ResMut<Orbit>,
     mut built: ResMut<SceneBuilt>,
-    existing: Query<Entity, With<PreviewPart>>,
     lights: Query<Entity, Or<(With<SceneLight>, With<super::decals::SceneDecal>)>>,
     layers: Option<Res<LayerVisibility>>,
     mut built_layers: Local<Option<LayerVisibility>>,
+    mut slots: Local<std::collections::HashMap<usize, WindowSlot>>,
+    mut previews: Local<Vec<Entity>>,
 ) {
+    let _profile = crate::preview::profile::span("rebuild_scene");
     if modeler.session.viewer_away() {
         return;
     }
     // Map mode's eye toggles (view only).
     let layers = layers.map(|l| *l).unwrap_or_default();
     let version = modeler.session.model.version;
-    if built.version == Some(version) && *built_layers == Some(layers) {
-        return;
-    }
-    built.version = Some(version);
-    built.doc = Some(modeler.session.model.name.clone());
-    *built_layers = Some(layers);
-    pbr_cache.tick();
-    for e in existing.iter().chain(&lights) {
-        commands.entity(e).despawn();
-    }
-    if layers.lights {
-        spawn_lights(&mut commands, &modeler.session.model);
-    }
-    if layers.decals {
-        super::decals::spawn_decals(
-            &mut commands,
-            &modeler.session.model,
-            &mut images,
-            &mut pbr_cache,
-            &mut decal_mats,
-            None,
-        );
-    }
-    // The model changed under any pending pin; drop it so no stale comment lands.
-    modeler.session.pending_pin = None;
-    // Bake every part's material at once (in parallel) before spawning.
-    let is_drawn = {
-        let model = &modeler.session.model;
-        let base = drawn(model);
-        move |p: &Part| base(p) && layers.shows_part(model, &p.name)
-    };
-    modeler::material::pbr::prebake(
-        modeler
-            .session
-            .model
-            .parts
-            .iter()
-            .filter(|p| !p.verts.is_empty() && is_drawn(p))
-            .map(|p| &**p),
-    );
-    for part in &modeler.session.model.parts {
-        if part.verts.is_empty() || part.indices.is_empty() || !is_drawn(part) {
-            continue;
+    if built.version != Some(version) || *built_layers != Some(layers) {
+        built.version = Some(version);
+        built.doc = Some(modeler.session.model.name.clone());
+        *built_layers = Some(layers);
+        pbr_cache.tick();
+        for e in &lights {
+            commands.entity(e).despawn();
         }
-        commands.spawn((
-            part_bundle(
-                part,
-                &mut meshes,
-                &mut materials,
+        if layers.lights {
+            spawn_lights(&mut commands, &modeler.session.model);
+        }
+        if layers.decals {
+            super::decals::spawn_decals(
+                &mut commands,
+                &modeler.session.model,
                 &mut images,
                 &mut pbr_cache,
-            ),
-            PreviewPart,
-        ));
+                &mut decal_mats,
+                None,
+            );
+        }
+        // The model changed under any pending pin; drop it so no stale comment lands.
+        modeler.session.pending_pin = None;
+        let is_drawn = {
+            let model = &modeler.session.model;
+            let base = drawn(model);
+            move |p: &Part| base(p) && layers.shows_part(model, &p.name)
+        };
+        // The cosmetic variant the window shows (set_camera variant / the chip).
+        let variant_parts = modeler.session.window_variant_parts();
+        // Parts whose shared `Arc` is unchanged keep their entity (an edit
+        // to one part of a scene doesn't respawn the other 800).
+        let mut previous = std::mem::take(&mut *slots);
+        let mut fresh: Vec<usize> = Vec::new();
+        for part in variant_parts
+            .as_ref()
+            .unwrap_or(&modeler.session.model.parts)
+        {
+            if part.verts.is_empty() || part.indices.is_empty() || !is_drawn(part) {
+                continue;
+            }
+            let ptr = std::sync::Arc::as_ptr(part) as usize;
+            if let Some(slot) = previous.remove(&ptr) {
+                if let Some(e) = slot.entity.filter(|_| slot.finished) {
+                    // Playback may have posed it: back to the part's own place.
+                    commands.entity(e).insert(part_transform(part));
+                }
+                slots.insert(ptr, slot);
+                continue;
+            }
+            fresh.push(ptr);
+            slots.insert(
+                ptr,
+                WindowSlot {
+                    part: std::sync::Arc::clone(part),
+                    entity: None,
+                    old: None,
+                    finished: false,
+                    lods_done: false,
+                    has_lods: false,
+                },
+            );
+        }
+        // What the gone parts showed stands in for a changed part of the
+        // same name until its own entity is ready.
+        let mut by_name: std::collections::HashMap<String, Entity> = Default::default();
+        for (_, slot) in previous.drain() {
+            let shown = if slot.finished { slot.entity } else { slot.old };
+            let spare = if slot.finished { slot.old } else { slot.entity };
+            if let Some(e) = spare {
+                commands.entity(e).despawn();
+            }
+            if let Some(e) = shown
+                && let Some(other) = by_name.insert(slot.part.name.clone(), e)
+            {
+                commands.entity(other).despawn();
+            }
+        }
+        for ptr in fresh {
+            if let Some(slot) = slots.get_mut(&ptr) {
+                slot.old = by_name.remove(&slot.part.name);
+            }
+        }
+        for (_, e) in by_name {
+            commands.entity(e).despawn();
+        }
+        for e in previews.drain(..) {
+            commands.entity(e).despawn();
+        }
+        let marker_parts = if layers.game_built {
+            marker_previews(&modeler.session.model)
+        } else {
+            Vec::new()
+        };
+        for (at, parts) in marker_parts {
+            let root = commands
+                .spawn((at, Visibility::default(), PreviewPart))
+                .id();
+            for part in &parts {
+                let child = commands
+                    .spawn(part_bundle(
+                        part,
+                        &mut meshes,
+                        &mut materials,
+                        &mut images,
+                        &mut pbr_cache,
+                    ))
+                    .id();
+                commands.entity(root).add_child(child);
+            }
+            previews.push(root);
+        }
+        if let Some((min, max)) = modeler.session.model.bounds() {
+            let radius = (max - min).length() * 0.5;
+            orbit.scene_radius = radius.max(0.01);
+            // A new model (or the first build) re-frames the view and hands
+            // control back to the drift; edits keep a camera the human steered.
+            let name = modeler.session.model.name.clone();
+            if !orbit.user || built.framed.as_deref() != Some(name.as_str()) {
+                orbit.target = (min + max) * 0.5;
+                orbit.dist = (radius * 2.4).max(1.0);
+                orbit.user = false;
+            }
+            built.framed = Some(name);
+        }
     }
-    let previews = if layers.game_built {
-        marker_previews(&modeler.session.model)
-    } else {
-        Vec::new()
-    };
-    for (at, parts) in previews {
-        let root = commands
-            .spawn((at, Visibility::default(), PreviewPart))
-            .id();
-        for part in &parts {
-            let child = commands
-                .spawn(part_bundle(
-                    part,
-                    &mut meshes,
-                    &mut materials,
-                    &mut images,
-                    &mut pbr_cache,
+    // Stream the parts in: whatever finished since last frame spawns now.
+    let mut pending = 0;
+    let mut has_lods = false;
+    for slot in slots.values_mut() {
+        if slot.finished && slot.lods_done {
+            has_lods |= slot.has_lods;
+            continue;
+        }
+        if slot.part.rig.is_some() {
+            // Rigged parts keep their own mesh with CPU data (playback
+            // poses it in place): built here, as before.
+            let e = commands
+                .spawn((
+                    part_bundle(
+                        &slot.part,
+                        &mut meshes,
+                        &mut materials,
+                        &mut images,
+                        &mut pbr_cache,
+                    ),
+                    PreviewPart,
                 ))
                 .id();
-            commands.entity(root).add_child(child);
+            slot.despawn(&mut commands);
+            slot.entity = Some(e);
+            slot.old = None;
+            slot.finished = true;
+            slot.lods_done = true;
+            continue;
+        }
+        let Some(b) = super::stream::try_bundle(
+            &slot.part,
+            super::stream::Detail::Lod,
+            &mut streams,
+            &mut pbr_cache,
+            &mut materials,
+        ) else {
+            pending += 1;
+            continue;
+        };
+        let bundle = |m: &Handle<StandardMaterial>| {
+            (
+                Name::new(slot.part.name.clone()),
+                Mesh3d(b.mesh.clone()),
+                MeshMaterial3d(m.clone()),
+                part_transform(&slot.part),
+                PreviewPart,
+            )
+        };
+        if !slot.finished {
+            if b.final_material {
+                let e = commands.spawn(bundle(&b.material)).id();
+                slot.despawn(&mut commands);
+                slot.entity = Some(e);
+                slot.old = None;
+                slot.finished = true;
+            } else {
+                pending += 1;
+                if slot.entity.is_none() && slot.old.is_none() {
+                    // Nothing to keep showing: the part in its flat colour
+                    // until the bake lands.
+                    slot.entity = Some(commands.spawn(bundle(&b.material)).id());
+                }
+                continue;
+            }
+        }
+        if let (Some(lods), Some(e)) = (&b.lods, slot.entity) {
+            super::stream::attach_lods(&mut commands, e, &b.material, lods);
+            slot.lods_done = true;
+            slot.has_lods = !lods.is_empty();
+            has_lods |= slot.has_lods;
         }
     }
-    if let Some((min, max)) = modeler.session.model.bounds() {
-        let radius = (max - min).length() * 0.5;
-        orbit.scene_radius = radius.max(0.01);
-        // A new model (or the first build) re-frames the view and hands
-        // control back to the drift; edits keep a camera the human steered.
-        let name = modeler.session.model.name.clone();
-        if !orbit.user || built.framed.as_deref() != Some(name.as_str()) {
-            orbit.target = (min + max) * 0.5;
-            orbit.dist = (radius * 2.4).max(1.0);
-            orbit.user = false;
-        }
-        built.framed = Some(name);
-    }
+    built.pending = pending;
+    built.lods = has_lods;
 }
 
 /// Uploads one RGBA8 texture with a box-filtered mip chain and a repeating,
@@ -559,6 +715,18 @@ pub(crate) fn pbr_image(
     cutoff: Option<f32>,
     images: &mut Assets<Image>,
 ) -> Handle<Image> {
+    images.add(pbr_image_cpu(w, h, px, srgb, cutoff))
+}
+
+/// [`pbr_image`]'s image, built on any thread (the mip chain is the dear
+/// part), for the main thread to add.
+pub(crate) fn pbr_image_cpu(
+    w: usize,
+    h: usize,
+    px: &[u8],
+    srgb: bool,
+    cutoff: Option<f32>,
+) -> Image {
     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
     use bevy::render::render_resource::{Extent3d, TextureDimension};
     let (data, levels) = modeler::material::pbr::mips_with(w, h, px, srgb, cutoff);
@@ -589,38 +757,52 @@ pub(crate) fn pbr_image(
         anisotropy_clamp: 8,
         ..default()
     });
-    images.add(img)
+    img
 }
 
-/// The textured material of a part with a procedural material (baked on
-/// first use, then cached by bake key). `None` for plain parts or when the
-/// bake fails (reported on stderr; the part falls back to its factors).
-fn pbr_material(
-    part: &Part,
-    materials: &mut Assets<StandardMaterial>,
-    images: &mut Assets<Image>,
-    cache: &mut PbrCache,
-) -> Option<Handle<StandardMaterial>> {
+/// The key a part's textured material is cached under: the bake plus the
+/// factors that tint it (a colour token change must reach a part whose
+/// texture is already cached) and whether the mesh is a closed solid
+/// (cutouts are one-sided on closed solids, double on open cards).
+pub(crate) fn material_key(part: &Part, closed: bool) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
     let r = part.material.pbr.as_ref()?;
-    // The bake plus the factors that tint it: a colour token change must
-    // reach a part whose texture is already cached.
-    let key = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        modeler::material::pbr::bake_key(r, Some(part)).hash(&mut h);
-        // Cutouts are one-sided on closed solids, double on open cards.
-        (modeler::verify::open_edge_count(part) == 0).hash(&mut h);
-        let m = &part.material;
-        for x in m.base_color.iter().chain([&m.roughness, &m.metalness]) {
-            x.to_bits().hash(&mut h);
-        }
-        h.finish()
-    };
-    let generation = cache.generation;
-    if let Some((h, used)) = cache.pbr.get_mut(&key) {
-        *used = generation;
-        return Some(h.clone());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    modeler::material::pbr::bake_key(r, Some(part)).hash(&mut h);
+    closed.hash(&mut h);
+    let m = &part.material;
+    for x in m.base_color.iter().chain([&m.roughness, &m.metalness]) {
+        x.to_bits().hash(&mut h);
     }
+    Some(h.finish())
+}
+
+/// Whether a part with a procedural material is a closed solid (counting
+/// open edges walks every triangle).
+pub(crate) fn closed_solid(part: &Part) -> bool {
+    !part.verts.is_empty()
+        && !part.indices.is_empty()
+        && modeler::verify::open_edge_count(part) == 0
+}
+
+/// A part's material bake as CPU images, ready for the main thread to add
+/// ([`finish_material`]). Runs on any thread. `None` for plain parts or a
+/// failed bake (reported on stderr; the part falls back to its factors).
+pub(crate) struct PreparedMat {
+    ch: Arc<modeler::material::bake::Channels>,
+    base: Image,
+    metal_rough: Image,
+    normal: Image,
+    occlusion: Option<Image>,
+    emissive: Option<Image>,
+    alpha: modeler::material::pbr::Alpha,
+    double_sided: bool,
+    color: [f32; 4],
+    roughness: f32,
+    metalness: f32,
+}
+
+pub(crate) fn prepare_material(part: &Part) -> Option<PreparedMat> {
     let ch = match modeler::material::pbr::bake_part(part) {
         Ok(Some(ch)) => ch,
         Ok(None) => return None,
@@ -634,33 +816,60 @@ fn pbr_material(
         modeler::material::pbr::Alpha::Mask(c) => Some(c),
         _ => None,
     };
-    let [cr, cg, cb, ca] = part.material.base_color;
+    Some(PreparedMat {
+        base: pbr_image_cpu(t.w, t.h, &t.base, true, cutoff),
+        metal_rough: pbr_image_cpu(t.w, t.h, &t.metal_rough, false, None),
+        normal: pbr_image_cpu(t.w, t.h, &t.normal, false, None),
+        occlusion: t
+            .occlusion
+            .as_ref()
+            .map(|ao| pbr_image_cpu(t.w, t.h, ao, false, None)),
+        emissive: t
+            .emissive
+            .as_ref()
+            .map(|e| pbr_image_cpu(t.w, t.h, e, true, None)),
+        alpha: t.alpha,
+        double_sided: modeler::material::pbr::double_sided_on(&t, part),
+        color: part.material.base_color,
+        roughness: part.material.roughness,
+        metalness: part.material.metalness,
+        ch,
+    })
+}
+
+/// Adds a prepared bake's images and its material.
+pub(crate) fn finish_material(
+    p: PreparedMat,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> Handle<StandardMaterial> {
+    let [cr, cg, cb, ca] = p.color;
     let mut m = StandardMaterial {
         base_color: Color::srgba(cr, cg, cb, ca),
-        perceptual_roughness: part.material.roughness,
-        metallic: part.material.metalness,
-        base_color_texture: Some(pbr_image(t.w, t.h, &t.base, true, cutoff, images)),
-        metallic_roughness_texture: Some(pbr_image(t.w, t.h, &t.metal_rough, false, None, images)),
-        normal_map_texture: Some(pbr_image(t.w, t.h, &t.normal, false, None, images)),
+        perceptual_roughness: p.roughness,
+        metallic: p.metalness,
+        base_color_texture: Some(images.add(p.base)),
+        metallic_roughness_texture: Some(images.add(p.metal_rough)),
+        normal_map_texture: Some(images.add(p.normal)),
         ..default()
     };
-    if let Some(ao) = &t.occlusion {
-        m.occlusion_texture = Some(pbr_image(t.w, t.h, ao, false, None, images));
+    if let Some(ao) = p.occlusion {
+        m.occlusion_texture = Some(images.add(ao));
     }
-    if let Some(e) = &t.emissive {
-        m.emissive_texture = Some(pbr_image(t.w, t.h, e, true, None, images));
+    if let Some(e) = p.emissive {
+        m.emissive_texture = Some(images.add(e));
         m.emissive = LinearRgba::WHITE;
     }
-    match t.alpha {
+    match p.alpha {
         modeler::material::pbr::Alpha::Opaque => {}
         modeler::material::pbr::Alpha::Mask(c) => m.alpha_mode = AlphaMode::Mask(c),
         modeler::material::pbr::Alpha::Blend => m.alpha_mode = AlphaMode::Blend,
     }
-    if modeler::material::pbr::double_sided_on(&t, part) {
+    if p.double_sided {
         m.double_sided = true;
         m.cull_mode = None;
     }
-    let x = &ch.extras;
+    let x = &p.ch.extras;
     if let Some(v) = x.clearcoat {
         m.clearcoat = v;
     }
@@ -685,8 +894,32 @@ fn pbr_material(
     if let Some(v) = x.ior {
         m.ior = v;
     }
+    materials.add(m)
+}
 
-    let h = materials.add(m);
+/// The textured material of a part with a procedural material (baked on
+/// first use, then cached by bake key), on this thread: agent views need
+/// it now. `None` for plain parts or when the bake fails.
+fn pbr_material(
+    part: &Part,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    cache: &mut PbrCache,
+) -> Option<Handle<StandardMaterial>> {
+    part.material.pbr.as_ref()?;
+    let closed = if part.verts.is_empty() || part.indices.is_empty() {
+        false
+    } else {
+        let mh = mesh_hash(part, cache);
+        *cache.closed.entry(mh).or_insert_with(|| closed_solid(part))
+    };
+    let key = material_key(part, closed)?;
+    let generation = cache.generation;
+    if let Some((h, used)) = cache.pbr.get_mut(&key) {
+        *used = generation;
+        return Some(h.clone());
+    }
+    let h = finish_material(prepare_material(part)?, materials, images);
     cache.pbr.insert(key, (h.clone(), generation));
     Some(h)
 }
@@ -697,16 +930,18 @@ fn pbr_material(
 /// flat look share one material so Bevy can batch them.
 #[derive(Resource, Default)]
 pub(crate) struct PbrCache {
-    pbr: std::collections::HashMap<u64, (Handle<StandardMaterial>, u64)>,
+    pub(crate) pbr: std::collections::HashMap<u64, (Handle<StandardMaterial>, u64)>,
     /// (verts ptr, lengths, sampled content) -> content hash, so unchanged
     /// parts aren't rehashed every rebuild.
-    fingerprints: std::collections::HashMap<(usize, usize, usize, u64), u64>,
-    meshes: std::collections::HashMap<(u64, bool), (Handle<Mesh>, u64)>,
-    flat: std::collections::HashMap<[u32; 6], Handle<StandardMaterial>>,
+    pub(crate) fingerprints: std::collections::HashMap<(usize, usize, usize, u64), u64>,
+    pub(crate) meshes: std::collections::HashMap<(u64, bool), (Handle<Mesh>, u64)>,
+    /// Mesh content hash -> closed solid (no open edges).
+    pub(crate) closed: std::collections::HashMap<u64, bool>,
+    pub(crate) flat: std::collections::HashMap<[u32; 6], Handle<StandardMaterial>>,
     /// A decal material's textures by bake key: base colour (alpha =
     /// opacity), normal, metallic-roughness, emissive.
     pub(crate) decals: std::collections::HashMap<u64, super::decals::DecalTextures>,
-    generation: u64,
+    pub(crate) generation: u64,
 }
 
 impl PbrCache {
@@ -726,27 +961,34 @@ impl PbrCache {
         if self.fingerprints.len() > 8192 {
             self.fingerprints.clear();
         }
+        if self.closed.len() > 8192 {
+            self.closed.clear();
+        }
         if self.flat.len() > 4096 {
             self.flat.clear();
         }
     }
 }
 
-fn mesh_hash(part: &Part, cache: &mut PbrCache) -> u64 {
+/// A cheap identity of a part's mesh buffers: their address, lengths and a
+/// few sampled values (not the content).
+pub(crate) fn fingerprint(part: &Part) -> (usize, usize, usize, u64) {
     use std::hash::{Hash, Hasher};
     let (nv, ni) = (part.verts.len(), part.indices.len());
-    let sample = {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if nv > 0 && ni > 0 {
         for k in 0..32 {
             part.verts[k * nv / 32].map(f32::to_bits).hash(&mut h);
             part.indices[k * ni / 32].hash(&mut h);
         }
-        h.finish()
-    };
-    let fp = (part.verts.as_ptr() as usize, nv, ni, sample);
-    if let Some(h) = cache.fingerprints.get(&fp) {
-        return *h;
     }
+    (part.verts.as_ptr() as usize, nv, ni, h.finish())
+}
+
+/// The full content hash of a part's mesh (positions, normals, uvs,
+/// indices). Any thread.
+pub(crate) fn content_hash(part: &Part) -> u64 {
+    use std::hash::{Hash, Hasher};
     let mut b = std::collections::hash_map::DefaultHasher::new();
     for v in &part.verts {
         v.map(f32::to_bits).hash(&mut b);
@@ -758,11 +1000,94 @@ fn mesh_hash(part: &Part, cache: &mut PbrCache) -> u64 {
         v.map(f32::to_bits).hash(&mut b);
     }
     part.indices.hash(&mut b);
-    let h = b.finish();
+    b.finish()
+}
+
+fn mesh_hash(part: &Part, cache: &mut PbrCache) -> u64 {
+    let fp = fingerprint(part);
+    if let Some(h) = cache.fingerprints.get(&fp) {
+        return *h;
+    }
+    let h = content_hash(part);
     cache.fingerprints.insert(fp, h);
     h
 }
 
+/// Whether a part's mesh carries tangents (a procedural material's normal
+/// map needs them).
+pub(crate) fn wants_tangents(part: &Part) -> bool {
+    part.material.pbr.is_some()
+        && !part.verts.is_empty()
+        && part.normals.len() == part.verts.len()
+        && part.uvs.len() == part.verts.len()
+}
+
+/// A part's render mesh, built on any thread. Main-world data stays:
+/// picking ray-casts these meshes.
+pub(crate) fn build_mesh(part: &Part, tangents: bool) -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+    .with_inserted_indices(Indices::U32(part.indices.clone()));
+    if !part.normals.is_empty() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+    }
+    if !part.uvs.is_empty() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs.clone());
+    }
+    if tangents && part.normals.len() == part.verts.len() && part.uvs.len() == part.verts.len() {
+        // Bevy's mikktspace takes seconds on a 400k-triangle sculpt;
+        // per-vertex accumulated tangents are a few milliseconds and
+        // match it on smooth meshes.
+        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, fast_tangents(part));
+    }
+    mesh
+}
+
+/// The shared flat material of a part's factors.
+pub(crate) fn flat_material(
+    part: &Part,
+    materials: &mut Assets<StandardMaterial>,
+    cache: &mut PbrCache,
+) -> Handle<StandardMaterial> {
+    let [r, g, b, a] = part.material.base_color;
+    let fkey = [r, g, b, a, part.material.roughness, part.material.metalness].map(f32::to_bits);
+    cache
+        .flat
+        .entry(fkey)
+        .or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: Color::srgba(r, g, b, a),
+                perceptual_roughness: part.material.roughness,
+                metallic: part.material.metalness,
+                // A colour with alpha (glass, holograms) blends; Bevy
+                // renders blended materials forward, over the deferred
+                // opaque pass.
+                alpha_mode: if a < 0.999 {
+                    AlphaMode::Blend
+                } else {
+                    AlphaMode::Opaque
+                },
+                ..default()
+            })
+        })
+        .clone()
+}
+
+/// A part's transform as Bevy's.
+pub(crate) fn part_transform(part: &Part) -> Transform {
+    Transform {
+        translation: Vec3::from_array(part.translation),
+        rotation: modeler::quat_of(part.rotation),
+        scale: Vec3::from_array(part.scale),
+    }
+}
+
+/// A part's entity, built on this thread (agent views, rigged parts):
+/// bakes and mesh conversion block. The window and grid tiles stream
+/// theirs instead ([`super::stream`]).
 pub(crate) fn part_bundle(
     part: &Part,
     meshes: &mut Assets<Mesh>,
@@ -770,8 +1095,11 @@ pub(crate) fn part_bundle(
     images: &mut Assets<Image>,
     cache: &mut PbrCache,
 ) -> impl Bundle {
+    let mat_span = super::profile::span("part_bundle: material");
     let textured = pbr_material(part, materials, images, cache);
-    let tangents = textured.is_some() && !part.normals.is_empty() && !part.uvs.is_empty();
+    drop(mat_span);
+    let _mesh_span = super::profile::span("part_bundle: mesh");
+    let tangents = wants_tangents(part);
     // Rigged parts are re-posed in place by playback: they keep their own
     // mesh with its data on the CPU side.
     let shared = part.rig.is_none();
@@ -782,62 +1110,68 @@ pub(crate) fn part_bundle(
         h.clone()
     });
     let mesh = cached.unwrap_or_else(|| {
-        // Main-world data stays: picking ray-casts these meshes.
-        let mut mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
-        .with_inserted_indices(Indices::U32(part.indices.clone()));
-        if !part.normals.is_empty() {
-            mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
-        }
-        if !part.uvs.is_empty() {
-            mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs.clone());
-        }
-        if tangents && let Err(e) = mesh.generate_tangents() {
-            eprintln!("tangents for `{}`: {e}", part.name);
-        }
-        let h = meshes.add(mesh);
+        let h = meshes.add(build_mesh(part, tangents));
         if let Some(k) = key {
             cache.meshes.insert(k, (h.clone(), generation));
         }
         h
     });
-    let material = textured.unwrap_or_else(|| {
-        let [r, g, b, a] = part.material.base_color;
-        let fkey = [r, g, b, a, part.material.roughness, part.material.metalness].map(f32::to_bits);
-        cache
-            .flat
-            .entry(fkey)
-            .or_insert_with(|| {
-                materials.add(StandardMaterial {
-                    base_color: Color::srgba(r, g, b, a),
-                    perceptual_roughness: part.material.roughness,
-                    metallic: part.material.metalness,
-                    // A colour with alpha (glass, holograms) blends; Bevy
-                    // renders blended materials forward, over the deferred
-                    // opaque pass.
-                    alpha_mode: if a < 0.999 {
-                        AlphaMode::Blend
-                    } else {
-                        AlphaMode::Opaque
-                    },
-                    ..default()
-                })
-            })
-            .clone()
-    });
+    let material = textured.unwrap_or_else(|| flat_material(part, materials, cache));
     (
         Name::new(part.name.clone()),
         Mesh3d(mesh),
         MeshMaterial3d(material),
-        Transform {
-            translation: Vec3::from_array(part.translation),
-            rotation: modeler::quat_of(part.rotation),
-            scale: Vec3::from_array(part.scale),
-        },
+        part_transform(part),
     )
+}
+
+/// Per-vertex tangents (xyz + handedness in w) accumulated from each
+/// triangle's uv gradient, then orthogonalized against the normal.
+fn fast_tangents(part: &Part) -> Vec<[f32; 4]> {
+    let n = part.verts.len();
+    let mut tan = vec![Vec3::ZERO; n];
+    let mut bit = vec![Vec3::ZERO; n];
+    for t in part.indices.as_chunks::<3>().0 {
+        let [a, b, c] = t.map(|i| i as usize);
+        if a >= n || b >= n || c >= n {
+            continue;
+        }
+        let (p0, p1, p2) = (
+            Vec3::from_array(part.verts[a]),
+            Vec3::from_array(part.verts[b]),
+            Vec3::from_array(part.verts[c]),
+        );
+        let (u0, u1, u2) = (
+            Vec2::from_array(part.uvs[a]),
+            Vec2::from_array(part.uvs[b]),
+            Vec2::from_array(part.uvs[c]),
+        );
+        let (e1, e2) = (p1 - p0, p2 - p0);
+        let (d1, d2) = (u1 - u0, u2 - u0);
+        let det = d1.x * d2.y - d2.x * d1.y;
+        if det.abs() < 1e-20 {
+            continue;
+        }
+        let r = 1.0 / det;
+        let sdir = (e1 * d2.y - e2 * d1.y) * r;
+        let tdir = (e2 * d1.x - e1 * d2.x) * r;
+        for i in [a, b, c] {
+            tan[i] += sdir;
+            bit[i] += tdir;
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let nrm = Vec3::from_array(part.normals[i]);
+            let t = (tan[i] - nrm * nrm.dot(tan[i])).normalize_or(nrm.any_orthonormal_vector());
+            let w = if nrm.cross(t).dot(bit[i]) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            [t.x, t.y, t.z, w]
+        })
+        .collect()
 }
 
 /// Environment light strength (cd/m² per unit of studio radiance).
@@ -923,6 +1257,10 @@ pub(crate) struct View3d {
 #[derive(Component)]
 pub(crate) struct View3dNode;
 
+/// Offscreen: the image the UI camera renders the whole window into.
+#[derive(Resource, Default)]
+pub(crate) struct UiCanvas(pub(crate) Option<Handle<Image>>);
+
 pub(crate) fn view_target(w: u32, h: u32) -> Image {
     let mut img = Image::new_target_texture(w, h, TextureFormat::Rgba8UnormSrgb, None);
     // Screenshots copy it back.
@@ -935,7 +1273,14 @@ pub(crate) fn setup_scene(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     assets: Res<AssetServer>,
+    offscreen: Option<Res<Offscreen>>,
 ) {
+    // Offscreen there is no surface: the UI camera renders the whole
+    // workbench into a 1280x800 image that window captures read.
+    let canvas = offscreen
+        .is_some_and(|o| o.0)
+        .then(|| images.add(view_target(1280, 800)));
+    commands.insert_resource(UiCanvas(canvas.clone()));
     // AmbientLight is a per-camera component in Bevy 0.20 (a standalone
     // entity does nothing), so faces turned from the sun went black. A dim
     // camera-aligned fill keeps every side readable as the human orbits.
@@ -943,15 +1288,26 @@ pub(crate) fn setup_scene(
     // size of the 3D area, shown by a UI node (`View3d`). A camera viewport
     // inside the window broke screen-space reflections: their ray march maps
     // to UVs over the whole target, so hits landed in the wrong place.
-    commands.spawn((
-        Name::new("ui camera"),
-        Camera2d,
-        Camera {
-            order: 1,
-            ..default()
-        },
-        IsDefaultUiCamera,
-    ));
+    let ui_cam = Some(
+        commands
+            .spawn((
+                Name::new("ui camera"),
+                Camera2d,
+                Camera {
+                    order: 1,
+                    ..default()
+                },
+                IsDefaultUiCamera,
+            ))
+            .id(),
+    );
+    if let Some(canvas) = canvas
+        && let Some(cam) = ui_cam
+    {
+        commands
+            .entity(cam)
+            .insert(RenderTarget::Image(canvas.into()));
+    }
     let view_image = images.add(view_target(16, 16));
     commands.spawn((
         Name::new("3d view"),
@@ -1065,6 +1421,7 @@ pub(crate) fn draw_game_gizmos(
     mut gizmos: Gizmos,
     layers: Option<Res<LayerVisibility>>,
 ) {
+    let _profile = crate::preview::profile::span("draw_game_gizmos");
     let layers = layers.map(|l| *l).unwrap_or_default();
     let model = &modeler.session.model;
     if cache.version != Some(model.version) {
@@ -1195,4 +1552,48 @@ pub(crate) fn marker_previews(
         }
     }
     out
+}
+
+/// Drops the window camera's screen-space reflections while frames run over
+/// budget (a dense forest: SSR's ray march over a full-screen G-buffer is a
+/// large share of the GPU frame) and brings them back once frames are cheap
+/// again. Hysteresis and a hold time keep it from flickering.
+/// `MODELER_SSR=0` / `1` pins it off / on.
+pub(crate) fn adapt_reflections(
+    time: Res<Time<Real>>,
+    mut state: Local<(f32, f32, bool)>,
+    cams: Query<(Entity, Has<bevy::pbr::ScreenSpaceReflections>), With<MainCamera>>,
+    mut commands: Commands,
+) {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let pinned = *MODE.get_or_init(|| match std::env::var("MODELER_SSR").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    });
+    let (ema, held, init) = &mut *state;
+    let dt = time.delta_secs() * 1000.0;
+    if !*init {
+        *init = true;
+        *ema = dt.min(16.0);
+    }
+    // Skip one-off stalls (a rebuild, a bake): they are not render cost.
+    if dt < 250.0 {
+        *ema += (dt - *ema) * 0.1;
+    }
+    *held += time.delta_secs();
+    let Ok((cam, on)) = cams.single() else {
+        return;
+    };
+    let want = pinned.unwrap_or(if on { *ema < 30.0 } else { *ema < 14.0 });
+    if want != on && (pinned.is_some() || *held > 2.0) {
+        *held = 0.0;
+        if want {
+            commands.entity(cam).insert(screen_reflections());
+        } else {
+            commands
+                .entity(cam)
+                .remove::<bevy::pbr::ScreenSpaceReflections>();
+        }
+    }
 }

@@ -41,3 +41,5 @@ pub(crate) use shading::*;
 pub(crate) mod app_icon;
 pub(crate) mod decals;
 pub(crate) mod ds;
+pub(crate) mod profile;
+pub(crate) mod stream;

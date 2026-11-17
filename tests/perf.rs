@@ -45,6 +45,15 @@ fn median(n: usize, mut f: impl FnMut(usize)) -> Duration {
     t[n / 2]
 }
 
+/// The tests in this binary run on parallel threads by default; a timing
+/// taken while another test saturates every core (rayon bakes, sdf meshing)
+/// measured contention, not the code. Each test holds this for its run.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn budget(what: &str, took: Duration, max_ms: u64) {
     println!("{what}: {took:?} (budget {max_ms} ms)");
     assert!(
@@ -55,6 +64,7 @@ fn budget(what: &str, took: Duration, max_ms: u64) {
 
 #[test]
 fn edits_place_verify_and_autosave_stay_fast() {
+    let _serial = serial();
     let dir = std::env::temp_dir().join(format!("modeler-perf-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: the only test in this binary; set before anything reads it.
@@ -67,15 +77,21 @@ fn edits_place_verify_and_autosave_stay_fast() {
     assert_eq!(s.model.parts.len(), 289);
 
     // A small edit on a big model: lints, summary, history record.
-    let edit = median(7, |i| {
+    // Warm up first (allocator, eval cache, first lint pass), then take the
+    // median of many runs: one scheduler hiccup must not decide the result.
+    let edit_at = |s: &mut Session, i: usize| {
         apply(
-            &mut s,
+            s,
             vec![
                 json!({"type": "primitive", "name": "probe", "kind": "box", "size": 0.05,
                         "translation": [14.0 + i as f64 * 0.01, 0.225, 14.0]}),
             ],
         );
-    });
+    };
+    for i in 0..3 {
+        edit_at(&mut s, 100 + i);
+    }
+    let edit = median(15, |i| edit_at(&mut s, i));
     budget("one edit on 290 parts", edit, 50);
 
     // place each: 40 keys dropped onto a dense dome (a few thousand
@@ -151,6 +167,7 @@ fn edits_place_verify_and_autosave_stay_fast() {
 /// fixed-size bake cache held, which rebaked everything on every edit.
 #[test]
 fn material_bakes_stay_cached_and_parallel() {
+    let _serial = serial();
     use modeler::material::pbr::{bake_part, prebake};
     let mut s = Session::default();
     s.materials
@@ -225,6 +242,7 @@ fn material_bakes_stay_cached_and_parallel() {
 /// parallel (this took about 30 s before both).
 #[test]
 fn sdf_creatures_mesh_for_their_decimates() {
+    let _serial = serial();
     let mut s = Session::default();
     let _ = s.new_model("critters");
     let t = Instant::now();
@@ -265,6 +283,7 @@ fn sdf_creatures_mesh_for_their_decimates() {
 /// the one the error names, and nothing is applied.
 #[test]
 fn a_deferred_batch_names_its_failing_item() {
+    let _serial = serial();
     let mut s = Session::default();
     let _ = s.new_model("defer");
     let e = s
@@ -290,6 +309,7 @@ fn a_deferred_batch_names_its_failing_item() {
 /// hillside. Every box-overlapping pair used to run an exact intersection.
 #[test]
 fn collisions_on_200_crowded_parts_stay_fast() {
+    let _serial = serial();
     let dir = std::env::temp_dir().join(format!("modeler-perf-coll-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: set before anything in this test reads it; same dir per process.
@@ -327,6 +347,7 @@ fn collisions_on_200_crowded_parts_stay_fast() {
 /// derives quickly; with `tris` it is meshed only as finely as it needs.
 #[test]
 fn a_default_body_biped_builds_fast() {
+    let _serial = serial();
     let mut s = Session::default();
     let _ = s.new_model("person");
     let t = Instant::now();

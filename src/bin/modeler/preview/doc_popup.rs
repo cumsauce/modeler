@@ -84,6 +84,7 @@ fn doc_popup(
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
+    let _profile = crate::preview::profile::span("doc_popup");
     if !wb.doc_popup {
         if let Some(r) = pop.root.take() {
             commands.entity(r).despawn();

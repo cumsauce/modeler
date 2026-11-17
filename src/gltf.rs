@@ -1023,6 +1023,18 @@ pub fn export_gltf_with(
     path: &Path,
     opts: &crate::export_opt::Options,
 ) -> Result<String, crate::ModelerError> {
+    export_gltf_variants(model, None, path, opts)
+}
+
+/// [`export_gltf_with`] with the cosmetic variants' models given (derived
+/// by a session, which knows its working materials); None derives them
+/// here ([`crate::variant::derive`]).
+pub fn export_gltf_variants(
+    model: &Model,
+    variants: Option<&[(String, Model)]>,
+    path: &Path,
+    opts: &crate::export_opt::Options,
+) -> Result<String, crate::ModelerError> {
     let stem = path.with_extension("");
     let stem_name = stem
         .file_name()
@@ -1031,8 +1043,9 @@ pub fn export_gltf_with(
         .to_owned();
     let mode = opts.textures.unwrap_or(TextureMode::Ktx2);
     let tex = texture_out(path, mode);
-    let (json, bin, report) = build_with(
+    let (json, bin, report) = build_variants(
         model,
+        variants,
         Some(format!("{stem_name}.bin")),
         opts,
         tex.as_ref(),
@@ -1056,10 +1069,27 @@ pub fn export_glb_with(
     path: &Path,
     opts: &crate::export_opt::Options,
 ) -> Result<String, crate::ModelerError> {
+    export_glb_variants(model, None, path, opts)
+}
+
+/// [`export_glb_with`] with the cosmetic variants' models given (see
+/// [`export_gltf_variants`]).
+pub fn export_glb_variants(
+    model: &Model,
+    variants: Option<&[(String, Model)]>,
+    path: &Path,
+    opts: &crate::export_opt::Options,
+) -> Result<String, crate::ModelerError> {
     let mode = opts.textures.unwrap_or(TextureMode::Embed);
     let tex = texture_out(path, mode);
-    let (json, bin, report) =
-        build_with(model, None, opts, tex.as_ref(), mode == TextureMode::Embed)?;
+    let (json, bin, report) = build_variants(
+        model,
+        variants,
+        None,
+        opts,
+        tex.as_ref(),
+        mode == TextureMode::Embed,
+    )?;
     let mut json_chunk = serde_json::to_vec(&json).map_err(|e| e.to_string())?;
     json_chunk.resize(align4(json_chunk.len()), b' ');
     let mut bin_chunk = bin;
@@ -1079,6 +1109,314 @@ pub fn export_glb_with(
     fs::write(path, &out)
         .map_err(|e| crate::ModelerError::Io(format!("writing {}: {e}", path.display())))?;
     Ok(format!("{report}\nfile: {} KB", out.len() / 1024))
+}
+
+/// [`build_with`] plus the model's cosmetic variants: each variant is
+/// built the same way (instancing and merging off, so every part keeps its
+/// own primitive), and its materials are folded into the base document as
+/// `KHR_materials_variants` (root `variants`, per-primitive `mappings`;
+/// variant 0 is "default") and node `extras.variants` {variant: material}.
+pub(crate) fn build_variants(
+    model: &Model,
+    variants: Option<&[(String, Model)]>,
+    buffer_uri: Option<String>,
+    opts: &crate::export_opt::Options,
+    tex_out: Option<&TextureOut>,
+    embed_ktx2: bool,
+) -> Result<(Value, Vec<u8>, String), crate::ModelerError> {
+    let names = crate::variant::names(model);
+    if names.is_empty() {
+        return build_with(model, buffer_uri, opts, tex_out, embed_ktx2);
+    }
+    let owned;
+    let variants = match variants {
+        Some(v) => v,
+        None => {
+            owned = names
+                .iter()
+                .map(|n| crate::variant::derive(model, n).map(|m| (n.clone(), m)))
+                .collect::<Result<Vec<_>, String>>()?;
+            &owned
+        }
+    };
+    let mut o = opts.clone();
+    let mut notes = Vec::new();
+    if o.instance || o.merge {
+        notes.push("instancing and merging off: each variant maps its own primitive");
+        o.instance = false;
+        o.merge = false;
+    }
+    let (mut doc, mut bin, mut report) =
+        build_with(model, buffer_uri.clone(), &o, tex_out, embed_ktx2)?;
+    let mut vdocs = Vec::with_capacity(variants.len());
+    for (n, m) in variants {
+        let (d, b, _) = build_with(m, buffer_uri.clone(), &o, tex_out, embed_ktx2)
+            .map_err(|e| format!("variant `{n}`: {e}"))?;
+        vdocs.push((n.clone(), d, b));
+    }
+    let line = merge_variants(&mut doc, &mut bin, &vdocs)?;
+    report += &format!("\n{line}");
+    for n in notes {
+        report += &format!("\n  {n}");
+    }
+    Ok((doc, bin, report))
+}
+
+/// Folds variant documents (same nodes, other materials) into `doc`.
+fn merge_variants(
+    doc: &mut Value,
+    bin: &mut Vec<u8>,
+    vdocs: &[(String, Value, Vec<u8>)],
+) -> Result<String, String> {
+    let mut names = vec![crate::variant::DEFAULT.to_string()];
+    names.extend(vdocs.iter().map(|v| v.0.clone()));
+    // Material identity without its display name, for dedup.
+    let key = |m: &Value| {
+        let mut m = m.clone();
+        if let Some(o) = m.as_object_mut() {
+            o.remove("name");
+        }
+        m.to_string()
+    };
+    let mut mat_ids: HashMap<String, usize> = doc["materials"]
+        .as_array()
+        .map(|a| a.iter().enumerate().map(|(i, m)| (key(m), i)).collect())
+        .unwrap_or_default();
+    // node index -> material per variant (0 = default)
+    let node_of = |d: &Value, name: &str| -> Option<usize> {
+        d["nodes"]
+            .as_array()?
+            .iter()
+            .position(|n| n["name"].as_str() == Some(name) && n.get("mesh").is_some())
+    };
+    let base_nodes: Vec<(usize, String, usize)> = doc["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .enumerate()
+                .filter_map(|(i, n)| {
+                    Some((
+                        i,
+                        n["name"].as_str()?.to_string(),
+                        n["mesh"].as_u64()? as usize,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut per_node: Vec<Vec<usize>> = Vec::new();
+    let mut tex_map: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut img_map: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut extensions: Vec<Value> = doc["extensionsUsed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut added = 0usize;
+    for (_, _, mesh) in &base_nodes {
+        let m = doc["meshes"][*mesh]["primitives"][0]["material"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+        per_node.push(vec![m]);
+    }
+    for (vi, (vname, vdoc, vbin)) in vdocs.iter().enumerate() {
+        for e in vdoc["extensionsUsed"].as_array().into_iter().flatten() {
+            if !extensions.contains(e) {
+                extensions.push(e.clone());
+            }
+        }
+        for (k, (_, name, _)) in base_nodes.iter().enumerate() {
+            let Some(vn) = node_of(vdoc, name) else {
+                return Err(format!(
+                    "variant `{vname}`: no node `{name}` (the variant changed the parts?)"
+                ));
+            };
+            let vm = vdoc["meshes"][vdoc["nodes"][vn]["mesh"].as_u64().unwrap_or(0) as usize]
+                ["primitives"][0]["material"]
+                .as_u64()
+                .unwrap_or(0) as usize;
+            let mut mat = vdoc["materials"][vm].clone();
+            remap_textures(
+                &mut mat,
+                vi,
+                vdoc,
+                vbin,
+                doc,
+                bin,
+                &mut tex_map,
+                &mut img_map,
+            );
+            let id = match mat_ids.get(&key(&mat)) {
+                Some(i) => *i,
+                None => {
+                    if let Some(n) = mat["name"].as_str() {
+                        mat["name"] = json!(format!("{vname}-{n}"));
+                    }
+                    let Some(arr) = doc["materials"].as_array_mut() else {
+                        return Err("export: no materials array".into());
+                    };
+                    arr.push(mat.clone());
+                    added += 1;
+                    mat_ids.insert(key(&mat), arr.len() - 1);
+                    arr.len() - 1
+                }
+            };
+            per_node[k].push(id);
+        }
+    }
+    let mut mapped = 0usize;
+    for ((node, _, mesh), mats) in base_nodes.iter().zip(&per_node) {
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut extras = serde_json::Map::new();
+        for (vi, m) in mats.iter().enumerate() {
+            extras.insert(names[vi].clone(), json!(m));
+            match groups.iter_mut().find(|g| g.0 == *m) {
+                Some(g) => g.1.push(vi),
+                None => groups.push((*m, vec![vi])),
+            }
+        }
+        if groups.len() > 1 {
+            mapped += 1;
+        }
+        let mappings: Vec<Value> = groups
+            .into_iter()
+            .map(|(m, v)| json!({"material": m, "variants": v}))
+            .collect();
+        doc["meshes"][*mesh]["primitives"][0]["extensions"] =
+            json!({"KHR_materials_variants": {"mappings": mappings}});
+        if !doc["nodes"][*node]["extras"].is_object() {
+            doc["nodes"][*node]["extras"] = json!({});
+        }
+        doc["nodes"][*node]["extras"]["variants"] = Value::Object(extras);
+    }
+    let ext = json!("KHR_materials_variants");
+    if !extensions.contains(&ext) {
+        extensions.push(ext);
+    }
+    doc["extensionsUsed"] = json!(extensions);
+    if !doc["extensions"].is_object() {
+        doc["extensions"] = json!({});
+    }
+    doc["extensions"]["KHR_materials_variants"] = json!({
+        "variants": names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>()
+    });
+    doc["buffers"][0]["byteLength"] = json!(bin.len());
+    Ok(format!(
+        "variants: {} (KHR_materials_variants; node extras.variants), {added} extra material(s), {mapped} primitive(s) change look",
+        names.join(", ")
+    ))
+}
+
+/// Copies the textures `mat` (from variant document `vi`) points at into
+/// `doc`, rewriting its indices; images by uri are shared, embedded ones
+/// copied into `bin`.
+#[allow(clippy::too_many_arguments)]
+fn remap_textures(
+    mat: &mut Value,
+    vi: usize,
+    vdoc: &Value,
+    vbin: &[u8],
+    doc: &mut Value,
+    bin: &mut Vec<u8>,
+    tex_map: &mut HashMap<(usize, usize), usize>,
+    img_map: &mut HashMap<(usize, usize), usize>,
+) {
+    match mat {
+        Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                if k.ends_with("Texture")
+                    && let Some(t) = v["index"].as_u64()
+                {
+                    let t = t as usize;
+                    let new = match tex_map.get(&(vi, t)) {
+                        Some(n) => *n,
+                        None => {
+                            let n = copy_texture(vi, t, vdoc, vbin, doc, bin, img_map);
+                            tex_map.insert((vi, t), n);
+                            n
+                        }
+                    };
+                    v["index"] = json!(new);
+                } else {
+                    remap_textures(v, vi, vdoc, vbin, doc, bin, tex_map, img_map);
+                }
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                remap_textures(v, vi, vdoc, vbin, doc, bin, tex_map, img_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn copy_texture(
+    vi: usize,
+    t: usize,
+    vdoc: &Value,
+    vbin: &[u8],
+    doc: &mut Value,
+    bin: &mut Vec<u8>,
+    img_map: &mut HashMap<(usize, usize), usize>,
+) -> usize {
+    let src = vdoc["textures"][t]["source"].as_u64().unwrap_or(0) as usize;
+    let img = match img_map.get(&(vi, src)) {
+        Some(i) => *i,
+        None => {
+            let mut image = vdoc["images"][src].clone();
+            if !doc["images"].is_array() {
+                doc["images"] = json!([]);
+                doc["textures"] = json!([]);
+                doc["samplers"] = vdoc["samplers"].clone();
+            }
+            let existing = image["uri"].as_str().and_then(|u| {
+                doc["images"]
+                    .as_array()?
+                    .iter()
+                    .position(|i| i["uri"].as_str() == Some(u))
+            });
+            let i = match existing {
+                Some(i) => i,
+                None => {
+                    if let Some(view) = image["bufferView"].as_u64() {
+                        let v = &vdoc["bufferViews"][view as usize];
+                        let off = v["byteOffset"].as_u64().unwrap_or(0) as usize;
+                        let len = v["byteLength"].as_u64().unwrap_or(0) as usize;
+                        let start = bin.len();
+                        bin.extend_from_slice(vbin.get(off..off + len).unwrap_or(&[]));
+                        bin.resize(align4(bin.len()), 0);
+                        if let Some(views) = doc["bufferViews"].as_array_mut() {
+                            views
+                                .push(json!({"buffer": 0, "byteOffset": start, "byteLength": len}));
+                            image["bufferView"] = json!(views.len() - 1);
+                        }
+                    }
+                    let arr = doc["images"].as_array_mut();
+                    match arr {
+                        Some(a) => {
+                            a.push(image);
+                            a.len() - 1
+                        }
+                        None => 0,
+                    }
+                }
+            };
+            img_map.insert((vi, src), i);
+            i
+        }
+    };
+    let mut tex = vdoc["textures"][t].clone();
+    tex["source"] = json!(img);
+    match doc["textures"].as_array_mut() {
+        Some(a) => {
+            if let Some(i) = a.iter().position(|x| *x == tex) {
+                return i;
+            }
+            a.push(tex);
+            a.len() - 1
+        }
+        None => 0,
+    }
 }
 
 fn glam_v(a: [f32; 3]) -> bevy::math::Vec3 {

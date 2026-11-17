@@ -31,6 +31,7 @@ pub(crate) fn highlight_selected(
     lit: Query<(), With<Highlight>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let _profile = crate::preview::profile::span("highlight_selected");
     let sel = |n: &str| {
         wb.selected.as_deref() == Some(n)
             || (outline.visible && outline.selected_parts.iter().any(|s| s == n))

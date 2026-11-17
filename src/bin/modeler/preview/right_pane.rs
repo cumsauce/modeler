@@ -92,6 +92,7 @@ fn update_right_pane(
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
+    let _profile = crate::preview::profile::span("update_right_pane");
     if modeler.session.viewer_away() {
         return;
     }

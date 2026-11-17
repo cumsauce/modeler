@@ -38,8 +38,30 @@ switches the catalog, exports and prefab lookups to it for that call
 server's own home library). Documents remember their project
 (`Model.project`, autosave only), a document of the same name from another
 project is refused rather than taken over, and `new_model` starts a
-document beside another agent's (or another project's) instead of
-replacing it. **Subagents of one Claude session share one proxy, so one client id and one active document: pass `doc` (an open document's name) on every `apply_ops`, `verify`, `inspect`, `agent_views`, `save_prefab`, `undo` and `redo`; the call errors if it isn't open.** `save_prefab` also refuses (unless `force`) a name another open document holds. A new agent's first call brings the window to the front (not once the human has picked a document).
+document beside any non-empty one instead of replacing it. **Subagents of one Claude session share one proxy, so one client id and one active document: pass `doc` (an open document's name) on every tool that reads or changes a document (`apply_ops`, `verify`, `inspect`, `agent_views`, `scene_summary`, `ops`, `op_get`, `probe_ray`, `screenshot`, `set_camera`, `style`, `material_ops`, the annotation tools, `history`, `undo`, `redo`, `jump`, `diff`, `cherry_pick`, `history_prune`, `set_model_name`, `save_prefab`, `export_model`); the call errors if it isn't open.** `save_prefab` also refuses (unless `force`) a name another open document holds. **`new_model` never displaces work**: unless the current document is empty (no ops, no parts) it stays open and the new one starts beside it, so `doc` reaches either; only an empty document is replaced, and a name that is already open is refused (switch to it or pass `doc`).
+
+**Shared daemon or one per agent.** Share the one daemon (the default)
+when the human should watch every agent in one window and agents may
+reach each other's documents. Run one per agent when agents must not see
+each other's open documents, or one agent's heavy renders shouldn't share
+a server with another's: set `MODELER_SOCKET=/tmp/modeler-<name>.sock` in
+that session's MCP config `env` (or pass `--socket PATH`; keep the path
+short, Unix sockets are limited to ~100 bytes). Each socket gets its own
+daemon, server, log (`daemon.<slot>.log`) and autosave slot
+(`session.<slot>.json`; the first server in a catalog dir holds the main
+`session.lock`), and the catalog is shared, with `save_prefab`'s
+changed-file check guarding writes. Caveat: separate windows and separate
+open documents, so a `prefab` item only sees the other daemon's work once
+it is saved to the catalog. `MODELER_BINARY` overrides the server binary
+(default `target/debug/modeler` beside `mcp_driver.py`).
+
+**Working efficiently.** Verify numerically (`verify`, `inspect`) between
+steps and render once per model at the end with one tiled `agent_views`
+(`["front", "right", "top", "iso"]`) rather than after every step. For
+many identical props in a map (hundreds of desk fans), model one prefab
+(the fan, with its rotor clip) and place `prefab` instances, or bake a set
+into one prefab with arrays: never hundreds of separate items. Prefab
+instances export by reference in a `.bsn`. A new agent's first call brings the window to the front (not once the human has picked a document).
 After `cargo build`, restart the
 server with `pkill -f target/debug/modeler` (the daemon respawns it on the
 next call) or stop everything with a `quit` call.
@@ -156,13 +178,14 @@ type, so there is no need to memorise field names.
 | `path_array` | name, input, path, count or spacing, [smooth], [closed], [align true], [roll_step], [on], [follow upright / slope / normal], [between] |
 | `mirror` | name, input, axis, [offset] |
 | `material` | name, [input = name], [color / base_color], [roughness], [metalness], [pbr], [bevel], [macro] |
-| `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale], [components] |
+| `prefab` | name, prefab (catalog entry), [translation], [rotation], [scale], [components], [variant] |
 | `hide_part` / `show_part` | part (`*` matches anything: `"cut*"` hides every cutter, `"*_raw"` every raw blank) |
 | `rename` | part, to |
 | `delete` | name (an op output, or a baked part; its own in-place hide/material/transform edits go with it) |
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor], [hidden] |
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [preview], [components] |
+| `variant` | name, [materials {part or glob: material item fields}], [style {token patch}] (a cosmetic skin; geometry unchanged) |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `decal` | name, pbr (a `decal`-domain material), size [w, h] or [w, h, depth], [on], [at], [toward down], [translation], [direction], [roll], [attach], [kind clustered / forward], [params] |
 | `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
@@ -1142,8 +1165,8 @@ name: the producer first, then in-place material/visibility/transform edits).
   picked op brings the param values it was built with, so the graph stays
   consistent. After a jump, this replaces re-issuing the old branch by hand.
 
-**Model, catalog, output:** `new_model(name)` (the old model stays one undo
-away), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
+**Model, catalog, output:** `new_model(name)` (starts beside a non-empty
+document, never replacing it; an open name is refused), `set_model_name(name)` (the prefab entry name), `save_prefab(description,
 tags, prompt, force?)` (reports when it overwrote an entry; refuses, unless
 `force`, when the catalog file changed since this session loaded or saved
 it: another agent or server saved it in between),
@@ -1318,6 +1341,56 @@ materials" in Material mode. To strew many decals over a surface
 
   Markers the same way: read `extras.marker` and spawn your own
   components at the node's `Transform`.
+
+**Variants (cosmetic skins):** alternate looks for one model (red / blue
+team, clean / rusty) that game code switches at runtime. Geometry never
+changes; the base model is the variant `default`.
+
+- `{"type": "variant", "name": "red_team", "materials": {"body*": {"pbr":
+  "paint", "params": {"hue": 0.0}}, "trim": {"color": "#c33", "flat":
+  true}}, "style": {"colors": {"primary": "#c33"}}}`. `materials` keys are
+  part names or `*` globs; values are a `material` item's fields (minus
+  name / input; `flat: true` drops the base pbr). Globs apply first, then
+  exact names, so an exact name wins. `style` patches style tokens for the
+  variant: every item that reads tokens re-resolves under it (like a
+  prefab's style patch). Either or both.
+- A variant is applied after the whole graph (`src/variant.rs`): the parts
+  derive as usual, then each matched part's material is replaced, so a
+  variant changes exactly the parts it names (not copies made from them:
+  name `"trim*"` to take those). A look that matches no part is a
+  `scene_summary` warning.
+- See it: `agent_views(variant: "red_team")`, or `variants: true` (or a
+  list) for the views once per variant in one tiled grid (labelled
+  `[red_team]`). `set_camera(variant: "red_team")` makes the window show it
+  (per document; `"default"` or `""` goes back), and the window's 3D view
+  has a Skin chip that cycles them. `scene_summary` lists the variants.
+- Check it: `verify` / `expect` `materials` runs on the base look and every
+  variant (one `materials (variant x)` line each); `variant: "x"` limits it
+  to one.
+- Export: glTF `KHR_materials_variants` (root `extensions` lists
+  `default` first, then each variant; each primitive's `mappings` give its
+  material per variant), every variant's materials written once (shared
+  ones deduplicated), and node `extras.variants: {variant: material
+  index}` for engines without the extension. Instancing and merging are
+  off in a model with variants (each part needs its own primitive).
+- Prefabs: a `prefab` item takes `variant: "red_team"` (the instance's
+  parts wear it in the modeler), and a `.bsn` export writes
+  `modeler_bevy::ModelerVariant { name: "red_team" }` on that entity (and
+  `variant` in `<stem>.map.json`); the prefab's glTF carries all its
+  variants.
+- In Bevy (whose loader ignores `KHR_materials_variants`), `ModelerPlugin`
+  reads `extras.variants` into `ModelerVariants`; put `ModelerVariant` on
+  the scene root (or any ancestor) to pick a look and change it to switch:
+
+  ```rust
+  let root = commands.spawn(WorldAssetRoot(assets.load(
+      GltfAssetLabel::Scene(0).from_asset("models/tank.gltf")))).id();
+  commands.entity(root).insert(modeler_bevy::ModelerVariant::new("red_team"));
+  // later: commands.entity(root).insert(ModelerVariant::new("blue_team"));
+  ```
+
+  It swaps each part's `MeshMaterial3d<StandardMaterial>` to the file's
+  `Material{i}/std` handle. The viewer example cycles them with V.
 
 **Level scenes (`.bsn`):** a map document (terrain, roads, `prefab`
 instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
@@ -1893,6 +1966,22 @@ Esc deselects, C toggles comments, G All documents.
   dots dim and labels hide. `set_camera(ui: {comment: {part, spot?, text?,
   action?: post / cancel}})` drives the box for checking the UI. The app icon is `icons/app-icon.png` (drawn from `icons/app-icon.svg`; `preview/app_icon.rs` sets the Dock icon on macOS, the window icon elsewhere).
   The comments chip ends the 3D view's HUD row.
+- **Streaming** (`preview/stream.rs`): the window and grid tiles never
+  convert meshes or bake materials on the main thread. Part -> Mesh
+  (content hash, tangents, closed check), material bakes (with mips) and
+  decimated copies run on the `AsyncComputeTaskPool`; `try_bundle` answers
+  from `PbrCache` / `Streams` and queues what is missing, `poll_streams`
+  lands finished jobs. Until a changed part is ready the window keeps its
+  old entity (or shows the mesh in its flat colour while the bake runs).
+  Parts over 50k triangles get two `simplify` LODs (1/4 from 6 part radii,
+  1/16 from 20) as `PartLod` children swapped by `VisibilityRange` (window
+  only: an agent shot drops the ranges and hides the copies for its frame).
+  Tiles draw proxies (at most 20k triangles a part, ~100k a tile), spawn
+  at most 300 parts a frame across tiles, derive ops-only documents off
+  thread, and keep their last image until the new render is complete.
+  `screenshot` waits until nothing streams (`SceneBuilt.pending`,
+  `Streams.pending_grid`) plus 12 frames; agent views build their
+  stand-ins synchronously (`part_bundle`), so both stay complete.
 - **All documents** tiles are cheap by design: each is its own camera on
   its own render layer rendering into its own image, active only for a few
   frames after its document changes, so an idle grid renders no 3D; the
@@ -1967,6 +2056,26 @@ domain, tile and params).
   Calls without `_meta` (a plain MCP client, the human's window) behave as
   before. Separate servers sharing one catalog are guarded by the session
   lock (autosave) and `save_prefab`'s changed-file check.
+- **Slow calls run off the app thread** (`server/tools.rs`), so the window
+  keeps drawing. `apply_ops` takes a `Session::snapshot` (the open
+  documents without history, parts shared, plus the working materials) in
+  a short app-thread closure (which also reads `ops_file` /
+  `from_reference` images, after begin_call set the project), applies the
+  same batch to that copy on a `spawn_blocking` worker to fill the op
+  cache, then runs the real apply on the app thread, which is all cache
+  hits (a 5 s sdf edit costs the frame ~3 ms). The worker's result is
+  discarded, so atomicity, rollback, history, authorship and undo guards
+  are exactly the real apply's; a stale copy only costs cache misses.
+  A per-document tokio lock (`Tools::doc_lock`) keeps one document's
+  `apply_ops` calls in order from snapshot to commit (and through its
+  `expect`); other documents and other tools proceed meanwhile. The
+  commit re-activates the call's document (`Session::ensure_active`) if
+  another call switched away, and errors if it was closed. `verify`,
+  `inspect` and `apply_ops`' `expect` run read-only on a snapshot on a
+  worker (`run_detached_json`). Other tools (material_ops, style, undo,
+  export, renders) still run on the app thread. New slow read-only tools
+  should use `run_detached_json`; new slow mutating ones, the
+  warm-then-commit pattern.
 - The daemon keeps the server's stderr (panics, bake errors) in
   `<catalog dir>/daemon.log` (rotated to `daemon.log.1` past 1 MB at each
   spawn; `MODELER_STDERR=<file>` overrides). The server's last line there
@@ -2008,8 +2117,8 @@ domain, tile and params).
   proxy) respawns the server from the binary on disk on the next tool call. The respawned session AUTOSAVES
   and RESTORES: mutations are written to `session.json` in the catalog dir
   0.5 s after the last edit (and on exit; a hard kill loses at most that), and a server started with `--restore` (the driver always does) parks it on startup, so
-  unsaved WIP survives restarts (`scene restore` NAME reopens it). `new_model` starts clean (the old model
-  stays one undo away, also in the autosave). `--model <path>` skips the
+  unsaved WIP survives restarts (`scene restore` NAME reopens it). `new_model` starts clean (a non-empty old
+  model stays open beside it, also in the autosave). `--model <path>` skips the
   restore and loads that file instead. The MCP tool list is fixed per
   connection, so newly added tools only appear in a NEW session.
 

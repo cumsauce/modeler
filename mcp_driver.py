@@ -55,15 +55,23 @@ restart note quotes the server's last "modeler: exit: <reason>" line.
 import json
 import subprocess, sys, base64, os, signal, socket, stat, time
 
-BINARY = "/Users/lume/modeler/target/debug/modeler"
-SOCKET = "/tmp/modeler-mcp.sock"
+# The server binary: MODELER_BINARY, else target/debug/modeler next to
+# this script (the repo checkout it lives in).
+BINARY = os.environ.get("MODELER_BINARY") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "target", "debug", "modeler")
+# The daemon socket: MODELER_SOCKET (one daemon per agent), else the one
+# shared daemon. --socket PATH overrides both.
+SOCKET = os.environ.get("MODELER_SOCKET") or "/tmp/modeler-mcp.sock"
 LOG_ROTATE_BYTES = 1 << 20
 EXIT_PREFIX = "modeler: exit: "
 
 
-def daemon_log_path():
+def daemon_log_path(socket_path=None):
     """MODELER_STDERR if set, else <catalog dir>/daemon.log (the server says
-    where its catalog dir is, so project / FRIENDSLOP_DATA_DIR rules hold)."""
+    where its catalog dir is, so project / FRIENDSLOP_DATA_DIR rules hold).
+    A daemon on another socket than the shared one logs to
+    daemon.<slot>.log, so side-by-side daemons don't read each other's
+    startup notes (autosave slot, exit reason)."""
     log = os.environ.get("MODELER_STDERR")
     if log:
         return log
@@ -76,7 +84,10 @@ def daemon_log_path():
     if not d:
         return None
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, "daemon.log")
+    name = "daemon.log"
+    if socket_path and os.path.abspath(socket_path) != os.path.abspath("/tmp/modeler-mcp.sock"):
+        name = f"daemon.{daemon_slot(socket_path)}.log"
+    path = os.path.join(d, name)
     try:
         if os.path.getsize(path) > LOG_ROTATE_BYTES:
             os.replace(path, path + ".1")
@@ -399,7 +410,7 @@ def daemon_mode(socket_path, mode):
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(socket_path)  # before spawning: a racing second daemon fails here
     srv.listen(16)
-    log = daemon_log_path()
+    log = daemon_log_path(socket_path)
     try:
         first = ModelerSession(mode=mode, log=log, slot=daemon_slot(socket_path))
     except Exception:
@@ -438,7 +449,7 @@ def daemon_mode(socket_path, mode):
         if session.proc.poll() is None:
             return session, None
         why = session.exit_reason()
-        session = ModelerSession(mode=mode, log=daemon_log_path(),
+        session = ModelerSession(mode=mode, log=daemon_log_path(socket_path),
                                  slot=daemon_slot(socket_path))
         state["session"] = session
         return session, (f"daemon: the modeler server had exited ({why}); "

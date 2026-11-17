@@ -126,6 +126,12 @@ pub(crate) struct MassArg {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExportModelArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// File path to write, e.g. "models/chair.gltf".
     pub(crate) path: String,
     /// "gltf" (default, preferred: textures as shared KTX2 files) or "glb"
@@ -167,6 +173,28 @@ pub(crate) struct SavePrefabArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct RenameModelArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
+    /// The new name.
+    pub(crate) name: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct DocOnlyArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct NameArgs {
     /// The new name.
     pub(crate) name: String,
@@ -174,6 +202,12 @@ pub(crate) struct NameArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AddAnnotationArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// The part the comment is about ("" with `material`).
     #[serde(default)]
     pub(crate) part: String,
@@ -202,6 +236,12 @@ pub(crate) struct AddAnnotationArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AnnotationIdArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// The annotation id, as shown by list_annotations.
     pub(crate) id: u32,
 }
@@ -237,6 +277,12 @@ pub(crate) struct UndoArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct MaterialOpsArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// The working material to edit (created if missing).
     pub(crate) material: String,
     /// Nodes to upsert, each {"type", "name", ...} (see describe_op).
@@ -308,6 +354,12 @@ pub(crate) struct SceneArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct StyleArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// show, set, replace, clear, list, describe, save, load or delete.
     pub(crate) action: String,
     /// For set / replace: {brief?, colors?: {name: colour}, materials?: {name:
@@ -328,6 +380,12 @@ pub(crate) struct StyleArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct OpNameArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// The op's output part name, as shown by the ops list.
     pub(crate) name: String,
 }
@@ -350,6 +408,12 @@ pub(crate) struct CatalogDescribeArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetCameraArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// Horizontal angle in degrees: 0 = from +z (front view), 90 = from +x (right).
     #[serde(default)]
     pub(crate) yaw: Option<f32>,
@@ -373,6 +437,10 @@ pub(crate) struct SetCameraArgs {
     /// "cancel"} (open, type into, post or cancel the comment box)}.
     #[serde(default)]
     pub(crate) ui: Option<UiArg>,
+    /// Show this cosmetic variant of your document in the window ("default"
+    /// or "" for the base look); it sticks to the document.
+    #[serde(default)]
+    pub(crate) variant: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema, Clone)]
@@ -391,6 +459,9 @@ pub(crate) struct UiArg {
     /// Open (true) or close the document popup (⌘K).
     #[serde(default)]
     pub(crate) popup: Option<bool>,
+    /// Scroll the All documents grid to this offset (pixels from the top).
+    #[serde(default)]
+    pub(crate) scroll: Option<f32>,
     /// Drive the comment box as the human would (for checking the UI):
     /// {"part"?: open it on a part, "spot"?: [x, y, z] pin it on that point
     /// of `part`, "text"?: type into it, "action"?: "post" | "cancel"}.
@@ -483,6 +554,13 @@ pub(crate) struct ReferenceArg {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum VariantsArg {
+    All(bool),
+    Names(Vec<String>),
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AgentViewsArgs {
     /// Run on this open document (by name) instead of your active one; the
     /// call errors if it isn't open. Agents sharing a session (subagents)
@@ -553,6 +631,14 @@ pub(crate) struct AgentViewsArgs {
     /// with the changed share.
     #[serde(default)]
     pub(crate) diff: bool,
+    /// Render this cosmetic variant's look ("default" = the base look;
+    /// omitted: the base look).
+    #[serde(default)]
+    pub(crate) variant: Option<String>,
+    /// Render every variant (true: default plus each `variant` item, or a
+    /// list of names), the views once per variant, tiled with labels.
+    #[serde(default)]
+    pub(crate) variants: Option<VariantsArg>,
     /// Render posed by this clip (default: the only one) at `time` / `times`.
     #[serde(default)]
     pub(crate) clip: Option<String>,
@@ -586,6 +672,12 @@ pub(crate) struct SessionLogArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProbeRayArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// Ray origin, world space [x, y, z].
     pub(crate) origin: [f32; 3],
     /// Ray direction (normalized internally).
@@ -597,6 +689,12 @@ pub(crate) struct ProbeRayArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct DiffArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// History node id to compare from.
     pub(crate) from: usize,
     /// History node id to compare to; default the live model.
@@ -606,6 +704,12 @@ pub(crate) struct DiffArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct CherryPickArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// History node to take ops from (e.g. the tip of a branch you jumped away from).
     pub(crate) from: usize,
     /// Only these op output names; default every op there that is new or
@@ -624,6 +728,12 @@ pub(crate) struct DescribeOpArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct HistoryPruneArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
     /// How many of the newest snapshots to keep (cursor, root and branch
     /// points are always kept as well).
     pub(crate) keep: usize,
