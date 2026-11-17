@@ -147,6 +147,10 @@ pub struct VerifySpec {
     /// material required).
     #[serde(default)]
     pub materials: Option<GroundedSpec>,
+    /// Run the `materials` check on this cosmetic variant only ("default":
+    /// the base look). Omitted: the base look and every variant.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// Limit the checks to these parts (`*` globs): grounded / supported /
     /// validate / bounds / stable report only them (grounding still uses
     /// every part), collisions keep pairs with at least one side in scope.
@@ -1106,15 +1110,23 @@ impl Session {
     /// in the (carried-over) history tree first, so it is one `undo` away —
     /// reset without losing work.
     pub fn new_model(&mut self, name: &str) -> CmdResult {
-        // Another agent's document, or one from another project: keep it
-        // open and start the new one beside it instead of replacing it.
-        let theirs = self
-            .clients
-            .iter()
-            .any(|(c, v)| self.client.as_ref() != Some(c) && v.doc == self.model.name);
-        let elsewhere = crate::catalog::call_project().is_some_and(|p| p != self.model.project)
-            && !(self.model.ops.is_empty() && self.model.parts.is_empty());
-        if theirs || elsewhere {
+        // Never displace a document someone may be working in: another
+        // agent, a subagent sharing this client id, or this agent's own
+        // earlier work. Only an empty document is replaced; anything else
+        // stays open and the new one starts beside it (`doc` reaches either).
+        let empty = self.model.ops.is_empty() && self.model.parts.is_empty();
+        if self.others.iter().any(|m| m.name == name) || (!empty && self.model.name == name) {
+            return Err(ModelerError::Invalid(format!(
+                "doc `{name}` is already open; switch to it (scene switch) or pass doc: \"{name}\", \
+                 or pick another name"
+            )));
+        }
+        if !empty {
+            let theirs = self
+                .clients
+                .iter()
+                .any(|(c, v)| self.client.as_ref() != Some(c) && v.doc == self.model.name);
+            let elsewhere = crate::catalog::call_project().is_some_and(|p| p != self.model.project);
             let old = self.model.name.clone();
             let mut model = Model::named(name);
             model.version = self.model.version + 1;
@@ -1124,26 +1136,30 @@ impl Session {
             self.others.push(outgoing);
             self.pending_pin = None;
             return Ok(format!(
-                "started new model `{name}` as its own document (`{old}` stays open: {})",
+                "started new model `{name}` as its own document (`{old}` stays open{}; pass doc: \"{old}\" to reach it)",
                 if theirs {
-                    "another agent is working in it"
+                    ": another agent is working in it"
+                } else if elsewhere {
+                    ": it belongs to another project"
                 } else {
-                    "it belongs to another project"
+                    ""
                 }
             ));
         }
+        let old = self.model.name.clone();
         let history = std::mem::take(&mut self.model.history);
         let snapshot = self.model.clone();
         let mut model = Model::named(name);
         model.history = history;
         model.version = self.model.version + 1;
+        model.project = crate::catalog::project_root();
         model
             .history
             .record(snapshot, format!("new model `{name}`"));
         self.pending_pin = None;
         self.model = model;
         Ok(format!(
-            "started new model `{name}` (the old model is one undo away)"
+            "started new model `{name}` (replaced the empty document `{old}`)"
         ))
     }
 
@@ -1234,10 +1250,9 @@ impl Session {
             .iter()
             .map(|p| {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for v in &p.verts {
-                    v.iter().for_each(|f| f.to_bits().hash(&mut h));
-                }
-                p.indices.hash(&mut h);
+                // Memoised by buffer identity: an unchanged part costs a
+                // lookup, not a pass over its vertices (twice per call).
+                crate::material::pbr::geometry_hash(p).hash(&mut h);
                 for f in p
                     .translation
                     .iter()
@@ -1329,6 +1344,15 @@ impl Session {
             item,
             BatchItem::Op(Op::Decal { .. } | Op::DecalScatter { .. })
         );
+        if let BatchItem::Op(Op::Variant { materials, .. }) = item {
+            for l in materials {
+                if let Some(r) = l.pbr_mut() {
+                    self.embed_pbr(r, false)
+                        .map_err(|e| format!("materials.{}: {e}", l.parts))?;
+                }
+            }
+            return Ok(());
+        }
         let r = match item {
             BatchItem::Op(Op::Material { pbr: Some(r), .. }) => r,
             BatchItem::Op(Op::Decal { pbr: r, .. }) => r,
@@ -1339,6 +1363,11 @@ impl Session {
             },
             _ => return Ok(()),
         };
+        self.embed_pbr(r, decal)
+    }
+
+    /// Embeds one pbr reference's graph (working materials, then library).
+    fn embed_pbr(&self, r: &mut crate::material::PbrRef, decal: bool) -> Result<(), String> {
         let doc = match self.materials.docs.get(&r.material) {
             Some(d) => d.clone(),
             None => crate::catalog::load_doc::<crate::material::MatDoc>(
@@ -1392,6 +1421,15 @@ impl Session {
         let before = self.model_without_history();
         let mut n = 0;
         for op in &mut self.model.ops {
+            if let Op::Variant { materials, .. } = op {
+                for r in materials.iter_mut().filter_map(|l| l.pbr.as_mut()) {
+                    if r.material == material {
+                        r.graph = Some(graph.clone());
+                        n += 1;
+                    }
+                }
+                continue;
+            }
             let r = match op {
                 Op::Material { pbr: Some(r), .. } => Some(r),
                 Op::Decal { pbr: r, .. } => Some(r),
@@ -2006,6 +2044,39 @@ impl Session {
 
     /// The active document was renamed (set_model_name): a window on it
     /// follows the new name.
+    /// A detached copy of the open documents (without their history trees)
+    /// and the working materials, for work done off the app thread: a
+    /// read-only call (verify, inspect) runs on it, and a slow `apply_ops`
+    /// runs on it first to fill the op cache, so the real apply on the
+    /// app thread is all cache hits. Parts are shared (`Arc`), ops are
+    /// data, so this is cheap. Nothing it does reaches the real session.
+    pub fn snapshot(&mut self) -> Session {
+        fn bare(m: &mut Model) -> Model {
+            let h = std::mem::take(&mut m.history);
+            let c = m.clone();
+            m.history = h;
+            c
+        }
+        Session {
+            model: bare(&mut self.model),
+            others: self.others.iter_mut().map(bare).collect(),
+            materials: self.materials.clone(),
+            viewer_doc: self.viewer_doc.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Makes `doc` the active document again when another call switched
+    /// away from it while this call's work ran off the app thread.
+    pub fn ensure_active(&mut self, doc: &str) -> Result<(), ModelerError> {
+        if self.model.name == doc {
+            return Ok(());
+        }
+        self.require_open(doc)
+            .map_err(|e| ModelerError::from(format!("{e} (it was closed while this call ran)")))?;
+        self.scene("switch", Some(doc)).map(|_| ())
+    }
+
     /// A call's `doc` argument: errors unless that document is open.
     pub fn require_open(&self, doc: &str) -> Result<(), String> {
         let open = self.doc_names();
@@ -3542,7 +3613,46 @@ impl Session {
                 None
             }
         };
-        if let Some(pbr) = pbr {
+        let variant_views: Vec<(String, Result<Model, String>)> = if pbr.is_some() {
+            let names = match &spec.variant {
+                Some(v) => vec![v.clone()],
+                None => crate::variant::names(&self.model),
+            };
+            names
+                .into_iter()
+                .map(|v| {
+                    let m = self.variant_model(&v).map(|mut m| {
+                        if !scope.is_empty() {
+                            m.parts.retain(|p| in_scope(&p.name));
+                        }
+                        m
+                    });
+                    (v, m)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let base_only = spec
+            .variant
+            .as_deref()
+            .is_none_or(|v| v == crate::variant::DEFAULT);
+        let mut views: Vec<(String, &Model)> = Vec::new();
+        if base_only {
+            views.push(("materials".into(), view));
+        }
+        for (v, m) in &variant_views {
+            match m {
+                Ok(m) if v != crate::variant::DEFAULT => {
+                    views.push((format!("materials (variant {v})"), m));
+                }
+                Ok(_) => {}
+                Err(e) => record(&format!("materials (variant {v})"), Err(e.clone())),
+            }
+        }
+        for (label, view) in &views {
+            let Some(pbr) = pbr else { break };
+            let label = label.as_str();
             let (bare, flat) = material_gaps(view);
             let mut bad = Vec::new();
             if !bare.is_empty() {
@@ -3561,7 +3671,7 @@ impl Session {
             }
             if bad.is_empty() {
                 record(
-                    "materials",
+                    label,
                     Ok(if pbr {
                         "every visible part has a pbr material".into()
                     } else {
@@ -3573,7 +3683,7 @@ impl Session {
                 );
             } else {
                 record(
-                    "materials",
+                    label,
                     Err(format!(
                         "{} (give each a material item; pbr: a procedural material, see material_ops)",
                         bad.join("; ")
@@ -3627,6 +3737,7 @@ impl Session {
                 })
             }).collect::<Vec<_>>(),
             "ops": self.model.ops.iter().map(Self::op_label).collect::<Vec<_>>(),
+            "variants": crate::variant::names(&self.model),
             "warnings": self.lints(),
             "annotations": self.model.annotations.iter().map(|a| json!({
                 "id": a.id, "part": a.part, "text": a.text, "face": a.face, "vertex": a.vertex,
@@ -3723,7 +3834,47 @@ impl Session {
     }
 
     pub fn lints(&self) -> Vec<String> {
-        crate::verify::lints(&self.model)
+        let mut l = crate::verify::lints(&self.model);
+        l.extend(crate::variant::unmatched(&self.model));
+        l
+    }
+
+    /// The active model as it looks in cosmetic variant `name` (history-
+    /// less; "default" is the model itself). A style patch re-derives the
+    /// token-reading items with this session's working materials.
+    pub fn variant_model(&self, name: &str) -> Result<Model, String> {
+        crate::variant::derive_with(&self.model, name, |m, st| {
+            let mut s = Session {
+                materials: self.materials.clone(),
+                ..Session::default()
+            };
+            s.model = m.clone();
+            s.set_style(st).map_err(|e| e.to_string())?;
+            Ok(s.model.clone_without_history())
+        })
+    }
+
+    /// The parts the window draws: the active variant's look when one is
+    /// picked (`set_camera variant`), else None (the model's own parts).
+    pub fn window_variant_parts(&self) -> Option<Vec<std::sync::Arc<Part>>> {
+        let v = self.model.active_variant.as_deref()?;
+        self.variant_model(v).ok().map(|m| m.parts)
+    }
+
+    /// Picks the variant the window shows ("default" or None: the base look).
+    pub fn set_window_variant(&mut self, name: Option<&str>) -> CmdResult {
+        let name = name.filter(|n| *n != crate::variant::DEFAULT);
+        if let Some(n) = name
+            && crate::variant::find(&self.model, n).is_none()
+        {
+            return Err(crate::variant::unknown(&self.model, n).into());
+        }
+        self.model.active_variant = name.map(str::to_string);
+        self.model.version += 1;
+        Ok(format!(
+            "window shows variant `{}`",
+            name.unwrap_or(crate::variant::DEFAULT)
+        ))
     }
 
     pub fn add_primitive(
@@ -4443,6 +4594,17 @@ impl Session {
                 self.doc_names()[1..].join(", ")
             );
         }
+        let variants = crate::variant::names(&self.model);
+        if !variants.is_empty() {
+            s += &format!(
+                "variants: default, {} (window shows `{}`; agent_views variants: true renders each)\n",
+                variants.join(", "),
+                self.model
+                    .active_variant
+                    .as_deref()
+                    .unwrap_or(crate::variant::DEFAULT)
+            );
+        }
         if !self.model.style.is_empty() {
             let st = &self.model.style;
             s += &format!(
@@ -5003,16 +5165,23 @@ mod tests {
     }
 
     #[test]
-    fn new_model_is_undoable() {
+    fn new_model_never_displaces_work() {
         let mut s = session_with_part();
         let old_name = s.model.name.clone();
-        s.new_model("second").unwrap_or_else(|e| panic!("{e}"));
+        let out = s.new_model("second").unwrap_or_else(|e| panic!("{e}"));
+        assert!(out.contains("stays open"), "{out}");
         assert_eq!(s.model.name, "second");
         assert!(s.model.parts.is_empty());
-        // One undo brings the old model back intact.
-        s.undo().unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(s.model.name, old_name);
-        assert_eq!(s.model.parts.len(), 1);
+        // The old document is still open, untouched, beside the new one.
+        assert!(s.doc_names().contains(&old_name));
+        assert!(s.require_open(&old_name).is_ok());
+        // A name already open is refused, not taken over.
+        assert!(s.new_model(&old_name).is_err());
+        // An empty document is replaced (and one undo away).
+        let out = s.new_model("third").unwrap_or_else(|e| panic!("{e}"));
+        assert!(out.contains("replaced the empty document"), "{out}");
+        assert!(!s.doc_names().iter().any(|n| n == "second"));
+        assert_eq!(s.model.name, "third");
     }
 
     #[test]

@@ -130,14 +130,44 @@ pub fn per_part(part: &Part) -> bool {
             .is_some_and(|g| g.domain == "object")
 }
 
+/// The content hash of an embedded graph, memoized per shared copy: a
+/// scatter's 800 copies point at one `Arc`, and serializing the graph for
+/// each of them cost about a millisecond per part on every rebuild.
+fn graph_hash(g: Option<&std::sync::Arc<MatGraph>>) -> u64 {
+    use std::sync::{OnceLock, Weak};
+    type Memo = HashMap<usize, (Weak<MatGraph>, u64)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    let Some(g) = g else {
+        return 0;
+    };
+    let ptr = Arc::as_ptr(g) as usize;
+    let memo = MEMO.get_or_init(Default::default);
+    if let Ok(m) = memo.lock()
+        && let Some((w, h)) = m.get(&ptr)
+        && w.upgrade().is_some_and(|a| Arc::ptr_eq(&a, g))
+    {
+        return *h;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let _ = serde_json::to_writer(&mut HashInto(&mut h), &**g);
+    let v = h.finish();
+    if let Ok(mut m) = memo.lock() {
+        if m.len() > 4096 {
+            m.retain(|_, (w, _)| w.strong_count() > 0);
+        }
+        m.insert(ptr, (Arc::downgrade(g), v));
+    }
+    v
+}
+
 /// The cache key of a bake for `part` (tile bakes are shared by every part
 /// using the same material + params; object bakes are per part geometry).
 pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Streamed into the hasher: no string per part per lookup.
+    graph_hash(r.graph.as_ref()).hash(&mut h);
     {
         let mut w = HashInto(&mut h);
-        let _ = serde_json::to_writer(&mut w, &r.graph);
         let _ = serde_json::to_writer(&mut w, &r.params);
     }
     // Image nodes: the file's mtime, so an edited PNG re-bakes.
@@ -191,7 +221,7 @@ static GEOMETRY: Mutex<Option<HashMap<GeomKey, u64>>> = Mutex::new(None);
 /// A hash of a part's vertices, normals, uvs and indices, memoised by the
 /// buffers' identity and a sample of their content (parts are shared
 /// `Arc`s, so an unchanged part isn't rehashed on every bake lookup).
-fn geometry_hash(p: &Part) -> u64 {
+pub(crate) fn geometry_hash(p: &Part) -> u64 {
     let (nv, ni) = (p.verts.len(), p.indices.len());
     let sample = {
         let mut h = std::collections::hash_map::DefaultHasher::new();

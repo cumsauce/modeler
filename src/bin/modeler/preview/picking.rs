@@ -17,6 +17,7 @@ pub(crate) fn click_in_view(
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut ray_cast: MeshRayCast,
     parts: Query<(Entity, &Name), With<PreviewPart>>,
+    lods: Query<&ChildOf, With<super::stream::PartLod>>,
     mut modeler: ResMut<Modeler>,
     drag: Res<CameraDrag>,
     mut wb: ResMut<Workbench>,
@@ -24,6 +25,7 @@ pub(crate) fn click_in_view(
     view: Res<View3d>,
     mut last: Local<Option<Vec2>>,
 ) {
+    let _profile = crate::preview::profile::span("click_in_view");
     let cursor = windows.single().ok().and_then(|w| {
         w.cursor_position()
             .filter(|c| view.rect.contains(*c))
@@ -53,14 +55,16 @@ pub(crate) fn click_in_view(
     let Ok(ray) = camera.viewport_to_world(cam_transform, cursor) else {
         return;
     };
-    let filter = |e| parts.contains(e);
+    // A far part shows its LOD copy (a child): that names the part too.
+    let part_of = |e: Entity| lods.get(e).map_or(e, |c| c.parent());
+    let filter = |e| parts.contains(part_of(e));
     let settings = MeshRayCastSettings::default().with_filter(&filter);
     let hit = ray_cast
         .cast_ray(ray, &settings)
         .first()
         .and_then(|(e, hit)| {
             parts
-                .get(*e)
+                .get(part_of(*e))
                 .ok()
                 .map(|(_, n)| (n.to_string(), hit.clone()))
         });
@@ -151,6 +155,7 @@ pub(crate) fn sync_pins(
     assets: Res<AssetServer>,
     mut commands: Commands,
 ) {
+    let _profile = crate::preview::profile::span("sync_pins");
     if modeler.session.viewer_away() {
         return;
     }
@@ -278,6 +283,7 @@ pub(crate) fn place_pins(
     view: Res<View3d>,
     mut nodes: Query<(&mut Node, &mut Visibility, &mut BackgroundColor)>,
 ) {
+    let _profile = crate::preview::profile::span("place_pins");
     if pins.badges.is_empty() {
         pins.last_cam = None;
         return;

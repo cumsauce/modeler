@@ -404,6 +404,7 @@ mod tests {
             style: None,
             restyle: None,
             components: Default::default(),
+            variant: None,
         });
         let p = Part {
             name: "lamp1.pole".into(),

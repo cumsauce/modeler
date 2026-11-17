@@ -161,6 +161,7 @@ fn adopt(
     new: Query<(Entity, &InSlot), Added<InSlot>>,
     slots: Query<(Entity, &PaneSlot)>,
 ) {
+    let _profile = crate::preview::profile::span("adopt");
     for (e, InSlot(which)) in &new {
         if let Some(s) = slot(&slots, *which) {
             commands.entity(e).insert(ChildOf(s));
@@ -215,6 +216,7 @@ fn setup_slots(mut commands: Commands) {
 /// A new active document opens in its default mode; a mode it can't use
 /// falls back to Model. The selection belongs to the document it was made in.
 fn follow_document(modeler: Res<Modeler>, mut wb: ResMut<Workbench>) {
+    let _profile = crate::preview::profile::span("follow_document");
     if modeler.session.viewer_away() {
         return;
     }
@@ -278,6 +280,7 @@ pub(crate) fn apply_layout(
     (mut view, mut images): (ResMut<View3d>, ResMut<Assets<Image>>),
     mut node: Query<(&mut Node, &mut Visibility, &mut ImageNode), With<View3dNode>>,
 ) {
+    let _profile = crate::preview::profile::span("apply_layout");
     let (Ok(window), Ok((mut target, mut camera))) = (windows.single(), cameras.single_mut())
     else {
         return;

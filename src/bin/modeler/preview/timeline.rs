@@ -322,6 +322,7 @@ fn refresh_cache(
     pb: Res<Playback>,
     mut cache: ResMut<TimelineCache>,
 ) {
+    let _profile = crate::preview::profile::span("refresh_cache");
     if wb.mode != Mode::Animate {
         return;
     }

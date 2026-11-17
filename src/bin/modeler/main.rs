@@ -271,6 +271,7 @@ fn main() -> AppExit {
     .init_resource::<CameraDrag>()
     .init_resource::<SceneBuilt>()
     .init_resource::<PbrCache>()
+    .init_resource::<crate::preview::stream::Streams>()
     // The material graph shows in Material mode; the left pane in a document.
     .insert_resource(MatPane::open(false))
     .insert_resource(OutlinePane::open(!offscreen))
@@ -294,6 +295,10 @@ fn main() -> AppExit {
             // The grid covers the window's own view: rebuild it only when
             // it shows (parallel agents switch the active document per call).
             track_recency.run_if(windowed),
+            crate::preview::stream::poll_streams
+                .run_if(windowed)
+                .before(rebuild_scene)
+                .before(update_grid),
             rebuild_scene.run_if(windowed).run_if(scene_wanted),
             (playback_keys, play_animation)
                 .chain()
@@ -334,7 +339,16 @@ fn main() -> AppExit {
             app.add_plugins(
                 plugins
                     .set(WindowPlugin {
-                        primary_window: None,
+                        // A window entity with no surface (no winit): the
+                        // workbench UI lays out against its 1280x800 size and
+                        // renders into an image (`UiCanvas`), so the grid and
+                        // `capture: "window"` work offscreen too.
+                        primary_window: Some(Window {
+                            title: "modeler".into(),
+                            resolution: bevy::window::WindowResolution::new(1280, 800)
+                                .with_scale_factor_override(1.0),
+                            ..default()
+                        }),
                         exit_condition: bevy::window::ExitCondition::DontExit,
                         close_when_requested: false,
                         ..default()
@@ -381,6 +395,7 @@ fn main() -> AppExit {
                 timeline_plugin,
                 minimap_plugin,
                 shading_plugin,
+                crate::preview::profile::profile_plugin,
             ))
             .add_systems(
                 Update,
@@ -388,7 +403,10 @@ fn main() -> AppExit {
             )
             .add_systems(
                 Update,
-                (process_agent_shot.run_if(windowed).after(rebuild_scene),),
+                (
+                    process_agent_shot.run_if(windowed).after(rebuild_scene),
+                    adapt_reflections,
+                ),
             );
     }
     // Catch a main-thread panic so the exit line and lock cleanup still run.

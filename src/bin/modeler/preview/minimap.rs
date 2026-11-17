@@ -143,6 +143,7 @@ fn refresh_minimap(
     mut cams: Query<(&mut Camera, &mut Transform, &mut Projection), With<MinimapCamera>>,
     mut node: Query<&mut Visibility, With<MinimapNode>>,
 ) {
+    let _profile = crate::preview::profile::span("refresh_minimap");
     let on = shown(&wb, &grid);
     if let Ok(mut v) = node.single_mut() {
         v.set_if_neq(if on {

@@ -52,6 +52,8 @@ pub(crate) struct ShotStyle {
     pub(crate) dims: bool,
     /// Light with the model's own lights only (studio lights hidden).
     pub(crate) scene_lit: bool,
+    /// Draw this cosmetic variant's look (None: the default look).
+    pub(crate) variant: Option<String>,
 }
 
 /// The studio's own lights (sun, fills, agent key), hidden for a
@@ -353,9 +355,11 @@ pub(crate) fn process_agent_shot(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    (mut pbr_cache, mut decal_mats): (
+    (mut pbr_cache, mut decal_mats, ranged, lod_copies): (
         ResMut<PbrCache>,
         ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
+        Query<(Entity, &bevy::camera::visibility::VisibilityRange), With<PreviewPart>>,
+        Query<Entity, With<super::stream::PartLod>>,
     ),
     mut cameras: Query<
         (
@@ -402,6 +406,20 @@ pub(crate) fn process_agent_shot(
     let mut image_handle = image_handle;
     let aspect = width as f32 / height.max(1) as f32;
     let model = &modeler.session.model;
+    let variant_model;
+    let model = match &style.variant {
+        Some(v) => match modeler.session.variant_model(v) {
+            Ok(m) => {
+                variant_model = m;
+                &variant_model
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        },
+        None => model,
+    };
     let bounds = match &focus {
         Some(names) => match model.bounds_of(names) {
             Some(b) => Some(b),
@@ -527,8 +545,12 @@ pub(crate) fn process_agent_shot(
     // The window's scene shows another document (the human's, while an
     // agent works in its own) or hasn't caught up: draw this model's own
     // parts instead of the window's entities.
-    let stale =
-        built.doc.as_deref() != Some(model.name.as_str()) || built.version != Some(model.version);
+    // Parts still streaming in aren't the full model either: agent views
+    // are always complete. (Distance LODs are switched off for the shot
+    // below: agent views stay full detail.)
+    let stale = built.doc.as_deref() != Some(model.name.as_str())
+        || built.version != Some(model.version)
+        || built.pending > 0;
     if style.ids
         || style.curvature
         || style.silhouette
@@ -536,6 +558,8 @@ pub(crate) fn process_agent_shot(
         || rig_shot
         || playback.posed
         || stale
+        || style.variant.is_some()
+        || modeler.session.model.active_variant.is_some()
     {
         let source = posed_parts.as_ref().unwrap_or(&model.parts);
         let drawable = source
@@ -736,7 +760,26 @@ pub(crate) fn process_agent_shot(
         || style.density
         || rig_shot
         || playback.posed
-        || stale;
+        || stale
+        || style.variant.is_some()
+        || modeler.session.model.active_variant.is_some();
+    // The shot draws the window's own entities: its distance LODs go for
+    // this frame (the agent camera would pick a decimated copy by its own
+    // distance), so agent views are full detail. Restored after capture.
+    let mut lod_ranges: Vec<(Entity, bevy::camera::visibility::VisibilityRange)> = Vec::new();
+    let mut lod_hidden: Vec<Entity> = Vec::new();
+    if !ids && built.lods {
+        for (e, r) in &ranged {
+            lod_ranges.push((e, r.clone()));
+            commands
+                .entity(e)
+                .remove::<bevy::camera::visibility::VisibilityRange>();
+        }
+        for e in &lod_copies {
+            lod_hidden.push(e);
+            commands.entity(e).insert(Visibility::Hidden);
+        }
+    }
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
     commands
@@ -768,6 +811,16 @@ pub(crate) fn process_agent_shot(
                 }
                 for e in &stand_ins {
                     commands.entity(*e).despawn();
+                }
+                for (e, r) in &lod_ranges {
+                    if let Ok(mut ec) = commands.get_entity(*e) {
+                        ec.insert(r.clone());
+                    }
+                }
+                for e in &lod_hidden {
+                    if let Ok(mut ec) = commands.get_entity(*e) {
+                        ec.insert(Visibility::Inherited);
+                    }
                 }
                 if ids {
                     commands

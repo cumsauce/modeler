@@ -12,8 +12,15 @@ pub(crate) fn take_screenshot(
     view: Res<View3d>,
     grid: Option<Res<Grid>>,
     wb: Option<Res<Workbench>>,
+    canvas: Option<Res<crate::preview::app::UiCanvas>>,
     env_ready: Query<(), (With<MainCamera>, With<bevy::light::EnvironmentMapLight>)>,
     mut warm: Local<(u32, u32)>,
+    (built, streams): (
+        Option<Res<crate::preview::app::SceneBuilt>>,
+        Option<Res<crate::preview::stream::Streams>>,
+    ),
+    mut held: Local<u32>,
+    mut quiet: Local<(Option<u64>, u32)>,
 ) {
     // Same hold as agent shots: the environment light must be filtered.
     warm.1 = warm.1.saturating_add(1);
@@ -25,13 +32,45 @@ pub(crate) fn take_screenshot(
     if warm.0 < 4 && warm.1 < 120 {
         return;
     }
+    if pending.0.is_empty() {
+        *held = 0;
+        return;
+    }
+    // Deterministic shots: hold until every part's mesh and bake streamed
+    // in (the window's parts, or every tile in the grid), within the
+    // render timeout.
+    let grid_on = grid.as_ref().is_some_and(|g| g.on);
+    let mut streaming = if grid_on {
+        streams.as_ref().map_or(0, |s| s.pending_grid)
+    } else {
+        built.as_ref().map_or(0, |b| b.pending)
+    };
+    // A few frames after the last part landed, so the window camera's
+    // temporal AA has converged on it.
+    let version = built.as_ref().and_then(|b| b.version);
+    if streaming > 0 || quiet.0 != version {
+        *quiet = (version, 0);
+    } else {
+        quiet.1 = quiet.1.saturating_add(1);
+    }
+    if !grid_on && quiet.1 < SETTLE_AFTER_STREAM {
+        streaming = streaming.max(1);
+    }
+    if !shot_ready(streaming, *held) {
+        *held += 1;
+        return;
+    }
+    *held = 0;
     let Some(reply) = pending.0.pop() else {
         return;
     };
     // The 3D view's own image: never a pane. In the grid view, the window
     // (every document's tile, as the human sees it).
-    let shot = if grid.is_some_and(|g| g.on) || wb.is_some_and(|w| w.capture_window) {
-        Screenshot::primary_window()
+    let shot = if grid_on || wb.is_some_and(|w| w.capture_window) {
+        match canvas.and_then(|c| c.0.clone()) {
+            Some(img) => Screenshot::image(img),
+            None => Screenshot::primary_window(),
+        }
     } else {
         Screenshot::image(view.image.clone())
     };
@@ -45,6 +84,15 @@ pub(crate) fn take_screenshot(
             }
         })
         .insert(Name::new("mcp screenshot"));
+}
+
+/// Frames a window screenshot waits after its parts finished streaming in.
+const SETTLE_AFTER_STREAM: u32 = 12;
+
+/// Whether a screenshot may be taken: nothing is streaming in, or it has
+/// waited about 12 s (60 fps) and shoots what there is rather than time out.
+pub(crate) fn shot_ready(streaming: usize, held_frames: u32) -> bool {
+    streaming == 0 || held_frames >= 720
 }
 
 /// Encode a captured frame to PNG bytes (BGRA/RGBA in, RGBA PNG out).
@@ -105,4 +153,19 @@ pub(crate) fn compose_grid(shots: &[(Vec<u8>, String)]) -> Result<Vec<u8>, Strin
         out.text(cx + 4, cy + 4, &format!("{}: {label}", k + 1), scale);
     }
     out.to_png()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shot_ready;
+
+    #[test]
+    fn screenshots_wait_for_streamed_parts() {
+        // Parts still streaming in: held, until the cap.
+        assert!(!shot_ready(3, 0));
+        assert!(!shot_ready(1, 719));
+        assert!(shot_ready(1, 720));
+        // Everything in: at once.
+        assert!(shot_ready(0, 0));
+    }
 }
