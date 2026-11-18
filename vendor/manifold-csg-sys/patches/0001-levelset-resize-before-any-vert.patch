@@ -1,0 +1,27 @@
+--- a/src/sdf.cpp
++++ b/src/sdf.cpp
+@@ -565,12 +565,19 @@
+         MakeEmpty(Error::Cancelled);
+         return;
+       }
+-      const vec3 lastVert = vertPos[index[0] - 1];
+-      const uint64_t lastIndex =
+-          EncodeIndex(ivec4(ivec3((lastVert - origin) / spacing), 1), gridPow);
+-      const double ratio = static_cast<double>(maxIndex) / lastIndex;
++      // The table can fill before any vert has moved (index[0] == 0, e.g.
++      // flat faces on a fine grid): vertPos[index[0] - 1] would then read
++      // before the buffer. Fall back to doubling when there is no last vert
++      // or its index gives no usable ratio.
++      double ratio = 0;
++      if (index[0] > 0) {
++        const vec3 lastVert = vertPos[index[0] - 1];
++        const uint64_t lastIndex = EncodeIndex(
++            ivec4(ivec3((lastVert - origin) / spacing), 1), gridPow);
++        if (lastIndex > 0) ratio = static_cast<double>(maxIndex) / lastIndex;
++      }
+ 
+-      if (ratio > 1000)  // do not trust the ratio if it is too large
++      if (!(ratio > 1) || ratio > 1000)  // do not trust the ratio
+         tableSize *= 2;
+       else
+         tableSize *= ratio;

@@ -84,8 +84,25 @@ pub fn lints(model: &Model) -> Vec<String> {
                 .any(|n| n == s || p.name.starts_with(&format!("{n}_")))
         })
         .collect();
+    // `lint_flush: 0` (model param or style number) opts out of near-flush
+    // findings: mechanical models (a rifle, an engine) are full of parts a
+    // millimetre apart on purpose.
+    let flush_off = model
+        .params
+        .get("lint_flush")
+        .copied()
+        .or_else(|| model.style.numbers.get("lint_flush").copied())
+        .is_some_and(|v| v == 0.0);
     if pair_vis.len() >= 2 && pair_vis.len() <= PAIR_LIMIT {
-        out.extend(capped(near_flush(model, &pair_vis), "near-flush faces"));
+        if !flush_off {
+            let mut flush = capped(near_flush(model, &pair_vis), "near-flush faces");
+            if flush.len() > CAP
+                && let Some(last) = flush.last_mut()
+            {
+                last.push_str(" (set param lint_flush: 0 to silence these on a mechanical model)");
+            }
+            out.extend(flush);
+        }
         out.extend(capped(near_sizes(&pair_vis), "near-equal sizes"));
     }
     out.extend(near_symmetry(model, &pair_vis));

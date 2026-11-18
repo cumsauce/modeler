@@ -1214,7 +1214,8 @@ Style::default()
     /// summary (parts added/changed/removed + warnings; summary: "full" for
     /// everything). Use describe_op(kind) for an example payload. A big
     /// generated batch can come from `ops_file` (a JSON array of items in a
-    /// file inside the project), applied before the inline `ops`: the file
+    /// file inside the project, or an absolute path when the call has no
+    /// project), applied before the inline `ops`: the file
     /// is the base and inline items are tweaks that win over it.
     #[tool]
     async fn apply_ops(
