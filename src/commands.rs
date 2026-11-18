@@ -177,6 +177,11 @@ pub struct VerifySpec {
     /// Pairs `[a, b]`: `a` rests on (or is attached to) `b`.
     #[serde(default)]
     pub rests: Option<Vec<[String; 2]>>,
+    /// Pairs `[a, b]` (`*` globs): every visible part matching `a` touches
+    /// or shares volume with a part matching `b`, on any side (no gravity:
+    /// a canvas hung below its arm, a wheel's spokes). Unlike `rests`.
+    #[serde(default)]
+    pub attached: Option<Vec<[String; 2]>>,
     /// No part passes through another: `true`, or `{allow: [[a, b]], max}`.
     /// Fails any pair where more than `max` (default 0.2) of the smaller
     /// part's volume is inside the other, unless `allow` lists the pair
@@ -245,18 +250,46 @@ pub enum GroundedSpec {
 }
 
 /// `collisions: true` or `{allow, max}`.
-#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum CollisionSpec {
     On(bool),
     With {
-        /// `[a, b]` pairs (`*` globs, either order), or `{"pair": [a, b],
-        /// "depth": 0.003, "max": 0.5}` to allow only shallow overlaps.
-        #[serde(default)]
+        /// `[a, b]` pairs (`*` globs, either order), `[a, b, depth]` (allowed
+        /// while at most `depth` m deep), or `{"pair": [a, b], "depth": 0.003,
+        /// "max": 0.5}` to allow only shallow overlaps.
         allow: Vec<crate::contact::AllowRule>,
-        #[serde(default)]
         max: Option<f64>,
     },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollisionWith {
+    #[serde(default)]
+    allow: Vec<crate::contact::AllowRule>,
+    #[serde(default)]
+    max: Option<f64>,
+}
+
+impl<'de> serde::Deserialize<'de> for CollisionSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        const SHAPES: &str = "collisions: use `true`, or `{allow: [[a, b] | [a, b, depth] | {pair: [a, b], depth?, max?}], max?}`";
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Bool(b) => Ok(CollisionSpec::On(b)),
+            serde_json::Value::Object(_) => {
+                let w: CollisionWith = serde_json::from_value(v)
+                    .map_err(|e| D::Error::custom(format!("{SHAPES} ({e})")))?;
+                Ok(CollisionSpec::With {
+                    allow: w.allow,
+                    max: w.max,
+                })
+            }
+            _ => Err(D::Error::custom(SHAPES)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -469,7 +502,11 @@ impl Default for Session {
 /// overlaps between moved and unmoved parts.
 fn move_report(before: &[Arc<Part>], after: &[Arc<Part>], patterns: &[String]) -> String {
     use crate::contact::{Body, contact};
-    let moved = |p: &Part| patterns.iter().any(|q| crate::name_matches(q, &p.name));
+    let moved = |p: &Part| {
+        patterns
+            .iter()
+            .any(|q| crate::move_pattern_hits(q, &p.name, p.visible))
+    };
     let live = |ps: &[Arc<Part>]| -> Vec<Arc<Part>> {
         ps.iter()
             .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
@@ -2090,6 +2127,54 @@ impl Session {
         }
     }
 
+    /// A call's `doc` argument when the document may have been closed:
+    /// opens it again without changing which document is active (so
+    /// other clients and the human's view are untouched). A parked
+    /// autosave of that name is restored; else a catalog prefab of that
+    /// name in the call's project is opened. Returns a note when it did
+    /// either, `Ok(None)` when `doc` was already open, and the
+    /// `require_open` error (plus a close-name hint) when the name is
+    /// unknown everywhere.
+    pub fn open_for_doc(&mut self, doc: &str) -> Result<Option<String>, String> {
+        let Err(err) = self.require_open(doc) else {
+            return Ok(None);
+        };
+        let prev = self.model.name.clone();
+        if let Ok(i) = self.parked_index(doc) {
+            let m = self.parked.remove(i);
+            self.others.push(m);
+            self.save_parked();
+            self.mark_autosave(true, true, false);
+            return Ok(Some(format!(
+                "note: restored the parked autosave of `{doc}` (it was not open)"
+            )));
+        }
+        if crate::catalog::load_prefab_file(doc).is_ok() {
+            self.scene("open", Some(doc)).map_err(|e| e.to_string())?;
+            if self.model.name != prev {
+                let _ = self.scene("switch", Some(&prev));
+            }
+            return Ok(Some(format!(
+                "note: opened `{doc}` from the catalog (it was closed)"
+            )));
+        }
+        let want = crate::catalog::sanitize(doc);
+        let close: Vec<String> = self
+            .doc_names()
+            .into_iter()
+            .chain(self.parked.iter().map(|m| m.name.clone()))
+            .filter(|n| {
+                let n = crate::catalog::sanitize(n);
+                n != want && (n.contains(&want) || want.contains(&n))
+            })
+            .collect();
+        Err(if close.is_empty() {
+            err
+        } else {
+            format!("{err}; did you mean {}?", close.join(", "))
+        })
+    }
+
     /// The other open document (same project) whose name saves to the
     /// same catalog entry as `name`, if any.
     pub fn name_holder(&self, name: &str) -> Option<String> {
@@ -3062,7 +3147,10 @@ impl Session {
             parts_now
                 .iter()
                 .filter(|p| {
-                    !p.verts.is_empty() && pats.iter().any(|q| crate::name_matches(q, &p.name))
+                    !p.verts.is_empty()
+                        && pats
+                            .iter()
+                            .any(|q| crate::move_pattern_hits(q, &p.name, p.visible))
                 })
                 .fold(None, |acc: Option<(Vec3, Vec3)>, p| {
                     let (lo, hi) = p.bounds();
@@ -3074,10 +3162,32 @@ impl Session {
         };
         let count = parts_now
             .iter()
-            .filter(|p| patterns.iter().any(|q| crate::name_matches(q, &p.name)))
+            .filter(|p| {
+                patterns
+                    .iter()
+                    .any(|q| crate::move_pattern_hits(q, &p.name, p.visible))
+            })
             .count();
         let Some((lo, hi)) = box_of(patterns) else {
-            return Err(format!("{verb}: no part matches {patterns:?}").into());
+            return Err(format!("{verb}: no visible part matches {patterns:?}").into());
+        };
+        // Hidden parts a glob skipped (exact names and a bare `*` still take them).
+        let skipped: Vec<String> = patterns
+            .iter()
+            .filter(|q| q.contains('*'))
+            .filter_map(|q| {
+                let n = parts_now
+                    .iter()
+                    .filter(|p| !p.visible && crate::name_matches(q, &p.name))
+                    .filter(|p| !crate::move_pattern_hits(q, &p.name, false))
+                    .count();
+                (n > 0).then(|| format!("skipped {n} hidden parts matching {q}"))
+            })
+            .collect();
+        let skipped = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("\n  note: {}", skipped.join("; "))
         };
         let pivot = match pivot {
             Some(PivotSpec::Point(p)) => p,
@@ -3130,7 +3240,7 @@ impl Session {
             },
             &label,
         )?;
-        let report = move_report(&parts_now, &self.model.parts, patterns);
+        let report = move_report(&parts_now, &self.model.parts, patterns) + &skipped;
         Ok(match on {
             Some(on) => format!(
                 "place `{name}`: {count} part(s) {} `{on}` (re-issue name `{name}` to adjust){report}",
@@ -3236,18 +3346,25 @@ impl Session {
     /// Runs the checks in `spec` (all of validate + rebuild when `spec` is
     /// empty). Returns (all passed, one line per check).
     pub fn verify(&self, spec: &VerifySpec) -> (bool, String) {
+        let (checks, report) = self.verify_run(spec);
+        (checks.iter().all(|c| c.1), report)
+    }
+
+    /// The checks and their PASS/FAIL report from one run (callers that
+    /// need both must not run the checks twice: collisions on hundreds of
+    /// parts take seconds).
+    pub fn verify_run(&self, spec: &VerifySpec) -> (Vec<(String, bool, String)>, String) {
         if let Some(inner) = &spec.expect {
-            return self.verify(inner);
+            return self.verify_run(inner);
         }
         let checks = self.verify_checks(spec);
-        let ok = checks.iter().all(|c| c.1);
         let lines: Vec<String> = checks
             .iter()
             .map(|(name, pass, detail)| {
                 format!("{} {name}: {detail}", if *pass { "PASS" } else { "FAIL" })
             })
             .collect();
-        (ok, lines.join("\n"))
+        (checks, lines.join("\n"))
     }
 
     /// The checks behind [`Self::verify`] as (name, passed, detail).
@@ -3281,6 +3398,7 @@ impl Session {
             && spec.stable.is_none()
             && spec.supported.is_none()
             && spec.rests.is_none()
+            && spec.attached.is_none()
             && spec.collisions.is_none()
             && spec.self_intersections.is_none()
             && spec.thickness.is_none()
@@ -3477,7 +3595,7 @@ impl Session {
                             format!("`{n}` touches nothing")
                         } else {
                             format!(
-                                "`{n}` only touches {} at/above its centre of mass",
+                                "`{n}` is held by nothing grounded (touches {}, only at/above its centre of mass or on parts that are themselves unsupported)",
                                 t.join(", ")
                             )
                         }
@@ -3517,6 +3635,12 @@ impl Session {
                     crate::contact::rests_on(&self.model, a, b),
                 );
             }
+        }
+        for [a, b] in spec.attached.iter().flatten() {
+            record(
+                &format!("attached {a} to {b}"),
+                crate::contact::attached_matching(&self.model, a, b),
+            );
         }
         if let Some(w) = &spec.walkable {
             let routes = w.routes();
@@ -4066,6 +4190,11 @@ impl Session {
             .part_mut(part)
             .ok_or_else(|| ModelerError::NoPart(part.to_string()))?;
         crate::uv::project(p, projection).map_err(|e| e.to_string())?;
+        if self.derived_by_ops(part) {
+            self.model
+                .uv_projections
+                .insert(part.to_string(), projection.to_string());
+        }
         self.model.mark_baked();
         self.commit(&format!("uvs on `{part}`"));
         Ok(format!("uvs on `{part}` set to {projection}"))
@@ -6700,6 +6829,47 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_card_material_keeps_label_uvs() {
+        let mut s = Session::default();
+        let mat = |c: &str| {
+            vec![
+                serde_json::json!({"type": "rect", "name": "r", "center": [0.5, 0.5], "size": [0.4, 0.4]}),
+                serde_json::json!({"type": "output", "name": "out", "base_color": c}),
+            ]
+        };
+        s.materials
+            .ops(
+                "sign",
+                mat("#ff0000"),
+                None,
+                Some("card".into()),
+                Some(1.0),
+                Some(16),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        run(
+            &mut s,
+            serde_json::json!([
+                {"type": "primitive", "name": "plate", "kind": "box", "size": [1.0, 0.5, 0.05], "translation": [0, 0.5, 0]},
+                {"type": "material", "name": "plate", "pbr": "sign"},
+                {"type": "uvs", "part": "plate", "projection": "label"}
+            ]),
+        );
+        let uvs = |s: &Session| {
+            s.model
+                .part("plate")
+                .map(|p| (p.verts.clone(), p.uvs.clone()))
+        };
+        let before = uvs(&s);
+        s.materials
+            .ops("sign", mat("#0000ff"), None, None, None, Some(16), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.refresh_pbr_users("sign"), Ok(1));
+        assert_eq!(before, uvs(&s));
+    }
+
+    #[test]
     fn a_failed_coverage_says_where_the_values_sit() {
         let mut s = Session::default();
         let ops = vec![
@@ -7224,6 +7394,54 @@ mod tests {
             "{}",
             checks[0].2
         );
+    }
+
+    #[test]
+    fn collisions_allow_accepts_triples_and_explains_bad_shapes() {
+        let spec: CollisionSpec =
+            serde_json::from_value(serde_json::json!({"allow": [["a", "b", 0.01], ["c", "d"]]}))
+                .unwrap_or_else(|e| panic!("{e}"));
+        let CollisionSpec::With { allow, .. } = spec else {
+            panic!("expected With");
+        };
+        assert_eq!(allow.len(), 2);
+        assert!(allow[0].describe().contains("depth <= 0.01"));
+        let e = serde_json::from_value::<CollisionSpec>(serde_json::json!({"allow": [["a"]]}))
+            .map(|_| ())
+            .expect_err("bad shape");
+        assert!(e.to_string().contains("[a, b, depth]"), "{e}");
+        let e = serde_json::from_value::<CollisionSpec>(serde_json::json!("yes"))
+            .map(|_| ())
+            .expect_err("bad shape");
+        assert!(e.to_string().contains("`true`"), "{e}");
+    }
+
+    #[test]
+    fn move_globs_skip_hidden_parts_but_exact_and_bare_star_keep_them() {
+        let (mut s, _) = batch(serde_json::json!([
+            {"type": "primitive", "name": "petal_raw", "kind": "box", "size": [0.1, 0.1, 0.1], "translation": [0, 0.05, 0]},
+            {"type": "transform", "name": "petal", "input": "petal_raw", "translation": [0, 0.05, 0.2]},
+            {"type": "hide_part", "part": "petal_raw"}
+        ]));
+        let t = s
+            .apply_values_as(
+                None,
+                vec![serde_json::json!({"type": "move", "name": "up", "parts": ["petal*"], "translation": [0, 1, 0]})],
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.contains("skipped 1 hidden parts matching petal*"), "{t}");
+        let y = |s: &Session, n: &str| s.model.part(n).map(|p| p.translation[1]);
+        assert_eq!(y(&s, "petal"), Some(1.05));
+        assert_eq!(y(&s, "petal_raw"), Some(0.05));
+        // `*` alone still carries hidden parts.
+        s.apply_values_as(
+            None,
+            vec![serde_json::json!({"type": "move", "name": "up", "parts": ["*"], "translation": [0, 1, 0]})],
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(y(&s, "petal_raw"), Some(1.05));
     }
 
     #[test]

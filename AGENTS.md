@@ -23,7 +23,13 @@ change.
 **One server, one window for every session.** The MCP config runs
 `python3 mcp_driver.py --proxy`, not the binary: each Claude session gets a
 thin stdio proxy, and all proxies share one daemon (started windowed on
-first use, detached, so it outlives the sessions). The `mcp__modeler__*`
+first use, detached, so it outlives the sessions). The proxy runs every
+request on its own daemon connection, so concurrent calls from subagents of
+one session never queue behind a slow one, and while a `tools/call` that
+carried `_meta.progressToken` runs it sends `notifications/progress` every
+5 s (`MODELER_PROGRESS_EVERY`), which resets the client's tool timeout. A
+client-side timeout does not mean the call failed: the server keeps working,
+so check `history` / `scene_summary` before retrying an `apply_ops`. The `mcp__modeler__*`
 tools and the driver below therefore talk to the same server and the same
 preview window. Each session is its own client (per-client active
 documents, authorship, undo guards). Closing the window ends the server;
@@ -38,7 +44,7 @@ switches the catalog, exports and prefab lookups to it for that call
 server's own home library). Documents remember their project
 (`Model.project`, autosave only), a document of the same name from another
 project is refused rather than taken over, and `new_model` starts a
-document beside any non-empty one instead of replacing it. **Subagents of one Claude session share one proxy, so one client id and one active document: pass `doc` (an open document's name) on every tool that reads or changes a document (`apply_ops`, `verify`, `inspect`, `agent_views`, `scene_summary`, `ops`, `op_get`, `probe_ray`, `screenshot`, `set_camera`, `style`, `material_ops`, the annotation tools, `history`, `undo`, `redo`, `jump`, `diff`, `cherry_pick`, `history_prune`, `set_model_name`, `save_prefab`, `export_model`); the call errors if it isn't open.** `save_prefab` also refuses (unless `force`) a name another open document holds. **`new_model` never displaces work**: unless the current document is empty (no ops, no parts) it stays open and the new one starts beside it, so `doc` reaches either; only an empty document is replaced, and a name that is already open is refused (switch to it or pass `doc`).
+document beside any non-empty one instead of replacing it. **Subagents of one Claude session share one proxy, so one client id and one active document: pass `doc` (an open document's name) on every tool that reads or changes a document (`apply_ops`, `verify`, `inspect`, `agent_views`, `scene_summary`, `ops`, `op_get`, `probe_ray`, `screenshot`, `set_camera`, `style`, `material_ops`, the annotation tools, `history`, `undo`, `redo`, `jump`, `diff`, `cherry_pick`, `history_prune`, `set_model_name`, `save_prefab`, `export_model`); the call errors if no document of that name exists.** A `doc` naming a document that was idle-closed, parked after a restart, or is a catalog prefab in the call's project is opened again automatically (the result starts with a `note: opened ... from the catalog` line); that never changes another client's active document or the human's view. An unknown name errors, with a did-you-mean hint. `save_prefab` also refuses (unless `force`) a name another open document holds. **`new_model` never displaces work**: unless the current document is empty (no ops, no parts) it stays open and the new one starts beside it, so `doc` reaches either; only an empty document is replaced, and a name that is already open is refused (switch to it or pass `doc`).
 
 **Shared daemon or one per agent.** Share the one daemon (the default)
 when the human should watch every agent in one window and agents may
@@ -128,7 +134,9 @@ Three layers, read top to bottom:
      the server's working directory with a `.modeler/` folder or a
      `Cargo.toml` beside an `assets/` folder. Relative `export_model` paths
      land in `<project>/assets/` (`"models/crate.glb"` ->
-     `assets/models/crate.glb`). `.modeler/.gitignore` is written once to
+     `assets/models/crate.glb`; a leading `assets/` is not doubled). Outside a
+     project a relative path lands in the shared library's `exports/`
+     folder, never the daemon's cwd; the result prints the absolute path. `.modeler/.gitignore` is written once to
      keep the per-machine autosaves (`session.json`, `open_docs.json`) and the
      prefabs' undo histories (`*.history.json` sidecars) out
      of git. `catalog_list`'s first line says which library is in use.
@@ -274,6 +282,11 @@ surfaces, not hundreds of scattered copies.
   "desk_top", "at": [-0.4, 0.1]}` slides the mug's footprint centre to
   x -0.4, z 0.1, then moves it vertically until its underside rests on the
   desk's top surface (sloped and uneven tops work; `gap` leaves clearance).
+  In `move` and `place`, a `parts` glob (any pattern with `*` other than a
+  bare `*`) matches visible parts only, so `"petal*"` never grabs hidden
+  `_raw` intermediates (the result notes how many it skipped); exact names
+  still match hidden parts, and `["*"]` carries everything, hidden cutters
+  included.
   It is a named, post-graph move like `move`, so it re-runs on every change:
   lower the desk with a param and the mug follows. `toward` sets the travel
   direction: `down` (default), `up` (under a shelf), or `back` / `front` /
@@ -331,7 +344,10 @@ surfaces, not hundreds of scattered copies.
 - **Profiles** (extrude/revolve/sweep/loft): ring entries are points or arcs,
   `{"arc": {"center": [a, b], "radius": r, "from": deg, "to": deg}}`
   (counter-clockwise from +a; 0 -> 360 is a full circle), so curves need no
-  hand-made point lists. `round: r` fillets every profile corner.
+  hand-made point lists. `round: r` fillets every profile corner; on a full
+  360° revolve the fillet arcs at corners turning under 40° keep the
+  unrounded corner's soft shading (no flat bands), sharper corners stay
+  creased.
   **SVG profiles**: anywhere a profile goes (extrude, revolve, sweep, loft
   sections, silhouette side / top / front) give `{"svg": "<svg ...>" or
   "<path d=...>", "size"?: [w, h] | w, "height"?: m, "center"?: [a, b],
@@ -819,8 +835,9 @@ surfaces, not hundreds of scattered copies.
   part errors with the part's extent along the normal.
 - **`shell`** hollows a closed solid: every face moves in by exactly
   `thickness` (erosion by a ball, so convex corners stay sharp), and each
-  face named in `open` (top/bottom/left/right/front/back, world axes) is left
-  open. A cabinet carcass: `{"type": "shell", "name": "cab", "input":
+  face named in `open` (top/bottom/left/right/front/back, world axes; or
+  compass words north = back (-z), south = front (+z), east = right, west =
+  left) is left open. A cabinet carcass: `{"type": "shell", "name": "cab", "input":
   "cab_box", "thickness": 0.018, "open": ["front", "top"]}`; a planter or
   well: `open: "top"`; a ring or band: `open: ["top", "bottom"]`. Hide the
   input. Doors over an open front should overlap the side panels, or they
@@ -883,7 +900,9 @@ surfaces, not hundreds of scattered copies.
   no hidden faces, no coplanar overlaps at seams. `facing` on another kind is
   an error; not a boolean input (open).
 - **Params**: `params: {"tower_h": 2}` sets named numbers before the items
-  run; any value may be `"$tower_h"` or `"=$tower_h / 2 + 0.1"`. The model
+  run; any value may be `"$tower_h"` or `"=$tower_h / 2 + 0.1"`.
+  Expressions also take comparisons `< <= > >= == !=` (1 or 0), `&&`, `||`
+  and `!`; comparisons bind looser than `+ -`: `"=($n >= 2) * 3 - 1.5"`. The model
   remembers which ops read which params, so a later
   `apply_ops({"params": {"tower_h": 3}})` re-derives all of them in one
   history step.
@@ -958,13 +977,19 @@ name: the producer first, then in-place material/visibility/transform edits).
     (over 20% of the smaller part inside: "`bar` (through body)"), which
     usually means a collision is doing the holding; `grounded: "strict"`
     fails them.
-  - `supported`: nothing hangs. Each part is on the ground, shares volume
-    with another (a joint), or touches another BELOW its centre of mass.
-    Catches a part only wedged against something above it, which
-    `grounded` passes.
+  - `supported`: nothing hangs. Each part is on the ground or is held,
+    through a chain of shared volume (a joint) or contact BELOW its centre
+    of mass, by parts that are themselves supported: a pile that floats and
+    props itself up fails. Catches a part only wedged against something
+    above it, which `grounded` passes. The ground is y = 0; a model sunk up
+    to 1 cm below it (grazing stems) still stands on it.
   - `rests: [["mug", "desk_top"], ...]`: each `a` rests on (or is
     attached to) `b`; failures say whether they don't touch at all or only
     touch at/above `a`'s centre of mass.
+  - `attached: [["canvas_*", "arm_*"], ...]`: every part matching `a`
+    touches or shares volume with a part matching `b`, on any side, with no
+    gravity assumption (a canvas hung below a windmill arm, a wheel's
+    spokes); use it instead of `rests` when `a` isn't sitting on `b`.
   - `bounds: {min, max, tol}`: per-axis world bounds, `null` skips an axis
     ("sits on the ground" = `min [null, 0, null]`); failures name the part
     that sets the extreme.
@@ -1029,7 +1054,7 @@ name: the producer first, then in-place material/visibility/transform edits).
     inside]`. Intended embeds (a chimney through a roof, a seat post in its
     tube, a bulb in a shade) go in `allow`. Every overlap reports its
     **depth** (penetration along the axis it covers least of the smaller
-    part). An allow entry is `[a, b]` or `{"pair": [a, b], "depth": 0.003,
+    part). An allow entry is `[a, b]`, `[a, b, depth]` or `{"pair": [a, b], "depth": 0.003,
     "max": 0.5}`: excused only while no deeper than 3 mm / 50%. The PASS
     lists what each allow excused and its deepest pair, and an allow with a
     bare `*` side (`["bars_*", "*"]`) that hides an overlap over `max` gets a
@@ -1197,9 +1222,16 @@ batches, bytes):
   shares the `StandardMaterial` handle and can batch.
 - `cull_contacts` (on): drops triangles whose samples, nudged outward, land
   inside another visible solid (bottoms on the deck, insets in frames).
-- `visible_from: [{min, max}]` (opt-in): keeps only triangles a ray can see
-  from some point in those camera boxes (`view_samples`, default 256), e.g.
-  an interior drops its hull's outer skin. Blended parts don't block.
+- `visible_from: [{min, max}]` (opt-in): drops every triangle of a closed
+  solid or one-sided sheet that faces away from all of those camera boxes
+  (an exact plane test, no sampling), e.g. an interior drops its walls'
+  outer faces. Thin visible parts are kept, open single-layer meshes (leaf
+  cards) are never touched, and copies that cull identically still
+  instance. `visible_from_rays: true` also drops triangles no ray reaches
+  from `view_samples` (default 256) points in the boxes (blended parts
+  don't block); it can cull thin visible surfaces and breaks instancing for
+  the parts it changes. The report gives the culled count in `.gltf`,
+  `.glb` and `.bsn` exports.
 - `instance` (on): translated copies share one mesh with their own node.
 - `merge: "by_material"` (opt-in): one mesh per material; `merge_keep:
   ["door*"]` keeps parts the game needs by name.
@@ -1602,8 +1634,8 @@ lists the open documents (click to switch).
 Saved documents nobody has touched for 20 minutes are **closed
 automatically** (`IDLE_CLOSE`): only when unchanged since they were saved or
 opened from the catalog (restored ones are compared with their file), so no
-work is lost; opening one again loads it from the catalog. Unsaved
-documents stay open.
+work is lost; opening one again loads it from the catalog (a tool call
+whose `doc` names it does so automatically). Unsaved documents stay open.
 
 **Annotations:** `add_annotation(part, text, face?, vertex?, position?, material?, node?)`; `add_annotation(resolve: id, text: "what you did")` resolves a comment you dealt with (`reopen: true` opens it again): the reply shows under it in the window, its pin greys out, and it moves under "Resolved". `scene_summary` lists the open ones in full; resolve them rather than deleting them
 (omit the optionals to consume a spot the human clicked; `material` + optional `node`
@@ -1829,6 +1861,17 @@ work, and every material has its own history tree.
   for dirt in crevices), from a voxelized copy of the part and the visible
   parts near it (a wing darkens the flank under it); without a mesh (tile domain, the
   preview sphere) they read neutral.
+- **Forgiving node inputs**: `output` takes `metalness` for `metallic`;
+  `noise` takes `noise` for `mode` (and `kind: "ridged"` is read as the
+  fractal mode; `kind` is value or gradient); `remap` takes `from: [lo,
+  hi]` / `to: [lo, hi]` or `in_min` / `in_max` / `out_min` / `out_max` (a
+  bare number for from / to is an error); `circle` takes `center` and
+  `radius` (an `arc: {center, radius}` is accepted); `color` takes `color`
+  for `value`; `mask` takes `input` for `sdf`; `dir_blur` has no
+  `iterations` (use `length`). A node missing a required field gets its
+  example payload in the error. Card and decal space is **y-down** (v 0 =
+  top) while the `text` node draws upright: an up-pointing `polygon` arrow
+  has its tip at the smallest y.
 - **`output`** names the channels: base_color, roughness, metallic,
   height (meters; the normal is derived from it, times normal_strength,
   unless `normal` is given), ao, emissive, opacity. Missing channels use
@@ -1931,7 +1974,10 @@ work, and every material has its own history tree.
 - **Edits to op-derived parts are graph ops**: hide/show, rename, in-place
   material and in-place absolute transform on a part an op produces are
   recorded as ops, so they survive re-derivation. On baked parts (from
-  `tri_mesh`) they edit the part directly; `uvs` is always baked.
+  `tri_mesh`) they edit the part directly. A `uvs` projection on an
+  op-derived part is remembered (`Model.uv_projections`) and re-applied after
+  every re-derivation (material edits, later batches), so label plates stay
+  upright.
 - **Op-driven snapshots store no parts**; undo/redo/jump re-derive via the
   eval cache. Snapshots are history-less (the live tree is the single source
   of truth).
@@ -2042,7 +2088,9 @@ Esc deselects, C toggles comments, G All documents.
   decimated copies run on the `AsyncComputeTaskPool`; `try_bundle` answers
   from `PbrCache` / `Streams` and queues what is missing, `poll_streams`
   lands finished jobs. Until a changed part is ready the window keeps its
-  old entity (or shows the mesh in its flat colour while the bake runs).
+  old entity (or shows the mesh in its flat colour while the bake runs; a
+  part whose procedural bake is pending or failed draws matte, not as a
+  white mirror, and bake errors go to `daemon.log`).
   Parts over 50k triangles get two `simplify` LODs (1/4 from 6 part radii,
   1/16 from 20) as `PartLod` children swapped by `VisibilityRange` (window
   only: an agent shot drops the ranges and hides the copies for its frame).
@@ -2126,6 +2174,9 @@ domain, tile and params).
   Calls without `_meta` (a plain MCP client, the human's window) behave as
   before. Separate servers sharing one catalog are guarded by the session
   lock (autosave) and `save_prefab`'s changed-file check.
+- `apply_ops` `expect` and the `verify` tool run the checks once
+  (`Session::verify_run` returns checks plus report); never call
+  `verify_checks` and `verify` back to back.
 - **Slow calls run off the app thread** (`server/tools.rs`), so the window
   keeps drawing. `apply_ops` takes a `Session::snapshot` (the open
   documents without history, parts shared, plus the working materials) in

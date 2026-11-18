@@ -437,7 +437,9 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
         let t = Vec3::from(translation.unwrap_or([0.0; 3]));
         let p = Vec3::from(*pivot);
         for (name, part) in named.iter_mut() {
-            let hit = parts.iter().any(|pat| crate::name_matches(pat, name));
+            let hit = parts
+                .iter()
+                .any(|pat| crate::move_pattern_hits(pat, name, part.visible));
             if !hit {
                 continue;
             }
@@ -606,11 +608,15 @@ fn place_on(
             Some([p[u], p[w]])
         }
     };
-    let hit = |n: &str| n != on && patterns.iter().any(|p| crate::name_matches(p, n));
+    let hit = |n: &str, vis: bool| {
+        n != on && patterns.iter().any(|p| crate::move_pattern_hits(p, n, vis))
+    };
     let Some(support) = named.iter().find(|(n, _)| n == on).map(|(_, p)| p.clone()) else {
         return Err(format!("place `{move_name}`: no part `{on}` to place on").into());
     };
-    let moving: Vec<usize> = (0..named.len()).filter(|&i| hit(&named[i].0)).collect();
+    let moving: Vec<usize> = (0..named.len())
+        .filter(|&i| hit(&named[i].0, named[i].1.visible))
+        .collect();
     if moving.is_empty() {
         return Err(format!("place `{move_name}`: no part matches {patterns:?}").into());
     }

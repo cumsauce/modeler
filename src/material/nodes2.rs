@@ -682,6 +682,9 @@ impl Eval for Islands {
 pub struct DirBlur {
     pub input: In,
     pub length: f32,
+    /// Not a field: only here to say "use length".
+    #[serde(default)]
+    pub iterations: Option<f32>,
     #[serde(default)]
     pub angle: Option<f32>,
     #[serde(default)]
@@ -692,6 +695,11 @@ pub struct DirBlur {
 
 impl Eval for DirBlur {
     fn eval(&self, cx: &Cx) -> Result<Outs, String> {
+        if self.iterations.is_some() {
+            return Err(
+                "iterations: not a dir_blur field; use length (meters) for a longer smear".into(),
+            );
+        }
         let a = cx.input(&self.input)?;
         let flow = match &self.flow {
             Some(f) => Some(cx.input(f)?),

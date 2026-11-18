@@ -1053,15 +1053,23 @@ pub(crate) fn flat_material(
     cache: &mut PbrCache,
 ) -> Handle<StandardMaterial> {
     let [r, g, b, a] = part.material.base_color;
-    let fkey = [r, g, b, a, part.material.roughness, part.material.metalness].map(f32::to_bits);
+    // A part wearing a procedural material has its factors set to 1 (they
+    // multiply the bake); stand-in for a pending or failed bake, they would
+    // read as a white mirror (metalness 1), so draw it matte instead.
+    let (rough, metal) = if part.material.pbr.is_some() {
+        (0.8, 0.0)
+    } else {
+        (part.material.roughness, part.material.metalness)
+    };
+    let fkey = [r, g, b, a, rough, metal].map(f32::to_bits);
     cache
         .flat
         .entry(fkey)
         .or_insert_with(|| {
             materials.add(StandardMaterial {
                 base_color: Color::srgba(r, g, b, a),
-                perceptual_roughness: part.material.roughness,
-                metallic: part.material.metalness,
+                perceptual_roughness: rough,
+                metallic: metal,
                 // A colour with alpha (glass, holograms) blends; Bevy
                 // renders blended materials forward, over the deferred
                 // opaque pass.
@@ -1127,6 +1135,15 @@ pub(crate) fn part_bundle(
 
 /// Per-vertex tangents (xyz + handedness in w) accumulated from each
 /// triangle's uv gradient, then orthogonalized against the normal.
+///
+/// Convention (checked against Bevy 0.20 and `modeler::gltf::tangents`, which
+/// the material bake encodes normal maps against): uvs are glTF's, v = 0 at
+/// the image top, and Bevy neither flips v nor sets `flip_normal_map_y`. Its
+/// shader builds the bitangent as `w * cross(N, T)` and maps the green
+/// channel (image up = -v) onto it, so that bitangent must point along
+/// `-dP/dv`: `w = -1` when `cross(N, T) . (-dP/dv) < 0`. (Bevy's own
+/// mikktspace path gets there by negating mikktspace's w, which is defined
+/// against `+dP/dv`.) `bit` below is `dP/dv`, hence the negation.
 fn fast_tangents(part: &Part) -> Vec<[f32; 4]> {
     let n = part.verts.len();
     let mut tan = vec![Vec3::ZERO; n];
@@ -1164,7 +1181,7 @@ fn fast_tangents(part: &Part) -> Vec<[f32; 4]> {
         .map(|i| {
             let nrm = Vec3::from_array(part.normals[i]);
             let t = (tan[i] - nrm * nrm.dot(tan[i])).normalize_or(nrm.any_orthonormal_vector());
-            let w = if nrm.cross(t).dot(bit[i]) < 0.0 {
+            let w = if nrm.cross(t).dot(-bit[i]) < 0.0 {
                 -1.0
             } else {
                 1.0
@@ -1595,5 +1612,38 @@ pub(crate) fn adapt_reflections(
                 .entity(cam)
                 .remove::<bevy::pbr::ScreenSpaceReflections>();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window must decode normal maps with the handedness the bake
+    /// (`modeler::gltf::tangents`) encoded them with.
+    #[test]
+    fn preview_tangents_match_the_bake_on_a_uv_sphere() {
+        let mut part =
+            modeler::primitives::primitive(modeler::PrimitiveKind::Sphere, [0.5, 0.0, 0.0], "s")
+                .unwrap_or_else(|e| panic!("{e}"));
+        modeler::uv::project(&mut part, "spherical").unwrap_or_else(|e| panic!("{e}"));
+        let fast = fast_tangents(&part);
+        let bake = modeler::gltf::tangents(&part);
+        let (mut compared, mut agree) = (0, 0);
+        for (i, (f, b)) in fast.iter().zip(&bake).enumerate() {
+            if part.normals[i][1].abs() > 0.95 {
+                continue; // poles: no uv gradient
+            }
+            let d = Vec3::new(f[0], f[1], f[2]).dot(Vec3::new(b[0], b[1], b[2]));
+            if d < 0.999 {
+                continue; // degenerate uv gradient (seam): fallbacks differ
+            }
+            compared += 1;
+            if f[3] == b[3] {
+                agree += 1;
+            }
+        }
+        assert!(compared > 100, "{compared}");
+        assert_eq!(agree, compared, "handedness differs from the bake");
     }
 }

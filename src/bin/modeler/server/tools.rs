@@ -1355,14 +1355,13 @@ Style::default()
         // first).
         let checked = self
             .detached_json(move |s| {
-                let checks = s.verify_checks(&spec);
+                let (checks, report) = s.verify_run(&spec);
                 let ok = checks.iter().all(|c| c.1);
                 let json = serde_json::json!({
                     "ok": ok,
                     "checks": Session::checks_json(&checks),
                     "summary": summary,
                 });
-                let (_, report) = s.verify(&spec);
                 if ok {
                     Ok((format!("{text}\nexpect: all passed\n{report}"), Some(json)))
                 } else {
@@ -1390,10 +1389,9 @@ Style::default()
     ) -> Result<CallToolResult, ErrorData> {
         // Read-only: on a snapshot, off the app thread.
         self.run_detached_json(move |s| {
-            let checks = s.verify_checks(&spec);
+            let (checks, report) = s.verify_run(&spec);
             let ok = checks.iter().all(|c| c.1);
             let json = serde_json::json!({"ok": ok, "checks": Session::checks_json(&checks)});
-            let (_, report) = s.verify(&spec);
             if ok {
                 Ok((report, Some(json)))
             } else {
@@ -2143,26 +2141,40 @@ impl rmcp::ServerHandler for Tools {
             })
             .flatten()
             .filter(|d| d != "model" && d != "material" && !d.starts_with("material:"));
+        let project =
+            meta("modeler/project").map(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
+        let mut doc_note = None;
         if let Some(d) = &arg_doc {
             let (want, (tx, rx)) = (d.clone(), oneshot::channel());
             let untagged = client.is_none();
+            let proj = project.clone();
             let cmd = Cmd::Exec(Box::new(move |s: &mut Session| {
-                let r = if let Err(e) = s.require_open(&want) {
-                    Err(e)
-                } else if untagged && s.model.name != want {
-                    s.scene("switch", Some(&want))
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                } else {
-                    Ok(())
+                // Catalog / parked lookups need the call's project.
+                if proj.is_some() {
+                    modeler::catalog::set_call_project(proj);
+                }
+                let r = match s.open_for_doc(&want) {
+                    Err(e) => Err(e),
+                    Ok(note) => {
+                        if untagged && s.model.name != want {
+                            s.scene("switch", Some(&want))
+                                .map(|_| note)
+                                .map_err(|e| e.to_string())
+                        } else {
+                            Ok(note)
+                        }
+                    }
                 };
                 let _ = tx.send(r);
                 Ok(String::new())
             }));
             let checked = match self.tx.send(cmd).await {
-                Ok(()) => rx.await.unwrap_or(Ok(())),
-                Err(_) => Ok(()),
+                Ok(()) => rx.await.unwrap_or(Ok(None)),
+                Err(_) => Ok(None),
             };
+            if let Ok(n) = &checked {
+                doc_note = n.clone();
+            }
             if let Err(e) = checked {
                 log_call_full(&name, false, started.elapsed().as_millis(), &args, &e);
                 return Ok(rmcp::model::CallToolResult::error(vec![
@@ -2173,8 +2185,6 @@ impl rmcp::ServerHandler for Tools {
         }
         // The caller's game project ("" = the shared library): one server
         // serves every project, switching per call.
-        let project =
-            meta("modeler/project").map(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
         // Bookkeeping is queued, not awaited one by one: the app loop drains
         // the whole queue in one frame, so begin_call, the tool's own work
         // and end_call run together (each await used to cost a frame).
@@ -2231,6 +2241,10 @@ impl rmcp::ServerHandler for Tools {
         };
         // The agent note goes in after the error is read: logged first, it
         // became the failure's "cause" and hid the real error.
+        let note = match (doc_note, note) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
         if let (Some(note), Ok(r)) = (note, result.as_mut()) {
             r.content.insert(0, rmcp::model::Content::text(note));
         }
@@ -2252,7 +2266,8 @@ impl rmcp::ServerHandler for Tools {
 - Every model gets materials. Shape first, materials after: build and check the geometry, then make the materials (material_ops) and give each visible part a material item in a later apply_ops, preferably a procedural pbr one ({\"type\": \"material\", \"name\": part, \"pbr\": name}; the material must exist when the item is applied); a part with only a flat colour is a warning until it gets a pbr material, or \"flat\": true on its material item when the user wants a plain colour. Check with verify/expect {\"materials\": true} (no default-grey parts) or \"pbr\" (no flat colours); save_prefab warns about grey parts.
 - Texture by default, even when the user only asks for a shape: a model is not finished until every visible part has a real surface. Plan the surfaces with the shape: tile pbr materials (wood grain, brushed metal, painted steel, fabric, stone, plastic with wear) for anything that repeats or is reused; an object-domain material for hero parts (mesh_ao / mesh_curvature for dirt in creases and edge wear, macro / bevel finishes); svg or text nodes on a project {face, at} for badges, labels, panels, markings; decals for stains and graffiti. Give painted parts edge wear and grime, not one flat tone. Check with material_view and an agent_views render; verify materials: \"pbr\". Only skip it when the user asks for a blockout or a plain colour (flat: true).
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
-- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on every tool that reads or changes a document (apply_ops, verify, inspect, agent_views, scene_summary, ops, op_get, probe_ray, screenshot, set_camera, style, material_ops, annotations, history, undo, redo, jump, diff, cherry_pick, history_prune, set_model_name, save_prefab, export_model); the call errors if that document isn't open, and save_prefab refuses a name another open document holds. new_model never displaces work: unless the current document is empty it starts beside it (both stay open), and a name that is already open is refused.
+- A timeout error from your MCP client does not mean the call failed: the server keeps working, so check history or scene_summary before retrying an apply_ops.
+- Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on every tool that reads or changes a document (apply_ops, verify, inspect, agent_views, scene_summary, ops, op_get, probe_ray, screenshot, set_camera, style, material_ops, annotations, history, undo, redo, jump, diff, cherry_pick, history_prune, set_model_name, save_prefab, export_model); a doc that was idle-closed, parked or is a catalog prefab is reopened automatically (unknown names error), and save_prefab refuses a name another open document holds. new_model never displaces work: unless the current document is empty it starts beside it (both stay open), and a name that is already open is refused.
 - Working efficiently: verify numerically between steps and render once per model at the end with one tiled agent_views (e.g. [\"front\", \"right\", \"top\", \"iso\"]), not after every step. For many identical props in a map (hundreds of desk fans), model one prefab (the fan, with its rotor clip) and place prefab instances, or bake a set into one prefab with arrays: never hundreds of separate items. Prefab instances export by reference in a .bsn.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
@@ -2261,7 +2276,7 @@ impl rmcp::ServerHandler for Tools {
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
-- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models (style number lint_boxy: 0 silences that). grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (contact below the centre of mass, or a joint); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
+- Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], attached [[a, b]] (touching on any side, no gravity: mechanisms), collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models (style number lint_boxy: 0 silences that). grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (held through contact below the centre of mass or a joint by parts that are themselves supported); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be [a, b, depth] or {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place part globs match visible parts only (exact names and a bare * still take hidden ones); move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
 - Organic workflow: start from body or silhouette (or sdf / skin with oval sections), compare with agent_views reference in up to 3 views and read the band deviations, fix them with local warps or joint overrides, check style \"curvature\" and inspect proportions, then set tris (+ bake) last.
 - inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not); proportions {parts?} gives a body's bone-chain lengths and ratios (biped head/height ~0.133, leg/height, arm span/height).
 - agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views; style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} (or a list: front, side, top in one call) compares the silhouette with a PNG: overlay, IoU and the biggest band deviations (\"front: top 0-20%: model 14% wider (+3.1 cm)\"). Look at an image after building.
@@ -2278,7 +2293,7 @@ impl rmcp::ServerHandler for Tools {
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.
 - Style tokens (a cohesive look): set them first with style(action \"set\" or \"load\"), then build with \"@primary\" colours (.darken(x) .lighten(x) .mix(@b, x) .alpha(x)), \"$bevel\" numbers, \"style\": \"<preset>\" on material items; style defaults fill omitted fields. Prefer tokens over literal colours; follow the style's brief. Changing a token re-derives every item reading it.
-- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic, height (m), ao...), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size and are shared: a .gltf export (the default, preferred over glb) writes each texture once into assets/textures/ as GPU-compressed mipmapped KTX2, named by content, so every model reusing the material points at one file; object materials wrap a per-part atlas no other model can share, so prefer tile for kit materials). undo/redo/jump/history take doc \"material:<name>\".
+- Procedural PBR materials: material_ops(material, ops) builds a node graph (coords, 2D/3D SDFs, noise, worley, math, colour; one output node with base_color, roughness, metallic (metalness works), height (m), ao...; card / decal space is y-down, v 0 = top), atomic like apply_ops, with expect {tileable, ranges, albedo, normals, coverage}. describe_op(\"nodes\") lists node types, \"node:<type>\" one. material_view shows a lit sphere + channels (or one node). material_catalog saves/loads the library. Put one on a part with an apply_ops material item: {\"type\": \"material\", \"name\": \"wall\", \"pbr\": \"bricks\", \"params\"?: {..}, \"scale\"?: 1.5} (tile materials map at real size and are shared: a .gltf export (the default, preferred over glb) writes each texture once into assets/textures/ as GPU-compressed mipmapped KTX2, named by content, so every model reusing the material points at one file; object materials wrap a per-part atlas no other model can share, so prefer tile for kit materials). undo/redo/jump/history take doc \"material:<name>\".
 Full details live in AGENTS.md next to the source.";
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()

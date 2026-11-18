@@ -4198,11 +4198,22 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             if s.thickness.is_nan() || s.thickness <= 0.0 {
                 return Err(format!("{ctx}: thickness: must be > 0 meters"));
             }
-            let open = s.open.into_vec();
+            let open: Vec<String> = s
+                .open
+                .into_vec()
+                .into_iter()
+                .map(|w| match w.as_str() {
+                    "north" => "back".to_string(),
+                    "south" => "front".to_string(),
+                    "east" => "right".to_string(),
+                    "west" => "left".to_string(),
+                    _ => w,
+                })
+                .collect();
             for w in &open {
                 if !["top", "bottom", "left", "right", "front", "back"].contains(&w.as_str()) {
                     return Err(format!(
-                        "{ctx}: open: `{w}` is not a face; use top, bottom, left, right, front or back"
+                        "{ctx}: open: `{w}` is not a face; use top, bottom, left, right, front or back (or north = back, south = front, east = right, west = left)"
                     ));
                 }
             }
@@ -5248,6 +5259,20 @@ mod tests {
             panic!("typo field should fail");
         };
         assert!(e.contains("positon"), "{e}");
+        let ok = one(
+            json!({"type": "shell", "name": "s", "input": "b", "thickness": 0.01, "open": ["north", "west"]}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(ok, BatchItem::Op(Op::Shell { open, .. }) if open == ["back", "left"]),
+            "compass words map to faces"
+        );
+        let Err(e) = one(
+            json!({"type": "shell", "name": "s", "input": "b", "thickness": 0.01, "open": "up"}),
+        ) else {
+            panic!("bad face should fail");
+        };
+        assert!(e.contains("north = back"), "{e}");
         let Err(e) = one(json!({"type": "spin", "name": "x"})) else {
             panic!("unknown type should fail");
         };

@@ -3,9 +3,10 @@
 //!
 //! - **contact culling**: triangles covered by another solid part (a box's
 //!   bottom on the floor, a screen inset in its frame) are dropped;
-//! - **viewpoint culling** (`visible_from`): triangles no ray reaches from
-//!   any point in the given boxes (the outside of a room the camera never
-//!   leaves) are dropped;
+//! - **viewpoint culling** (`visible_from`): triangles whose back side faces
+//!   every point of the given boxes (exact plane test, no sampling) are
+//!   dropped; `visible_from_rays` also drops those no sampled ray reaches
+//!   (the outside of a room the camera never leaves);
 //! - **weld**: duplicate vertices merged, unused ones dropped;
 //! - **instancing**: parts that are translated copies of another (array
 //!   copies) share its mesh, placed by their node;
@@ -30,7 +31,11 @@ pub struct Options {
     pub cull_contacts: bool,
     /// Boxes ([min, max]) the camera can be in; empty = no viewpoint culling.
     pub visible_from: Vec<(Vec3, Vec3)>,
-    /// Viewpoints sampled in those boxes.
+    /// Also drop triangles no sampled ray reaches from those boxes (opt-in:
+    /// sampling can cull thin visible parts and breaks instancing). The
+    /// exact back-face test always runs with `visible_from`.
+    pub visible_from_rays: bool,
+    /// Viewpoints sampled in those boxes for `visible_from_rays`.
     pub view_samples: usize,
     pub instance: bool,
     pub merge: bool,
@@ -77,6 +82,7 @@ impl Options {
             dedup_materials: false,
             cull_contacts: false,
             visible_from: Vec::new(),
+            visible_from_rays: false,
             view_samples: 256,
             instance: false,
             merge: false,
@@ -175,6 +181,11 @@ impl Options {
                     o.merge_keep = serde_json::from_value(x.clone())
                         .map_err(|e| format!("optimize.merge_keep: {e}"))?
                 }
+                "visible_from_rays" => {
+                    o.visible_from_rays = x
+                        .as_bool()
+                        .ok_or("optimize.visible_from_rays: true or false")?
+                }
                 "view_samples" => {
                     o.view_samples = x
                         .as_u64()
@@ -236,7 +247,7 @@ impl Options {
                 }
                 other => {
                     return Err(format!(
-                        "optimize: unknown field `{other}` (preset, dedup_materials, cull_contacts, visible_from, view_samples, instance, merge, merge_keep, weld, small_indices, orm, emissive_strength, lods, lod_distances, lod_min_tris, textures, ao)"
+                        "optimize: unknown field `{other}` (preset, dedup_materials, cull_contacts, visible_from, visible_from_rays, view_samples, instance, merge, merge_keep, weld, small_indices, orm, emissive_strength, lods, lod_distances, lod_min_tris, textures, ao)"
                     ));
                 }
             }
@@ -347,9 +358,13 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
         }
         if !o.visible_from.is_empty() {
             report.lines.push(format!(
-                "viewpoint culling: {dropped_view} triangle(s) unseen from {} box(es), {} viewpoints",
+                "viewpoint culling: {dropped_view} triangle(s) unseen from {} box(es) ({})",
                 o.visible_from.len(),
-                o.view_samples
+                if o.visible_from_rays {
+                    format!("back-facing + {} sampled viewpoints", o.view_samples)
+                } else {
+                    "back-facing, exact".to_string()
+                }
             ));
         }
         let empty: Vec<String> = parts
@@ -732,6 +747,13 @@ fn cull(parts: &[Part], o: &Options) -> Vec<Vec<Keep>> {
         .iter()
         .map(|p| p.rig.is_none() && occludes(p))
         .collect();
+    // Back faces can only be dropped where nothing shows them: closed solids
+    // and one-sided sheets. Open double-sided geometry (discs, leaf cards)
+    // and posed (rigged) parts keep every triangle.
+    let one_sided: Vec<bool> = parts
+        .iter()
+        .map(|p| p.rig.is_none() && (p.sheet || crate::verify::open_edge_count(p) == 0))
+        .collect();
     // One BVH per occluding part (point-in-solid), one over every occluder
     // (visibility rays).
     let solids: Vec<Option<Bvh>> = tris
@@ -746,7 +768,11 @@ fn cull(parts: &[Part], o: &Options) -> Vec<Vec<Keep>> {
             .flat_map(|(i, ts)| ts.iter().map(move |t| (*t, i as u32)))
             .collect(),
     );
-    let views = viewpoints(&o.visible_from, o.view_samples);
+    let views = if o.visible_from_rays {
+        viewpoints(&o.visible_from, o.view_samples)
+    } else {
+        Vec::new()
+    };
     let inside = |b: usize, p: Vec3| -> bool {
         let (lo, hi) = bounds[b];
         if p.cmplt(lo).any() || p.cmpgt(hi).any() {
@@ -779,6 +805,21 @@ fn cull(parts: &[Part], o: &Options) -> Vec<Vec<Keep>> {
                         })
                     {
                         return Keep::Covered;
+                    }
+                    if !o.visible_from.is_empty() && one_sided[a] {
+                        // Exact: every box wholly behind the triangle's plane.
+                        let t0 = t[0];
+                        let behind = o.visible_from.iter().all(|(lo, hi)| {
+                            let far = Vec3::new(
+                                if n.x > 0.0 { hi.x } else { lo.x },
+                                if n.y > 0.0 { hi.y } else { lo.y },
+                                if n.z > 0.0 { hi.z } else { lo.z },
+                            );
+                            (far - t0).dot(n) <= -1e-4
+                        });
+                        if behind {
+                            return Keep::Unseen;
+                        }
                     }
                     if !views.is_empty() {
                         let seen = pts.iter().any(|p| {
@@ -1100,6 +1141,66 @@ mod tests {
         let out = prepare(room, &o);
         assert_eq!(outward(&out.parts[0]), 0);
         assert!(tri_count(&out.parts) >= 12);
+    }
+
+    #[test]
+    fn exact_view_cull_keeps_instancing_and_thin_parts() {
+        let s = session(json!([
+            {"type": "primitive", "name": "post", "kind": "cylinder", "size": [0.05, 1], "translation": [0, 0.5, 0]},
+            {"type": "linear_array", "name": "post", "input": "post", "count": 4, "offset": [0.5, 0, 0]},
+            {"type": "primitive", "name": "slat", "kind": "box", "size": [1.0, 0.002, 0.2], "translation": [0, 2.0, 0]}
+        ]));
+        let o = Options {
+            visible_from: vec![(
+                Vec3::new(-100.0, 100.0, -100.0),
+                Vec3::new(100.0, 101.0, 100.0),
+            )],
+            ..Options::game()
+        };
+        let out = prepare(visible(&s), &o);
+        let copies = out.meshes.iter().filter(|m| **m != MeshRef::Own).count();
+        assert_eq!(copies, 3, "instancing kept: {:?}", out.meshes);
+        assert!(
+            out.parts
+                .iter()
+                .any(|p| p.name == "slat" && !p.indices.is_empty())
+        );
+        assert!(
+            out.report
+                .lines
+                .iter()
+                .any(|l| l.contains("viewpoint culling"))
+        );
+        // A box wholly behind a triangle's plane culls it: view from far below.
+        let below = Options {
+            visible_from: vec![(Vec3::new(-3.0, -5.0, -3.0), Vec3::new(3.0, -4.0, 3.0))],
+            ..Options::none()
+        };
+        let slat = visible(&s).into_iter().find(|p| p.name == "slat");
+        let Some(slat) = slat else { panic!("no slat") };
+        let n0 = slat.indices.len();
+        let out = prepare(vec![slat], &below);
+        assert!(out.parts[0].indices.len() < n0, "top faces culled");
+        // A disc carries a reversed copy of every triangle: the half facing
+        // away goes, the half facing the box stays.
+        let d = session(json!([
+            {"type": "primitive", "name": "disc", "kind": "disc", "size": 0.3,
+             "rotation": [-0.707, 0, 0, 0.707], "translation": [0, 1, 0]}
+        ]));
+        let disc = visible(&d).into_iter().find(|p| p.name == "disc");
+        let Some(disc) = disc else { panic!("no disc") };
+        let n0 = disc.indices.len();
+        let out = prepare(vec![disc], &below);
+        assert_eq!(out.parts[0].indices.len(), n0 / 2, "front layer kept");
+        // A single-layer open mesh (a leaf card, drawn double-sided) shows
+        // its back: the exact cull leaves it alone.
+        let mut card = Part::new("card");
+        card.verts = vec![[0.0, 1.0, 0.0], [0.0, 1.0, 0.2], [0.2, 1.0, 0.0]];
+        card.normals = vec![[0.0, 1.0, 0.0]; 3];
+        card.uvs = vec![[0.0; 2], [0.0, 1.0], [1.0, 0.0]];
+        card.indices = vec![0, 1, 2];
+        let out = prepare(vec![card], &below);
+        assert_eq!(out.parts[0].indices.len(), 3, "open card kept");
     }
 
     #[test]

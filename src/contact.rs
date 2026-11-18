@@ -196,18 +196,49 @@ pub struct Overlap {
 /// One `collisions.allow` entry: a pair of name patterns (`*` globs, either
 /// order), optionally only while the overlap stays shallow.
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
+#[serde(from = "AllowRaw")]
+#[schemars(with = "AllowRaw")]
 pub enum AllowRule {
     Pair([String; 2]),
     Limited {
         pair: [String; 2],
         /// Allowed only while the penetration depth is at most this (m).
-        #[serde(default)]
         depth: Option<f64>,
         /// Allowed only while at most this share of the smaller part is inside.
+        max: Option<f64>,
+    },
+}
+
+/// The accepted input shapes of an [`AllowRule`].
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AllowRaw {
+    /// `[a, b]`.
+    Pair([String; 2]),
+    /// `[a, b, depth]`: allowed only while the overlap is at most `depth` m deep.
+    Triple(String, String, f64),
+    /// `{"pair": [a, b], "depth": 0.003, "max": 0.5}`.
+    Limited {
+        pair: [String; 2],
+        #[serde(default)]
+        depth: Option<f64>,
         #[serde(default)]
         max: Option<f64>,
     },
+}
+
+impl From<AllowRaw> for AllowRule {
+    fn from(r: AllowRaw) -> Self {
+        match r {
+            AllowRaw::Pair(p) => AllowRule::Pair(p),
+            AllowRaw::Triple(a, b, d) => AllowRule::Limited {
+                pair: [a, b],
+                depth: Some(d),
+                max: None,
+            },
+            AllowRaw::Limited { pair, depth, max } => AllowRule::Limited { pair, depth, max },
+        }
+    }
 }
 
 impl AllowRule {
@@ -725,7 +756,12 @@ fn visible(model: &Model) -> impl Iterator<Item = &Part> {
 
 /// The floor: y = 0, or the model's lowest point if it sits below that.
 fn ground_level(model: &Model) -> f32 {
-    model.bounds().map_or(0.0, |(lo, _)| lo.y.min(0.0))
+    // Sinking up to 1 cm below y = 0 (grazing stems, a part sunk a few mm)
+    // is still standing on the ground plane: only a model that sits wholly
+    // lower moves the floor.
+    model
+        .bounds()
+        .map_or(0.0, |(lo, _)| if lo.y >= -0.01 { 0.0 } else { lo.y })
 }
 
 /// Visible parts that nothing holds up: off the ground, sharing no volume
@@ -746,22 +782,45 @@ pub fn unsupported_in(c: &Contacts, model: &Model) -> Vec<(String, Vec<String>)>
         touching[*i].push((*j, k));
         touching[*j].push((*i, k));
     }
-    let mut out = Vec::new();
+    // `a` is held by `b` through shared volume, or surface contact below its
+    // centre of mass (any contact, for a flat part).
+    let n = c.bodies.len();
+    let mut holders: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut on_ground = vec![false; n];
     for (i, a) in c.bodies.iter().enumerate() {
         let (lo, hi) = a.bounds;
-        if lo.y <= ground + ground_tolerance(a.part) {
-            continue;
-        }
+        on_ground[i] = lo.y <= ground + ground_tolerance(a.part);
         let cy = com_y(a.part);
         let margin = tolerance(a.part, a.part);
         let flat = hi.y - lo.y <= margin * 2.0;
-        // Same rule as support_of: shared volume holds it; so does surface
-        // contact below its centre of mass (any contact, for a flat part).
-        let held = touching[i].iter().any(|(_, k)| match k {
-            Contact::Overlap => true,
-            Contact::Surface(pts) => flat || pts.iter().any(|p| p.y < cy - margin),
-        });
-        if !held {
+        for &(j, k) in &touching[i] {
+            let held = match k {
+                Contact::Overlap => true,
+                Contact::Surface(pts) => flat || pts.iter().any(|p| p.y < cy - margin),
+            };
+            if held {
+                holders[i].push(j);
+            }
+        }
+    }
+    // A holder only counts if it is itself held, down to the ground: a pile
+    // of logs floating above y = 0 and propping each other is not support.
+    let mut ok = on_ground.clone();
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if !ok[i] && holders[i].iter().any(|&j| ok[j]) {
+                ok[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    for (i, a) in c.bodies.iter().enumerate() {
+        if !ok[i] {
             let mut idx: Vec<usize> = touching[i].iter().map(|(j, _)| *j).collect();
             idx.sort_unstable();
             out.push((
@@ -822,6 +881,83 @@ pub fn rests_on(model: &Model, a: &str, b: &str) -> Result<String, String> {
     }
 }
 
+/// Whether `a` and `b` are attached: they touch or share volume, on any
+/// side. Gravity-free, unlike [`rests_on`] (a canvas hung below its arm).
+pub fn attached(model: &Model, a: &str, b: &str) -> Result<String, String> {
+    let find = |n: &str| {
+        model
+            .parts
+            .iter()
+            .find(|p| p.name == n)
+            .map(|p| &**p)
+            .ok_or_else(|| format!("no part `{n}`"))
+    };
+    let (pa, pb) = (find(a)?, find(b)?);
+    let (ba, bb) = (Body::new(pa), Body::new(pb));
+    match contact(&ba, &bb) {
+        Some(Contact::Overlap) => Ok(format!("`{a}` is attached to `{b}` (shared volume)")),
+        Some(Contact::Surface(pts)) => Ok(format!(
+            "`{a}` is attached to `{b}` ({} contact point(s))",
+            pts.len()
+        )),
+        None => {
+            let gap = match (&ba.solid, &bb.solid) {
+                (Some(x), Some(y)) => {
+                    format!(" (closest surfaces {:.4} m apart)", x.min_gap(y, 10.0))
+                }
+                _ => String::new(),
+            };
+            Err(format!("`{a}` is not attached to `{b}`{gap}"))
+        }
+    }
+}
+
+/// [`attached`] over `*` globs: every visible part matching `a` touches or
+/// shares volume with some visible part matching `b` (other than itself).
+pub fn attached_matching(model: &Model, a: &str, b: &str) -> Result<String, String> {
+    let (xs, ys): (Vec<&Part>, Vec<&Part>) = (
+        visible(model)
+            .filter(|p| crate::name_matches(a, &p.name))
+            .collect(),
+        visible(model)
+            .filter(|p| crate::name_matches(b, &p.name))
+            .collect(),
+    );
+    if xs.is_empty() {
+        return Err(format!("no visible part matches `{a}`"));
+    }
+    if ys.is_empty() {
+        return Err(format!("no visible part matches `{b}`"));
+    }
+    let yb: Vec<Body> = ys.iter().map(|p| Body::new(p)).collect();
+    let mut loose = Vec::new();
+    let mut shown = None;
+    for x in &xs {
+        let bx = Body::new(x);
+        let hit = yb
+            .iter()
+            .filter(|by| by.part.name != x.name)
+            .find_map(|by| contact(&bx, by).map(|_| by.part.name.clone()));
+        match hit {
+            Some(n) if shown.is_none() => shown = Some((x.name.clone(), n)),
+            Some(_) => {}
+            None => loose.push(x.name.clone()),
+        }
+    }
+    if loose.is_empty() {
+        let (x, y) = shown.unwrap_or_default();
+        Ok(format!(
+            "{} part(s) matching `{a}` each touch or share volume with a part matching `{b}` (e.g. `{x}` with `{y}`)",
+            xs.len()
+        ))
+    } else {
+        Err(format!(
+            "not attached to any part matching `{b}`: {}",
+            loose.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::commands::Session;
@@ -862,6 +998,82 @@ mod tests {
             {"type": "primitive", "name": "knob", "kind": "box", "size": 0.04, "translation": [3, 1, 0.03]}
         ]));
         assert_eq!(super::floating(&s.model), ["door", "knob"]);
+    }
+
+    #[test]
+    fn floating_log_pile_is_unsupported() {
+        let mut items = vec![];
+        for (row, y) in [(0, 0.05 + 0.1), (1, 0.35)] {
+            for i in 0..3 {
+                items.push(
+                    serde_json::json!({"type": "primitive", "name": format!("log_{row}_{i}"),
+                    "kind": "cylinder", "size": [0.1, 1.0],
+                    "rotation": {"x": 90}, "translation": [i as f64 * 0.19, y, 0]}),
+                );
+            }
+        }
+        let s = session(serde_json::Value::Array(items));
+        assert_eq!(super::floating(&s.model).len(), 6);
+        assert_eq!(super::unsupported(&s.model).len(), 6);
+    }
+
+    #[test]
+    fn thin_tilted_stem_grazing_the_ground_is_grounded() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "stem", "kind": "cylinder", "size": [0.004, 0.5],
+             "rotation": {"x": 8}, "translation": [0.3, 0.2473, 0.1]},
+            {"type": "primitive", "name": "stem2", "kind": "cylinder", "size": [0.004, 0.5],
+             "rotation": {"x": 8}, "translation": [-0.3, 0.2433, 0.1]}
+        ]));
+        let lo = |n: &str| {
+            s.model
+                .parts
+                .iter()
+                .find(|p| p.name == n)
+                .map(|p| p.bounds().0.y)
+        };
+        assert!(lo("stem").is_some_and(|y| y < -0.0005 && y > -0.003));
+        assert!(lo("stem2").is_some_and(|y| y < lo("stem").unwrap_or(0.0)));
+        assert!(
+            super::floating(&s.model).is_empty(),
+            "{:?}",
+            super::floating(&s.model)
+        );
+        assert!(super::grounding(&s.model, 0.2).0.is_empty());
+        assert!(super::unsupported(&s.model).is_empty());
+    }
+
+    #[test]
+    fn attached_is_gravity_free() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "arm", "kind": "box", "size": [1, 0.1, 0.1], "translation": [0, 1, 0]},
+            {"type": "primitive", "name": "canvas", "kind": "box", "size": [0.2, 0.2, 0.05], "translation": [0, 0.85, 0]},
+            {"type": "primitive", "name": "far", "kind": "box", "size": 0.1, "translation": [3, 1, 0]}
+        ]));
+        assert!(super::rests_on(&s.model, "canvas", "arm").is_err());
+        assert!(super::attached(&s.model, "canvas", "arm").is_ok());
+        assert!(super::attached(&s.model, "arm", "canvas").is_ok());
+        assert!(super::attached(&s.model, "far", "arm").is_err());
+        assert!(super::attached_matching(&s.model, "canvas*", "arm*").is_ok());
+        let Err(e) = super::attached_matching(&s.model, "*a*", "arm") else {
+            panic!("`far` is not attached to `arm`");
+        };
+        assert!(e.contains("far") && !e.contains("canvas"), "{e}");
+    }
+
+    #[test]
+    fn verify_attached_field_and_expect_wrapper() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "arm", "kind": "box", "size": [1, 0.1, 0.1], "translation": [0, 1, 0]},
+            {"type": "primitive", "name": "canvas", "kind": "box", "size": [0.2, 0.2, 0.05], "translation": [0, 0.85, 0]}
+        ]));
+        let Ok(spec) = serde_json::from_value::<crate::commands::VerifySpec>(
+            serde_json::json!({"expect": {"attached": [["canvas", "arm"]]}}),
+        ) else {
+            panic!("spec")
+        };
+        let (ok, text) = s.verify(&spec);
+        assert!(ok && text.contains("PASS attached canvas to arm"), "{text}");
     }
 
     #[test]

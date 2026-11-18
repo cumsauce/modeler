@@ -438,7 +438,121 @@ pub fn revolve(
     };
     let segs = if segments == 0 { 48 } else { segments.max(3) } as i32;
     let m = Manifold::revolve(&cs, segs, degrees as f64);
-    finish_sweep(&m, name, "revolve")
+    let mut part = finish_sweep(&m, name, "revolve")?;
+    if round > 0.0 && degrees >= 360.0 {
+        soften_rounded_corners(&mut part, &cs.to_polygons(), round as f64);
+    }
+    Ok(part)
+}
+
+/// Soft shading across `round`ed corners of a revolved profile. The fillet
+/// arcs are a run of tiny facets between two long profile segments, and the
+/// area-weighted vertex normals at the arc's ends then lean on the long
+/// segment, so a gently curving profile (a bowl, a vase) turns into flat
+/// bands joined by a hairline. Corners that turn less than the crease angle
+/// (40 degrees) give every vertex of the arc the normal halfway between the
+/// two long segments, which is the shading the unrounded corner had; sharper
+/// corners keep their own normals.
+fn soften_rounded_corners(part: &mut Part, polys: &[Vec<[f64; 2]>], r: f64) {
+    use std::collections::HashMap;
+    let cos_limit = 40.0f64.to_radians().cos();
+    let short = r * 0.2;
+    // (radius, y, normal radial part, normal y part) of every soft-arc vertex.
+    let mut soft: Vec<[f64; 4]> = Vec::new();
+    for ring in polys {
+        let n = ring.len();
+        if n < 4 {
+            continue;
+        }
+        let edge = |i: usize| {
+            let (a, b) = (ring[i % n], ring[(i + 1) % n]);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l = d[0].hypot(d[1]);
+            (
+                l,
+                if l > 0.0 {
+                    [d[1] / l, -d[0] / l]
+                } else {
+                    [0.0; 2]
+                },
+            )
+        };
+        let is_short: Vec<bool> = (0..n).map(|i| edge(i).0 < short).collect();
+        if is_short.iter().all(|&s| s) || !is_short.iter().any(|&s| s) {
+            continue;
+        }
+        // Start at a long edge so runs never wrap.
+        let Some(first) = (0..n).find(|&i| !is_short[i]) else {
+            continue;
+        };
+        let mut i = 0;
+        while i < n {
+            let e = (first + i) % n;
+            if !is_short[e] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < n && is_short[(first + i) % n] {
+                i += 1;
+            }
+            // Short edges start..i; long edges first+start-1 and first+i.
+            let na = edge(first + start + n - 1).1;
+            let nb = edge(first + i).1;
+            if na[0] * nb[0] + na[1] * nb[1] < cos_limit {
+                continue;
+            }
+            let m = [na[0] + nb[0], na[1] + nb[1]];
+            let l = m[0].hypot(m[1]);
+            if l < 1e-9 {
+                continue;
+            }
+            // Vertices from the end of the first long edge to the start of the next.
+            for k in start..=i {
+                let v = ring[(first + k) % n];
+                soft.push([v[0], v[1], m[0] / l, m[1] / l]);
+            }
+        }
+    }
+    if soft.is_empty() {
+        return;
+    }
+    let cell = (r * 0.05).max(1e-6);
+    let key = |a: f64, b: f64| ((a / cell).floor() as i64, (b / cell).floor() as i64);
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (k, s) in soft.iter().enumerate() {
+        grid.entry(key(s[0], s[1])).or_default().push(k);
+    }
+    let eps = cell * 0.5;
+    for (v, n) in part.verts.iter().zip(part.normals.iter_mut()) {
+        let (rad, y) = ((v[0] as f64).hypot(v[2] as f64), v[1] as f64);
+        if rad < 1e-9 {
+            continue;
+        }
+        let (kx, ky) = key(rad, y);
+        let mut hit = None;
+        'find: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &k in grid.get(&(kx + dx, ky + dy)).into_iter().flatten() {
+                    let s = soft[k];
+                    if (s[0] - rad).abs() < eps && (s[1] - y).abs() < eps {
+                        hit = Some(s);
+                        break 'find;
+                    }
+                }
+            }
+        }
+        let Some(s) = hit else { continue };
+        let want = Vec3::new(
+            (s[2] * v[0] as f64 / rad) as f32,
+            s[3] as f32,
+            (s[2] * v[2] as f64 / rad) as f32,
+        );
+        // Only soften: never override a crease the mesh really has.
+        if want.dot(Vec3::from(*n)) >= cos_limit as f32 {
+            *n = want.to_array();
+        }
+    }
 }
 
 /// Rounds every corner of a 2D region by `r` (concave and convex): grow,
@@ -1702,6 +1816,63 @@ mod tests {
         let half = revolve("half", &[ring], 180.0, 64, 0.0).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(crate::verify::open_edge_count(&half), 0);
         assert!((signed_volume(&half) - v / 2.0).abs() < 0.05);
+    }
+
+    /// Number of positions carrying more than one distinct normal (creased rings).
+    fn creased_positions(p: &Part) -> usize {
+        use std::collections::HashMap;
+        let mut at: HashMap<[i64; 3], Vec<Vec3>> = HashMap::new();
+        for (v, n) in p.verts.iter().zip(&p.normals) {
+            let k = [
+                (v[0] * 1e4).round() as i64,
+                (v[1] * 1e4).round() as i64,
+                (v[2] * 1e4).round() as i64,
+            ];
+            let n = Vec3::from(*n);
+            let e = at.entry(k).or_default();
+            if !e.iter().any(|o| o.dot(n) > 0.99) {
+                e.push(n);
+            }
+        }
+        at.values().filter(|e| e.len() > 1).count()
+    }
+
+    #[test]
+    fn revolve_round_keeps_a_smooth_profile_smooth() {
+        // A bowl: a coarse quarter-ellipse (turns of ~15 degrees between points)
+        // plus a short straight rim, rounded by a few millimetres.
+        let mut ring = vec![[0.0, 0.0]];
+        for i in 0..=6 {
+            let a = (i as f32) * 15.0f32.to_radians();
+            ring.push([0.05 + 0.25 * a.sin(), 0.02 + 0.2 * (1.0 - a.cos())]);
+        }
+        ring.push([0.3, 0.3]);
+        ring.push([0.28, 0.3]);
+        ring.push([0.28, 0.2]);
+        ring.push([0.0, 0.2]);
+        let plain = revolve("plain", std::slice::from_ref(&ring), 360.0, 12, 0.0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let round = revolve("round", &[ring], 360.0, 12, 0.006).unwrap_or_else(|e| panic!("{e}"));
+        let steps = |p: &Part| -> Vec<f32> {
+            let mut wall: Vec<(f32, Vec3)> = p
+                .verts
+                .iter()
+                .zip(&p.normals)
+                .filter(|(v, _)| v[2].abs() < 1e-5 && v[0] > 0.0 && v[1] > 0.03 && v[1] < 0.2)
+                .map(|(v, n)| (v[1], Vec3::from(*n)))
+                .collect();
+            wall.sort_by(|a, b| a.0.total_cmp(&b.0));
+            wall.windows(2)
+                .filter(|w| w[1].0 - w[0].0 > 0.01)
+                .map(|w| w[0].1.dot(w[1].1).clamp(-1.0, 1.0).acos().to_degrees())
+                .collect()
+        };
+        let (a, b) = (steps(&plain), steps(&round));
+        assert!(a.len() >= 3 && b.len() >= 3, "{a:?} {b:?}");
+        for (p, r) in a.iter().zip(&b) {
+            assert!(*r > 0.9 * p, "rounded wall shades flat: {b:?} vs {a:?}");
+        }
+        assert_eq!(creased_positions(&round), 0, "no creased rings");
     }
 
     #[test]

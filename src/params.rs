@@ -108,7 +108,64 @@ impl Parser<'_> {
         self.ws();
         self.s.get(self.i).copied()
     }
+    /// `||` < `&&` < comparisons < `+ -` < `* /` (booleans are 1.0 / 0.0).
     fn expr(&mut self) -> Result<f64, String> {
+        let mut v = self.and()?;
+        while self.eat2(b'|', b'|') {
+            let r = self.and()?;
+            v = f64::from(v != 0.0 || r != 0.0);
+        }
+        Ok(v)
+    }
+    fn eat2(&mut self, a: u8, b: u8) -> bool {
+        self.ws();
+        if self.s.get(self.i) == Some(&a) && self.s.get(self.i + 1) == Some(&b) {
+            self.i += 2;
+            true
+        } else {
+            false
+        }
+    }
+    fn and(&mut self) -> Result<f64, String> {
+        let mut v = self.cmp()?;
+        while self.eat2(b'&', b'&') {
+            let r = self.cmp()?;
+            v = f64::from(v != 0.0 && r != 0.0);
+        }
+        Ok(v)
+    }
+    fn cmp(&mut self) -> Result<f64, String> {
+        let mut v = self.arith()?;
+        loop {
+            let op = if self.eat2(b'<', b'=') {
+                "<="
+            } else if self.eat2(b'>', b'=') {
+                ">="
+            } else if self.eat2(b'=', b'=') {
+                "=="
+            } else if self.eat2(b'!', b'=') {
+                "!="
+            } else if self.peek() == Some(b'<') {
+                self.i += 1;
+                "<"
+            } else if self.peek() == Some(b'>') {
+                self.i += 1;
+                ">"
+            } else {
+                return Ok(v);
+            };
+            let r = self.arith()?;
+            v = f64::from(match op {
+                "<=" => v <= r,
+                ">=" => v >= r,
+                "==" => v == r,
+                "!=" => v != r,
+                "<" => v < r,
+                _ => v > r,
+            });
+        }
+    }
+    fn arith(&mut self) -> Result<f64, String> {
         let mut v = self.term()?;
         while let Some(c @ (b'+' | b'-')) = self.peek() {
             self.i += 1;
@@ -131,6 +188,10 @@ impl Parser<'_> {
             Some(b'-') => {
                 self.i += 1;
                 Ok(-self.factor()?)
+            }
+            Some(b'!') => {
+                self.i += 1;
+                Ok(f64::from(self.factor()? == 0.0))
             }
             Some(b'(') => {
                 self.i += 1;
@@ -184,6 +245,18 @@ impl Parser<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn comparisons_and_logic() {
+        let p: Params = [("a".to_string(), 2.0)].into();
+        assert_eq!(eval("(0 >= 2) * 3 - 1.5", &p), Ok(-1.5));
+        assert_eq!(eval("($a >= 2) * 3 - 1.5", &p), Ok(1.5));
+        assert_eq!(eval("1 + 1 == 2", &p), Ok(1.0));
+        assert_eq!(eval("$a != 2", &p), Ok(0.0));
+        assert_eq!(eval("$a < 3 && $a > 1", &p), Ok(1.0));
+        assert_eq!(eval("$a < 1 || !0", &p), Ok(1.0));
+        assert_eq!(eval("!($a <= 1)", &p), Ok(1.0));
+    }
 
     #[test]
     fn resolves_refs_and_expressions() {
