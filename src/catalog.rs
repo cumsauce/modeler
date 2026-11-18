@@ -162,14 +162,30 @@ pub fn find_project(start: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Where relative export paths land: the project's `assets/` (created on
-/// demand), or the working directory outside a project.
+/// demand; a leading `assets/` is not doubled), or, outside a project, the
+/// shared library's `exports/` folder (never the daemon's working
+/// directory). Absolute paths are kept as they are.
 pub fn resolve_export_path(path: &std::path::Path) -> PathBuf {
+    resolve_export_path_in(path, project_root())
+}
+
+fn resolve_export_path_in(path: &std::path::Path, project: Option<PathBuf>) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
     }
-    match project_root() {
-        Some(root) => root.join("assets").join(path),
-        None => path.to_path_buf(),
+    match project {
+        Some(root) => {
+            let rel = path.strip_prefix("assets").unwrap_or(path);
+            root.join("assets").join(rel)
+        }
+        None => match kind_dir_for(Kind::Prefabs, None) {
+            Ok(d) => d
+                .parent()
+                .map(|p| p.join("exports"))
+                .unwrap_or(d)
+                .join(path),
+            Err(_) => std::env::temp_dir().join("modeler-exports").join(path),
+        },
     }
 }
 
@@ -1576,6 +1592,44 @@ mod tests {
         assert!(s.save_prefab_checked("x", &[], "x", true).is_ok());
     }
 
+    /// A `doc` naming a closed document opens it again (catalog entry or
+    /// parked autosave) without changing the active document; a name
+    /// unknown everywhere still errors.
+    #[test]
+    fn a_doc_arg_reopens_closed_catalog_documents() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("doc_reopen")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("saved_one")));
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "a", "kind": "box", "size": 1})],
+        ));
+        assert!(s.save_prefab_checked("x", &[], "x", false).is_ok());
+        ok(s.scene("open", Some("keeper")));
+        ok(s.scene("close", Some("saved_one")));
+        assert!(s.require_open("saved_one").is_err());
+        let note = s
+            .open_for_doc("saved_one")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(note.is_some_and(|n| n.contains("from the catalog")));
+        assert!(s.require_open("saved_one").is_ok());
+        assert_eq!(s.model.name, "keeper", "active document unchanged");
+        // Already open: no note.
+        assert!(matches!(s.open_for_doc("saved_one"), Ok(None)));
+        // Unknown everywhere: still an error, with a hint for a close name.
+        let e = s.open_for_doc("saved_on").err().unwrap_or_default();
+        assert!(
+            e.contains("is not open") && e.contains("did you mean saved_one"),
+            "{e}"
+        );
+        let e = s.open_for_doc("zzz_nothing").err().unwrap_or_default();
+        assert!(e.contains("is not open"), "{e}");
+        assert!(s.require_open("zzz_nothing").is_err());
+    }
+
     /// Two subagents sharing one client id keep their edits apart by
     /// pinning each call to a document; a pin on a closed document errors.
     #[test]
@@ -2087,6 +2141,26 @@ mod tests {
 
 #[cfg(test)]
 mod project_tests {
+    #[test]
+    fn relative_export_paths_never_use_the_cwd_or_double_assets() {
+        let proj = PathBuf::from("/tmp/game");
+        let r = |p: &str, pr: Option<PathBuf>| resolve_export_path_in(std::path::Path::new(p), pr);
+        assert_eq!(
+            r("assets/models/a.glb", Some(proj.clone())),
+            proj.join("assets/models/a.glb")
+        );
+        assert_eq!(
+            r("models/a.glb", Some(proj.clone())),
+            proj.join("assets/models/a.glb")
+        );
+        assert_eq!(r("/abs/a.glb", None), PathBuf::from("/abs/a.glb"));
+        let out = r("models/a.glb", None);
+        assert!(
+            out.is_absolute() && out.ends_with("exports/models/a.glb"),
+            "{out:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

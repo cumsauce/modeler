@@ -16,7 +16,8 @@ fn small_silhouettes_build() {
         let name = it["name"].as_str().unwrap_or("?").to_string();
         eprintln!("building {name}");
         let mut s = modeler::commands::Session::default();
-        s.apply_values(None, vec![it]).unwrap_or_else(|e| panic!("{name}: {e}"));
+        s.apply_values(None, vec![it])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(s.model.part(&name).is_some(), "{name}: no part");
     }
 }

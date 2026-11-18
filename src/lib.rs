@@ -22,6 +22,17 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
+/// Move / place `parts` pattern against a part: an exact name matches even
+/// when hidden, a bare `*` (everything) keeps matching hidden parts so a whole
+/// -model lean carries cutters too, any other glob matches visible parts only
+/// (`"petal*"` must not catch hidden `_raw` intermediates).
+pub fn move_pattern_hits(pattern: &str, name: &str, visible: bool) -> bool {
+    if !name_matches(pattern, name) {
+        return false;
+    }
+    visible || !pattern.contains('*') || pattern.chars().all(|c| c == '*')
+}
+
 /// Shortens runs of array copies for display: `book_1, book_2, … book_13`
 /// becomes `book_1..13` (three or more consecutive numbers); everything else
 /// is kept as is, in order.
@@ -335,6 +346,12 @@ pub struct Model {
     /// after the pattern was issued get it too.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub material_patterns: std::collections::BTreeMap<String, serde_json::Value>,
+    /// `uvs` projections applied to op-derived parts, keyed by part name.
+    /// Re-applied after every re-derivation (a material edit, a later batch)
+    /// so a label plate stays upright instead of falling back to the
+    /// material's own mapping.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub uv_projections: std::collections::BTreeMap<String, String>,
     /// The cosmetic variant the window shows for this document (None: the
     /// default look). View state only, never saved.
     #[serde(skip)]
@@ -371,6 +388,7 @@ impl Model {
             derived_from_ops: self.derived_from_ops,
             project: None,
             material_patterns: self.material_patterns.clone(),
+            uv_projections: self.uv_projections.clone(),
             active_variant: self.active_variant.clone(),
         }
     }
@@ -401,7 +419,21 @@ impl Model {
         }
         self.parts = crate::graph::evaluate(&self.ops)?;
         self.derived_from_ops = true;
+        self.reapply_uv_projections();
         Ok(())
+    }
+
+    /// Re-runs the recorded `uvs` projections over freshly derived parts.
+    fn reapply_uv_projections(&mut self) {
+        if self.uv_projections.is_empty() {
+            return;
+        }
+        let wanted = self.uv_projections.clone();
+        for (name, projection) in wanted {
+            if let Some(p) = self.part_mut(&name) {
+                let _ = crate::uv::project(p, &projection);
+            }
+        }
     }
 
     /// Like [`Model::refresh`] but bypasses the eval cache, for verification.
@@ -412,6 +444,7 @@ impl Model {
         }
         self.parts = crate::graph::evaluate_uncached(&self.ops)?;
         self.derived_from_ops = true;
+        self.reapply_uv_projections();
         Ok(())
     }
 

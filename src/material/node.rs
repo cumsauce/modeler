@@ -336,7 +336,17 @@ fn with_schema(e: String, ty: &str) -> String {
             }
         })
         .collect();
-    format!("{e}\n  `{ty}` node fields: {}", fields.join(", "))
+    let ex = example(ty).map(|mut x| {
+        if let Value::Object(m) = &mut x {
+            m.remove("name");
+        }
+        format!("\n  example: {x}")
+    });
+    format!(
+        "{e}\n  `{ty}` node fields: {}{}",
+        fields.join(", "),
+        ex.unwrap_or_default()
+    )
 }
 
 fn de<T: serde::de::DeserializeOwned>(ctx: &str, body: &Value) -> Result<T, String> {
@@ -835,29 +845,55 @@ fn at3(p: [f32; 3], c: Option<[f32; 3]>) -> [f32; 3] {
     [p[0] - c[0], p[1] - c[1], p[2] - c[2]]
 }
 
-/// Circle SDF (negative inside), radius may be a field.
+/// Circle SDF (negative inside), radius may be a field. In card/decal space
+/// y runs down (v 0 = top).
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Circle {
     #[serde(default)]
     #[serde(alias = "input")]
     pub coords: Option<In>,
-    pub radius: In,
+    #[serde(default)]
+    pub radius: Option<In>,
+    /// Centre [u, v]. In card/decal space y runs down (v 0 = top).
     #[serde(default)]
     pub center: Option<[f32; 2]>,
+    /// Accepted for the geometry-profile form `{center, radius}`.
+    #[serde(default)]
+    pub arc: Option<serde_json::Value>,
 }
 
 impl Eval for Circle {
     fn eval(&self, cx: &Cx) -> Result<Outs, String> {
-        let (c, r) = (cx.coords2(&self.coords)?, cx.input(&self.radius)?);
+        let mut center = self.center;
+        let mut radius = self.radius.clone();
+        if let Some(a) = &self.arc {
+            let c = a
+                .get("center")
+                .and_then(|c| serde_json::from_value::<[f32; 2]>(c.clone()).ok());
+            let r = a.get("radius").and_then(Value::as_f64);
+            let (Some(c), Some(r)) = (c, r) else {
+                return Err(
+                    "circle takes center and radius directly (arc needs center [u, v] and radius)"
+                        .into(),
+                );
+            };
+            center = center.or(Some(c));
+            radius = radius.or(Some(In::Num(r as f32)));
+        }
+        let Some(radius) = radius else {
+            return Err("radius: circle takes center and radius directly, e.g. {\"type\": \"circle\", \"center\": [0.5, 0.5], \"radius\": 0.2}".into());
+        };
+        let (c, r) = (cx.coords2(&self.coords)?, cx.input(&radius)?);
         Ok(vec![(
             "",
-            pf(cx.n(), |i| sdf::circle(at2(c.v2(i), self.center), r.f(i))),
+            pf(cx.n(), |i| sdf::circle(at2(c.v2(i), center), r.f(i))),
         )])
     }
 }
 
-/// Rectangle SDF: full `size` [w, h], corners rounded by `round`.
+/// Rectangle SDF: full `size` [w, h], corners rounded by `round`. In
+/// card/decal space y runs down (v 0 = top).
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Rect {
@@ -907,7 +943,8 @@ impl Eval for Segment {
     }
 }
 
-/// Closed polygon SDF through `points`.
+/// Closed polygon SDF through `points`. In card/decal space y runs down
+/// (v 0 = top), so an "up" arrow has its tip at the smallest y.
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Polygon {
@@ -1364,6 +1401,7 @@ impl Eval for Displace {
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mask {
+    #[serde(alias = "input")]
     pub sdf: In,
     #[serde(default)]
     pub mode: Option<String>,
@@ -1425,6 +1463,7 @@ pub struct Noise {
     pub gain: Option<f32>,
     /// "fbm" (default), "ridged" or "turbulence".
     #[serde(default)]
+    #[serde(alias = "noise")]
     pub mode: Option<String>,
 }
 
@@ -1433,11 +1472,19 @@ impl Eval for Noise {
         let c = cx.coords2(&self.coords)?;
         let dims = c.dims().max(2);
         let l = Lattice::new(self.size, cx.s.period);
-        let kind = self.kind.as_deref().unwrap_or("gradient");
-        if !matches!(kind, "value" | "gradient") {
-            return Err(format!("kind: `{kind}`: use value or gradient"));
+        let mut kind = self.kind.as_deref().unwrap_or("gradient");
+        let mut mode = self.mode.as_deref();
+        if matches!(kind, "fbm" | "ridged" | "turbulence") {
+            // The fractal mode, guessed into `kind`.
+            mode = mode.or(Some(kind));
+            kind = "gradient";
         }
-        let mode = self.mode.as_deref().unwrap_or("fbm");
+        if !matches!(kind, "value" | "gradient") {
+            return Err(format!(
+                "kind: `{kind}`: use value or gradient (fractal: mode fbm, ridged or turbulence)"
+            ));
+        }
+        let mode = mode.unwrap_or("fbm");
         if !matches!(mode, "fbm" | "ridged" | "turbulence") {
             return Err(format!("mode: `{mode}`: use fbm, ridged or turbulence"));
         }
@@ -1628,16 +1675,53 @@ impl Eval for Math {
 #[serde(deny_unknown_fields)]
 pub struct Remap {
     pub input: In,
-    pub from: [f32; 2],
-    pub to: [f32; 2],
+    /// [lo, hi] (or use in_min / in_max).
+    #[serde(default)]
+    pub from: Option<Range>,
+    /// [lo, hi] (or use out_min / out_max).
+    #[serde(default)]
+    pub to: Option<Range>,
+    #[serde(default)]
+    pub in_min: Option<f32>,
+    #[serde(default)]
+    pub in_max: Option<f32>,
+    #[serde(default)]
+    pub out_min: Option<f32>,
+    #[serde(default)]
+    pub out_max: Option<f32>,
     #[serde(default)]
     pub clamp: Option<bool>,
+}
+
+/// A [lo, hi] pair; a bare number parses only to give a clear error.
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Range {
+    Pair([f32; 2]),
+    Scalar(f32),
+}
+
+fn range(
+    name: &str,
+    r: &Option<Range>,
+    lo: Option<f32>,
+    hi: Option<f32>,
+    dflt: [f32; 2],
+) -> Result<[f32; 2], String> {
+    match r {
+        Some(Range::Pair(p)) => Ok(*p),
+        Some(Range::Scalar(_)) => Err(format!(
+            "{name}: from/to are [lo, hi] ranges, e.g. from: [0.25, 0.75], to: [0, 1]"
+        )),
+        None => Ok([lo.unwrap_or(dflt[0]), hi.unwrap_or(dflt[1])]),
+    }
 }
 
 impl Eval for Remap {
     fn eval(&self, cx: &Cx) -> Result<Outs, String> {
         let a = cx.input(&self.input)?;
-        let (f, t) = (self.from, self.to);
+        let f = range("from", &self.from, self.in_min, self.in_max, [0.0, 1.0])?;
+        let t = range("to", &self.to, self.out_min, self.out_max, [0.0, 1.0])?;
         let cl = self.clamp.unwrap_or(true);
         Ok(vec![(
             "",
@@ -1693,6 +1777,7 @@ impl Eval for Random {
 #[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Color {
+    #[serde(alias = "color")]
     pub value: In,
 }
 
@@ -2116,6 +2201,7 @@ pub struct Output {
     #[serde(default)]
     pub roughness: Option<In>,
     #[serde(default)]
+    #[serde(alias = "metalness")]
     pub metallic: Option<In>,
     /// Height in meters (relief), drives the derived normal.
     #[serde(default)]
@@ -2342,5 +2428,47 @@ mod tests {
             parse_body(t, &Value::Object(m), t).unwrap_or_else(|e| panic!("{e}"));
             assert!(describe(Some(t)).is_ok());
         }
+    }
+
+    fn ok(t: &str, v: Value) {
+        parse_body(t, &v, t).unwrap_or_else(|e| panic!("{t}: {e}"));
+    }
+    fn err(t: &str, v: Value) -> String {
+        match parse_body(t, &v, t) {
+            Ok(_) => String::new(),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn forgiving_aliases_parse() {
+        use serde_json::json;
+        ok("output", json!({"metalness": 1}));
+        ok("noise", json!({"size": 0.1, "noise": "ridged"}));
+        ok("noise", json!({"size": 0.1, "kind": "ridged"}));
+        ok(
+            "remap",
+            json!({"input": "a", "in_min": 0, "in_max": 1, "out_min": 0, "out_max": 2}),
+        );
+        ok("remap", json!({"input": "a", "from": [0, 1], "to": [0, 1]}));
+        ok(
+            "circle",
+            json!({"arc": {"center": [0.5, 0.5], "radius": 0.2}}),
+        );
+        ok("color", json!({"color": "#a84e5c"}));
+        ok("mask", json!({"input": "c"}));
+        ok("remap", json!({"input": "a", "from": 0.25, "to": 0.75})); // parses; eval errors
+        let Err(e) = range("from", &Some(Range::Scalar(0.25)), None, None, [0.0, 1.0]) else {
+            panic!("a scalar from must be refused");
+        };
+        assert!(e.contains("[lo, hi]"));
+        assert!(
+            err(
+                "dir_blur",
+                json!({"input": "a", "length": 0.1, "iterations": 3})
+            )
+            .is_empty()
+        ); // parses; eval says "use length"
+        assert!(err("scatter", json!({"size": [0.1, 0.1]})).contains("example:"));
     }
 }

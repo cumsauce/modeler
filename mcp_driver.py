@@ -53,7 +53,7 @@ The daemon keeps the server's stderr in <catalog dir>/daemon.log (rotated at
 restart note quotes the server's last "modeler: exit: <reason>" line.
 """
 import json
-import subprocess, sys, base64, os, signal, socket, stat, time
+import subprocess, sys, base64, os, signal, socket, stat, threading, time
 
 # The server binary: MODELER_BINARY, else target/debug/modeler next to
 # this script (the repo checkout it lives in).
@@ -68,6 +68,8 @@ BINARY = os.environ.get("MODELER_BINARY") or next(
 # shared daemon. --socket PATH overrides both.
 SOCKET = os.environ.get("MODELER_SOCKET") or "/tmp/modeler-mcp.sock"
 LOG_ROTATE_BYTES = 1 << 20
+# --proxy: seconds between MCP progress notifications on a long tool call.
+PROGRESS_EVERY = float(os.environ.get("MODELER_PROGRESS_EVERY") or 5)
 EXIT_PREFIX = "modeler: exit: "
 
 
@@ -82,7 +84,7 @@ def daemon_log_path(socket_path=None):
         return log
     try:
         out = subprocess.run([BINARY, "--print-catalog-dir"], capture_output=True,
-                             text=True, timeout=30)
+                             text=True, timeout=60)
         d = out.stdout.strip()
     except Exception:
         d = ""
@@ -664,55 +666,76 @@ def proxy_mode(socket_path, mode):
     the sessions; closing the window just restarts the server (from
     autosave) on the next call."""
     client = client_identity_of(os.getppid())
-    conn = {"s": None, "f": None}
-
-    def link():
-        s = ensure_daemon(socket_path, mode)
-        conn["s"], conn["f"] = s, s.makefile("r")
-        s.sendall((json.dumps({"hello": {"client": client, "project": project_of()}})
-                   + "\n").encode())
-
-    def ask(payload):
-        for attempt in (0, 1):  # the daemon was stopped: start it again once
-            try:
-                if conn["s"] is None:
-                    link()
-                conn["s"].sendall((json.dumps(payload) + "\n").encode())
-            except OSError:
-                pass  # not sent: safe to start the daemon and send again
-            else:
-                try:
-                    line = conn["f"].readline()
-                except OSError:
-                    line = ""
-                if line:
-                    return json.loads(line)
-                # Sent, but the daemon went away before answering: the call
-                # may have run, so don't send it twice.
-                try:
-                    conn["s"].close()
-                except OSError:
-                    pass
-                conn["s"] = None
-                return {"error": {"code": -32603, "message":
-                                  "the modeler server exited during this call; it may or may "
-                                  "not have been applied: check (scene_summary / history) "
-                                  "before retrying"}}
-            try:
-                conn["s"] and conn["s"].close()
-            except OSError:
-                pass
-            conn["s"] = None
-        return {"error": {"code": -32603, "message":
-                          f"modeler daemon on {socket_path} is not answering"}}
-
+    project = project_of()
     out = sys.stdout
+    out_lock = threading.Lock()
+
+    def write(msg):
+        with out_lock:
+            out.write(json.dumps(msg) + "\n")
+            out.flush()
+
     def reply(rid, body):
         msg = {"jsonrpc": "2.0", "id": rid}
         msg.update(body if ("result" in body or "error" in body)
                    else {"error": {"code": -32603, "message": str(body)}})
-        out.write(json.dumps(msg) + "\n")
-        out.flush()
+        write(msg)
+
+    def ask(payload):
+        """One request on its own daemon connection, so a slow call never
+        queues the others behind it (subagents share this proxy)."""
+        for attempt in (0, 1):  # the daemon was stopped: start it again once
+            s = None
+            try:
+                s = ensure_daemon(socket_path, mode)
+                s.sendall((json.dumps({"hello": {"client": client, "project": project}})
+                           + "\n").encode())
+                s.sendall((json.dumps(payload) + "\n").encode())
+            except RuntimeError as e:  # no daemon came up
+                return {"error": {"code": -32603, "message": str(e)}}
+            except OSError:
+                if s is not None:
+                    s.close()
+                continue  # not sent: safe to start the daemon and send again
+            try:
+                line = s.makefile("r").readline()
+            except OSError:
+                line = ""
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            if line:
+                return json.loads(line)
+            # Sent, but the daemon went away before answering: the call
+            # may have run, so don't send it twice.
+            return {"error": {"code": -32603, "message":
+                              "the modeler server exited during this call; it may or may "
+                              "not have been applied: check (scene_summary / history) "
+                              "before retrying"}}
+        return {"error": {"code": -32603, "message":
+                          f"modeler daemon on {socket_path} is not answering"}}
+
+    def handle(rid, method, params):
+        """Answers one request. While a tools/call runs, a client that sent
+        a progressToken gets `notifications/progress` every few seconds, so
+        its tool timeout keeps resetting while the server works."""
+        token = ((params or {}).get("_meta") or {}).get("progressToken")
+        stop = threading.Event()
+        if token is not None and method == "tools/call":
+            def beat():
+                n, t0 = 0, time.time()
+                while not stop.wait(PROGRESS_EVERY):
+                    n += 1
+                    write({"jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": {"progressToken": token, "progress": n,
+                                      "message": f"modeler: still working ({int(time.time() - t0)} s)"}})
+            threading.Thread(target=beat, daemon=True).start()
+        try:
+            reply(rid, ask({"raw": {"method": method, "params": params}}))
+        finally:
+            stop.set()
 
     for line in sys.stdin:
         line = line.strip()
@@ -741,7 +764,12 @@ def proxy_mode(socket_path, mode):
         elif method == "ping":
             reply(rid, {"result": {}})
         else:
-            reply(rid, ask({"raw": {"method": method, "params": req.get("params")}}))
+            threading.Thread(target=handle, args=(rid, method, req.get("params")),
+                             daemon=True).start()
+    # stdin closed: let in-flight calls answer before the process exits
+    for t in threading.enumerate():
+        if t is not threading.current_thread() and not t.daemon:
+            t.join()
 
 
 def client_mode(socket_path, calls_path, save_shot, save_dir=None, b64=False, json_only=False):

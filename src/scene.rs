@@ -575,7 +575,10 @@ pub fn export_scene(
                         "exported prefab `{prefab}` -> {}",
                         rel(&root, &file)
                     ));
-                    if let Some(l) = r.lines().find(|l| l.starts_with("- ambient occlusion")) {
+                    for l in r
+                        .lines()
+                        .filter(|l| l.starts_with("- ambient occlusion") || l.contains("culling"))
+                    {
                         report.push(format!("  {l}"));
                     }
                 }
@@ -668,7 +671,10 @@ pub fn export_scene(
             rel(&root, &file),
             r.lines().next().unwrap_or("")
         ));
-        if let Some(l) = r.lines().find(|l| l.starts_with("- ambient occlusion")) {
+        for l in r
+            .lines()
+            .filter(|l| l.starts_with("- ambient occlusion") || l.contains("culling"))
+        {
             report.push(format!("  {l}"));
         }
         entities.push(Entity {

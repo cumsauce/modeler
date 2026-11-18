@@ -367,3 +367,118 @@ fn a_default_body_biped_builds_fast() {
 }
 
 const BIPED_MS: u64 = 6000;
+
+/// A building with furniture: ~320 boxes and cylinders, floor slabs, walls,
+/// and rows of tables / chairs / pillars that touch or sink into each other.
+fn building() -> Vec<Value> {
+    vec![
+        json!({"type": "primitive", "name": "slab", "kind": "box", "round": 0.01,
+               "size": [24, 0.3, 24], "translation": [0, 0.15, 0]}),
+        json!({"type": "primitive", "name": "wall_n", "kind": "box", "round": 0.01,
+               "size": [24, 3, 0.3], "translation": [0, 1.8, -12]}),
+        json!({"type": "primitive", "name": "wall_s", "kind": "box", "round": 0.01,
+               "size": [24, 3, 0.3], "translation": [0, 1.8, 12]}),
+        json!({"type": "primitive", "name": "wall_e", "kind": "box", "round": 0.01,
+               "size": [0.3, 3, 24], "translation": [12, 1.8, 0]}),
+        json!({"type": "primitive", "name": "wall_w", "kind": "box", "round": 0.01,
+               "size": [0.3, 3, 24], "translation": [-12, 1.8, 0]}),
+        json!({"type": "repeat", "var": "r", "count": 8, "items": [
+            {"type": "repeat", "var": "c", "count": 8, "items": [
+                {"type": "primitive", "name": "table{r}_{c}", "kind": "box", "round": 0.01,
+                 "size": [1.0, 0.05, 0.6],
+                 "translation": ["=$r * 2.6 - 9", 0.75, "=$c * 2.6 - 9"]},
+                {"type": "primitive", "name": "leg{r}_{c}", "kind": "cylinder",
+                 "size": [0.04, 0.5], "segments": 16,
+                 "translation": ["=$r * 2.6 - 9", 0.45, "=$c * 2.6 - 9"]},
+                {"type": "primitive", "name": "seat{r}_{c}", "kind": "box", "round": 0.01,
+                 "size": [0.4, 0.05, 0.4],
+                 "translation": ["=$r * 2.6 - 9", 0.45, "=$c * 2.6 - 8.3"]},
+                {"type": "primitive", "name": "back{r}_{c}", "kind": "box", "round": 0.01,
+                 "size": [0.4, 0.4, 0.04],
+                 "translation": ["=$r * 2.6 - 9", 0.7, "=$c * 2.6 - 8.1"]},
+                {"type": "primitive", "name": "lamp{r}_{c}", "kind": "cylinder",
+                 "size": [0.1, 0.2], "segments": 24,
+                 "translation": ["=$r * 2.6 - 9.2", 0.9, "=$c * 2.6 - 9"], "round": 0.01}
+            ]}
+        ]}),
+    ]
+}
+
+#[test]
+fn building_of_325_boxes_verifies_and_applies_fast() {
+    let _serial = serial();
+    let dir = std::env::temp_dir().join(format!("modeler-perf-bld-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: set before anything in this test reads it; same dir per process.
+    unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &dir) };
+    let mut s = Session::default();
+    let t0 = Instant::now();
+    s.apply_values_as(None, building(), false)
+        .unwrap_or_else(|e| panic!("apply failed: {e}"));
+    budget(
+        "apply 325-part building (brief summary)",
+        t0.elapsed(),
+        8000,
+    );
+    assert!(s.model.parts.len() >= 320);
+    for (label, spec) in [
+        ("collisions", json!({"collisions": true})),
+        ("grounded", json!({"grounded": true})),
+        ("validate", json!({"validate": true})),
+        (
+            "grounded+supported+collisions+validate",
+            json!({
+            "grounded": true, "supported": true, "collisions": true, "validate": true}),
+        ),
+    ] {
+        let spec: modeler::commands::VerifySpec =
+            serde_json::from_value(spec).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = Instant::now();
+        let _ = s.verify_checks(&spec);
+        budget(&format!("verify {label}, 325 parts"), t0.elapsed(), 6000);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 300 rounded tiles and cylinders edge to edge on a slab: nearly every
+/// part touches 4-8 others, so contact (not just overlap) work dominates.
+#[test]
+fn tiled_floor_of_300_touching_parts_verifies_fast() {
+    let _serial = serial();
+    let dir = std::env::temp_dir().join(format!("modeler-perf-tile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: set before anything in this test reads it; same dir per process.
+    unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &dir) };
+    let mut s = Session::default();
+    s.apply_values_as(
+        None,
+        vec![
+            json!({"type": "primitive", "name": "slab", "kind": "box", "size": [20, 0.2, 16],
+                   "translation": [0, 0.1, 0]}),
+            json!({"type": "repeat", "var": "r", "count": 20, "items": [
+                {"type": "repeat", "var": "c", "count": 15, "items": [
+                    {"type": "primitive", "name": "tile{r}_{c}", "kind": "box", "round": 0.01,
+                     "size": [1.0, 0.1, 1.0],
+                     "translation": ["=$r * 1.0 - 9.5", 0.25, "=$c * 1.0 - 7"]}
+                ]}
+            ]}),
+        ],
+        false,
+    )
+    .unwrap_or_else(|e| panic!("apply failed: {e}"));
+    let spec: modeler::commands::VerifySpec = serde_json::from_value(json!({
+        "grounded": true, "supported": true, "collisions": true
+    }))
+    .unwrap_or_else(|e| panic!("{e}"));
+    let t0 = Instant::now();
+    let checks = s.verify_checks(&spec);
+    budget(
+        "verify grounded+supported+collisions, 301 touching",
+        t0.elapsed(),
+        6000,
+    );
+    for (name, ok, detail) in &checks {
+        assert!(ok, "{name} failed: {detail}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
