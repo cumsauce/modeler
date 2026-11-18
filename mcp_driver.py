@@ -57,8 +57,13 @@ import subprocess, sys, base64, os, signal, socket, stat, time
 
 # The server binary: MODELER_BINARY, else target/debug/modeler next to
 # this script (the repo checkout it lives in).
-BINARY = os.environ.get("MODELER_BINARY") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "target", "debug", "modeler")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# An installed copy (bin/modeler/) has the binary beside the script.
+BINARY = os.environ.get("MODELER_BINARY") or next(
+    (p for p in (os.path.join(_HERE, "modeler"),
+                 os.path.join(_HERE, "target", "debug", "modeler"))
+     if os.path.isfile(p)),
+    os.path.join(_HERE, "target", "debug", "modeler"))
 # The daemon socket: MODELER_SOCKET (one daemon per agent), else the one
 # shared daemon. --socket PATH overrides both.
 SOCKET = os.environ.get("MODELER_SOCKET") or "/tmp/modeler-mcp.sock"

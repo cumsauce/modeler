@@ -7267,6 +7267,49 @@ mod tests {
     }
 
     #[test]
+    fn svg_profiles_extrude_with_holes_and_feed_sweeps_and_lofts() {
+        let ring = r#"<path fill-rule="evenodd" d="M0 0 H100 V100 H0 Z M25 25 H75 V75 H25 Z"/>"#;
+        let (s, _) = batch(serde_json::json!([
+            {"type": "extrude", "name": "emblem", "height": 0.2,
+             "profile": {"svg": ring, "size": [1.0, 1.0]}},
+            {"type": "sweep", "name": "rail", "path": [[0, 0, 2], [1, 0, 2]],
+             "profile": {"svg": "<circle cx=\"0\" cy=\"0\" r=\"10\"/>", "height": 0.1}},
+            {"type": "loft", "name": "post", "sections": [
+                {"y": 0, "profile": {"svg": "<rect width=\"10\" height=\"10\"/>", "size": 0.2}},
+                {"y": 1, "profile": {"svg": "<circle r=\"5\"/>", "size": 0.1}}]}
+        ]));
+        let Some(p) = s.model.part("emblem") else {
+            panic!("no emblem");
+        };
+        let (v, _) = crate::inspect::volume_centroid(p);
+        assert!((v - 0.75 * 0.2).abs() < 1e-4, "volume {v}");
+        let Some(r) = s.model.part("rail") else {
+            panic!("no rail");
+        };
+        let (v, _) = crate::inspect::volume_centroid(r);
+        let want = std::f64::consts::PI * 0.05 * 0.05;
+        assert!((v - want).abs() / want < 0.02, "rail volume {v} vs {want}");
+        // A broken SVG names the item and field.
+        let mut s2 = Session::default();
+        let e = s2
+            .apply_values_as(
+                None,
+                vec![
+                    serde_json::json!({"type": "extrude", "name": "x", "height": 1,
+                    "profile": {"svg": "<path d=\"M0 0 L"}}),
+                ],
+                true,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("extrude \"x\"") && e.contains("profile: svg:"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn shell_hollows_a_box_with_exact_walls_and_an_open_face() {
         let (s, _) = batch(serde_json::json!([
             {"type": "primitive", "name": "raw", "kind": "box", "size": [0.6, 0.8, 0.5], "translation": [0, 0.4, 0]},

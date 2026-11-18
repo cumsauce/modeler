@@ -38,6 +38,9 @@ libc = "0.2"
 texture-compressor = { version = "0.2", features = ["parallel"] }
 ruzstd = "0.8.3"
 ttf-parser = "0.25"
+# SVG artwork (the material `svg` node, svg profiles): parsing, transforms,
+# strokes and text converted to paths.
+usvg = { version = "0.50.0", default-features = false, features = ["text"] }
 
 # Load libwayland at runtime on Linux (Bevy links it otherwise), so the
 # headless binary starts in bare containers that don't have it.

@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::eval::Samples;
 use super::nodes2::{DirBlur, Facing, Gradient, Image, Islands, MeshAo, MeshCurvature, Scatter};
+use super::nodes3::{Project, Svg};
 use super::noise::{self, Lattice};
 use super::sdf;
 
@@ -401,6 +402,8 @@ node_types! {
     "gradient" => Gradient,
     "facing" => Facing,
     "image" => Image,
+    "svg" => Svg,
+    "project" => Project,
     "islands" => Islands,
     "dir_blur" => DirBlur,
     "output" => Output,
@@ -2196,7 +2199,7 @@ impl Eval for Output {
 pub fn refs(body: &Value) -> Vec<(String, String)> {
     const WORDS: &[&str] = &[
         "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path", "alpha",
-        "text", "font", "align",
+        "text", "font", "align", "svg", "fit", "face",
     ];
     let mut out = Vec::new();
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {
@@ -2277,6 +2280,10 @@ pub fn example(ty: &str) -> Option<Value> {
         "gradient" => json!({"from": [0, 0.3, 0.1], "to": [0, 0.2, -0.2]}),
         "facing" => json!({"dir": [0, 1, 0], "lo": 0.3, "hi": 0.8}),
         "image" => json!({"path": "textures/decal.png", "size": [0.5, 0.5]}),
+        "svg" => {
+            json!({"svg": "<svg viewBox=\"0 0 100 100\"><circle id=\"ring\" cx=\"50\" cy=\"50\" r=\"40\" fill=\"none\" stroke=\"#c33\" stroke-width=\"8\"/><path id=\"star\" fill=\"#fc0\" d=\"M50 22 L58 42 L80 42 L62 55 L69 77 L50 64 L31 77 L38 55 L20 42 L42 42 Z\"/></svg>", "size": [0.3, 0.3], "center": [0, 0]})
+        }
+        "project" => json!({"face": "front", "at": [0, 0.6], "depth": 0.05}),
         "islands" => json!({"input": "stone_mask"}),
         "dir_blur" => json!({"input": "n1", "length": 0.02, "angle": 90}),
         "output" => {

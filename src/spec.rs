@@ -293,6 +293,80 @@ pub struct ArcSpec {
 pub enum ProfileArg {
     Ring(Vec<RingItem>),
     Rings(Vec<Vec<RingItem>>),
+    Svg(SvgProfile),
+}
+
+/// A profile drawn in SVG: {"svg": "<svg ...>" or "<path d=...>", "size"?:
+/// [w, h] meters (or the width alone), "height"?: meters, "center"?: [a,
+/// b], "flip_y"?: true, "id"?: element id}. Every filled shape (strokes as
+/// outlines, text as glyphs) becomes rings, holes kept (even-odd); the
+/// content's bounds are fitted to size / height (default 1 unit = 1 mm)
+/// and centred on `center` (default [0, 0]). SVG's y runs down: flip_y
+/// (default) makes the drawing's up the profile's +b.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SvgProfile {
+    svg: String,
+    #[serde(default)]
+    size: Option<ScaleArg>,
+    #[serde(default)]
+    height: Option<f32>,
+    #[serde(default)]
+    center: Option<[f32; 2]>,
+    #[serde(default)]
+    flip_y: Option<bool>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+impl SvgProfile {
+    fn rings(&self) -> Result<Vec<Vec<[f32; 2]>>, String> {
+        let (size, width_only) = match self.size {
+            Some(ScaleArg::One(w)) => (Some([w, w]), true),
+            Some(ScaleArg::Two(s)) => (Some(s), false),
+            None => (None, false),
+        };
+        crate::svg::profile_rings(
+            &self.svg,
+            self.id.as_deref(),
+            size,
+            width_only,
+            self.height,
+            self.center.unwrap_or([0.0, 0.0]),
+            self.flip_y.unwrap_or(true),
+        )
+        .map_err(|e| format!("svg: {e}"))
+    }
+}
+
+/// One ring: points / arcs, or an svg profile (its largest ring).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RingArg {
+    Ring(Vec<RingItem>),
+    Svg(SvgProfile),
+}
+
+fn ring_area(r: &[[f32; 2]]) -> f32 {
+    let mut a = 0.0;
+    for i in 0..r.len() {
+        let (p, q) = (r[i], r[(i + 1) % r.len()]);
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    (a * 0.5).abs()
+}
+
+fn expand_ring_arg(a: RingArg) -> Result<Vec<[f32; 2]>, String> {
+    match a {
+        RingArg::Ring(r) => expand_ring(r),
+        RingArg::Svg(s) => {
+            let rings = s.rings()?;
+            rings
+                .into_iter()
+                .max_by(|a, b| ring_area(a).total_cmp(&ring_area(b)))
+                .ok_or_else(|| "svg: no rings".to_string())
+        }
+    }
 }
 
 fn expand_ring(items: Vec<RingItem>) -> Result<Vec<[f32; 2]>, String> {
@@ -338,6 +412,7 @@ impl ProfileArg {
         match self {
             ProfileArg::Ring(r) => Ok(vec![expand_ring(r)?]),
             ProfileArg::Rings(r) => r.into_iter().map(expand_ring).collect(),
+            ProfileArg::Svg(s) => s.rings(),
         }
     }
 }
@@ -1006,8 +1081,9 @@ pub struct SweepSpec {
     /// Cross-section [[u, v], ...] (points or arcs, one ring) centred on the
     /// path: u along the frame normal (starts as world up, or +z for a
     /// vertical path), v across. A circle: [{"arc": {"center": [0, 0],
-    /// "radius": 0.02, "from": 0, "to": 360}}].
-    profile: Vec<RingItem>,
+    /// "radius": 0.02, "from": 0, "to": 360}}]. Or an svg profile (its
+    /// largest ring).
+    profile: RingArg,
     /// World points [[x, y, z], ...] the profile travels along (bends are
     /// mitred to keep thickness). With smooth, a few control points of a
     /// curve instead.
@@ -1060,8 +1136,9 @@ fn curve_smooth(ctx: &str, smooth: bool, curve: &Option<String>) -> Result<bool,
 pub struct LoftSectionSpec {
     /// One ring [[a, b], ...] (points or arcs). Straight lofts: a is world x
     /// and b world z before `rotation` (like an extrude footprint); on a
-    /// path, a is along the path normal (up) and b across, like sweep.
-    profile: Vec<RingItem>,
+    /// path, a is along the path normal (up) and b across, like sweep. Or
+    /// an svg profile (its largest ring).
+    profile: RingArg,
     /// Centre of the section [x, y, z] (straight lofts).
     #[serde(default)]
     at: Option<[f32; 3]>,
@@ -3678,7 +3755,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let s: SweepSpec = de(&ctx, &body)?;
             BatchItem::Op(Op::Sweep {
                 name: s.name,
-                profile: expand_ring(s.profile).map_err(|e| format!("{ctx}: profile: {e}"))?,
+                profile: expand_ring_arg(s.profile).map_err(|e| format!("{ctx}: profile: {e}"))?,
                 smooth: curve_smooth(&ctx, s.smooth, &s.curve)?,
                 samples: s.samples,
                 path: s.path,
@@ -3714,7 +3791,8 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     return Err(format!("{c}: t needs a path; use y or at"));
                 }
                 sections.push(crate::loft::LoftSection {
-                    profile: expand_ring(sec.profile).map_err(|e| format!("{c}: profile: {e}"))?,
+                    profile: expand_ring_arg(sec.profile)
+                        .map_err(|e| format!("{c}: profile: {e}"))?,
                     at,
                     t: sec.t,
                     rotation: rot(&c, &sec.rotation)?,

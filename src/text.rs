@@ -5,9 +5,9 @@
 
 use ttf_parser::{Face, OutlineBuilder};
 
-const SANS: &[u8] = include_bytes!("../fonts/FiraSans-Regular.ttf");
-const BOLD: &[u8] = include_bytes!("../fonts/FiraSans-Bold.ttf");
-const MONO: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
+pub(crate) const SANS: &[u8] = include_bytes!("../fonts/FiraSans-Regular.ttf");
+pub(crate) const BOLD: &[u8] = include_bytes!("../fonts/FiraSans-Bold.ttf");
+pub(crate) const MONO: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
 
 pub const FONTS: &[&str] = &["sans", "bold", "mono"];
 

@@ -98,6 +98,7 @@ pub mod simplify;
 pub mod smooth;
 pub mod spec;
 pub mod style;
+pub mod svg;
 pub mod terrain;
 pub mod text;
 pub mod uv;
