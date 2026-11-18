@@ -10,7 +10,21 @@ use std::path::{Path, PathBuf};
 /// Where `file` is, inside `project` (relative paths are taken from it).
 /// Refuses paths that leave the project, through `..` or a symlink, and calls
 /// with no project (the shared library has no folder to read from).
+/// With no project (an agent working outside a game folder), an absolute
+/// path is read as given: the caller wrote the file itself, and the items
+/// are only data, applied like inline ones.
 pub(crate) fn resolve(project: Option<&Path>, file: &str) -> Result<PathBuf, String> {
+    if project.is_none() {
+        let p = Path::new(file);
+        if !p.is_absolute() {
+            return Err(format!(
+                "ops_file `{file}`: this call has no project, so give an absolute path (relative paths are taken from the caller's game project)"
+            ));
+        }
+        return p
+            .canonicalize()
+            .map_err(|e| format!("ops_file `{file}`: {e}"));
+    }
     resolve_as(project, file, "ops_file")
 }
 
@@ -156,6 +170,9 @@ mod tests {
             assert!(read(Some(&p), &abs).is_err());
         }
         assert!(read(None, "gen/a.json").is_err_and(|e| e.contains("no project")));
+        // With no project, an absolute path is read as given.
+        let abs = p.join("gen/a.json").to_string_lossy().to_string();
+        assert!(read(None, &abs).is_ok());
     }
 
     #[test]

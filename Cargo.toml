@@ -78,3 +78,9 @@ debug = false
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+
+# Carry patch for manifold's level set: a full grid table before any vert has
+# moved read vertPos[-1] and crashed the server (SIGSEGV) on small silhouettes.
+# See vendor/manifold-csg-sys/patches.
+[patch.crates-io]
+manifold-csg-sys = { path = "vendor/manifold-csg-sys" }

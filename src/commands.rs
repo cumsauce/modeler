@@ -3739,6 +3739,10 @@ impl Session {
             "ops": self.model.ops.iter().map(Self::op_label).collect::<Vec<_>>(),
             "variants": crate::variant::names(&self.model),
             "warnings": self.lints(),
+            // After a restart (a crash too) unsaved work is parked, not open:
+            // say so here, the first call an agent makes, or the empty
+            // document reads as lost work.
+            "parked": (!self.parked.is_empty()).then(|| self.parked_note()),
             "annotations": self.model.annotations.iter().map(|a| json!({
                 "id": a.id, "part": a.part, "text": a.text, "face": a.face, "vertex": a.vertex,
                 "group": a.group, "material": a.material, "node": a.node,

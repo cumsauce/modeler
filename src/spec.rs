@@ -5166,8 +5166,18 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "tri_mesh" => schemars::schema_for!(TriMeshSpec),
         "uvs" => schemars::schema_for!(UvsSpec),
         "prefab" => schemars::schema_for!(PrefabSpec),
+        // Not an apply_ops item: a material_ops node type (noise, ramp,
+        // output, ...) gets its own schema instead of an "unknown" error.
+        other if crate::material::node::NODE_TYPES.contains(&other) => {
+            return crate::material::node::describe(Some(other)).map(|s| {
+                format!("material_ops node `{other}` (apply_ops has no item of this type):\n{s}")
+            });
+        }
         other => {
-            return Err(format!("unknown item {}", unknown_type(other)));
+            return Err(format!(
+                "unknown item {} (for a material_ops node use \"node:<type>\"; \"nodes\" lists them)",
+                unknown_type(other)
+            ));
         }
     };
     let example = example(ty).unwrap_or(Value::Null);
