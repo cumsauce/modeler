@@ -332,6 +332,17 @@ surfaces, not hundreds of scattered copies.
   `{"arc": {"center": [a, b], "radius": r, "from": deg, "to": deg}}`
   (counter-clockwise from +a; 0 -> 360 is a full circle), so curves need no
   hand-made point lists. `round: r` fillets every profile corner.
+  **SVG profiles**: anywhere a profile goes (extrude, revolve, sweep, loft
+  sections, silhouette side / top / front) give `{"svg": "<svg ...>" or
+  "<path d=...>", "size"?: [w, h] | w, "height"?: m, "center"?: [a, b],
+  "flip_y"?: true, "id"?: "element"}`: every filled shape (strokes as
+  outlines, text as glyphs) becomes rings, holes kept (even-odd), the
+  content's bounds fitted to `size` / `height` (default 1 unit = 1 mm) and
+  centred on `center` (default origin); `flip_y` (default) makes the
+  drawing's up +b. Sweep and loft take its largest ring. An emblem:
+  `{"type": "extrude", "name": "emblem", "height": 0.01, "profile":
+  {"svg": "<path fill-rule=\"evenodd\" d=\"M0 0 H100 V100 H0 Z M25 25 H75
+  V75 H25 Z\"/>", "size": [0.2, 0.2]}}`.
 - **`sweep`** runs a closed profile along a 3D polyline (pipes, rails,
   handles, frames, hoses); bends are mitred to keep the thickness, and
   `closed: true` loops the path (a ring) instead of capping it. Profile u is
@@ -1629,6 +1640,28 @@ or pruning, so the autosave stays small however long the session runs and
 however often agents switch documents. `save_prefab` only
 names and indexes it.
 
+## Texturing by default
+
+Agents tend to stop at grey or flat-coloured geometry. Don't: unless the
+user asks for a blockout or plain colours (`flat: true`), every model
+ships textured, planned together with the shape.
+
+1. **Pick a domain per part.** Tile (the default) for anything that
+   repeats or is reused across models (wood, brushed metal, painted steel,
+   fabric, stone, concrete): metric uvs map it at real size and kits share
+   one texture. Object for hero parts that need wear following their own
+   shape: `mesh_ao` / `mesh_curvature` (dirt in creases, worn edges),
+   `gradient` fades, 3D noise with no seams. Card / decal for cutouts.
+2. **Put artwork where it belongs.** Badges, labels, gauges, panel lines
+   and markings: an `svg` (or `text`) node on a `project {face, at}` coords
+   node, masked by `project.facing`, in the part's object material; stains,
+   cracks, graffiti: `decal` items or a decal `scatter`.
+3. **Layer, don't paint one tone.** Base + `over` layers (rust over paint,
+   dirt where `mesh_curvature.concave`, wear where `.convex`), roughness
+   variation, a `bevel` finish on hard edges, `macro` on big surfaces.
+4. **Check it**: `material_view` per material, one `agent_views` render
+   of the model, and `verify materials: "pbr"` in the batch's `expect`.
+
 ## Organic workflow
 
 Creatures, characters, vehicles and other sculpted forms (the per-op
@@ -1733,7 +1766,7 @@ work, and every material has its own history tree.
   height in meters, `\n` for lines, `align`, `line_spacing`,
   `letter_spacing`, `angle` degrees; the same fonts as the `text` item;
   feed it to `mask` for the fill, `mask` glow for an outline: signs,
-  labels, graffiti decals, stencils on crates). 3D SDFs: sphere, box, torus, capsule, cylinder, plane. SDF ops:
+  labels, graffiti decals, stencils on crates), svg (see below). 3D SDFs: sphere, box, torus, capsule, cylinder, plane. SDF ops:
   sdf_op (union / intersect / subtract and smooth_ versions), sdf_round,
   onion, displace, mask (fill / stroke / glow, anti-aliased). Noise: noise
   (value / gradient; fbm / ridged / turbulence), worley (f1 / f2 / edge /
@@ -1745,6 +1778,43 @@ work, and every material has its own history tree.
   angle or a `flow` field: streaks, brushed metal, hair),
   normal_from_height, ao_from_height, curvature, dilate, islands (connected
   regions of a mask: `id` per island for `random`, `area`).
+- **`svg`**: an SVG drawing as an exact signed distance field, like the
+  other 2D SDFs (mask, sdf_op, onion, displace, heights all work):
+  `{"type": "svg", "name": "logo", "svg": "<svg viewBox=...>...</svg>"` (or
+  `"path": "art/logo.svg"`, project-relative) `, "size": [w, h]` meters
+  (or the width alone), `"center"` (default [0.5, 0.5]), `"angle"`,
+  `"fit": "contain" | "stretch"}`. usvg parses it (transforms, groups,
+  shapes, paths, strokes as outlines, text as Fira glyphs; fill-rule
+  honoured). Ports: default = union of every filled shape; one per element
+  `id` (`logo.ring`); `logo.colors` (the SVG's own fill colours, linear,
+  anti-aliased: a full-colour decal) and `logo.alpha` (coverage). Parsed
+  once per content hash, edges bucketed in a grid. Gradients read as
+  their average colour; images, filters, masks, clips and dashes are
+  ignored.
+- **`project`**: planar coordinates on one side of a part, so 2D artwork
+  (svg, text, shapes) lands on a named face in the object domain without
+  knowing the atlas: `{"type": "project", "name": "front_uv", "face":
+  "front" (back/left/right/top/bottom; or "normal": [x, y, z], "up"?),
+  "at": [a, b], "depth"?: m}`. `at` is the artwork origin in the face's
+  cross axes (front/back [x, y], left/right [z, y], top/bottom [x, z]; the
+  part's own local axes: a box primitive is centred on its origin, so a
+  translated hull 0.9 tall has its front's centre at [0, 0]). Output: vec2 meters, `at` at [0, 0], +x to the right
+  seen from outside, +y down, so give the artwork `"center": [0, 0]`;
+  `front_uv.facing` is 1 on surfaces facing that way (cosine `lo` 0.6 ..
+  `hi` 0.85) and 0 elsewhere and further than `depth` behind the part's
+  front. A badge on a tank's front (object domain):
+  `material_ops("tank_paint", domain: "object", ops: [{"type": "project",
+  "name": "fp", "face": "front", "at": [0, 0.1], "depth": 0.05}, {"type":
+  "svg", "name": "badge", "coords": "fp", "center": [0, 0], "size": 0.4,
+  "svg": "<svg viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\"
+  r=\"45\" fill=\"#fff\"/><path fill=\"#c22\" d=\"M50 12 L61 40 L90 40
+  L66 58 L75 88 L50 70 L25 88 L34 58 L10 40 L39 40 Z\"/></svg>"}, {"type":
+  "math", "name": "m", "op": "mul", "a": "badge.alpha", "b": "fp.facing"},
+  {"type": "noise", "name": "n", "size": 0.3}, {"type": "ramp", "name":
+  "paint", "input": "n", "stops": [[0, "#3e4a2c"], [1, "#55603a"]]},
+  {"type": "blend", "name": "col", "a": "paint", "b": "badge.colors",
+  "opacity": "m"}, {"type": "output", "name": "o", "base_color": "col",
+  "roughness": 0.6}])`.
 - **`scatter`** is a tile sampler: shapes (ellipse, circle, rect, feather,
   leaf) strewn on a jittered grid of `cell` meters, `per_cell` each, with
   random `scale`, `angle_jitter` and `density`, pointing along `angle` or a

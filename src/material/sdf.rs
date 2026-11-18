@@ -124,10 +124,18 @@ pub struct EdgeGrid {
     cells: Vec<Vec<u32>>,
     /// Per row of cells: edges whose y span meets the row.
     rows: Vec<Vec<u32>>,
+    /// Inside by the nonzero winding rule instead of even-odd.
+    nonzero: bool,
 }
 
 impl EdgeGrid {
     pub fn new(rings: &[Vec<V2>]) -> EdgeGrid {
+        EdgeGrid::with_rule(rings, false)
+    }
+
+    /// [`EdgeGrid::new`] filled by the nonzero winding rule (`true`, SVG's
+    /// default) or even-odd (`false`).
+    pub fn with_rule(rings: &[Vec<V2>], nonzero: bool) -> EdgeGrid {
         let mut edges = Vec::new();
         for r in rings {
             for i in 0..r.len() {
@@ -176,7 +184,19 @@ impl EdgeGrid {
             ny,
             cells,
             rows,
+            nonzero,
         }
+    }
+
+    /// The edges' bounds (min, max).
+    pub fn bounds(&self) -> (V2, V2) {
+        (
+            self.lo,
+            [
+                self.lo[0] + self.nx as f32 * self.cell,
+                self.lo[1] + self.ny as f32 * self.cell,
+            ],
+        )
     }
 
     fn inside(&self, p: V2) -> bool {
@@ -184,17 +204,21 @@ impl EdgeGrid {
         if y < 0.0 || y >= self.ny as f32 {
             return false;
         }
-        let mut odd = false;
+        let mut wind = 0i32;
         for &k in &self.rows[y as usize] {
             let (a, b) = self.edges[k as usize];
             if (a[1] > p[1]) != (b[1] > p[1]) {
                 let x = a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
                 if x > p[0] {
-                    odd = !odd;
+                    wind += if b[1] > a[1] { 1 } else { -1 };
                 }
             }
         }
-        odd
+        if self.nonzero {
+            wind != 0
+        } else {
+            wind % 2 != 0
+        }
     }
 
     /// Signed distance: negative inside.

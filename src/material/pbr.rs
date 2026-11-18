@@ -174,7 +174,7 @@ pub fn bake_key(r: &PbrRef, part: Option<&Part>) -> u64 {
     if let Some(g) = &r.graph {
         for n in &g.nodes {
             if let Some(path) = n.get("path").and_then(|v| v.as_str()) {
-                std::fs::metadata(path)
+                std::fs::metadata(super::nodes3::art_path(path))
                     .and_then(|m| m.modified())
                     .ok()
                     .hash(&mut h);

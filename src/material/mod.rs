@@ -11,6 +11,7 @@ pub mod finish;
 pub mod meshvox;
 pub mod node;
 pub mod nodes2;
+pub mod nodes3;
 pub mod noise;
 pub mod pbr;
 pub mod sdf;

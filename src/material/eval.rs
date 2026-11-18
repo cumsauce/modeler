@@ -403,10 +403,10 @@ pub fn evaluate(
                 (p.ty.as_str(), p.body.to_string(), s.key).hash(&mut h);
                 // An image node also keys on its file's mtime, so editing the
                 // PNG re-bakes.
-                if p.ty == "image"
+                if matches!(p.ty.as_str(), "image" | "svg")
                     && let Some(path) = p.body.get("path").and_then(|v| v.as_str())
                 {
-                    std::fs::metadata(path)
+                    std::fs::metadata(super::nodes3::art_path(path))
                         .and_then(|m| m.modified())
                         .ok()
                         .hash(&mut h);
