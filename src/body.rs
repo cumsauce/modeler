@@ -1011,7 +1011,10 @@ pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
             at: Some([c.x + out, c.y, c.z]),
             rotation: Some(x90),
             radius: Some(vec![w.r * 0.62]),
-            height: Some(w.w * 0.25),
+            // Half of it cuts in: about 0.07 m on a default car, over two
+            // voxels, so the dish meshes with a clean rim and floor (a
+            // recess a voxel deep can't).
+            height: Some(w.w * 0.6),
             ..Shape::default()
         });
     }

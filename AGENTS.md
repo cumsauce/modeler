@@ -1719,6 +1719,13 @@ details are in the `body`, `sdf`, `skin` and oval-section bullets above):
 5. **Make it light last**: `tris: N` on the item (plus `bake: true` to keep
    the dense detail in normal / height maps), then rig and animate.
 
+Level-set results (`sdf`, `skin`, `body`, `silhouette`, `blob`, `smooth`
+remesh) are finished automatically: vertices are projected onto the field,
+sharp joins are reconstructed as straight runs of mesh edges and normals
+come from the field gradient. A join meant to be soft needs a `blend`, not
+a mesher trick. `decimate` / `tris` keeps those creases (feature-edge
+quadrics); a `ragged crease` warning means one came out zigzag anyway.
+
 `examples/creature.rs` (body + warps + tris) and `examples/car_body.rs`
 (silhouette shape + arch subtractions + wheels) run this end to end.
 
@@ -2009,7 +2016,10 @@ mirror-symmetric about x = 0 or its centre plane except for a few parts a
 little off (named), runs of numbered or same-size parts with nearly but not
 quite even spacing, pairs of parts under 2% apart in size, and **boxy**
 (at least 5 and over 70% of visible parts are unrounded axis-aligned boxes:
-round, loft, deform taper, smooth subdiv); a style number (or param) `lint_boxy: 0` silences it for a deliberately blocky model. Volume checks
+round, loft, deform taper, smooth subdiv); a style number (or param) `lint_boxy: 0` silences it for a deliberately blocky model; and a
+**ragged crease** (a part over 2000 triangles whose sharp joins, edges
+over 40 degrees chained into runs of 8 or more, zigzag instead of running
+straight: fix as the line says). Volume checks
 and welds scale with the part, so centimetre-scale models validate
 correctly. Hidden parts are excluded. An empty list means none
 fired.

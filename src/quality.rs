@@ -118,6 +118,173 @@ pub fn lints(model: &Model) -> Vec<String> {
     if !boxy_off {
         out.extend(boxiness(&vis));
     }
+    out.extend(capped(ragged_creases(&vis), "ragged creases"));
+    out
+}
+
+/// Parts under this many triangles are too coarse for a zigzag to read.
+const RAGGED_MIN_TRIS: u32 = 2000;
+/// Parts over this many triangles are skipped (the lint must stay cheap).
+const RAGGED_MAX_TRIS: u32 = 400_000;
+/// Dihedral angle (degrees) above which an edge is a crease.
+const RAGGED_CREASE: f32 = 40.0;
+/// Shortest crease chain (edges) that is judged.
+const RAGGED_CHAIN: usize = 8;
+/// A turn smaller than this (degrees) is noise, not a zig.
+const RAGGED_TURN: f32 = 15.0;
+
+/// Zigzag crease edges of a part: sharp joins (dihedral over 40 degrees)
+/// chained into polylines, counting the edges of chains of at least 8 edges
+/// where over half the interior vertices turn the opposite way to the sharp
+/// turn before by more than 15 degrees (a sawtooth, not a clean run or a
+/// curve). Returns `(zigzag edges, all edges in judged chains)`.
+fn zigzag_edges(p: &Part) -> (usize, usize) {
+    use std::collections::{HashMap, HashSet};
+    let n = p.verts.len();
+    let pos: Vec<Vec3> = (0..n).map(|i| p.world_vert(i)).collect();
+    let (lo, hi) = pos.iter().fold(
+        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        |(a, b), v| (a.min(*v), b.max(*v)),
+    );
+    let inv = 1.0 / ((hi - lo).max_element() * 1e-5).max(1e-9);
+    let mut ids: HashMap<[i64; 3], u32> = HashMap::new();
+    let mut wp: Vec<Vec3> = Vec::new();
+    let of: Vec<u32> = pos
+        .iter()
+        .map(|v| {
+            let k = [v.x, v.y, v.z].map(|c| (c * inv).round() as i64);
+            *ids.entry(k).or_insert_with(|| {
+                wp.push(*v);
+                (wp.len() - 1) as u32
+            })
+        })
+        .collect();
+    let mut normals: Vec<Vec3> = Vec::new();
+    let mut edges: Vec<(u64, u32)> = Vec::new();
+    let key = |a: u32, b: u32| (u64::from(a.min(b)) << 32) | u64::from(a.max(b));
+    for t in p.indices.as_chunks::<3>().0 {
+        if t.iter().any(|&i| i as usize >= n) {
+            continue;
+        }
+        let [a, b, c] = t.map(|i| of[i as usize]);
+        if a == b || b == c || a == c {
+            continue;
+        }
+        let nrm = (wp[b as usize] - wp[a as usize]).cross(wp[c as usize] - wp[a as usize]);
+        let Some(nrm) = nrm.try_normalize() else {
+            continue;
+        };
+        let f = normals.len() as u32;
+        normals.push(nrm);
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            edges.push((key(u, v), f));
+        }
+    }
+    edges.sort_unstable();
+    let cos = RAGGED_CREASE.to_radians().cos();
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut i = 0;
+    while i < edges.len() {
+        let mut j = i + 1;
+        while j < edges.len() && edges[j].0 == edges[i].0 {
+            j += 1;
+        }
+        if j - i == 2 && normals[edges[i].1 as usize].dot(normals[edges[i + 1].1 as usize]) < cos {
+            let (u, v) = ((edges[i].0 >> 32) as u32, (edges[i].0 & 0xffff_ffff) as u32);
+            adj.entry(u).or_default().push(v);
+            adj.entry(v).or_default().push(u);
+        }
+        i = j;
+    }
+    // Chains start at vertices that are not plain run-throughs, then loops.
+    let mut starts: Vec<u32> = adj
+        .iter()
+        .filter(|(_, v)| v.len() != 2)
+        .map(|(k, _)| *k)
+        .collect();
+    let mut loops: Vec<u32> = adj
+        .iter()
+        .filter(|(_, v)| v.len() == 2)
+        .map(|(k, _)| *k)
+        .collect();
+    starts.sort_unstable();
+    loops.sort_unstable();
+    starts.extend(loops);
+    let mut used: HashSet<u64> = HashSet::new();
+    let min_turn = RAGGED_TURN.to_radians().cos();
+    let (mut zig, mut total) = (0usize, 0usize);
+    for s in starts {
+        for &first in &adj[&s] {
+            if used.contains(&key(s, first)) {
+                continue;
+            }
+            let mut chain = vec![s, first];
+            used.insert(key(s, first));
+            loop {
+                let cur = chain[chain.len() - 1];
+                let nb = &adj[&cur];
+                if nb.len() != 2 {
+                    break;
+                }
+                let prev = chain[chain.len() - 2];
+                let next = if nb[0] == prev { nb[1] } else { nb[0] };
+                if used.contains(&key(cur, next)) {
+                    break;
+                }
+                used.insert(key(cur, next));
+                chain.push(next);
+            }
+            let edges_n = chain.len() - 1;
+            if edges_n < RAGGED_CHAIN {
+                continue;
+            }
+            // A sharp turn whose axis flips against the previous sharp
+            // turn's is a zig.
+            let mut prev_axis: Option<Vec3> = None;
+            let (mut flips, mut interior) = (0usize, 0usize);
+            for w in chain.windows(3) {
+                interior += 1;
+                let d1 = (wp[w[1] as usize] - wp[w[0] as usize]).normalize_or_zero();
+                let d2 = (wp[w[2] as usize] - wp[w[1] as usize]).normalize_or_zero();
+                if d1.dot(d2) > min_turn {
+                    prev_axis = None;
+                    continue;
+                }
+                let axis = d1.cross(d2);
+                if let Some(pa) = prev_axis
+                    && pa.dot(axis) < 0.0
+                {
+                    flips += 1;
+                }
+                prev_axis = Some(axis);
+            }
+            total += edges_n;
+            if flips * 2 > interior {
+                zig += edges_n;
+            }
+        }
+    }
+    (zig, total)
+}
+
+/// Sawtooth creases on dense parts: a sharp join meshed as a zigzag instead
+/// of a straight run of edges (level-set surfaces and decimation can leave
+/// it). Fires when at least 16 crease edges zigzag and they are a third of
+/// the part's judged crease length.
+fn ragged_creases(vis: &[(&Part, Vec3, Vec3)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(p, _, _) in vis {
+        if !(RAGGED_MIN_TRIS..=RAGGED_MAX_TRIS).contains(&p.tri_count()) {
+            continue;
+        }
+        let (zig, total) = zigzag_edges(p);
+        if zig >= 16 && zig * 3 >= total {
+            out.push(format!(
+                "`{}`: ragged crease ({zig} zigzag edges along sharp joins): re-derive it (sharp joins are reconstructed now), give the join a small `blend`, or decimate with a higher `tris`",
+                p.name
+            ));
+        }
+    }
     out
 }
 
@@ -1276,5 +1443,93 @@ mod tests {
         run(&mut s, serde_json::Value::Array(items));
         let (ok, t) = check(&s, serde_json::json!({"density": {}}), "density");
         assert!(ok, "{t}");
+    }
+
+    /// A ridge between two planes whose crease zigzags in z.
+    fn sawtooth(cols: usize, amp: f32) -> crate::Part {
+        let mut p = crate::Part::new("saw");
+        let mut idx = Vec::new();
+        for i in 0..cols {
+            let x = i as f32 * 0.01;
+            let a = if i % 2 == 0 { amp } else { -amp };
+            p.verts.push([x, 0.0, -0.5]);
+            p.verts.push([x, 0.3, a]);
+            p.verts.push([x, 0.0, 0.5]);
+            if i > 0 {
+                let b = (i * 3) as u32;
+                let q = b - 3;
+                idx.extend([q, q + 1, b + 1, q, b + 1, b]);
+                idx.extend([q + 1, q + 2, b + 2, q + 1, b + 2, b + 1]);
+            }
+        }
+        p.indices = idx;
+        p
+    }
+
+    #[test]
+    fn sawtooth_crease_is_ragged() {
+        let p = sawtooth(1100, 0.004);
+        assert!(p.tri_count() > super::RAGGED_MIN_TRIS);
+        let (zig, total) = super::zigzag_edges(&p);
+        eprintln!("sawtooth: {zig} of {total}");
+        assert!(zig >= 1000, "{zig} of {total}");
+        let vis = [(&p, crate::Vec3::ZERO, crate::Vec3::ONE)];
+        let l = super::ragged_creases(&vis);
+        assert!(
+            l.len() == 1 && l[0].contains("`saw`: ragged crease"),
+            "{l:?}"
+        );
+        // The same ridge, dead straight: clean.
+        let p = sawtooth(1100, 0.0);
+        let (zig, _) = super::zigzag_edges(&p);
+        assert_eq!(zig, 0);
+    }
+
+    #[test]
+    fn clean_primitives_are_not_ragged() {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            serde_json::json!([
+                bx("box", [1.0, 0.5, 0.7], [0.0, 0.25, 0.0]),
+                {"type": "primitive", "name": "cyl", "kind": "cylinder", "size": [0.3, 1.0], "segments": 200},
+                {"type": "primitive", "name": "rbox", "kind": "box", "size": [1.0, 0.5, 0.7], "round": 0.05, "segments": 12}
+            ]),
+        );
+        for p in s.model.parts.iter() {
+            let (zig, total) = super::zigzag_edges(p);
+            assert_eq!(zig, 0, "{}: {zig} of {total}", p.name);
+        }
+        assert!(
+            !s.lints().iter().any(|w| w.contains("ragged")),
+            "{:?}",
+            s.lints()
+        );
+    }
+
+    #[test]
+    fn finished_sdf_box_creases_are_not_ragged() {
+        let q = crate::Quat::from_rotation_y(30f32.to_radians())
+            * crate::Quat::from_rotation_x(20f32.to_radians());
+        let def: crate::sdf::SdfDef = serde_json::from_value(serde_json::json!({
+            "shapes": [{"shape": "box", "size": [0.3, 0.2, 0.25], "rotation": q.to_array()}],
+            "blend": 0.0,
+            "resolution": 0.006
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let p = crate::sdf::build("b", &def, &|n: &str| {
+            Err(crate::ModelerError::Invalid(format!("no part {n}")))
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.tri_count() > super::RAGGED_MIN_TRIS);
+        let t = std::time::Instant::now();
+        let (zig, total) = super::zigzag_edges(&p);
+        eprintln!(
+            "sdf box: {} tris, {zig} zigzag of {total} judged crease edges, {:?}",
+            p.tri_count(),
+            t.elapsed()
+        );
+        assert!(total > 0, "no crease chains found");
+        assert!(zig < 16, "{zig} of {total}");
     }
 }

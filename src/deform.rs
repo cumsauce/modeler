@@ -548,26 +548,16 @@ fn displace(verts: &mut [Vec3], indices: &[u32], def: &Deform, scale: f32, size:
     let octaves = def.octaves.unwrap_or(4);
     let seed = def.seed.unwrap_or(0);
     let mode = def.noise.as_deref().unwrap_or("fbm");
-    let inv = 1.0 / (size.max_element() * 1e-6).clamp(1e-7, 1e-5);
-    let mut normals: HashMap<[i64; 3], Vec3> = HashMap::new();
-    for t in indices.as_chunks::<3>().0 {
-        let [a, b, c] = t.map(|i| verts[i as usize]);
-        let n = (b - a).cross(c - a); // length = 2 x area
-        for p in [a, b, c] {
-            *normals.entry(key(p, inv)).or_insert(Vec3::ZERO) += n;
-        }
-    }
+    // Smoothed welded normals: raw facet normals would push every vertex of
+    // an old facet the same way and print its edges as bands.
+    let normals = welded_normals(verts, indices, size);
     // Keep the noise lattice off integer coordinates (the noise is 0.5 at
     // every lattice point) and vary it per seed.
     let shift = Vec3::new(17.13, 31.71, 7.37) * scale + Vec3::splat(seed as f32 * 0.618 * scale);
     let lattice = Lattice::new(scale, 0.0);
     let base = |p: [f32; 3], l: Lattice, s: u32| gradient(p, 3, l, s);
-    for v in verts.iter_mut() {
-        let n = normals
-            .get(&key(*v, inv))
-            .copied()
-            .unwrap_or(Vec3::ZERO)
-            .normalize_or_zero();
+    for (v, n) in verts.iter_mut().zip(&normals) {
+        let n = *n;
         let q = (*v + shift).to_array();
         let f = fractal(base, q, lattice, seed, octaves, 2.0, 0.5, mode);
         // fbm of gradient noise sits near 0.5 (+-0.25 is already rare), so
@@ -870,6 +860,45 @@ mod tests {
         assert_eq!(crate::verify::open_edge_count(p), 0, "open edges");
         let m = crate::csg::part_to_manifold(p).unwrap_or_else(|e| panic!("{e}"));
         assert!(m.volume() > 0.0, "outward wound");
+    }
+
+    #[test]
+    fn displace_normals_vary_across_an_old_facet() {
+        // A cube refined to small triangles: raw facet normals would give
+        // every vertex of the top face exactly +y.
+        let cube = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0; 3], "c")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let m = crate::csg::part_to_manifold(&cube).unwrap_or_else(|e| panic!("{e}"));
+        let mesh = m.refine_to_length(0.1).to_meshgl64();
+        let n = mesh.num_prop().max(3);
+        let verts: Vec<Vec3> = mesh
+            .vert_properties()
+            .chunks(n)
+            .map(|v| Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32))
+            .collect();
+        let idx: Vec<u32> = mesh.tri_verts().iter().map(|&i| i as u32).collect();
+        let nrm = welded_normals(&verts, &idx, Vec3::ONE);
+        let top: Vec<(Vec3, Vec3)> = verts
+            .iter()
+            .zip(&nrm)
+            .filter(|(v, _)| v.y > 0.499 && v.x.abs() < 0.45)
+            .map(|(v, n)| (*v, *n))
+            .collect();
+        assert!(top.len() > 20);
+        let center = top
+            .iter()
+            .filter(|(v, _)| v.x.abs() < 0.05)
+            .all(|(_, n)| n.x.abs() < 0.05);
+        let edge_tilt = top
+            .iter()
+            .filter(|(v, _)| v.x > 0.38)
+            .map(|(_, n)| n.x)
+            .fold(0.0f32, f32::max);
+        assert!(center, "middle of the facet stays on its normal");
+        assert!(
+            edge_tilt > 0.05,
+            "normals lean toward the edge: {edge_tilt}"
+        );
     }
 
     #[test]

@@ -73,6 +73,7 @@ struct Cand {
     u: u32,
     v: u32,
     ver_u: u32,
+    ver_v: u32,
 }
 impl PartialEq for Cand {
     fn eq(&self, o: &Self) -> bool {
@@ -121,8 +122,6 @@ struct State<'a> {
     quad: Vec<Quadric>,
     locked: Vec<bool>,
     ver: Vec<u32>,
-    /// Neighbours the last collapse gave its target (sorted).
-    fresh: Vec<u32>,
     /// Each triangle's unit normal before any collapse.
     orig: Vec<[f64; 3]>,
 }
@@ -158,27 +157,32 @@ impl State<'_> {
         let pu = self.pos[u as usize];
         let pv = self.pos[v as usize];
         let e = sub(pu, pv);
+        // The merged vertex carries Q_u + Q_v, so judge it by both: a vertex
+        // collapsing onto a crease is charged for leaving v's planes too.
+        let mut q = self.quad[u as usize];
+        quadric_add(&mut q, &self.quad[v as usize]);
         // A tiny length term breaks ties on flat regions toward short edges.
-        quadric_eval(&self.quad[u as usize], pv).max(0.0) + 1e-9 * dot(e, e)
+        quadric_eval(&q, pv).max(0.0) + 1e-9 * dot(e, e)
     }
 
-    /// After `u` collapsed onto `p`: `p`'s quadric changed, so its own
-    /// candidates are re-costed; a neighbour's candidate toward `p` keeps
-    /// its cost (vertices never move) unless it is a new edge (`fresh`).
-    fn push_edges(&self, heap: &mut BinaryHeap<Cand>, p: u32, fresh: &[u32]) {
+    fn cand(&self, u: u32, v: u32) -> Cand {
+        Cand {
+            cost: self.cost(u, v),
+            u,
+            v,
+            ver_u: self.ver[u as usize],
+            ver_v: self.ver[v as usize],
+        }
+    }
+
+    /// After `u` collapsed onto `p`: `p`'s quadric changed, and every cost
+    /// touching `p` reads it, so both directions of each edge at `p` are
+    /// re-costed (the old ones go stale through `p`'s version).
+    fn push_edges(&self, heap: &mut BinaryHeap<Cand>, p: u32) {
         for q in self.neighbors(p) {
-            let back = fresh.binary_search(&q).is_ok();
             for (u, v) in [(p, q), (q, p)] {
-                if u == q && !back {
-                    continue;
-                }
                 if !self.locked[u as usize] {
-                    heap.push(Cand {
-                        cost: self.cost(u, v),
-                        u,
-                        v,
-                        ver_u: self.ver[u as usize],
-                    });
+                    heap.push(self.cand(u, v));
                 }
             }
         }
@@ -212,12 +216,6 @@ impl State<'_> {
         if common != shared.len() {
             return 0;
         }
-        self.fresh.clear();
-        self.fresh.extend(
-            nu.iter()
-                .copied()
-                .filter(|x| *x != v && nv.binary_search(x).is_err()),
-        );
         // The wedge of v that u's corners become: all shared triangles agree.
         let mut target: Option<u32> = None;
         for &t in &shared {
@@ -252,9 +250,10 @@ impl State<'_> {
             if lo > 1e-20 && dot(n_old, n_new) < 0.2 * lo * ln {
                 return 0;
             }
-            // Small turns add up over many collapses: never past a right
-            // angle from the triangle's original facing either.
-            if dot(self.orig[t as usize], n_new) <= 0.0 {
+            // Small turns add up over many collapses: never past the same
+            // ~78 degrees from the triangle's original facing either (a
+            // looser bound let chords fold edge-on along a locked seam).
+            if dot(self.orig[t as usize], n_new) < 0.2 * ln {
                 return 0;
             }
         }
@@ -285,6 +284,13 @@ impl State<'_> {
 /// A copy of `part` with about `ratio` (clamped 0.00001..1) of its triangles.
 /// Locked seams, borders and hard edges can stop it short of the target.
 pub fn simplify(part: &Part, ratio: f32) -> Part {
+    simplify_creased(part, ratio, None)
+}
+
+/// [`simplify`], plus feature edges: where two faces meet at more than
+/// `crease` degrees, each face adds a plane through the edge perpendicular
+/// to itself, so collapses may slide along the crease but not off it.
+pub fn simplify_creased(part: &Part, ratio: f32, crease: Option<f32>) -> Part {
     let ratio = ratio.clamp(1e-5, 1.0);
     let n_tris = part.indices.len() / 3;
     let target = ((n_tris as f32 * ratio).round() as usize).max(1);
@@ -336,6 +342,9 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
             *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
         }
     }
+    if let Some(deg) = crease {
+        add_feature_quadrics(&tris, &wpos, &pos, &edges, &mut quad, deg);
+    }
     let mut locked = vec![false; np];
     for (&(a, b), &count) in &edges {
         if count != 2 {
@@ -381,7 +390,6 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
         quad,
         locked,
         ver: vec![0; np],
-        fresh: Vec::new(),
         orig,
     };
     let mut live = st.tris.len();
@@ -394,28 +402,21 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
         for p in 0..np as u32 {
             if !st.locked[p as usize] {
                 for q in st.neighbors(p) {
-                    heap.push(Cand {
-                        cost: st.cost(p, q),
-                        u: p,
-                        v: q,
-                        ver_u: st.ver[p as usize],
-                    });
+                    heap.push(st.cand(p, q));
                 }
             }
         }
         while live > target {
             let Some(c) = heap.pop() else { break };
-            // Only u's quadric sets the cost (v stays put); a dead v makes
-            // the collapse find no shared triangle.
-            if st.ver[c.u as usize] != c.ver_u {
+            // Both quadrics set the cost, so a candidate is stale once
+            // either end changed; a dead v finds no shared triangle.
+            if st.ver[c.u as usize] != c.ver_u || st.ver[c.v as usize] != c.ver_v {
                 continue;
             }
             let removed = st.collapse(c.u, c.v);
             if removed > 0 {
                 live -= removed;
-                let fresh = std::mem::take(&mut st.fresh);
-                st.push_edges(&mut heap, c.v, &fresh);
-                st.fresh = fresh;
+                st.push_edges(&mut heap, c.v);
             }
         }
         if live <= target || live == before {
@@ -447,6 +448,60 @@ pub fn simplify(part: &Part, ratio: f32) -> Part {
         }
     }
     out
+}
+
+/// Constraint planes for edges sharper than `deg` degrees (two faces only;
+/// borders are locked already). Weighted by squared edge length, ten times
+/// a face plane of the same size, so the crease outranks the faces.
+fn add_feature_quadrics(
+    tris: &[[u32; 3]],
+    wpos: &[u32],
+    pos: &[[f64; 3]],
+    edges: &BTreeMap<(u32, u32), u32>,
+    quad: &mut [Quadric],
+    deg: f32,
+) {
+    let cos_limit = f64::from(deg).to_radians().cos();
+    let mut faces: BTreeMap<(u32, u32), Vec<[f64; 3]>> = BTreeMap::new();
+    for t in tris {
+        let p = t.map(|w| wpos[w as usize]);
+        let c = p.map(|q| pos[q as usize]);
+        let n = cross(sub(c[1], c[0]), sub(c[2], c[0]));
+        let l = len(n);
+        if l <= 0.0 {
+            continue;
+        }
+        let un = n.map(|x| x / l);
+        for k in 0..3 {
+            let (a, b) = (p[k], p[(k + 1) % 3]);
+            let key = (a.min(b), a.max(b));
+            if edges.get(&key) == Some(&2) {
+                faces.entry(key).or_default().push(un);
+            }
+        }
+    }
+    for ((a, b), ns) in faces {
+        if ns.len() != 2 || dot(ns[0], ns[1]) >= cos_limit {
+            continue;
+        }
+        let (pa, pb) = (pos[a as usize], pos[b as usize]);
+        let e = sub(pb, pa);
+        let el = len(e);
+        if el <= 0.0 {
+            continue;
+        }
+        for n in &ns {
+            let m = cross(e, *n);
+            let ml = len(m);
+            if ml <= 0.0 {
+                continue;
+            }
+            let um = m.map(|x| x / ml);
+            let q = quadric_from_plane(um, -dot(um, pa), 10.0 * el * el);
+            quadric_add(&mut quad[a as usize], &q);
+            quadric_add(&mut quad[b as usize], &q);
+        }
+    }
 }
 
 #[cfg(test)]

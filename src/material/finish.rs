@@ -122,6 +122,9 @@ pub struct Edges {
 /// Dihedral angle (degrees) above which an edge gets bevelled.
 const CREASE: f32 = 30.5;
 
+/// Edges shorter than this fraction of the bevel radius are ignored.
+const MIN_EDGE: f32 = 0.25;
+
 impl Edges {
     pub fn new(lv: &[Vec3], tris: &[[u32; 3]], radius: f32) -> Edges {
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
@@ -168,6 +171,12 @@ impl Edges {
             if n1 == Vec3::ZERO || n2 == Vec3::ZERO || n1.dot(n2) > cos {
                 continue;
             }
+            // Slivers (level-set meshes, tiny triangles) are noise, not
+            // creases: a bevel only reads along an edge a fair share of its
+            // own width.
+            if (lv[*a] - lv[*b]).length() < radius * MIN_EDGE {
+                continue;
+            }
             edges.push((lv[*a], lv[*b], n1, n2));
         }
         let cell = radius.max(diag / 256.0);
@@ -197,8 +206,11 @@ impl Edges {
     }
 
     /// The rounded normal at `p` on a face with normal `nf`, or None when
-    /// no crease of that face is within the radius.
-    pub fn bend(&self, p: Vec3, nf: Vec3) -> Option<Vec3> {
+    /// no crease of that face is within the radius. The result blends from
+    /// `shading` (the interpolated vertex normal at the texel, which equals
+    /// `nf` on a flat-shaded box) so a smooth-shaded mesh isn't re-faceted
+    /// around its creases.
+    pub fn bend(&self, p: Vec3, nf: Vec3, shading: Vec3) -> Option<Vec3> {
         let c = (p / self.cell).floor().as_ivec3();
         let list = self.grid.get(&[c.x, c.y, c.z])?;
         let mut best: Option<(f32, Vec3)> = None;
@@ -216,7 +228,7 @@ impl Edges {
             }
         }
         let (d, avg) = best?;
-        Some(slerp(nf, avg, 1.0 - d / self.radius))
+        Some(slerp(shading, avg, 1.0 - d / self.radius))
     }
 }
 
@@ -289,10 +301,26 @@ mod tests {
         assert_eq!(e.edges.len(), 12);
         let top = Vec3::Y;
         let near = e
-            .bend(Vec3::new(0.49, 0.5, 0.0), top)
+            .bend(Vec3::new(0.49, 0.5, 0.0), top, top)
             .unwrap_or_else(|| panic!("no bend near the edge"));
         assert!(near.x > 0.3 && near.y > 0.6, "{near}");
-        assert!(e.bend(Vec3::new(0.0, 0.5, 0.0), top).is_none());
+        assert!(e.bend(Vec3::new(0.0, 0.5, 0.0), top, top).is_none());
+    }
+
+    #[test]
+    fn sliver_edges_are_ignored() {
+        // Two triangles folded 90 degrees along an edge of length 0.01.
+        let lv = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.01, 0.0, 0.0),
+            Vec3::new(0.0, 0.01, 0.0),
+            Vec3::new(0.0, 0.0, 0.01),
+        ];
+        let tris = vec![[0u32, 1, 2], [1, 0, 3]];
+        // Radius 0.05: the 0.01 edge is under a quarter of it.
+        assert!(Edges::new(&lv, &tris, 0.05).is_empty());
+        // Radius 0.02: the same edge is long enough to keep.
+        assert!(!Edges::new(&lv, &tris, 0.02).is_empty());
     }
 
     #[test]
