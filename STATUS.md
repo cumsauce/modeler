@@ -42,6 +42,12 @@ wrong:
   non-overshooting spline now (existing models re-derive slightly
   differently); a blend or rounding the mesh can't resolve renders as a
   sharp edge; a mirror fold with nothing else hard shades smooth.
+- **Saved silhouettes keep their old outline.** A `smooth: true`
+  silhouette restored from an autosave still shows the old outline shape
+  and facet bands on its walls; the same item applied fresh is clean.
+  Seen in a render after the restart, cause not traced (the op seems to
+  store the already-smoothed points). Re-issue the item to get the new
+  spline.
 - **Tangent fix** (preview handedness now matches the bake) is confirmed
   by a unit test and plausible lighting, not by a side-by-side with the
   dense mesh.
