@@ -2085,11 +2085,45 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
     let band = SMIN_WIDTH * k + disp + 4.0 * res;
     b.res = res;
     b.band = band;
+    // A join blend under [`SHARPEN_CELLS`] cells, or an edge rounding under
+    // [`SHARPEN_ROUND_CELLS`], can't be meshed as a fillet (marching
+    // tetrahedra chord across it in a zigzag): such joins and edges are
+    // meshed sharp and finished as creases. The choice is per join, so one
+    // rim never alternates between the two.
+    // A shape too small for clean creases (an eye socket a few cells
+    // wide) keeps its fillet: sharpened, its rim would be all corners.
+    let min_thin = SHARPEN_MIN_CELLS * res;
     let mut nodes = Vec::new();
-    for s in &def.shapes {
+    // Nodes of shapes that can make a crease (sharp edges, a hard join).
+    let mut hard_nodes: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, s) in def.shapes.iter().enumerate() {
+        let start = nodes.len();
         b.compile(s, k, &mut nodes)?;
+        // The shape's largest extent: a wide shallow disc has a long rim
+        // that snaps cleanly even though it is thin.
+        let extent = nodes[start..]
+            .iter()
+            .map(|n| (n.hi - n.lo).max_element())
+            .fold(0.0f32, f32::max);
+        let mut s = s.clone();
+        if extent >= min_thin {
+            let sharp = sharpen_shape(&s, i, k, SHARPEN_CELLS * res, SHARPEN_ROUND_CELLS * res);
+            if sharp != s {
+                nodes.truncate(start);
+                b.compile(&sharp, k, &mut nodes)?;
+                s = sharp;
+            }
+        }
+        let join = i > 0 && s.blend.unwrap_or(k) <= 0.0;
+        if join || has_creases(std::slice::from_ref(&s), k, res) {
+            hard_nodes.push(start..nodes.len());
+        }
     }
     let buckets = Buckets::new(&nodes, band);
+    let mut is_hard = vec![false; nodes.len()];
+    for r in &hard_nodes {
+        is_hard[r.clone()].fill(true);
+    }
 
     let mirror = def.mirror.as_deref();
     let disp_stages: Vec<&Stage> = stages.iter().filter(|s| s.w.mode == "displace").collect();
@@ -2159,8 +2193,34 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
             "nothing to mesh (the subtracts remove everything, or shapes are thinner than the {res:.4} m resolution)"
         )));
     }
-    let mut out = crate::csg::manifold_to_part(&m, name, crate::Material::default());
-    crate::uv::crease_normals(&mut out, 60.0);
+    let meshed = crate::csg::manifold_to_part(&m, name, crate::Material::default());
+    let mut sampling = crate::sdf_finish::Sampling::analytic(res);
+    if hard_nodes.is_empty() {
+        sampling = sampling.smooth();
+    }
+    if has_sampled(&def.shapes) {
+        sampling = sampling.wide();
+    }
+    // Creases only form on the surfaces of the hard shapes (warps move
+    // them: then anywhere).
+    let reach = 2.0 * res;
+    let zone = |p: Vec3| -> bool {
+        if !stages.is_empty() {
+            return true;
+        }
+        let q = fold(p, mirror);
+        buckets
+            .get(q)
+            .iter()
+            .any(|&i| is_hard[i as usize] && nodes[i as usize].eval(q, band).abs() < reach)
+    };
+    let mut out = crate::sdf_finish::finish_in(&meshed, &field, sampling, Some(&zone));
+    #[cfg(test)]
+    tests::PROBE.with(|p| {
+        if let Some(f) = p.borrow_mut().as_mut() {
+            f(&meshed, &out, &field, res);
+        }
+    });
     out.visible = true;
     if let Some(t) = def.tris {
         let d = crate::decimate::Decimate {
@@ -2171,6 +2231,73 @@ pub fn build(name: &str, def: &SdfDef, lookup: &Lookup) -> Result<Part, ModelerE
         out = crate::decimate::decimate(name, &out, &d).map_err(err)?;
     }
     Ok(out)
+}
+
+/// Joins blended over fewer cells than this are meshed sharp.
+const SHARPEN_CELLS: f32 = 1.25;
+
+/// Edge roundings (box, cylinder, silhouette `round`) under this many cells
+/// are meshed sharp: an edge fillet under two cells chords into teeth.
+const SHARPEN_ROUND_CELLS: f32 = 2.0;
+
+/// Shapes smaller than this many cells (largest extent) are never
+/// sharpened.
+const SHARPEN_MIN_CELLS: f32 = 10.0;
+
+/// Shape `i` of a list with its join blend under `lim` and its edge
+/// rounding under `round_lim` set to 0 (`k` is the item's blend, the
+/// default of a join); a group's members likewise.
+fn sharpen_shape(s: &Shape, i: usize, k: f32, lim: f32, round_lim: f32) -> Shape {
+    let mut s = s.clone();
+    if i > 0 && s.blend.unwrap_or(k) < lim {
+        s.blend = Some(0.0);
+    }
+    if matches!(s.shape.as_str(), "box" | "cylinder" | "silhouette")
+        && s.round.is_some_and(|r| r < round_lim)
+    {
+        s.round = Some(0.0);
+    }
+    if let Some(kids) = &s.shapes {
+        let kk = s.blend.unwrap_or(k);
+        let kk = if kk < lim { 0.0 } else { kk };
+        s.shapes = Some(
+            kids.iter()
+                .enumerate()
+                .map(|(j, c)| sharpen_shape(c, j, kk, lim, round_lim))
+                .collect(),
+        );
+    }
+    s
+}
+
+/// Is any shape sampled (a silhouette's outline grids, a part's grid)?
+/// Its gradient is piecewise flat.
+fn has_sampled(shapes: &[Shape]) -> bool {
+    shapes.iter().any(|s| match s.shape.as_str() {
+        "silhouette" | "part" => true,
+        "group" => has_sampled(s.shapes.as_deref().unwrap_or(&[])),
+        _ => false,
+    })
+}
+
+/// Can these shapes make a crease (after [`sharpen`])? A hard join, a shape with sharp edges (a box or cylinder rounded less
+/// than a cell, a silhouette, a sampled part). A `mirror` fold is not
+/// counted: bodies and skins cross it symmetrically.
+fn has_creases(shapes: &[Shape], k: f32, res: f32) -> bool {
+    shapes.iter().enumerate().any(|(i, s)| {
+        let join = i > 0 && s.blend.unwrap_or(k) <= 0.0;
+        let own = match s.shape.as_str() {
+            "box" | "cylinder" | "silhouette" => s.round.unwrap_or(0.0) < res,
+            "part" => true,
+            "group" => has_creases(
+                s.shapes.as_deref().unwrap_or(&[]),
+                s.blend.unwrap_or(k),
+                res,
+            ),
+            _ => false,
+        };
+        join || own
+    })
 }
 
 /// The union box of the volume-adding shapes and the thinnest feature.
@@ -2251,6 +2378,36 @@ pub fn skin(name: &str, def: &SkinDef, lookup: &Lookup) -> Result<Part, ModelerE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A field probe for tests: called by [`build`] with the raw mesh, the
+    /// finished one, the field and the resolution.
+    pub(super) type Probe = Box<dyn FnMut(&Part, &Part, &dyn Fn(Vec3) -> f32, f32)>;
+    thread_local! {
+        pub(super) static PROBE: std::cell::RefCell<Option<Probe>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Builds `def` and returns (raw mesh, finished mesh, field sampled by
+    /// `sample` at the given points, res).
+    fn build_probed(def: &SdfDef, pts: &[Vec3]) -> (Part, Part, Vec<f32>, f32) {
+        let got = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let g2 = got.clone();
+        let pts = pts.to_vec();
+        PROBE.with(|p| {
+            *p.borrow_mut() = Some(Box::new(
+                move |raw: &Part, fin: &Part, f: &dyn Fn(Vec3) -> f32, res: f32| {
+                    let vals = pts.iter().map(|q| f(*q)).collect::<Vec<_>>();
+                    *g2.borrow_mut() = Some((raw.clone(), fin.clone(), vals, res));
+                },
+            ));
+        });
+        let r = build("probe", def, &no_parts);
+        PROBE.with(|p| *p.borrow_mut() = None);
+        r.unwrap_or_else(|e| panic!("{e}"));
+        got.borrow_mut()
+            .take()
+            .unwrap_or_else(|| panic!("probe not called"))
+    }
 
     #[test]
     fn local_warps_move_the_surface_only_within_their_radius() {
@@ -2703,5 +2860,615 @@ mod tests {
         };
         let bad = SkinDef { tris: None, ..bad };
         assert!(bad.validate().is_err());
+    }
+
+    // --- finishing pass (sdf_finish) ---
+
+    fn seg_tri_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
+        // Distance from p to triangle abc (Ericson's closest point).
+        let (ab, ac, ap) = (b - a, c - a, p - a);
+        let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+        if d1 <= 0.0 && d2 <= 0.0 {
+            return p.distance(a);
+        }
+        let bp = p - b;
+        let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+        if d3 >= 0.0 && d4 <= d3 {
+            return p.distance(b);
+        }
+        let vc = d1 * d4 - d3 * d2;
+        if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+            return p.distance(a + ab * (d1 / (d1 - d3)));
+        }
+        let cp = p - c;
+        let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+        if d6 >= 0.0 && d5 <= d6 {
+            return p.distance(c);
+        }
+        let vb = d5 * d2 - d1 * d6;
+        if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+            return p.distance(a + ac * (d2 / (d2 - d6)));
+        }
+        let va = d3 * d6 - d5 * d4;
+        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+            return p.distance(b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6))));
+        }
+        let den = 1.0 / (va + vb + vc);
+        p.distance(a + ab * (vb * den) + ac * (vc * den))
+    }
+
+    fn surface_dist(part: &Part, p: Vec3) -> f32 {
+        part.indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| Vec3::from(part.verts[i as usize]));
+                seg_tri_dist(p, a, b, c)
+            })
+            .fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn finished_sphere_is_on_the_field_with_radial_normals() {
+        let def = ball(vec![], None);
+        let p = build("s", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        let mut worst = 0.0f32;
+        let mut worst_deg = 0.0f32;
+        for (v, n) in p.verts.iter().zip(&p.normals) {
+            let v = Vec3::from(*v);
+            worst = worst.max((v.length() - 0.2).abs());
+            let d = Vec3::from(*n)
+                .dot(v.normalize())
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            worst_deg = worst_deg.max(d);
+        }
+        eprintln!("sphere: radius error {worst:e} m (size 0.4), normals {worst_deg:.3} deg");
+        assert!(worst < 1e-4 * 0.4, "radius error {worst}");
+        assert!(worst_deg < 1.0, "normal error {worst_deg} deg");
+    }
+
+    fn rotated_box(res: f32) -> (SdfDef, Quat) {
+        let q =
+            Quat::from_rotation_y(30f32.to_radians()) * Quat::from_rotation_x(20f32.to_radians());
+        let def: SdfDef = serde_json::from_value(serde_json::json!({
+            "shapes": [{"shape": "box", "size": [0.3, 0.2, 0.25], "rotation": q.to_array()}],
+            "blend": 0.0,
+            "resolution": res
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        (def, q)
+    }
+
+    #[test]
+    fn finished_box_creases_are_straight() {
+        let res = 0.01;
+        let (def, q) = rotated_box(res);
+        let p = build("b", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        // Samples along the middle of the four edges parallel to local y.
+        let h = Vec3::new(0.15, 0.1, 0.125);
+        let mut worst = 0.0f32;
+        for (sx, sz) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            for k in 0..9 {
+                let y = -0.06 + 0.015 * k as f32;
+                let e = q * Vec3::new(sx * h.x, y, sz * h.z);
+                worst = worst.max(surface_dist(&p, e));
+            }
+        }
+        eprintln!(
+            "box crease: max surface distance from the edge {:.3} res",
+            worst / res
+        );
+        crate::csg::part_to_manifold(&p).unwrap_or_else(|e| panic!("{e}"));
+        let (n, _) = crate::organic::self_intersections(&p);
+        assert_eq!(n, 0, "{n} self-intersections");
+        assert!(worst < 0.05 * res, "crease off by {} res", worst / res);
+    }
+
+    #[test]
+    fn finished_mirror_fold_stays_closed() {
+        let def: SdfDef = serde_json::from_value(serde_json::json!({
+            "shapes": [{"shape": "capsule", "from": [-0.05, 0.0, 0.0], "to": [0.2, 0.15, 0.05], "radius": [0.05]}],
+            "blend": 0.0,
+            "mirror": "x",
+            "resolution": 0.008
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let p = build("m", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        crate::csg::part_to_manifold(&p).unwrap_or_else(|e| panic!("{e}"));
+        let (n, _) = crate::organic::self_intersections(&p);
+        assert_eq!(n, 0, "{n} self-intersections");
+    }
+
+    #[test]
+    fn finished_hard_subtract_and_intersect_stay_closed() {
+        let q =
+            Quat::from_rotation_y(30f32.to_radians()) * Quat::from_rotation_z(25f32.to_radians());
+        for op in ["subtract", "intersect"] {
+            let def: SdfDef = serde_json::from_value(serde_json::json!({
+                "shapes": [
+                    {"shape": "box", "size": [0.3, 0.2, 0.25]},
+                    {"shape": "box", "size": [0.2, 0.2, 0.2], "at": [0.12, 0.08, 0.05],
+                     "rotation": q.to_array(), "op": op}
+                ],
+                "blend": 0.0,
+                "resolution": 0.01
+            }))
+            .unwrap_or_else(|e| panic!("{e}"));
+            let p = build("c", &def, &no_parts).unwrap_or_else(|e| panic!("{op}: {e}"));
+            crate::csg::part_to_manifold(&p).unwrap_or_else(|e| panic!("{op}: {e}"));
+            let (n, _) = crate::organic::self_intersections(&p);
+            assert_eq!(n, 0, "{op}: {n} self-intersections");
+        }
+    }
+
+    /// A sphere cut flat by a box whose face meets it at a grazing angle:
+    /// the max distance from the true rim circle to the surface, in cells.
+    fn grazing_rim(deg: f32) -> f32 {
+        let (r, res) = (0.2f32, 0.008f32);
+        let h = r * deg.to_radians().cos();
+        let tilt = Quat::from_rotation_z(0.3) * Quat::from_rotation_x(0.2);
+        let def: SdfDef = serde_json::from_value(serde_json::json!({
+            "shapes": [
+                {"shape": "sphere", "radius": [r]},
+                {"shape": "box", "size": [1.0, 0.5, 1.0], "at": (tilt * Vec3::new(0.0, h + 0.25, 0.0)).to_array(),
+                 "rotation": tilt.to_array(), "op": "subtract"}
+            ],
+            "blend": 0.0,
+            "resolution": res
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let p = build("g", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        crate::csg::part_to_manifold(&p).unwrap_or_else(|e| panic!("{e}"));
+        let (n, _) = crate::organic::self_intersections(&p);
+        assert_eq!(n, 0, "{deg}: {n} self-intersections");
+        let rr = (r * r - h * h).sqrt();
+        let mut worst = 0.0f32;
+        for k in 0..48 {
+            let a = k as f32 / 48.0 * std::f32::consts::TAU;
+            let e = tilt * Vec3::new(rr * a.cos(), h, rr * a.sin());
+            worst = worst.max(surface_dist(&p, e));
+        }
+        worst / res
+    }
+
+    #[test]
+    fn finished_grazing_rims_are_straight() {
+        for deg in [8.0, 15.0, 25.0] {
+            let d = grazing_rim(deg);
+            eprintln!("grazing rim {deg} deg: {d:.3} res");
+            assert!(d < 0.05, "{deg} deg rim off by {d} res");
+        }
+    }
+
+    /// A box cut at a grazing angle into a blended ellipsoid (the cut's
+    /// rim runs along the box's edge, nearly in the ellipsoid's surface): no
+    /// corner keeps a normal from the other side of a crease.
+    #[test]
+    fn finished_grazing_cut_has_no_wrong_side_normals() {
+        let def: SdfDef = serde_json::from_value(serde_json::json!({"blend": 0.03, "shapes": [
+            {"shape": "ellipsoid", "size": [0.2, 0.14, 0.26], "at": [0.7, 0.15, 0]},
+            {"shape": "capsule", "from": [0.7, 0.2, 0.1], "to": [0.95, 0.3, 0.25], "radius": [0.06, 0.03]},
+            {"shape": "box", "size": [0.3, 0.12, 0.3], "at": [0.62, 0.3, -0.12],
+             "rotation": [0.16773126, 0.254887, -0.044943456, 0.95125127], "op": "subtract", "blend": 0}]}))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let p = build("g", &def, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        let mut bad = 0;
+        for t in p.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from(p.verts[i as usize]));
+            let fnn = (b - a).cross(c - a).normalize_or_zero();
+            bad += t
+                .iter()
+                .filter(|&&i| Vec3::from(p.normals[i as usize]).dot(fnn) < 0.7)
+                .count();
+        }
+        assert_eq!(bad, 0, "{bad} corners shade from the wrong side");
+        crate::csg::part_to_manifold(&p).unwrap_or_else(|e| panic!("{e}"));
+        let (n, _) = crate::organic::self_intersections(&p);
+        assert_eq!(n, 0, "{n} self-intersections");
+    }
+
+    fn cut_defs() -> (SdfDef, SdfDef, Quat, Vec3) {
+        let q = Quat::from_array([0.16773126, 0.254887, -0.044943456, 0.95125127]);
+        let full: SdfDef = serde_json::from_value(serde_json::json!({"blend": 0.03, "shapes": [
+            {"shape": "ellipsoid", "size": [0.2, 0.14, 0.26], "at": [0.7, 0.15, 0]},
+            {"shape": "capsule", "from": [0.7, 0.2, 0.1], "to": [0.95, 0.3, 0.25], "radius": [0.06, 0.03]},
+            {"shape": "box", "size": [0.3, 0.12, 0.3], "at": [0.62, 0.3, -0.12],
+             "rotation": q.to_array(), "op": "subtract", "blend": 0}]}))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut ell = full.clone();
+        ell.shapes.truncate(2);
+        (full, ell, q, Vec3::new(0.62, 0.3, -0.12))
+    }
+
+    /// The cut's true rims: per sample z along the box's bottom-left edge
+    /// (box-local x = -0.15, y = -0.06), the wall / ellipsoid crease, the
+    /// floor / ellipsoid crease and the exposed box edge. Returns the max
+    /// distance (in cells) of each from the finished surface.
+    fn cut_rim_deviation() -> [f32; 3] {
+        let (full, ell, q, c) = cut_defs();
+        let (_, fin, _, res) = build_probed(&full, &[]);
+        let at = |dx: f32, dy: f32, z: f32| c + q * Vec3::new(-0.15 + dx, -0.06 + dy, z);
+        let zs: Vec<f32> = (0..41).map(|k| 0.0 + 0.004 * k as f32).collect();
+        let steps = 600;
+        let span = 6.0 * res;
+        let mut pts = Vec::new();
+        for &z in &zs {
+            for i in 0..=steps {
+                let t = span * i as f32 / steps as f32;
+                pts.push(at(0.0, t, z)); // up the wall
+                pts.push(at(t, 0.0, z)); // along the floor
+            }
+        }
+        // The floor / ellipsoid crease across the floor: per x, scan z.
+        let xs: Vec<f32> = (0..31).map(|k| 0.005 + 0.0095 * k as f32).collect();
+        let zsteps = 800;
+        let floor_at = |dx: f32, i: usize| at(dx, 0.0, -0.15 + 0.3 * i as f32 / zsteps as f32);
+        let mut fpts = Vec::new();
+        for &dx in &xs {
+            for i in 0..=zsteps {
+                fpts.push(floor_at(dx, i));
+            }
+        }
+        let (_, _, fe, _) = build_probed(&ell, &fpts);
+        let (_, _, ff, _) = build_probed(&full, &fpts);
+        let mut floor_worst = 0.0f32;
+        for (xi, &dx) in xs.iter().enumerate() {
+            let base = xi * (zsteps + 1);
+            for i in 1..=zsteps {
+                let (e0, e1) = (fe[base + i - 1], fe[base + i]);
+                // A sign change of the ellipsoid on the floor, where the floor
+                // is really surface (the full field is zero there).
+                if (e0 < 0.0) != (e1 < 0.0) && ff[base + i].abs() < 0.05 * res {
+                    let p = floor_at(dx, i);
+                    floor_worst = floor_worst.max(surface_dist(&fin, p) / res);
+                }
+            }
+        }
+        let (_, _, e, _) = build_probed(&ell, &pts);
+        let mut worst = [0.0f32, floor_worst, 0.0];
+        for (zi, &z) in zs.iter().enumerate() {
+            let base = zi * (steps + 1) * 2;
+            let e_at = |i: usize, k: usize| e[base + 2 * i + k];
+            let t_of = |i: usize| span * i as f32 / steps as f32;
+            if e_at(0, 0) < 0.0 {
+                // The edge is inside the ellipsoid: a wall rises to the
+                // ellipsoid; the edge itself is a concave crease.
+                if let Some(i) = (1..=steps).find(|&i| e_at(i, 0) >= 0.0) {
+                    // Where the wall is under 2 cells tall (it shrinks to
+                    // nothing at the junction) its rim is within a cell of
+                    // the edge; the shading count covers that stretch.
+                    if t_of(i) > 2.0 * res {
+                        let d = surface_dist(&fin, at(0.0, t_of(i), z));
+                        worst[0] = worst[0].max(d / res);
+                        let d = surface_dist(&fin, at(0.0, 0.0, z));
+                        worst[2] = worst[2].max(d / res);
+                    }
+                }
+            } else if let Some(i) = (1..=steps).find(|&i| e_at(i, 1) < 0.0) {
+                // The edge is outside: the floor meets the ellipsoid.
+                if t_of(i) > 0.3 * res {
+                    let d = surface_dist(&fin, at(t_of(i), 0.0, z));
+                    worst[1] = worst[1].max(d / res);
+                }
+            }
+        }
+        worst
+    }
+
+    /// Corners of the finished cut whose shading normal is more than 15
+    /// degrees off the field's gradient at their face's centre (faces over a
+    /// twentieth of a cell): what shows as teeth along a ragged crease.
+    fn cut_shading_errors() -> usize {
+        let (full, _, _, _) = cut_defs();
+        let (_, fin, _, res) = build_probed(&full, &[]);
+        let h = 0.02 * res;
+        let mut pts = Vec::new();
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        for t in fin.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from(fin.verts[i as usize]));
+            if (b - a).cross(c - a).length() * 0.5 < 0.05 * res * res {
+                continue;
+            }
+            let m = (a + b + c) / 3.0;
+            tris.push(*t);
+            for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+                pts.push(m + d * h);
+                pts.push(m - d * h);
+            }
+        }
+        let (_, _, f, _) = build_probed(&full, &pts);
+        let cos = 15f32.to_radians().cos();
+        let mut bad = 0;
+        for (i, t) in tris.iter().enumerate() {
+            let g = Vec3::new(
+                f[6 * i] - f[6 * i + 1],
+                f[6 * i + 2] - f[6 * i + 3],
+                f[6 * i + 4] - f[6 * i + 5],
+            )
+            .normalize_or_zero();
+            let nb = t
+                .iter()
+                .filter(|&&j| Vec3::from(fin.normals[j as usize]).dot(g) < cos)
+                .count();
+            bad += nb;
+        }
+        bad
+    }
+
+    #[test]
+    fn finished_cut_rims_are_straight() {
+        let w = cut_rim_deviation();
+        let bad = cut_shading_errors();
+        eprintln!(
+            "cut rims: wall/ellipsoid {:.3} res, floor/ellipsoid {:.3} res, box edge {:.3} res; {bad} corners shaded > 15 deg off",
+            w[0], w[1], w[2]
+        );
+        assert!(w[0] < 0.02 && w[1] < 0.1 && w[2] < 0.02, "rims off: {w:?}");
+        assert!(bad < 120, "{bad} corners shaded off the surface");
+    }
+
+    /// Output vertices that are extra copies of a position (split normals).
+    fn split_verts(p: &Part) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for v in &p.verts {
+            seen.insert(v.map(|x| (x * 1e5).round() as i64));
+        }
+        p.verts.len() - seen.len()
+    }
+
+    fn smooth_shapes() -> Vec<(&'static str, Part)> {
+        let sdf = |v: serde_json::Value| -> Part {
+            let d: SdfDef = serde_json::from_value(v).unwrap_or_else(|e| panic!("{e}"));
+            build("s", &d, &no_parts).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let mut out = vec![
+            (
+                "thin capsule",
+                sdf(
+                    serde_json::json!({"shapes": [{"shape": "capsule", "from": [0, 0.02, 0], "to": [0.3, 0.1, 0.05], "radius": [0.012]}]}),
+                ),
+            ),
+            (
+                "thin capsule coarse",
+                sdf(
+                    serde_json::json!({"resolution": 0.008, "shapes": [{"shape": "capsule", "from": [0, 0.02, 0], "to": [0.3, 0.1, 0.05], "radius": [0.012]}]}),
+                ),
+            ),
+            (
+                "small torus",
+                sdf(serde_json::json!({"shapes": [{"shape": "torus", "size": [0.05, 0.012]}]})),
+            ),
+            (
+                "small torus coarse",
+                sdf(
+                    serde_json::json!({"resolution": 0.006, "shapes": [{"shape": "torus", "size": [0.05, 0.012]}]}),
+                ),
+            ),
+            ("car body", {
+                let ring = |r: serde_json::Value| -> Vec<Vec<[f32; 2]>> {
+                    let r: Vec<[f32; 2]> =
+                        serde_json::from_value(r).unwrap_or_else(|e| panic!("{e}"));
+                    crate::silhouette::shape_rings(vec![r], true, 0.0)
+                };
+                let side = ring(serde_json::json!([
+                    [2.2, 0.3],
+                    [2.25, 0.75],
+                    [1.0, 0.85],
+                    [0.4, 1.4],
+                    [-1.2, 1.4],
+                    [-2.2, 0.95],
+                    [-2.2, 0.3]
+                ]));
+                let top = ring(serde_json::json!([
+                    [-0.8, 2.2],
+                    [0.8, 2.2],
+                    [0.9, 1.2],
+                    [0.9, -1.4],
+                    [0.85, -2.2],
+                    [-0.85, -2.2],
+                    [-0.9, -1.4],
+                    [-0.9, 1.2]
+                ]));
+                let front = ring(serde_json::json!([
+                    [-0.9, 0.3],
+                    [0.9, 0.3],
+                    [0.92, 0.85],
+                    [0.65, 1.42],
+                    [-0.65, 1.42],
+                    [-0.92, 0.85]
+                ]));
+                // Rounded well over the sharpening limit (2 cells of the
+                // ~0.037 m default voxel), so only the arches are creases.
+                sdf(serde_json::json!({"blend": 0.15, "mirror": "x", "shapes": [
+                    {"shape": "silhouette", "round": 0.15, "side": side, "top": top, "front": front},
+                    {"shape": "cylinder", "op": "subtract", "blend": 0.03, "radius": [0.4], "height": 0.5,
+                     "at": [0.8, 0.33, 1.35], "rotation": [0.0, 0.0, 0.70710677, 0.70710677]}]}))
+            }),
+        ];
+        let skin: SkinDef = serde_json::from_value(serde_json::json!({"chains": [[[0, 0.1, 0, [0.03, 0.02]], [0.1, 0.12, 0.02, [0.025, 0.015], 20], [0.2, 0.1, 0.05, [0.015, 0.01]]]]}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        out.push(("oval skin limb", skin_build(&skin)));
+        let body: crate::body::BodyDef =
+            serde_json::from_value(serde_json::json!({"preset": "quadruped"}))
+                .unwrap_or_else(|e| panic!("{e}"));
+        out.push((
+            "quadruped",
+            crate::body::build("q", &body, &no_parts).unwrap_or_else(|e| panic!("{e}")),
+        ));
+        out
+    }
+
+    fn skin_build(d: &SkinDef) -> Part {
+        skin("k", d, &no_parts).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Tight smooth bends at coarse resolutions are not creases: no
+    /// vertex of a smooth shape gets split normals. The car body has real
+    /// creases only round its unrounded wheel-arch cutters.
+    #[test]
+    fn finished_smooth_shapes_have_no_split_normals() {
+        for (name, p) in smooth_shapes() {
+            let n = split_verts(&p);
+            eprintln!("{name}: {n} split vertices of {}", p.verts.len());
+            if name == "car body" {
+                // Splits away from the cutters (outside 0.15 m of either).
+                let far = p
+                    .verts
+                    .iter()
+                    .map(|v| Vec3::from(*v))
+                    .filter(|v| {
+                        let r = Vec3::new(0.0, v.y - 0.33, v.z.abs() - 1.35).length();
+                        !(r < 0.55 && (v.x.abs() - 0.8).abs() < 0.4)
+                    })
+                    .count();
+                let all = p.verts.len();
+                let uniq_far = {
+                    let mut seen = std::collections::HashSet::new();
+                    p.verts
+                        .iter()
+                        .map(|v| Vec3::from(*v))
+                        .filter(|v| {
+                            let r = Vec3::new(0.0, v.y - 0.33, v.z.abs() - 1.35).length();
+                            !(r < 0.55 && (v.x.abs() - 0.8).abs() < 0.4)
+                        })
+                        .for_each(|v| {
+                            seen.insert(v.to_array().map(|x| (x * 1e5).round() as i64));
+                        });
+                    seen.len()
+                };
+                eprintln!(
+                    "car body: {} split vertices away from the arches (of {all})",
+                    far - uniq_far
+                );
+                assert_eq!(far - uniq_far, 0, "car body splits away from its arches");
+            } else {
+                assert_eq!(n, 0, "{name}: {n} split vertices");
+            }
+        }
+    }
+
+    /// A box with a tilted cylinder hole, subtracted with `blend` (in
+    /// cells): along the top rim (the unblended crease of the box top and
+    /// the cylinder), the spread (max - min) of the surface's distance from
+    /// the crease, in cells, and the rim corners shaded > 15 degrees off.
+    fn blended_rim(blend_cells: f32) -> (f32, f32, usize) {
+        let res = 0.01f32;
+        let tilt = Quat::IDENTITY;
+        let def: SdfDef = serde_json::from_value(serde_json::json!({
+            "resolution": res,
+            "shapes": [
+                {"shape": "box", "size": [0.6, 0.4, 0.6], "round": 0.03},
+                {"shape": "cylinder", "op": "subtract", "blend": blend_cells * res, "radius": [0.1],
+                 "height": 1.0, "rotation": tilt.to_array()}
+            ]
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (_, fin, _, _) = build_probed(&def, &[]);
+        let axis = tilt * Vec3::Y;
+        // The top rim: on y = 0.2, distance to the axis = 0.1.
+        let mut dists = Vec::new();
+        let mut rim = Vec::new();
+        for k in 0..72 {
+            let a = k as f32 / 72.0 * std::f32::consts::TAU;
+            let dir = Vec3::new(a.cos(), 0.0, a.sin());
+            let c = Vec3::new(0.0, 0.2, 0.0);
+            let off = |t: f32| {
+                let p = c + dir * t;
+                (p - axis * p.dot(axis)).length() - 0.1
+            };
+            let (mut lo, mut hi) = (0.0f32, 0.3f32);
+            for _ in 0..40 {
+                let m = 0.5 * (lo + hi);
+                if off(m) < 0.0 { lo = m } else { hi = m }
+            }
+            let p = c + dir * lo;
+            rim.push(p);
+            dists.push(surface_dist(&fin, p) / res);
+        }
+        let spread = dists.iter().cloned().fold(f32::MIN, f32::max)
+            - dists.iter().cloned().fold(f32::MAX, f32::min);
+        let mean = dists.iter().sum::<f32>() / dists.len() as f32;
+        // Rim corners shaded off the field's gradient at their face centre.
+        let h = 0.02 * res;
+        let mut pts = Vec::new();
+        let mut tris = Vec::new();
+        for t in fin.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from(fin.verts[i as usize]));
+            let m = (a + b + c) / 3.0;
+            if (b - a).cross(c - a).length() * 0.5 < 0.05 * res * res
+                || rim.iter().all(|r| r.distance(m) > 2.0 * res)
+            {
+                continue;
+            }
+            tris.push(*t);
+            for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+                pts.push(m + d * h);
+                pts.push(m - d * h);
+            }
+        }
+        let (_, _, f, _) = build_probed(&def, &pts);
+        let cos = 15f32.to_radians().cos();
+        let mut bad = 0;
+        for (i, t) in tris.iter().enumerate() {
+            let g = Vec3::new(
+                f[6 * i] - f[6 * i + 1],
+                f[6 * i + 2] - f[6 * i + 3],
+                f[6 * i + 4] - f[6 * i + 5],
+            )
+            .normalize_or_zero();
+            bad += t
+                .iter()
+                .filter(|&&j| Vec3::from(fin.normals[j as usize]).dot(g) < cos)
+                .count();
+        }
+        (spread, mean, bad)
+    }
+
+    #[test]
+    fn finished_blended_rims_are_clean() {
+        for b in [0.5, 1.0, 1.5, 2.0, 3.0] {
+            let (spread, mean, bad) = blended_rim(b);
+            eprintln!(
+                "blend {b} cells: rim distance spread {spread:.3} res (mean {mean:.3}), {bad} corners shaded off"
+            );
+            // The rim runs at an even distance from the crease (no zigzag).
+            assert!(spread < 0.1, "blend {b}: rim zigzags by {spread} res");
+            if b < SHARPEN_CELLS {
+                // Meshed sharp: on the crease, shaded per side.
+                assert!(mean < 0.05, "blend {b}: rim {mean} res off the crease");
+                assert!(bad < 10, "blend {b}: {bad} rim corners shaded off");
+            }
+        }
+    }
+
+    /// Tight smooth valleys (a quadruped's hips and neck) don't shade as
+    /// specks: no corner normal far off its face.
+    #[test]
+    fn finished_tight_valleys_shade_without_specks() {
+        let body: crate::body::BodyDef =
+            serde_json::from_value(serde_json::json!({"preset": "quadruped"}))
+                .unwrap_or_else(|e| panic!("{e}"));
+        let p = crate::body::build("q", &body, &no_parts).unwrap_or_else(|e| panic!("{e}"));
+        let mut bad = 0;
+        let mut worst = 0.0f32;
+        for t in p.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from(p.verts[i as usize]));
+            let n = (b - a).cross(c - a).normalize_or_zero();
+            for &j in t {
+                let d = Vec3::from(p.normals[j as usize]).dot(n);
+                if d < 0.5 {
+                    bad += 1;
+                }
+                worst = worst.min(d);
+            }
+        }
+        eprintln!("cat corners over 60 deg off their face: {bad}, worst dot {worst}");
+        assert!(
+            bad < 25 && worst > -0.05,
+            "{bad} corners off, worst {worst}"
+        );
     }
 }

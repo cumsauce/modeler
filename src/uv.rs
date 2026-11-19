@@ -42,9 +42,12 @@ pub fn ensure_normals(part: &mut Part) {
     }
 }
 
-/// Angle-thresholded smooth normals: each triangle corner averages the face
-/// normals of the triangles sharing its vertex that lie within `degrees` of the
-/// corner's own face. Vertices whose corners disagree are split, so a hard edge
+/// Angle-thresholded smooth normals by smoothing groups: around each vertex
+/// the incident faces are flood-filled across shared edges whose dihedral is
+/// within `degrees`, and each group gets one angle-weighted normal (corner
+/// angle x face normal). Transitive, so a chamfer strip of faces each within
+/// the threshold of the next shades as one band instead of zigzagging.
+/// Vertices whose corners fall in different groups are split, so a hard edge
 /// (a boolean cut) stays crisp while a faceted cylinder wall stays smooth.
 /// Incidence is gathered by position (1e-5 grid), so verts split only for a UV
 /// seam still share one smooth normal. Rewrites verts/normals/indices; UVs are
@@ -59,7 +62,7 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
     };
     let idx = |i: usize| -> usize { part.indices.get(i).copied().unwrap_or(i as u32) as usize };
     let mut tri_ids = Vec::with_capacity(tris);
-    let mut face_n = Vec::with_capacity(tris);
+    let mut face_n: Vec<Vec3> = Vec::with_capacity(tris);
     // Group verts by position so UV-seam duplicates share incidence.
     let mut group_of_pos: HashMap<[i64; 3], usize> = HashMap::new();
     let group: Vec<usize> = part
@@ -75,7 +78,9 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
             *group_of_pos.entry(k).or_insert(next)
         })
         .collect();
-    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); group_of_pos.len()];
+    let ngroups = group_of_pos.len();
+    // Edge (position groups) -> triangles using it.
+    let mut edge_tris: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for t in 0..tris {
         let (a, b, c) = (idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2));
         if a >= count || b >= count || c >= count {
@@ -85,12 +90,71 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
             .cross(Vec3::from(part.verts[c]) - Vec3::from(part.verts[a]));
         let k = tri_ids.len();
         tri_ids.push([a, b, c]);
-        face_n.push(n);
-        for v in [a, b, c] {
-            incident[group[v]].push(k);
+        // Near-degenerate slivers (|cross|^2 under 1e-12, the old cut-off)
+        // have no trustworthy direction: they join no group and carry no weight.
+        face_n.push(if n.length_squared() > 1e-12 {
+            n.normalize()
+        } else {
+            Vec3::ZERO
+        });
+        let g = [group[a], group[b], group[c]];
+        for s in 0..3 {
+            let (x, y) = (g[s], g[(s + 1) % 3]);
+            if x != y {
+                edge_tris.entry((x.min(y), x.max(y))).or_default().push(k);
+            }
         }
     }
+    // Union-find over corners (3 * tri + slot).
+    let mut parent: Vec<u32> = (0..tri_ids.len() as u32 * 3).collect();
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x {
+            p[x as usize] = p[p[x as usize] as usize];
+            x = p[x as usize];
+        }
+        x
+    }
+    let slot =
+        |k: usize, g: usize| -> Option<usize> { (0..3).find(|&s| group[tri_ids[k][s]] == g) };
     let cos_limit = degrees.to_radians().cos();
+    let mut keys: Vec<&(usize, usize)> = edge_tris.keys().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let ts = &edge_tris[key];
+        for i in 0..ts.len() {
+            for j in i + 1..ts.len() {
+                let (t1, t2) = (ts[i], ts[j]);
+                let (n1, n2) = (face_n[t1], face_n[t2]);
+                if n1 == Vec3::ZERO || n2 == Vec3::ZERO || n1.dot(n2) < cos_limit {
+                    continue;
+                }
+                for g in [key.0, key.1] {
+                    if let (Some(s1), Some(s2)) = (slot(t1, g), slot(t2, g)) {
+                        let a = find(&mut parent, (t1 * 3 + s1) as u32);
+                        let b = find(&mut parent, (t2 * 3 + s2) as u32);
+                        if a != b {
+                            parent[a.max(b) as usize] = a.min(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Angle-weighted normal per group; per position, an all-faces fallback.
+    let mut acc = vec![Vec3::ZERO; parent.len()];
+    let mut pos_acc = vec![Vec3::ZERO; ngroups];
+    for (k, ids) in tri_ids.iter().enumerate() {
+        let p = ids.map(|v| Vec3::from(part.verts[v]));
+        for s in 0..3 {
+            let e1 = p[(s + 1) % 3] - p[s];
+            let e2 = p[(s + 2) % 3] - p[s];
+            let ang = e1.angle_between(e2);
+            let w = if ang.is_finite() { ang } else { 0.0 };
+            let r = find(&mut parent, (k * 3 + s) as u32) as usize;
+            acc[r] += face_n[k] * w;
+            pos_acc[group[ids[s]]] += face_n[k] * w;
+        }
+    }
     let mut verts = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let keep_uvs = part.uvs.len() == count;
@@ -98,16 +162,12 @@ pub fn crease_normals(part: &mut Part, degrees: f32) {
     let mut indices = Vec::new();
     let mut remap: HashMap<(usize, [i32; 3]), u32> = HashMap::new();
     for (k, ids) in tri_ids.iter().enumerate() {
-        let own = face_n[k].normalize_or_zero();
-        for &v in ids {
-            let mut acc = Vec3::ZERO;
-            for &o in &incident[group[v]] {
-                if face_n[o].normalize_or_zero().dot(own) >= cos_limit {
-                    acc += face_n[o];
-                }
-            }
-            let n = if acc.length_squared() > 1e-12 {
-                acc.normalize()
+        for (s, &v) in ids.iter().enumerate() {
+            let r = find(&mut parent, (k * 3 + s) as u32) as usize;
+            let n = if acc[r].length_squared() > 1e-12 {
+                acc[r].normalize()
+            } else if pos_acc[group[v]].length_squared() > 1e-12 {
+                pos_acc[group[v]].normalize()
             } else {
                 Vec3::Y
             };
@@ -506,6 +566,59 @@ mod tests {
         assert!((span(0) - 2.0).abs() < 1e-5, "{}", span(0));
         assert!((span(1) - 3.0).abs() < 1e-5, "{}", span(1));
         assert_eq!(p.uvs.len(), p.verts.len());
+    }
+
+    #[test]
+    fn crease_groups_are_transitive_along_a_chamfer() {
+        // Floor y = 0 (x < 0), wall x = 0.1 (y > 0.1), joined by a 45 degree
+        // chamfer band; four sections along z.
+        let prof = [[-1.0f32, 0.0], [0.0, 0.0], [0.1, 0.1], [0.1, 1.0]];
+        let strip = |deg: f32| {
+            let mut p = Part::new("chamfer");
+            for k in 0..5 {
+                for [x, y] in prof {
+                    p.verts.push([x, y, -0.2 * k as f32]);
+                }
+            }
+            for k in 0..4u32 {
+                for i in 0..3u32 {
+                    let (a, b) = (k * 4 + i, k * 4 + i + 1);
+                    let (c, d) = (a + 4, b + 4);
+                    p.indices.extend([a, b, d, a, d, c]);
+                }
+            }
+            crease_normals(&mut p, deg);
+            p
+        };
+        let normals_at = |p: &Part, x: f32, y: f32| {
+            let mut ns: Vec<[i32; 3]> = p
+                .verts
+                .iter()
+                .zip(&p.normals)
+                .filter(|(v, _)| (v[0] - x).abs() < 1e-6 && (v[1] - y).abs() < 1e-6)
+                .map(|(_, n)| n.map(|c| (c * 1000.0).round() as i32))
+                .collect();
+            ns.sort_unstable();
+            ns.dedup();
+            ns
+        };
+        // 60: one group, the same normal all along each crease line.
+        let p = strip(60.0);
+        let g = |x, y| normals_at(&p, x, y);
+        assert_eq!(g(0.0, 0.0).len(), 1, "{:?}", g(0.0, 0.0));
+        assert_eq!(g(0.1, 0.1).len(), 1, "{:?}", g(0.1, 0.1));
+        // Both crease lines read floor + chamfer (+ wall): no lone chamfer.
+        assert!(!g(0.0, 0.0).contains(&[-707, 707, 0]));
+        // 40: floor, chamfer and wall split cleanly.
+        let p = strip(40.0);
+        let g = |x, y| normals_at(&p, x, y);
+        assert_eq!(g(0.0, 0.0).len(), 2, "{:?}", g(0.0, 0.0));
+        assert_eq!(g(0.1, 0.1).len(), 2, "{:?}", g(0.1, 0.1));
+        let s = 1000.0f32 * std::f32::consts::FRAC_1_SQRT_2;
+        let ch = [(-s).round() as i32, s.round() as i32, 0];
+        assert!(g(0.0, 0.0).contains(&ch) && g(0.1, 0.1).contains(&ch));
+        assert!(g(0.0, 0.0).contains(&[0, 1000, 0]));
+        assert!(g(0.1, 0.1).contains(&[-1000, 0, 0]));
     }
 
     #[test]

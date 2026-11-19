@@ -104,6 +104,7 @@ pub mod raster;
 pub mod scatter;
 pub mod scene;
 pub mod sdf;
+pub mod sdf_finish;
 pub mod silhouette;
 pub mod simplify;
 pub mod smooth;

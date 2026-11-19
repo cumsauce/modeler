@@ -1432,44 +1432,45 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             let mut part = source.clone();
             part.name = name.clone();
             part.visible = name != input || part.visible;
-            // Bake: world verts, reflect across the plane, flip winding.
+            // Bake: world verts, reflect across the plane, flip winding. The
+            // vertex structure stays, so smooth shading survives: normals
+            // are reflected with the positions (not rebuilt from a soup).
             let rot = quat_of(part.rotation);
             let scale = Vec3::from(part.scale);
             let translation = Vec3::from(part.translation);
-            let mut tris = Vec::with_capacity(part.tri_count() as usize);
-            for t in part.indices.as_chunks::<3>().0 {
-                let world: Vec<Vec3> = t
-                    .iter()
-                    .map(|&i| {
-                        let mut v =
-                            rot * (Vec3::from(part.verts[i as usize]) * scale) + translation;
-                        v[ax] = 2.0 * plane - v[ax];
-                        v
-                    })
-                    .collect();
-                tris.push([world[0], world[1], world[2]]);
+            let had_normals = part.normals.len() == part.verts.len();
+            let reflect = |mut v: Vec3| {
+                v[ax] = -v[ax];
+                v
+            };
+            if !had_normals {
+                crate::uv::ensure_normals(&mut part);
             }
-            let mut verts = Vec::with_capacity(tris.len() * 3);
-            let mut indices = Vec::with_capacity(tris.len() * 3);
-            for (i, t) in tris.iter().enumerate() {
-                for v in t {
-                    verts.push(v.to_array());
-                }
-                // Mirrored faces wind the other way.
-                let b = (i * 3) as u32;
-                indices.extend([b, b + 2, b + 1]);
+            // Normals transform by the inverse transpose of the scale.
+            let nrm: Vec<[f32; 3]> = part
+                .normals
+                .iter()
+                .map(|n| {
+                    reflect(rot * (Vec3::from(*n) / scale))
+                        .normalize_or_zero()
+                        .to_array()
+                })
+                .collect();
+            for v in part.verts.iter_mut() {
+                let mut w = rot * (Vec3::from(*v) * scale) + translation;
+                w[ax] = 2.0 * plane - w[ax];
+                *v = w.to_array();
             }
-            part.verts = verts;
-            part.indices = indices;
-            part.normals.clear();
-            crate::uv::ensure_normals(&mut part);
-            crate::uv::ensure_uvs(&mut part, Some("box"))?;
+            // Mirrored faces wind the other way.
+            for t in part.indices.as_chunks_mut::<3>().0 {
+                t.swap(1, 2);
+            }
+            part.normals = nrm;
+            if part.uvs.len() != part.verts.len() {
+                crate::uv::ensure_uvs(&mut part, Some("box"))?;
+            }
             // A baked dense surface goes through the same reflection.
             if let Some(d) = part.detail.take() {
-                let reflect = |mut v: Vec3| {
-                    v[ax] = -v[ax];
-                    v
-                };
                 part.detail = Some(Arc::new(d.mapped(
                     |v| {
                         let mut w = rot * (v * scale) + translation;
@@ -2612,6 +2613,44 @@ fn mapped_part(part: &Arc<Part>) -> Result<Arc<Part>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_keeps_smooth_normals_and_a_closed_solid() {
+        let sphere = Op::Primitive {
+            name: "ball".into(),
+            kind: crate::PrimitiveKind::Sphere,
+            size: [0.5, 0.0, 0.0],
+            translation: [0.3, 0.2, 0.1],
+            rotation: None,
+            frame: None,
+            round: 0.0,
+            segments: 0,
+            facing: None,
+        };
+        let mirror = Op::Mirror {
+            name: "twin".into(),
+            input: "ball".into(),
+            axis: crate::Axis::X,
+            offset: [0.0; 3],
+        };
+        let parts = evaluate(&[sphere, mirror]).unwrap_or_else(|e| panic!("{e}"));
+        let src = parts.iter().find(|p| p.name == "ball").cloned();
+        let Some(src) = src else { panic!("no source") };
+        let Some(twin) = parts.iter().find(|p| p.name == "twin") else {
+            panic!("no mirror")
+        };
+        assert_eq!(twin.verts.len(), src.verts.len(), "not a soup");
+        assert_eq!(twin.normals.len(), twin.verts.len());
+        let rot = quat_of(src.rotation);
+        for (n, m) in src.normals.iter().zip(&twin.normals) {
+            let w = rot * Vec3::from(*n);
+            let want = Vec3::new(-w.x, w.y, w.z);
+            assert!((Vec3::from(*m) - want).length() < 1e-5, "{m:?} vs {want}");
+        }
+        let m = crate::csg::part_to_manifold(twin).unwrap_or_else(|e| panic!("{e}"));
+        assert!(m.volume() > 0.0, "outward wound");
+        assert_eq!(crate::verify::open_edge_count(twin), 0);
+    }
 
     #[test]
     fn primitive_then_transform_moves_the_part() {

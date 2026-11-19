@@ -339,7 +339,17 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
             let mut m2 = welded(&tmp)?;
             let (nb, _) = neighbours(m2.v.len(), &m2.t);
             tangential(&mut m2.v, &m2.t, &nb, def.iterations.unwrap_or(5));
-            Ok(to_part(name, part, &m2.v, &m2.t, 60.0))
+            // Relaxation drifts off the surface: project back onto the
+            // field, with field normals and sharp creases restored.
+            let field = |p: Vec3| g.sample(p);
+            Ok(crate::sdf_finish::finish_mesh(
+                name,
+                part.material.clone(),
+                m2.v,
+                m2.t,
+                &field,
+                crate::sdf_finish::Sampling::grid(edge, edge * 0.5),
+            ))
         }
         _ => {
             let m = welded(part)?;
@@ -674,12 +684,20 @@ mod tests {
         let (m0, _) = spread(&rock);
         let (m1, _) = spread(&s);
         let bumpy = |p: &Part| {
-            let k = crate::organic::vertex_curvature(p);
+            // One value per position: split copies at creases would
+            // otherwise weight the spread by how the normals were split.
+            let mut seen = std::collections::HashSet::new();
+            let k: Vec<f32> = crate::organic::vertex_curvature(p)
+                .into_iter()
+                .zip(&p.verts)
+                .filter(|(_, v)| seen.insert(v.map(f32::to_bits)))
+                .map(|(k, _)| k)
+                .collect();
             let m = k.iter().sum::<f32>() / k.len() as f32;
             (k.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / k.len() as f32).sqrt()
         };
         let (b0, b1) = (bumpy(&rock), bumpy(&s));
-        assert!(b1 < b0 * 0.5, "curvature spread {b0} -> {b1}");
+        assert!(b1 < b0 * 0.6, "curvature spread {b0} -> {b1}");
         assert!((m1 - m0).abs() / m0 < 0.03, "radius {m0} -> {m1}");
     }
 

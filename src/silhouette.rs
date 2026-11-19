@@ -248,36 +248,79 @@ fn area(r: &[[f32; 2]]) -> f32 {
     0.5 * a
 }
 
-/// A closed centripetal Catmull-Rom through every point of the ring,
-/// `per` samples a span. Each sample is clamped per axis to the box of the
-/// four control points shaping its span, so the curve never overshoots
-/// past its neighbours (a flat car floor stays at its height instead of
-/// sagging below it, a corner doesn't bulge outside the outline's box).
+/// Degrees of turning per sample of a smooth outline.
+const SMOOTH_TURN_DEG: f32 = 1.5;
+
+/// A closed smooth curve through every point of the ring: a cubic
+/// Hermite spline over centripetal (square-root chord) parameters, at
+/// least `per` samples a span, more where the span turns (one sample per
+/// [`SMOOTH_TURN_DEG`] of turning, at most 96), so a curved outline is a
+/// polyline whose facets meet at under two degrees and shade smooth.
+/// Tangents are monotone per axis (Fritsch-Carlson): a point that is an
+/// extreme along x or y gets a flat tangent there, and no span overshoots
+/// its end points on either axis. So the curve never leaves its control
+/// points' box (a flat car floor stays at its height instead of sagging
+/// below it, a corner doesn't bulge outside the outline's box) and stays
+/// smooth where it touches it: no clamped flat with a kink at each end.
 pub fn smooth_ring(r: &[[f32; 2]], per: usize) -> Vec<[f32; 2]> {
     let n = r.len();
     if n < 3 {
         return r.to_vec();
     }
     let p = |i: usize| Vec2::from(r[i % n]);
+    // Centripetal parameter step from point i to i + 1.
+    let dt = |i: usize| p(i).distance(p(i + 1)).max(1e-6).sqrt();
+    // Per-axis tangent at point i: the central difference, flat at a
+    // per-axis extreme.
+    let tangent = |i: usize| -> Vec2 {
+        let (a, b, c) = (p(i + n - 1), p(i), p(i + 1));
+        let h = dt(i + n - 1) + dt(i);
+        let m = (c - a) / h;
+        let flat = |x0: f32, x1: f32, x2: f32| (x1 - x0) * (x2 - x1) <= 0.0;
+        Vec2::new(
+            if flat(a.x, b.x, c.x) { 0.0 } else { m.x },
+            if flat(a.y, b.y, c.y) { 0.0 } else { m.y },
+        )
+    };
+    let tangents: Vec<Vec2> = (0..n).map(tangent).collect();
     let mut out = Vec::with_capacity(n * per);
     for i in 0..n {
-        let (p0, p1, p2, p3) = (p(i + n - 1), p(i), p(i + 1), p(i + 2));
-        let t = |a: Vec2, b: Vec2| a.distance(b).max(1e-6).sqrt();
-        let t0 = 0.0;
-        let t1 = t0 + t(p0, p1);
-        let t2 = t1 + t(p1, p2);
-        let t3 = t2 + t(p2, p3);
+        let (p1, p2) = (p(i), p(i + 1));
+        let h = dt(i);
+        let (mut m1, mut m2) = (tangents[i], tangents[(i + 1) % n]);
+        // Fritsch-Carlson per axis: no overshoot inside the span.
+        for ax in 0..2 {
+            let d = (p2[ax] - p1[ax]) / h;
+            if d == 0.0 {
+                m1[ax] = 0.0;
+                m2[ax] = 0.0;
+                continue;
+            }
+            let (a, b) = ((m1[ax] / d).max(0.0), (m2[ax] / d).max(0.0));
+            let (a, b) = if a * a + b * b > 9.0 {
+                let k = 3.0 / (a * a + b * b).sqrt();
+                (a * k, b * k)
+            } else {
+                (a, b)
+            };
+            m1[ax] = a * d;
+            m2[ax] = b * d;
+        }
+        let (d0, d1) = (
+            (p2 - p(i + n - 1)).normalize_or_zero(),
+            (p(i + 2) - p1).normalize_or_zero(),
+        );
+        let turn = d0.dot(d1).clamp(-1.0, 1.0).acos().to_degrees();
+        let per = per.max(((turn / SMOOTH_TURN_DEG).ceil() as usize).min(96));
         for k in 0..per {
-            let tt = t1 + (t2 - t1) * k as f32 / per as f32;
-            let a1 = p0 * ((t1 - tt) / (t1 - t0)) + p1 * ((tt - t0) / (t1 - t0));
-            let a2 = p1 * ((t2 - tt) / (t2 - t1)) + p2 * ((tt - t1) / (t2 - t1));
-            let a3 = p2 * ((t3 - tt) / (t3 - t2)) + p3 * ((tt - t2) / (t3 - t2));
-            let b1 = a1 * ((t2 - tt) / (t2 - t0)) + a2 * ((tt - t0) / (t2 - t0));
-            let b2 = a2 * ((t3 - tt) / (t3 - t1)) + a3 * ((tt - t1) / (t3 - t1));
-            let c = b1 * ((t2 - tt) / (t2 - t1)) + b2 * ((tt - t1) / (t2 - t1));
-            let lo = p0.min(p1).min(p2.min(p3));
-            let hi = p0.max(p1).max(p2.max(p3));
-            out.push(c.clamp(lo, hi).to_array());
+            let u = k as f32 / per as f32;
+            let (u2, u3) = (u * u, u * u * u);
+            let h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+            let h10 = u3 - 2.0 * u2 + u;
+            let h01 = -2.0 * u3 + 3.0 * u2;
+            let h11 = u3 - u2;
+            let c = p1 * h00 + m1 * (h10 * h) + p2 * h01 + m2 * (h11 * h);
+            out.push(c.to_array());
         }
     }
     out
@@ -993,5 +1036,82 @@ mod tests {
         crate::catalog::set_call_project(prev);
         let _ = std::fs::remove_dir_all(&dir);
         out.unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn smooth_outline_walls_shade_like_the_curve() {
+        let side = vec![vec![
+            [0.5, 0.02],
+            [0.45, 0.2],
+            [0.0, 0.32],
+            [-0.5, 0.12],
+            [-0.5, 0.02],
+        ]];
+        let top = vec![vec![
+            [-0.03, 0.5],
+            [0.12, 0.3],
+            [0.18, -0.2],
+            [0.0, -0.5],
+            [-0.18, -0.2],
+            [-0.12, 0.3],
+        ]];
+        let def = SilhouetteDef {
+            side: shape_rings(side, true, 0.0),
+            top: shape_rings(top.clone(), true, 0.0),
+            rotation: ident(),
+            ..SilhouetteDef::default()
+        };
+        let none = |n: &str| -> Result<std::sync::Arc<crate::Part>, crate::ModelerError> {
+            Err(crate::ModelerError::Invalid(n.into()))
+        };
+        let p = crate::sdf::build("fin", &def.to_sdf(), &none).unwrap_or_else(|e| panic!("{e}"));
+        // The true wall normal: a dense sampling of the same curve.
+        let dense = smooth_ring(&top[0], 400);
+        let n = dense.len();
+        let seg_n = |i: usize| {
+            let (a, b) = (Vec2::from(dense[i]), Vec2::from(dense[(i + 1) % n]));
+            let d = (b - a).normalize_or_zero();
+            Vec2::new(d.y, -d.x)
+        };
+        let ring_area: f32 = (0..n)
+            .map(|i| dense[i][0] * dense[(i + 1) % n][1] - dense[(i + 1) % n][0] * dense[i][1])
+            .sum();
+        let flip = if ring_area > 0.0 { 1.0 } else { -1.0 };
+        let cos_kink = 0.5f32.to_radians().cos();
+        let kinks: Vec<Vec2> = (0..n)
+            .filter(|&i| seg_n(i).dot(seg_n((i + 1) % n)) < cos_kink)
+            .map(|i| Vec2::from(dense[(i + 1) % n]))
+            .collect();
+        let mut worst = 0.0f32;
+        let mut count = 0;
+        for (v, nm) in p.verts.iter().zip(&p.normals) {
+            if v[1] < 0.05 || v[1] > 0.1 || nm[1].abs() > 0.05 {
+                continue;
+            }
+            let q = Vec2::new(v[0], v[2]);
+            let (mut best, mut bi) = (f32::MAX, 0);
+            for (i, pt) in dense.iter().enumerate() {
+                let d = Vec2::from(*pt).distance_squared(q);
+                if d < best {
+                    best = d;
+                    bi = i;
+                }
+            }
+            // Skip the curve's own kinks (where the per-axis clamp flattens it).
+            if kinks.iter().any(|k| k.distance(q) < 0.02) {
+                continue;
+            }
+            let truth = seg_n(bi) * flip;
+            let m = Vec2::new(nm[0], nm[2]).normalize_or_zero();
+            let deg = m.dot(truth).clamp(-1.0, 1.0).acos().to_degrees();
+            worst = worst.max(deg);
+            count += 1;
+        }
+        eprintln!("fin wall: {count} vertices, worst normal error {worst:.2} deg");
+        assert!(count > 50, "{count}");
+        assert!(
+            worst < 1.0,
+            "wall normals off the smooth curve by {worst} deg"
+        );
     }
 }

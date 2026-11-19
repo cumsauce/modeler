@@ -190,10 +190,13 @@ pub fn decimate(name: &str, src: &Part, def: &Decimate) -> Result<Part, String> 
     }
     // simplify welds by exact bits: snap near-coincident corners together.
     weld(&mut bare);
-    let mut out = crate::simplify::simplify(&bare, ratio.max(1e-5));
+    // The same crease angle guards the collapses (feature-edge quadrics)
+    // and splits the normals afterwards.
+    let crease = def.crease.unwrap_or(60.0);
+    let mut out = crate::simplify::simplify_creased(&bare, ratio.max(1e-5), Some(crease));
     out.name = name.to_string();
     out.visible = true;
-    crate::uv::crease_normals(&mut out, def.crease.unwrap_or(60.0));
+    crate::uv::crease_normals(&mut out, crease);
     crate::uv::ensure_uvs(&mut out, Some("box")).map_err(|e| e.to_string())?;
     if def.bake {
         let mut hi = src.clone();
@@ -504,7 +507,7 @@ pub fn bake(
                 let nf = (lv[t[1]] - lv[t[0]])
                     .cross(lv[t[2]] - lv[t[0]])
                     .normalize_or(nn);
-                if let Some(bent) = e.bend(p, nf) {
+                if let Some(bent) = e.bend(p, nf, nn) {
                     tx.normal = whiteout(to_tangent(bent), tx.normal);
                 }
             }
@@ -616,6 +619,140 @@ pub fn plain_graph() -> crate::material::MatGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tri_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
+        // Distance from p to triangle abc (Ericson's closest point).
+        let (ab, ac, ap) = (b - a, c - a, p - a);
+        let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+        if d1 <= 0.0 && d2 <= 0.0 {
+            return p.distance(a);
+        }
+        let bp = p - b;
+        let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+        if d3 >= 0.0 && d4 <= d3 {
+            return p.distance(b);
+        }
+        let vc = d1 * d4 - d3 * d2;
+        if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+            return p.distance(a + ab * (d1 / (d1 - d3)));
+        }
+        let cp = p - c;
+        let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+        if d6 >= 0.0 && d5 <= d6 {
+            return p.distance(c);
+        }
+        let vb = d5 * d2 - d1 * d6;
+        if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+            return p.distance(a + ac * (d2 / (d2 - d6)));
+        }
+        let va = d3 * d6 - d5 * d4;
+        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+            return p.distance(b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6))));
+        }
+        let den = 1.0 / (va + vb + vc);
+        p.distance(a + ab * (vb * den) + ac * (vc * den))
+    }
+
+    /// Max distance from points on `crease` to `lo`'s surface.
+    fn crease_dev(lo: &Part, crease: &[Vec3]) -> f32 {
+        crease
+            .iter()
+            .map(|&p| {
+                lo.indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.map(|i| Vec3::from(lo.verts[i as usize]));
+                        tri_dist(p, a, b, c)
+                    })
+                    .fold(f32::MAX, f32::min)
+            })
+            .fold(0.0, f32::max)
+    }
+
+    fn sdf_part(shapes: serde_json::Value, res: f32) -> Part {
+        let def: crate::sdf::SdfDef = serde_json::from_value(serde_json::json!({
+            "shapes": shapes, "blend": 0.0, "resolution": res
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let none = |n: &str| -> Result<Arc<Part>, crate::ModelerError> {
+            Err(crate::ModelerError::Invalid(format!("no part {n}")))
+        };
+        crate::sdf::build("s", &def, &none).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn decimate_keeps_sdf_creases() {
+        let res = 0.01;
+        let q = bevy::math::Quat::from_rotation_y(30f32.to_radians())
+            * bevy::math::Quat::from_rotation_x(20f32.to_radians());
+        // A rotated box (flat faces) and a sphere cut flat top and bottom
+        // (two crease circles between a curved and a flat face).
+        let boxy = sdf_part(
+            serde_json::json!([{"shape": "box", "size": [0.3, 0.2, 0.25], "rotation": q.to_array()}]),
+            res,
+        );
+        let h = Vec3::new(0.15, 0.1, 0.125);
+        let mut box_edges = Vec::new();
+        for axis in 0..3 {
+            for sa in [-1.0f32, 1.0] {
+                for sb in [-1.0f32, 1.0] {
+                    for k in 0..9 {
+                        let mut l = [0.0; 3];
+                        l[axis] = (-0.8 + 0.2 * k as f32) * h[axis];
+                        l[(axis + 1) % 3] = sa * h[(axis + 1) % 3];
+                        l[(axis + 2) % 3] = sb * h[(axis + 2) % 3];
+                        box_edges.push(q * Vec3::from(l));
+                    }
+                }
+            }
+        }
+        let puck = sdf_part(
+            serde_json::json!([
+                {"shape": "sphere", "radius": [0.15]},
+                {"shape": "box", "size": [0.4, 0.2, 0.4], "op": "intersect"}
+            ]),
+            res,
+        );
+        let r = (0.15f32 * 0.15 - 0.1 * 0.1).sqrt();
+        let circles: Vec<Vec3> = (0..72)
+            .flat_map(|k| {
+                let a = (k as f32 * 5.0).to_radians();
+                [-0.1, 0.1].map(|y| Vec3::new(r * a.cos(), y, r * a.sin()))
+            })
+            .collect();
+        for (what, hi, crease, tris) in [
+            ("box", &boxy, &box_edges, 400),
+            ("puck", &puck, &circles, 2000),
+        ] {
+            let d = Decimate {
+                tris: Some(tris),
+                ..Default::default()
+            };
+            let t = std::time::Instant::now();
+            let lo = decimate("lo", hi, &d).unwrap_or_else(|e| panic!("{e}"));
+            let took = t.elapsed();
+            let worst = crease_dev(&lo, crease);
+            eprintln!(
+                "decimated {what} ({} -> {} tris, {took:?}): crease off by {:.3} res",
+                hi.tri_count(),
+                lo.tri_count(),
+                worst / res
+            );
+            crate::csg::part_to_manifold(&lo).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(
+                (lo.tri_count() as i64 - tris as i64).abs() < tris as i64 / 10,
+                "{what}: {}",
+                lo.tri_count()
+            );
+            assert!(
+                worst < 0.2 * res,
+                "{what}: crease off by {} res",
+                worst / res
+            );
+        }
+    }
 
     fn bumpy_sphere() -> Part {
         let p = crate::primitives::primitive(crate::PrimitiveKind::Sphere, [0.5, 0.0, 0.0], "s")

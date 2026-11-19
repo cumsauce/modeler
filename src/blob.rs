@@ -343,7 +343,10 @@ pub fn blob(
             _ => "nothing to mesh (inputs too thin for the resolution?)".into(),
         }));
     }
-    let mut out = crate::csg::manifold_to_part(&m, name, first.material.clone());
+    let meshed = crate::csg::manifold_to_part(&m, name, first.material.clone());
+    // Grids are trilinear: their gradient is taken over a full cell.
+    let mut out =
+        crate::sdf_finish::finish(&meshed, &field, crate::sdf_finish::Sampling::grid(res, res));
     out.visible = true;
     Ok(out)
 }
