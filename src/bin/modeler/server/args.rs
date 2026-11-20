@@ -80,6 +80,37 @@ pub(crate) struct InspectArgs {
     /// head against the shoulder height).
     #[serde(default)]
     pub(crate) proportions: Option<ThicknessArg>,
+    /// Motion over a clip, no renderer needed: {"clip"?, "bones"?: [globs],
+    /// "channels"?: ["height", "speed", "angle", "x", "z"], "samples"?: 120}.
+    /// Per bone tip and channel: min / max with their times, mean, the
+    /// stretches where the tip is within 3 cm of the ground (planted), the
+    /// sampled series, and ONE image of line plots (time on x, a row per
+    /// channel, a line per bone, planted bars underneath). height = tip
+    /// world y (m), speed = tip speed (m/s), angle = bone rotation from rest
+    /// (deg), x / z = tip world position (m). A root bone's tip is its head,
+    /// any other bone's its tail. Default bones: moving end bones, head and
+    /// root.
+    #[serde(default)]
+    pub(crate) curves: Option<CurvesArg>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurvesArg {
+    /// The clip (default: the only one).
+    #[serde(default)]
+    pub(crate) clip: Option<String>,
+    /// Bone names or `*` globs. Default: moving end bones, head and root.
+    #[serde(default)]
+    pub(crate) bones: Option<Vec<String>>,
+    /// Rows of the plot: "height", "speed", "angle", "x", "z". Default
+    /// height, speed, angle.
+    #[serde(default)]
+    pub(crate) channels: Option<Vec<String>>,
+    /// Samples over the clip (8..2000, default 120). The structured result
+    /// keeps at most 60 points per line.
+    #[serde(default)]
+    pub(crate) samples: Option<usize>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -614,8 +645,13 @@ pub(crate) struct AgentViewsArgs {
     /// legend, to tell which shape is which part) or "curvature" (mean
     /// curvature heat map: red convex, white flat, blue concave; lumps,
     /// pinches and creases on organic surfaces stand out), "bones" (the
-    /// skeleton over see-through parts) or "weights" (one `bone`'s skin
-    /// weights: red 1, blue 0).
+    /// skeleton over see-through parts), "weights" (one `bone`'s skin
+    /// weights: red 1, blue 0) or "trails" (needs `clip`: the model
+    /// see-through at `time`, and for each bone of `bones` the 3D path its
+    /// tip travels over the whole clip, one colour per bone with a legend,
+    /// dots at 24 even time steps growing with time so spacing shows speed,
+    /// a big dot at t = 0, planted stretches (tip within 3 cm of the
+    /// ground) thick and white).
     #[serde(default)]
     pub(crate) style: Option<String>,
     /// Overlay the framed box's width/height and a scale bar (true scale in
@@ -654,6 +690,11 @@ pub(crate) struct AgentViewsArgs {
     /// With style "weights": the bone whose skin weights are painted.
     #[serde(default)]
     pub(crate) bone: Option<String>,
+    /// With style "trails": bone names or `*` globs whose tip paths are
+    /// drawn. Default: the moving end bones (hands, feet, head, tail tips)
+    /// and the root, at most 8.
+    #[serde(default)]
+    pub(crate) bones: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -753,4 +794,28 @@ pub(crate) struct HistoryArgs {
 /// `agent_views` with no `views`: one perspective look.
 fn default_views() -> Vec<ViewArg> {
     vec![ViewArg::Name("iso".into())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curves_args_parse_and_reject_typos() {
+        let ok: InspectArgs = serde_json::from_value(serde_json::json!({
+            "curves": {"clip": "walk", "bones": ["foot_*"], "channels": ["height"], "samples": 60}
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let c = ok.curves.unwrap_or_else(|| panic!("no curves"));
+        assert_eq!(c.samples, Some(60));
+        assert_eq!(c.bones, Some(vec!["foot_*".to_string()]));
+        let bad =
+            serde_json::from_value::<InspectArgs>(serde_json::json!({"curves": {"bone": ["x"]}}));
+        assert!(bad.is_err());
+        let v: AgentViewsArgs = serde_json::from_value(
+            serde_json::json!({"style": "trails", "clip": "walk", "bones": ["hand_*"]}),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(v.bones, Some(vec!["hand_*".to_string()]));
+    }
 }

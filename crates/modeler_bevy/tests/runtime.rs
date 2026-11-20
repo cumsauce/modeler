@@ -41,6 +41,40 @@ fn scene(app: &mut App, kind: &str) -> (Entity, Entity, Entity) {
     (root, j0, j1)
 }
 
+/// The same two-bone rig, with joint rest rotations (a frame turned about y,
+/// as an exported rig with `rest` bones has).
+fn scene_rest(app: &mut App, kind: &str) -> (Entity, Entity, Entity) {
+    let (root, j0, j1) = scene(app, kind);
+    let world = app.world_mut();
+    if let Some(mut t) = world.get_mut::<Transform>(j0) {
+        t.rotation = Quat::from_rotation_y(1.2);
+    }
+    if let Some(mut t) = world.get_mut::<Transform>(j1) {
+        t.rotation = Quat::from_rotation_y(-0.5) * Quat::from_rotation_z(0.6);
+    }
+    (root, j0, j1)
+}
+
+fn rot(app: &App, e: Entity) -> Quat {
+    app.world()
+        .get::<Transform>(e)
+        .map_or(Quat::IDENTITY, |t| t.rotation)
+}
+
+/// Joint 1's world rotation with its rest orientation taken out.
+fn world_without_rest(app: &App, j0: Entity, j1: Entity, rest: &[Quat; 2]) -> Quat {
+    ((rot(app, j0) * rot(app, j1)) * (rest[0] * rest[1]).inverse()).normalize()
+}
+
+/// Rotations apart by an angle (radians). `Quat::angle_between` is
+/// `2 acos(dot)`, whose f32 noise near equality is about 1e-4 (a 3e-8
+/// component difference reads as 1.4e-4), so measure the difference of the
+/// (sign-aligned) components instead: the angle is about twice that.
+fn apart(a: Quat, b: Quat) -> f32 {
+    let b = if a.dot(b) < 0.0 { -b } else { b };
+    2.0 * (a - b).length()
+}
+
 fn app() -> App {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, TransformPlugin, ModelerPlugin));
@@ -133,4 +167,55 @@ fn colliders_and_markers_from_extras() {
         m.map(|m| (m.kind, m.data["team"].as_i64())),
         Some(("spawn".into(), Some(1)))
     );
+}
+
+fn rest_of_scene_rest() -> [Quat; 2] {
+    [
+        Quat::from_rotation_y(1.2),
+        Quat::from_rotation_y(-0.5) * Quat::from_rotation_z(0.6),
+    ]
+}
+
+#[test]
+fn wind_leans_the_same_with_rest_rotations() {
+    let mut app = app();
+    let (plain, p0, p1) = scene(&mut app, "wind");
+    let (rested, r0, r1) = scene_rest(&mut app, "wind");
+    app.update();
+    for root in [plain, rested] {
+        if let Some(mut s) = app.world_mut().get_mut::<Sway>(root) {
+            s.phase = 0.0;
+        }
+    }
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.update();
+        let a = world_without_rest(&app, p0, p1, &[Quat::IDENTITY; 2]);
+        let b = world_without_rest(&app, r0, r1, &rest_of_scene_rest());
+        assert!(a.angle_between(Quat::IDENTITY) > 1e-3, "leans {a:?}");
+        assert!(apart(a, b) < 1e-4, "{a:?} vs {b:?}");
+    }
+}
+
+#[test]
+fn spring_follows_a_moved_root_with_rest_rotations() {
+    let mut app = app();
+    let (_, p0, p1) = scene(&mut app, "spring");
+    let (_, r0, r1) = scene_rest(&mut app, "spring");
+    app.update();
+    for j in [p0, r0] {
+        if let Some(mut t) = app.world_mut().get_mut::<Transform>(j) {
+            t.translation.x = 0.5;
+        }
+    }
+    let mut moved = 0.0f32;
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.update();
+        let a = world_without_rest(&app, p0, p1, &[Quat::IDENTITY; 2]);
+        let b = world_without_rest(&app, r0, r1, &rest_of_scene_rest());
+        moved = moved.max(a.angle_between(Quat::IDENTITY));
+        assert!(apart(a, b) < 1e-3, "{a:?} vs {b:?}");
+    }
+    assert!(moved > 1e-3, "the tip lags behind ({moved})");
 }

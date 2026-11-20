@@ -6,8 +6,12 @@
 //! game. The baked clip and the live motion therefore match.
 //!
 //! Bone frames follow the modeler: at rest every bone is world-aligned (identity
-//! rotation) and pivots at its `head`, and bones are listed parents first. A
-//! pose is one local (translation offset, rotation) per bone, relative to rest.
+//! rotation) by default and pivots at its `head`, and bones are listed parents
+//! first. A pose is one local (translation offset, rotation) per bone, relative
+//! to rest. Both simulations work in world-aligned frames; a bone with a rest
+//! rotation converts through [`SwayRig::rest_parent_frames`] and [`conj`] /
+//! [`unconj`] (the runtime reads the rest rotations from the joints' rest
+//! transforms).
 //!
 //! Two kinds:
 //! - **Wind**: a pure function of time, [`SwayRig::wind_rotations`]. Thick bones
@@ -119,6 +123,17 @@ pub struct SwayRig {
     /// that clip or the live simulation, not both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<String>,
+}
+
+/// `p * q * p^-1`: the rotation `q`, given in frame `p`, as seen from the
+/// frame `p` sits in.
+pub fn conj(p: Quat, q: Quat) -> Quat {
+    (p * q * p.inverse()).normalize()
+}
+
+/// `p^-1 * q * p`: the inverse of [`conj`].
+pub fn unconj(p: Quat, q: Quat) -> Quat {
+    (p.inverse() * q * p).normalize()
 }
 
 /// A frequency snapped to a whole number of cycles per `period`.
@@ -239,6 +254,30 @@ impl SwayRig {
             }
             out.push(q.normalize());
         }
+    }
+
+    /// The world rest rotation of each bone's parent frame (identity for a
+    /// root), from each bone's rest rotation relative to its parent
+    /// (`local_rest`, e.g. a glTF joint's rest rotation; missing = identity).
+    /// With these, a world-aligned rotation `w` on bone `i` is
+    /// `unconj(frames[i], w)` in the joint's local frame.
+    pub fn rest_parent_frames(&self, local_rest: &[Quat]) -> Vec<Quat> {
+        let mut world: Vec<Quat> = Vec::with_capacity(self.bones.len());
+        let mut frames = Vec::with_capacity(self.bones.len());
+        for (i, b) in self.bones.iter().enumerate() {
+            let p = b
+                .parent
+                .and_then(|p| world.get(p as usize).copied())
+                .unwrap_or(Quat::IDENTITY);
+            let rl = local_rest.get(i).copied().unwrap_or(Quat::IDENTITY);
+            frames.push(p);
+            world.push(if rl == Quat::IDENTITY {
+                p
+            } else {
+                (p * rl).normalize()
+            });
+        }
+        frames
     }
 
     /// World (position, rotation) of every bone for local (translation
@@ -470,5 +509,183 @@ mod tests {
         assert!(s.contains("\"kind\":\"wind\""), "{s}");
         let back: SwayRig = serde_json::from_str(&s).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(back, rig);
+    }
+
+    /// Local joint rotations (rest included) for world-aligned per-bone
+    /// rotations `w`, the way the runtime converts them.
+    fn joint_locals(rig: &SwayRig, rest: &[Quat], w: &[Quat]) -> Vec<Quat> {
+        let frames = rig.rest_parent_frames(rest);
+        (0..w.len())
+            .map(|i| (unconj(frames[i], w[i]) * rest[i]).normalize())
+            .collect()
+    }
+
+    /// World rotation of each joint from local rotations down the chain.
+    fn chain_world(locals: &[Quat]) -> Vec<Quat> {
+        let mut out: Vec<Quat> = Vec::new();
+        for (i, q) in locals.iter().enumerate() {
+            out.push(if i == 0 {
+                *q
+            } else {
+                (out[i - 1] * *q).normalize()
+            });
+        }
+        out
+    }
+
+    fn rests() -> Vec<Quat> {
+        vec![
+            Quat::from_rotation_y(1.2),
+            Quat::from_euler(glam::EulerRot::XYZ, 0.4, -0.3, 0.8),
+            Quat::IDENTITY,
+            Quat::from_rotation_z(0.5),
+            Quat::from_rotation_x(-0.7),
+        ]
+    }
+
+    #[test]
+    fn wind_leans_the_same_with_rest_rotations() {
+        let w = Wind {
+            strength: 1.0,
+            ..Default::default()
+        };
+        let rig = SwayRig {
+            bones: chain(5),
+            kind: SwayKind::Wind(w.clone()),
+            period: Some(4.0),
+            clip: None,
+        };
+        let rest = rests();
+        let rest_world = chain_world(&rest);
+        let mut a = Vec::new();
+        for k in 0..20 {
+            rig.wind_rotations(&w, k as f32 * 0.2, 0.0, &mut a);
+            let plain = chain_world(&a);
+            let world = chain_world(&joint_locals(&rig, &rest, &a));
+            for i in 0..5 {
+                let back = (world[i] * rest_world[i].inverse()).normalize();
+                assert!(back.angle_between(plain[i]) < 1e-3, "k{k} bone {i}");
+            }
+        }
+        // Identity rest frames are the plain path, bit for bit.
+        let id = vec![Quat::IDENTITY; 5];
+        assert_eq!(joint_locals(&rig, &id, &a), a);
+    }
+
+    #[test]
+    fn spring_follows_a_moved_root_with_rest_rotations() {
+        let s = Spring::default();
+        let rig = SwayRig {
+            bones: chain(3),
+            kind: SwayKind::Spring(s.clone()),
+            period: None,
+            clip: None,
+        };
+        let rest = rests()[..3].to_vec();
+        let frames = rig.rest_parent_frames(&rest);
+        let rest_world = chain_world(&rest);
+        // World-aligned driver: the root jerked sideways, then held.
+        let at = |x: f32| {
+            vec![
+                (Vec3::new(x, 0.0, 0.0), Quat::IDENTITY),
+                (Vec3::ZERO, Quat::IDENTITY),
+                (Vec3::ZERO, Quat::IDENTITY),
+            ]
+        };
+        let (mut plain, mut sim_r) = (SpringSim::new(), SpringSim::new());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        plain.step(&rig, &s, &at(0.0), 0.0, 0.1, &mut a);
+        sim_r.step(&rig, &s, &at(0.0), 0.0, 0.1, &mut b);
+        let mut lag = 0.0f32;
+        for k in 0..30 {
+            let t = 0.1 + k as f32 / 60.0;
+            plain.step(&rig, &s, &at(0.3), t, 1.0 / 60.0, &mut a);
+            sim_r.step(&rig, &s, &at(0.3), t, 1.0 / 60.0, &mut b);
+            // The rest-frame joint rotations, folded back to world.
+            let locals: Vec<Quat> = (0..3)
+                .map(|i| (unconj(frames[i], b[i]) * rest[i]).normalize())
+                .collect();
+            let world = chain_world(&locals);
+            let wa = chain_world(&a);
+            for i in 0..3 {
+                let back = (world[i] * rest_world[i].inverse()).normalize();
+                assert!(back.angle_between(wa[i]) < 1e-3, "step {k} bone {i}");
+            }
+            lag = lag.max(a[1].angle_between(Quat::IDENTITY));
+        }
+        assert!(lag > 0.01, "the tip lags ({lag})");
+    }
+}
+
+/// One pose-driven corrective morph target as exported in a mesh node's
+/// `extras.correctives`: its weight follows `bone`'s rotation about `axis`
+/// (the bone's rest frame) — see [`corrective_weight`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CorrectiveDriver {
+    /// The morph target index on the mesh (after the authored shapes).
+    pub target: usize,
+    #[serde(default)]
+    pub name: String,
+    pub bone: String,
+    pub axis: [f32; 3],
+    pub degrees: f32,
+    #[serde(default)]
+    pub from: f32,
+    #[serde(default)]
+    pub to: Option<f32>,
+    /// The joint node's rest rotation (relative to its parent): the
+    /// driver reads `rest_local⁻¹ * rotation`.
+    pub rest_local: [f32; 4],
+}
+
+impl CorrectiveDriver {
+    /// The weight for a joint node's current local rotation.
+    pub fn weight(&self, local_rotation: Quat) -> f32 {
+        let r = Quat::from_array(self.rest_local).inverse() * local_rotation;
+        corrective_weight(r, Vec3::from(self.axis), self.from, self.degrees, self.to)
+    }
+}
+
+/// The corrective driver curve on the twist angle of `r` about `axis`
+/// (the swing-twist split, so a turn about another axis adds nothing):
+/// 0 at `from` degrees, rising linearly to 1 at `peak`, back to 0 at `to`
+/// (or held at 1 when `to` is `None`). Signed: a negative `peak` reads the
+/// angle the other way.
+pub fn corrective_weight(r: Quat, axis: Vec3, from: f32, peak: f32, to: Option<f32>) -> f32 {
+    let r = if r.w < 0.0 { -r } else { r };
+    let p = Vec3::new(r.x, r.y, r.z).dot(axis);
+    let a = (2.0 * p.atan2(r.w)).to_degrees();
+    let s = if peak < 0.0 { -1.0 } else { 1.0 };
+    let (a, from, peak) = (a * s, from * s, peak * s);
+    if peak - from < 1e-3 {
+        return 0.0;
+    }
+    if a <= peak {
+        return ((a - from) / (peak - from)).clamp(0.0, 1.0);
+    }
+    match to {
+        Some(t) if t * s - peak > 1e-3 => (1.0 - (a - peak) / (t * s - peak)).clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod corrective_tests {
+    use super::*;
+
+    #[test]
+    fn tents_interpolate_between_keys() {
+        let q = |d: f32| Quat::from_axis_angle(Vec3::X, d.to_radians());
+        let w = |d: f32, f: f32, p: f32, t: Option<f32>| corrective_weight(q(d), Vec3::X, f, p, t);
+        assert!((w(20.0, 0.0, 40.0, Some(80.0)) - 0.5).abs() < 1e-4);
+        assert!((w(60.0, 0.0, 40.0, Some(80.0)) - 0.5).abs() < 1e-4);
+        assert!(w(90.0, 0.0, 40.0, Some(80.0)) < 1e-4);
+        assert!((w(150.0, 80.0, 120.0, None) - 1.0).abs() < 1e-4);
+        assert!(w(-30.0, 0.0, 40.0, None) < 1e-4);
+        // Negative keys read the other way.
+        assert!((w(-45.0, 0.0, -90.0, None) - 0.5).abs() < 1e-4);
+        // A turn about another axis does nothing.
+        let y = Quat::from_axis_angle(Vec3::Y, 1.0);
+        assert!(corrective_weight(y, Vec3::X, 0.0, 40.0, None) < 1e-4);
     }
 }

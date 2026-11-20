@@ -87,14 +87,17 @@ pub mod error;
 pub mod export_opt;
 pub mod feedback;
 pub mod game;
+pub mod garment;
 pub mod gltf;
 pub mod graph;
+pub mod human;
 pub mod inspect;
 pub mod ktx2;
 pub mod light;
 pub mod loft;
 pub mod lsystem;
 pub mod material;
+pub mod mocap;
 pub mod organic;
 pub mod outline;
 pub mod params;
@@ -224,6 +227,21 @@ pub struct Part {
     /// usable as anchors (`cat:paw_l`). Derived by the op; never saved.
     #[serde(skip)]
     pub joints: Option<std::sync::Arc<Vec<(String, [f32; 3])>>>,
+    /// Skin weights the mesh came with (the `human` template's), which a
+    /// smooth bind uses instead of envelope weights when the skeleton has
+    /// those bones and the vertex count still matches. Derived; never saved.
+    #[serde(skip)]
+    pub skin: Option<std::sync::Arc<crate::human::SkinWeights>>,
+    /// Named morph targets: per vertex offsets (same vertex order), exported
+    /// as glTF morph targets and keyed by clips. Derived; never saved.
+    #[serde(skip)]
+    pub morphs: Option<std::sync::Arc<Vec<(String, Vec<[f32; 3]>)>>>,
+    /// Pose-driven corrective shapes a smooth bind computed (sparse rest
+    /// space offsets, each weighted by one bone's rotation), applied by
+    /// every posing path before skinning and exported as morph targets
+    /// after `morphs`. Derived after the graph; never saved.
+    #[serde(skip)]
+    pub correctives: Option<std::sync::Arc<Vec<crate::anim::skin::Corrective>>>,
 }
 
 fn one() -> f32 {
@@ -1270,6 +1288,13 @@ pub enum Op {
     /// Hollows a solid to walls `thickness` thick; each `open` face
     /// (top/bottom/left/right/front/back) is left open. Cabinets, drawers,
     /// boxes, tubs, planters.
+    /// Clothing cut from the surface of the part it is `on`
+    /// ([`crate::garment`]).
+    Garment {
+        name: String,
+        #[serde(flatten)]
+        def: crate::garment::GarmentDef,
+    },
     Shell {
         name: String,
         input: String,
@@ -1476,6 +1501,12 @@ pub enum Op {
         #[serde(flatten)]
         def: crate::anim::ClipDef,
     },
+    /// A named static pose of a skeleton, keyable by clips.
+    Pose {
+        name: String,
+        #[serde(flatten)]
+        def: crate::anim::PoseDef,
+    },
     /// Dynamic motion (wind or springs) baked into a clip of this name.
     Sway {
         name: String,
@@ -1612,6 +1643,12 @@ pub enum Op {
         materials: Vec<crate::variant::Look>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<serde_json::Value>,
+        /// Parts (names / globs) shown in this variant (an outfit).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        show: Vec<String>,
+        /// Parts hidden in this variant.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hide: Vec<String>,
     },
 }
 

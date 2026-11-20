@@ -593,9 +593,33 @@ fn material_items(session: &Session, expanded: &HashSet<String>) -> Vec<Item> {
 
 fn animate_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
     let mut out = vec![Item::heading("Clips")];
+    // A layered (`over`), `mocap` or `pose` clip takes its length from what
+    // it is built from, not from its own item's `duration`.
+    let built: Option<std::collections::HashMap<String, f32>> = model
+        .ops
+        .iter()
+        .any(|o| matches!(o, Op::Clip { def, .. } if def.duration <= 0.0))
+        .then(|| {
+            modeler::anim::clips(model)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(c, _)| (c.name, c.duration))
+                .collect()
+        });
     for o in &model.ops {
         let (name, detail) = match o {
-            Op::Clip { name, def } => (name, format!("{:.2} s", def.duration)),
+            Op::Clip { name, def } => {
+                let d = if def.duration > 0.0 {
+                    def.duration
+                } else {
+                    built
+                        .as_ref()
+                        .and_then(|b| b.get(name))
+                        .copied()
+                        .unwrap_or(0.0)
+                };
+                (name, format!("{d:.2} s"))
+            }
             Op::Sway { name, .. } => (name, "sway".to_string()),
             _ => continue,
         };
@@ -607,6 +631,22 @@ fn animate_items(model: &Model, expanded: &HashSet<String>) -> Vec<Item> {
         it.icon = Some(Icon::Clip);
         it.detail = detail;
         out.push(it);
+    }
+    // Clips prefab instances bring (`inst.<clip>`).
+    if model.ops.iter().any(|o| matches!(o, Op::Prefab { .. })) {
+        for (c, _) in modeler::anim::clips(model).unwrap_or_default() {
+            if out.iter().any(|i| i.key == format!("clip:{}", c.name)) {
+                continue;
+            }
+            let mut it = Item::new(
+                format!("clip:{}", c.name),
+                c.name.clone(),
+                Act::Clip(c.name.clone()),
+            );
+            it.icon = Some(Icon::Clip);
+            it.detail = format!("{:.2} s", c.duration);
+            out.push(it);
+        }
     }
     if out.len() == 1 {
         let mut e = Item::new("noclip".into(), "no clips yet", Act::Heading);

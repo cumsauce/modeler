@@ -2129,7 +2129,10 @@ pub struct BodySpec {
     name: String,
     /// biped (a person, 1.75 m), quadruped (a cat, 0.25 m at the
     /// shoulder), bird (0.25 m), fish (0.4 m long), serpent (2 m long),
-    /// car (4.3 m long). Facing +z, left = +x, standing on y = 0.
+    /// car (4.3 m long), or human: a parametric template mesh (MakeHuman's
+    /// CC0 base mesh + morph targets: gender, age, muscle, weight, shape,
+    /// expression; needs the data/human/human.bin file). Facing +z, left
+    /// = +x, standing on y = 0.
     preset: String,
     /// Size in meters: standing height (biped, bird), shoulder height
     /// (quadruped), length (fish, serpent, car).
@@ -2170,9 +2173,11 @@ pub struct BodySpec {
     /// With tris: bake the dense surface into normal + height maps.
     #[serde(default)]
     bake: Option<bool>,
-    /// false: no automatic `<name>_rig` skeleton (default true).
+    /// false: no automatic `<name>_rig` skeleton (default true). human:
+    /// "game" (default, ~58 bones named like the biped's) or "full" (the
+    /// template's whole skeleton with face bones, `xxx.L` -> `xxx_l`).
     #[serde(default)]
-    rig: Option<bool>,
+    rig: Option<RigArg>,
     /// false: no automatic smooth `<name>_bind` of the body to its rig
     /// (default true with the rig; a `bind` item on the rig replaces it).
     #[serde(default)]
@@ -2182,6 +2187,72 @@ pub struct BodySpec {
     /// "amount": 0.02}).
     #[serde(default)]
     warps: Option<Vec<WarpSpec>>,
+    /// human: 0 female .. 1 male (default 0.5).
+    #[serde(default)]
+    gender: Option<f32>,
+    /// human: age in years (> 1; default 25), or MakeHuman's 0..1 scale.
+    #[serde(default)]
+    age: Option<f32>,
+    /// human: 0..1 (default 0.5).
+    #[serde(default)]
+    muscle: Option<f32>,
+    /// human: body fat 0..1 (default 0.5).
+    #[serde(default)]
+    weight: Option<f32>,
+    /// human: 0..1, 0.5 neutral (above: idealized, below: uncommon).
+    #[serde(default)]
+    proportions: Option<f32>,
+    /// human: 0..1 (default 0.5; female share only).
+    #[serde(default)]
+    breast_size: Option<f32>,
+    /// human: 0..1 (default 0.5).
+    #[serde(default)]
+    breast_firmness: Option<f32>,
+    /// human: {"african", "asian", "caucasian"} weights (normalized;
+    /// default equal).
+    #[serde(default)]
+    ethnicity: Option<std::collections::BTreeMap<String, f32>>,
+    /// human: detail targets by name, -1..1 between their decrease and
+    /// increase files ({"nose-width1": 0.3, "head-fat": -0.5}).
+    #[serde(default)]
+    shape: Option<std::collections::BTreeMap<String, f32>>,
+    /// human: expression units 0..1 ({"mouth-open": 0.6,
+    /// "mouth-corner-puller": 1}).
+    #[serde(default)]
+    expression: Option<std::collections::BTreeMap<String, f32>>,
+    /// human: Catmull-Clark levels over the quad cage, 0..2 (default 0:
+    /// ~27k triangles; 1: ~110k).
+    #[serde(default)]
+    detail: Option<u32>,
+    /// human: extras to make, separate parts `<name>_eyes`, `<name>_teeth`,
+    /// `<name>_tongue` (default all three; [] for none).
+    #[serde(default)]
+    parts: Option<Vec<String>>,
+    /// human: named morph targets {"smile": {"expression": {...},
+    /// "shape": {...}}}: deltas against this item, exported as glTF morph
+    /// targets and keyed by a clip's `morphs`.
+    #[serde(default)]
+    shapes: Option<std::collections::BTreeMap<String, crate::human::ShapeKey>>,
+    /// human: iris colour of the built-in eye material ("#5a3a22",
+    /// [r, g, b]; default a mid brown).
+    #[serde(default)]
+    eye_color: Option<Value>,
+    /// human: pupil size, 1 = normal (0.5..2).
+    #[serde(default)]
+    pupil: Option<f32>,
+    /// human: body measurements to hit, meters ({"chest": 1.0, "waist":
+    /// 0.85, "hips": 1.0, "neck": 0.38, "upper_arm": 0.31, "thigh": 0.58,
+    /// "calf": 0.37}): girths solved through MakeHuman's measure targets.
+    #[serde(default)]
+    measure: Option<std::collections::BTreeMap<String, f32>>,
+}
+
+/// `rig`: true / false, or a human's rig kind ("game" / "full").
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RigArg {
+    On(bool),
+    Kind(String),
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2612,6 +2683,22 @@ pub struct VariantSpec {
     #[serde(default)]
     #[schemars(with = "Option<serde_json::Value>")]
     style: Option<serde_json::Value>,
+    /// Parts (names / `*` globs) shown in this variant: an outfit's
+    /// garments, hidden in the base model.
+    #[serde(default)]
+    show: OneOrMany,
+    /// Parts hidden in this variant (another outfit's pieces).
+    #[serde(default)]
+    hide: OneOrMany,
+}
+
+/// A garment item: `name` plus [`crate::garment::GarmentDef`].
+#[derive(schemars::JsonSchema)]
+pub struct GarmentSpec {
+    /// The garment part's name.
+    pub name: String,
+    #[serde(flatten)]
+    pub def: crate::garment::GarmentDef,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2840,14 +2927,51 @@ pub struct BoneSpec {
     /// the length): about the limb's thickness.
     #[serde(default)]
     radius: Option<f32>,
+    /// Rest rotation of the bone's frame in world space (any rotation
+    /// form). Default: world-aligned. With a rest rotation, clip rotations
+    /// of this bone turn about its own local axes.
+    #[serde(default)]
+    rest: Option<RotationSpec>,
+    /// Degrees about the head -> tail axis, with the frame's +y along the
+    /// bone (applied after `rest` when both are given). Setting it (even 0)
+    /// aligns the bone's frame to the bone.
+    #[serde(default)]
+    roll: Option<f32>,
+    /// Joint limits, degrees per axis of the bone's rest frame: `{"x":
+    /// [-10, 140]}`. The clip rotation (offset from rest) is split into
+    /// Euler angles in the order rotations `{x, y, z}` apply (x, then y,
+    /// then z) and each named axis is clamped, after the tracks and after
+    /// IK. Mirror twins get y and z flipped.
+    #[serde(default)]
+    limits: Option<crate::anim::Limits>,
+    /// Aim the bone after IK: `{"target": [x, y, z] | "part:anchor" |
+    /// "bone", "axis"?: "z" | "-x" | [x, y, z] (in the rest frame, default
+    /// head -> tail), "weight"?: 0..1}` (eyes, a head tracking a target).
+    #[serde(default)]
+    look_at: Option<LookAtSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LookAtSpec {
+    /// A point, a part anchor ("ball:center") or a bone of the skeleton.
+    target: crate::anim::PointRef,
+    /// "x" / "-z" / [x, y, z] in the bone's rest frame (default head -> tail).
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    axis: Option<Value>,
+    /// 0..1 (default 1).
+    #[serde(default)]
+    weight: Option<f32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkeletonSpec {
     name: String,
-    /// Bones by name. Rest frames are world-aligned: a clip's rotation
-    /// `{"x": 25}` pitches the bone about world x from rest.
+    /// Bones by name. Rest frames are world-aligned unless a bone sets
+    /// `rest` / `roll`: a clip's rotation `{"x": 25}` pitches the bone
+    /// about its rest frame's x (world x by default).
     #[serde(default)]
     bones: std::collections::BTreeMap<String, BoneSpec>,
     /// "x": every `*_l` bone gets a `*_r` twin mirrored across x = 0.
@@ -2910,6 +3034,14 @@ pub struct BindSpec {
     /// Smooth: force regions onto a bone before blending.
     #[serde(default)]
     paint: Vec<PaintSpec>,
+    /// Smooth: weights from the closest point of this bound part's surface
+    /// (clothing, armour, hair caps over a body); `blend` then smooths them.
+    #[serde(default)]
+    weights_from: Option<String>,
+    /// Smooth: pose-driven corrective shapes: true / false, or {joints,
+    /// poses: [{bone, axis, degrees}], max} (default on for the human).
+    #[serde(default)]
+    correctives: Option<crate::anim::skin::CorrectivesDef>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2975,13 +3107,120 @@ pub struct ClipMirrorSpec {
     phase: f32,
 }
 
+/// A clip from motion capture: a BVH file retargeted onto a skeleton.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MocapSpec {
+    name: String,
+    skeleton: String,
+    /// A BVH file in the project (resolved like `ops_file`; a changed file
+    /// re-derives the clip).
+    #[serde(default)]
+    file: Option<String>,
+    /// Inline BVH text instead of `file`.
+    #[serde(default)]
+    bvh: Option<String>,
+    /// Set by the server (the file content's hash); not written by hand.
+    #[serde(default)]
+    hash: Option<String>,
+    /// "auto" (default: by name, CMU / Mixamo / 3ds Max biped conventions),
+    /// or {our bone: BVH joint} overrides on top of it ("" unmaps a bone);
+    /// {"only": {...}} uses just those entries.
+    #[serde(default)]
+    map: Option<Value>,
+    /// [t0, t1] seconds of the file.
+    #[serde(default)]
+    range: Option<[f32; 2]>,
+    /// Keys per second (default 30).
+    #[serde(default)]
+    fps: Option<f32>,
+    /// false (default), true, "blend" (crossfade the end into the start for
+    /// a seamless loop, over `blend` seconds, default 0.25) or {"blend": s}.
+    #[serde(default, rename = "loop")]
+    looping: Option<Value>,
+    #[serde(default)]
+    blend: Option<f32>,
+    /// Root translation scale (default: target / source leg length, so
+    /// file units cancel).
+    #[serde(default)]
+    scale: Option<f32>,
+    /// "in_place" (default: travel removed, its speed reported and kept on
+    /// the clip), true (root motion on xz) or {"axes": "xz"}.
+    #[serde(default)]
+    root_motion: Option<Value>,
+    /// Foot planting: true (default), false or {plant, contact_height 0.03,
+    /// contact_speed 0.15}.
+    #[serde(default)]
+    feet: Option<Value>,
+    /// Hand planting, the same fields (default off).
+    #[serde(default)]
+    hands: Option<Value>,
+    /// Swap left and right.
+    #[serde(default)]
+    mirror: bool,
+    /// Playback rate (2 = twice as fast).
+    #[serde(default)]
+    speed: Option<f32>,
+    /// Degrees about +y, or "auto" (turn so the travel goes toward +z).
+    #[serde(default)]
+    facing: Option<Value>,
+    /// linear (default) or smooth.
+    #[serde(default)]
+    interp: Option<String>,
+}
+
+fn plant_of(
+    ctx: &str,
+    field: &str,
+    v: Option<&Value>,
+    default: bool,
+) -> Result<crate::mocap::Plant, String> {
+    let mut p = if default {
+        crate::mocap::Plant::on()
+    } else {
+        crate::mocap::Plant::off()
+    };
+    match v {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(b)) => p.plant = *b,
+        Some(Value::Object(o)) => {
+            p.plant = true;
+            for (k, x) in o {
+                match (k.as_str(), x) {
+                    ("plant", Value::Bool(b)) => p.plant = *b,
+                    ("contact_height", x) if x.is_number() => {
+                        p.contact_height = x.as_f64().unwrap_or(0.03) as f32
+                    }
+                    ("contact_speed", x) if x.is_number() => {
+                        p.contact_speed = x.as_f64().unwrap_or(0.15) as f32
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{ctx}: {field}.{k}: fields are plant (bool), contact_height (m), contact_speed (m/s)"
+                        ));
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "{ctx}: {field}: true, false or {{plant, contact_height, contact_speed}}, got {}",
+                describe_json(other)
+            ));
+        }
+    }
+    Ok(p)
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClipSpec {
     name: String,
     skeleton: String,
-    /// Seconds.
-    duration: f32,
+    /// Seconds (with `over`, default the base clip's; a whole number of
+    /// its cycles when both loop).
+    #[serde(default)]
+    duration: Option<f32>,
     /// Loops (default true): t wraps, and smooth keys pass through the seam.
     #[serde(default, rename = "loop")]
     looping: Option<bool>,
@@ -3001,6 +3240,266 @@ pub struct ClipSpec {
     /// (`{"leg_r": {"from": "leg_l", "phase": 0.5}}`).
     #[serde(default)]
     mirror: std::collections::BTreeMap<String, ClipMirrorSpec>,
+    /// Inverse kinematics, keyed by the END bone whose head (its joint) is
+    /// driven to a target: `{"ankle_l": {"target": [x, y, z] |
+    /// "part:anchor" | [[t, [x, y, z]], ...], "chain": 2, "pole"?: [x, y,
+    /// z] | anchor, "weight"?: 0..1 or keys, "rotate"?: keys}}`. Solved
+    /// after the tracks; `chain` bones above the end bend (2: analytic,
+    /// the middle joint toward `pole`, else the bend the pose already
+    /// has; more: FABRIK). `weight` blends FK (0) to IK (1); `rotate` keys
+    /// the end bone's world rotation as an offset from rest (a foot kept
+    /// flat). `mirror` copies an entry too (target x negated).
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
+    #[serde(default)]
+    ik: std::collections::BTreeMap<String, Value>,
+    /// Whole-pose keys `[[t, "pose"], ...]` (`pose` items; `"rest"` is
+    /// built in): each key keys every bone either neighbouring pose
+    /// touches, with the clip's `interp`. An explicit track channel on a
+    /// bone overrides what the poses key on that channel.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    #[serde(default)]
+    poses: Vec<Value>,
+    /// A keyed clip of the same skeleton this one layers over: its tracks
+    /// replace the base's on their bones (blended by `weight`), or with
+    /// `additive` compose on top (rotation after the base's, translation
+    /// added, scale multiplied). Limits, IK (base entries first) and
+    /// look_at then run once on the result.
+    #[serde(default)]
+    over: Option<String>,
+    #[serde(default)]
+    additive: bool,
+    /// With `over`: 0..1 (a number or keys `[[t, w], ...]`; default 1).
+    #[schemars(with = "Option<serde_json::Value>")]
+    #[serde(default)]
+    weight: Option<Value>,
+    /// With `over`: the bones the layer touches (`*` globs).
+    #[serde(default)]
+    bones: Vec<String>,
+    /// `true` (bone `hip`, else the first root bone; axes `xz`) or
+    /// `{"bone", "axes": "xz", "yaw": false}`: that root bone's travel is
+    /// the character's motion. The modeler plays it travelling; exports
+    /// remove it from the bone and write it to the animation's
+    /// `extras.root_motion` for the game to move the entity.
+    #[schemars(with = "Option<serde_json::Value>")]
+    #[serde(default)]
+    root_motion: Option<Value>,
+    /// `[[t, "name"], [t, "name", data], ...]`: named moments (footsteps),
+    /// exported in the animation's `extras.events`.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    #[serde(default)]
+    events: Vec<Value>,
+    /// Morph target weights per part (a `human` body's name) and shape:
+    /// `{"eve": {"smile": [[0, 0], [0.5, 1], [1, 0]], "jaw_open": 0.3,
+    /// "blink": {"wave": {"amount": 0.5, "period": 2}}}}`: keys `[[t, w],
+    /// ...]` (the clip's interp, or `{"keys", "interp"}`), a constant, or
+    /// a wave. Weights are usually 0..1 but not clamped. A layer (`over`)
+    /// replaces its base's weight (by `weight`) or, `additive`, adds.
+    #[schemars(
+        with = "std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>"
+    )]
+    #[serde(default)]
+    morphs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
+}
+
+/// One morph weight channel of a clip: keys `[[t, w], ...]`, `{"keys",
+/// "interp"}`, a number (constant) or `{"wave": {"amount", "period"?,
+/// "phase"?}}` (the weight in x).
+fn morph_channel(
+    ctx: &str,
+    v: &Value,
+    duration: f32,
+    default: crate::anim::Interp,
+) -> Result<crate::anim::Channel, String> {
+    use crate::anim::Channel;
+    match v {
+        Value::Number(n) => {
+            let w = n.as_f64().unwrap_or(0.0) as f32;
+            Ok(Channel::Keys {
+                keys: vec![(0.0, [w, w, w, 0.0])],
+                interp: crate::anim::Interp::Linear,
+            })
+        }
+        Value::Object(o) if o.contains_key("wave") => {
+            let mut o = o.clone();
+            if let Some(Value::Object(w)) = o.get_mut("wave") {
+                if w.contains_key("axis") {
+                    return Err(format!("{ctx}: wave: a morph weight has no axis"));
+                }
+                w.insert("axis".into(), Value::String("x".into()));
+            }
+            channel(ctx, "scale", &Value::Object(o), duration, default)
+        }
+        Value::Array(keys) => {
+            for (k, item) in keys.iter().enumerate() {
+                let ok = item
+                    .as_array()
+                    .is_some_and(|a| a.len() == 2 && a[0].is_number() && a[1].is_number());
+                if !ok {
+                    return Err(format!(
+                        "{ctx}: key #{k}: expected [t, weight] (numbers), got {}",
+                        describe_json(item)
+                    ));
+                }
+            }
+            channel(ctx, "scale", v, duration, default)
+        }
+        Value::Object(_) => channel(ctx, "scale", v, duration, default),
+        other => Err(format!(
+            "{ctx}: expected keys [[t, w], ...], a number or {{\"wave\": ...}}, got {}",
+            describe_json(other)
+        )),
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PoseBoneSpec {
+    #[serde(default)]
+    rotate: Option<RotationSpec>,
+    #[serde(default)]
+    translate: Option<[f32; 3]>,
+    /// A factor or [x, y, z].
+    #[schemars(with = "Option<serde_json::Value>")]
+    #[serde(default)]
+    scale: Option<Value>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PoseSpec {
+    name: String,
+    skeleton: String,
+    /// Per bone: `{"rotate"?: rotation, "translate"?: [x, y, z],
+    /// "scale"?: s}`, offsets from rest like clip track values.
+    #[serde(default)]
+    bones: std::collections::BTreeMap<String, PoseBoneSpec>,
+    /// Fill each `_r` bone from its `_l` twin mirrored (and back) where
+    /// it isn't given; IK entries too.
+    #[serde(default)]
+    mirror: bool,
+    /// IK solved once when the pose is built: `{"ankle_l": {"target":
+    /// [x, y, z] | "part:anchor", "chain"?, "pole"?, "rotate"?}}`.
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
+    #[serde(default)]
+    ik: std::collections::BTreeMap<String, Value>,
+    /// Morph target weights per part and shape (`{"eve": {"smile": 1}}`),
+    /// keyed with the pose by a clip's `poses` (0 where a pose leaves a
+    /// shape alone).
+    #[serde(default)]
+    morphs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f32>>,
+}
+
+/// An axis word ("x", "-z") or a vector.
+fn signed_axis(ctx: &str, v: &Value) -> Result<[f32; 3], String> {
+    if let Value::String(s) = v {
+        let (neg, w) = match s.strip_prefix('-') {
+            Some(w) => (-1.0, w),
+            None => (1.0, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let a = axis_of(ctx, &Value::String(w.to_string()))?;
+        return Ok([a[0] * neg, a[1] * neg, a[2] * neg]);
+    }
+    axis_of(ctx, v)
+}
+
+/// One `ik` entry of a clip.
+fn ik_entry(
+    ctx: &str,
+    v: &Value,
+    duration: f32,
+    default: crate::anim::Interp,
+) -> Result<crate::anim::IkDef, String> {
+    use crate::anim::{Channel, IkTarget, Interp};
+    let Value::Object(o) = v else {
+        return Err(format!(
+            "{ctx}: expected {{target, chain?, pole?, weight?, rotate?}}"
+        ));
+    };
+    for k in o.keys() {
+        if !matches!(
+            k.as_str(),
+            "target" | "chain" | "pole" | "weight" | "rotate"
+        ) {
+            return Err(format!(
+                "{ctx}: unknown field `{k}` (target, chain, pole, weight, rotate)"
+            ));
+        }
+    }
+    let Some(t) = o.get("target") else {
+        return Err(format!(
+            "{ctx}: needs target: [x, y, z], an anchor \"part:words\" or keys [[t, [x, y, z]], ...]"
+        ));
+    };
+    let tctx = format!("{ctx}.target");
+    let target = match t {
+        Value::String(a) if a.contains(':') => IkTarget::Anchor(a.clone()),
+        Value::String(a) => {
+            return Err(format!(
+                "{tctx} `{a}`: an anchor names a part and words, like \"crate:top\""
+            ));
+        }
+        Value::Array(a) if a.first().is_some_and(Value::is_number) => {
+            IkTarget::Point(de(&tctx, t)?)
+        }
+        _ => match channel(&tctx, "translate", t, duration, default)? {
+            Channel::Wave { .. } => {
+                return Err(format!("{tctx}: a point, an anchor or keys, not a wave"));
+            }
+            c => IkTarget::Keys(c),
+        },
+    };
+    let chain = match o.get("chain") {
+        None => 2,
+        Some(c) => match c.as_u64() {
+            Some(n @ 1..=32) => n as u32,
+            _ => return Err(format!("{ctx}.chain: a whole number of bones, 1..32")),
+        },
+    };
+    let pole: Option<crate::anim::PointRef> = o
+        .get("pole")
+        .map(|p| de(&format!("{ctx}.pole"), p))
+        .transpose()?;
+    if let Some(crate::anim::PointRef::Anchor(a)) = &pole
+        && !a.contains(':')
+    {
+        return Err(format!(
+            "{ctx}.pole `{a}`: an anchor names a part and words, like \"leg_l:front\""
+        ));
+    }
+    let wctx = format!("{ctx}.weight");
+    let weight = match o.get("weight") {
+        None => None,
+        Some(Value::Number(n)) => {
+            let w = n.as_f64().unwrap_or(1.0) as f32;
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!("{wctx} must be 0..1"));
+            }
+            Some(Channel::Keys {
+                keys: vec![(0.0, [w, w, w, 0.0])],
+                interp: Interp::Linear,
+            })
+        }
+        Some(w) => {
+            let c = channel(&wctx, "scale", w, duration, default)?;
+            if let Channel::Keys { keys, .. } = &c
+                && keys.iter().any(|(_, v)| !(0.0..=1.0).contains(&v[0]))
+            {
+                return Err(format!("{wctx}: key values must be 0..1"));
+            }
+            Some(c)
+        }
+    };
+    let rotate = o
+        .get("rotate")
+        .map(|r| channel(&format!("{ctx}.rotate"), "rotate", r, duration, default))
+        .transpose()?;
+    Ok(crate::anim::IkDef {
+        target,
+        chain,
+        pole,
+        weight,
+        rotate,
+    })
 }
 
 fn axis_of(ctx: &str, v: &Value) -> Result<[f32; 3], String> {
@@ -3074,6 +3573,11 @@ fn channel(
                 .and_then(Value::as_f64)
                 .map(|p| p as f32)
                 .unwrap_or(duration);
+            if !period.is_finite() {
+                return Err(format!(
+                    "{ctx}: wave needs a period when the duration comes from `over`"
+                ));
+            }
             if period.is_nan() || period <= 0.0 {
                 return Err(format!("{ctx}: wave period must be positive"));
             }
@@ -3085,11 +3589,63 @@ fn channel(
                 phase,
             });
         }
+        Value::Object(o) if o.contains_key("euler") => {
+            if kind != "rotate" {
+                return Err(format!("{ctx}: euler keys are for rotate"));
+            }
+            for k in o.keys() {
+                if !matches!(k.as_str(), "euler" | "interp") {
+                    return Err(format!("{ctx}: unknown field `{k}` (euler, interp)"));
+                }
+            }
+            let interp = match o.get("interp").and_then(Value::as_str) {
+                Some(s) => interp_of(ctx, s)?,
+                None => default,
+            };
+            let Some(Value::Array(items)) = o.get("euler") else {
+                return Err(format!(
+                    "{ctx}: euler: expected [[t, {{x, y, z}} degrees], ...]"
+                ));
+            };
+            let mut keys: Vec<(f32, [f32; 4])> = Vec::new();
+            for (k, item) in items.iter().enumerate() {
+                let kctx = format!("{ctx}: euler key #{k}");
+                let Some([t, val]) = item
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .and_then(|a| <&[Value; 2]>::try_from(a).ok())
+                else {
+                    return Err(format!("{kctx}: expected [t, {{x, y, z}}]"));
+                };
+                let t = t.as_f64().ok_or(format!("{kctx}: time must be a number"))? as f32;
+                if t.is_nan() || t < -1e-6 || t > duration + 1e-4 {
+                    return Err(format!("{kctx}: time {t} is outside 0..{duration}"));
+                }
+                let e: [f32; 3] = if val.is_array() {
+                    de(&kctx, val)?
+                } else {
+                    let e: Euler = de(&kctx, val)?;
+                    [e.x, e.y, e.z]
+                };
+                if e.iter().any(|v| !v.is_finite()) {
+                    return Err(format!("{kctx}: degrees must be finite"));
+                }
+                keys.push((t, [e[0], e[1], e[2], 0.0]));
+            }
+            if keys.is_empty() {
+                return Err(format!("{ctx}: euler needs at least one key"));
+            }
+            keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if keys.windows(2).any(|w| (w[1].0 - w[0].0).abs() < 1e-6) {
+                return Err(format!("{ctx}: two keys at the same time"));
+            }
+            return Ok(Channel::Euler { keys, interp });
+        }
         Value::Object(o) => {
             for k in o.keys() {
                 if !matches!(k.as_str(), "keys" | "interp") {
                     return Err(format!(
-                        "{ctx}: unknown field `{k}` (keys, interp, or wave)"
+                        "{ctx}: unknown field `{k}` (keys, interp, or wave / euler)"
                     ));
                 }
             }
@@ -3192,6 +3748,8 @@ pub enum OpSpec {
     Skeleton(SkeletonSpec),
     Bind(BindSpec),
     Clip(ClipSpec),
+    Mocap(MocapSpec),
+    Pose(PoseSpec),
     Sway(SwaySpec),
     Place(PlaceSpec),
     Boolean(BooleanSpec),
@@ -3218,6 +3776,8 @@ pub const OP_TYPES: &[&str] = &[
     "skeleton",
     "bind",
     "clip",
+    "mocap",
+    "pose",
     "sway",
     "primitive",
     "extrude",
@@ -3242,6 +3802,7 @@ pub const OP_TYPES: &[&str] = &[
     "smooth",
     "decimate",
     "shell",
+    "garment",
     "panel",
     "transform",
     "move",
@@ -3603,7 +4164,7 @@ const PRIMITIVE_KINDS: &[&str] = &[
     "box", "sphere", "cylinder", "cone", "capsule", "torus", "plane", "wedge", "disc", "washer",
 ];
 
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {
@@ -4094,6 +4655,17 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         }
         "body" => {
             let s: BodySpec = de(&ctx, &body)?;
+            let (rig, rig_full) = match s.rig {
+                None => (None, false),
+                Some(RigArg::On(b)) => (Some(b), false),
+                Some(RigArg::Kind(k)) if k == "game" => (None, false),
+                Some(RigArg::Kind(k)) if k == "full" => (None, true),
+                Some(RigArg::Kind(k)) => {
+                    return Err(format!(
+                        "{ctx}: rig: true, false, \"game\" or \"full\", got \"{k}\""
+                    ));
+                }
+            };
             let def = crate::body::BodyDef {
                 preset: s.preset,
                 height: s.height,
@@ -4107,7 +4679,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 resolution: s.resolution,
                 tris: s.tris,
                 bake: s.bake.unwrap_or(false),
-                rig: s.rig,
+                rig,
                 bind: s.bind,
                 warps: s
                     .warps
@@ -4116,6 +4688,28 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map(WarpSpec::into_deform)
                     .collect(),
                 target_tris: None,
+                gender: s.gender,
+                age: s.age,
+                muscle: s.muscle,
+                weight: s.weight,
+                proportions: s.proportions,
+                breast_size: s.breast_size,
+                breast_firmness: s.breast_firmness,
+                ethnicity: s.ethnicity,
+                shape: s.shape.unwrap_or_default(),
+                expression: s.expression.unwrap_or_default(),
+                detail: s.detail,
+                parts: s.parts,
+                shapes: s.shapes.unwrap_or_default(),
+                rig_full,
+                eye_color: s
+                    .eye_color
+                    .as_ref()
+                    .map(parse_color)
+                    .transpose()
+                    .map_err(|e| format!("{ctx}: eye_color: {e}"))?,
+                pupil: s.pupil,
+                measure: s.measure.unwrap_or_default(),
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Body {
@@ -4192,6 +4786,28 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 input: s.input,
                 def: Box::new(def),
             })
+        }
+        "garment" => {
+            let Some(obj) = body.as_object() else {
+                return Err(format!("{ctx}: expected an object"));
+            };
+            let mut obj = obj.clone();
+            let name = match obj.remove("name") {
+                Some(Value::String(n)) if !n.is_empty() => n,
+                _ => return Err(format!("{ctx}: name: a non-empty string is required")),
+            };
+            obj.remove("type");
+            for k in obj.keys() {
+                if !crate::garment::FIELDS.contains(&k.as_str()) {
+                    return Err(format!(
+                        "{ctx}: unknown field `{k}` (fields: name, {})",
+                        crate::garment::FIELDS.join(", ")
+                    ));
+                }
+            }
+            let def: crate::garment::GarmentDef = de(&ctx, &Value::Object(obj))?;
+            crate::garment::validate(&def).map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Garment { name, def })
         }
         "shell" => {
             let s: ShellSpec = de(&ctx, &body)?;
@@ -4326,12 +4942,55 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                         "{ctx}: bones.{n}.head `{a}`: an anchor names a part and words, like \"leg_l:top\""
                     ));
                 }
+                if b.roll.is_some_and(|r| !r.is_finite()) {
+                    return Err(format!("{ctx}: bones.{n}.roll must be a number of degrees"));
+                }
+                let rest = b
+                    .rest
+                    .as_ref()
+                    .map(|r| r.quat())
+                    .transpose()
+                    .map_err(|e| format!("{ctx}: bones.{n}.rest: {e}"))?;
+                if let Some(l) = &b.limits {
+                    for (ax, r) in [("x", l.x), ("y", l.y), ("z", l.z)] {
+                        if let Some([lo, hi]) = r
+                            && (!lo.is_finite() || !hi.is_finite() || lo > hi)
+                        {
+                            return Err(format!(
+                                "{ctx}: bones.{n}.limits.{ax}: [min, max] degrees, min <= max"
+                            ));
+                        }
+                    }
+                }
+                let look_at = match b.look_at {
+                    None => None,
+                    Some(la) => {
+                        let lctx = format!("{ctx}: bones.{n}.look_at");
+                        let axis = la
+                            .axis
+                            .as_ref()
+                            .map(|a| signed_axis(&lctx, a))
+                            .transpose()?;
+                        if la.weight.is_some_and(|w| !(0.0..=1.0).contains(&w)) {
+                            return Err(format!("{lctx}.weight must be 0..1"));
+                        }
+                        Some(crate::anim::LookAtDef {
+                            target: la.target,
+                            axis,
+                            weight: la.weight,
+                        })
+                    }
+                };
                 bones.push(crate::anim::BoneDef {
                     name: n,
                     parent: b.parent,
                     head: b.head,
                     tail: b.tail,
                     radius: b.radius,
+                    rest,
+                    roll: b.roll,
+                    limits: b.limits,
+                    look_at,
                 });
             }
             BatchItem::Op(Op::Skeleton {
@@ -4390,14 +5049,170 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                             max: p.region.max,
                         })
                         .collect(),
+                    weights_from: s.weights_from,
+                    correctives: s.correctives,
+                },
+            })
+        }
+        "mocap" => {
+            let s: MocapSpec = de(&ctx, &body)?;
+            if s.file.is_some() == s.bvh.is_some() {
+                return Err(format!(
+                    "{ctx}: give `file` (a BVH file in the project, e.g. \"mocap/walk.bvh\") or inline `bvh` text"
+                ));
+            }
+            if let Some(t) = &s.bvh {
+                crate::mocap::parse(t).map_err(|e| format!("{ctx}: bvh: {e}"))?;
+            }
+            let mut m = crate::mocap::MocapDef {
+                file: s.file,
+                bvh: s.bvh,
+                hash: s.hash.unwrap_or_default(),
+                range: s.range,
+                scale: s.scale,
+                mirror: s.mirror,
+                ..crate::mocap::MocapDef::default()
+            };
+            match &s.map {
+                None => {}
+                Some(Value::String(a)) if a == "auto" => {}
+                Some(Value::Object(o)) => {
+                    let (o, only) = match o.get("only") {
+                        Some(Value::Object(x)) if o.len() == 1 => (x, true),
+                        _ => (o, false),
+                    };
+                    m.map_only = only;
+                    for (k, v) in o {
+                        let Some(v) = v.as_str() else {
+                            return Err(format!(
+                                "{ctx}: map.{k}: a BVH joint name (\"LeftUpLeg\"), or \"\" to leave the bone unmapped"
+                            ));
+                        };
+                        m.map.insert(k.clone(), v.to_string());
+                    }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{ctx}: map: \"auto\" or {{our bone: BVH joint}}, got {}",
+                        describe_json(other)
+                    ));
+                }
+            }
+            for (f, v) in [
+                ("fps", s.fps),
+                ("speed", s.speed),
+                ("scale", s.scale),
+                ("blend", s.blend),
+            ] {
+                if let Some(v) = v
+                    && !(v > 0.0 && v.is_finite())
+                {
+                    return Err(format!("{ctx}: {f} must be a positive number, got {v}"));
+                }
+            }
+            if let Some([a, b]) = s.range
+                && !(b > a && a >= 0.0)
+            {
+                return Err(format!(
+                    "{ctx}: range [{a}, {b}]: seconds of the file, t0 < t1"
+                ));
+            }
+            m.fps = s.fps.unwrap_or(30.0);
+            m.speed = s.speed.unwrap_or(1.0);
+            let looping = match &s.looping {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(x)) if x == "blend" => {
+                    m.blend = s.blend.unwrap_or(0.25);
+                    true
+                }
+                Some(Value::Object(o))
+                    if o.len() == 1 && o.get("blend").is_some_and(Value::is_number) =>
+                {
+                    m.blend = o.get("blend").and_then(Value::as_f64).unwrap_or(0.25) as f32;
+                    true
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{ctx}: loop: true, false, \"blend\" or {{\"blend\": seconds}}, got {}",
+                        describe_json(other)
+                    ));
+                }
+            };
+            if s.blend.is_some() && m.blend == 0.0 {
+                return Err(format!("{ctx}: blend: goes with loop: \"blend\""));
+            }
+            m.root_motion = match &s.root_motion {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+                Some(Value::String(x)) if x == "in_place" => None,
+                Some(Value::Bool(true)) => Some("xz".into()),
+                Some(Value::Object(o)) => {
+                    for k in o.keys() {
+                        if k != "axes" {
+                            return Err(format!("{ctx}: root_motion: unknown field `{k}` (axes)"));
+                        }
+                    }
+                    let ax = o.get("axes").and_then(Value::as_str).unwrap_or("xz");
+                    if ax.is_empty() || !ax.chars().all(|c| matches!(c, 'x' | 'y' | 'z')) {
+                        return Err(format!(
+                            "{ctx}: root_motion axes `{ax}`: letters x, y, z (\"xz\")"
+                        ));
+                    }
+                    Some(ax.to_string())
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{ctx}: root_motion: \"in_place\" (default), true or {{\"axes\": \"xz\"}}, got {}",
+                        describe_json(other)
+                    ));
+                }
+            };
+            m.feet = plant_of(&ctx, "feet", s.feet.as_ref(), true)?;
+            m.hands = plant_of(&ctx, "hands", s.hands.as_ref(), false)?;
+            match &s.facing {
+                None | Some(Value::Null) => {}
+                Some(Value::String(x)) if x == "auto" => m.facing_auto = true,
+                Some(v) if v.is_number() => m.facing = v.as_f64().unwrap_or(0.0) as f32,
+                Some(other) => {
+                    return Err(format!(
+                        "{ctx}: facing: degrees about +y or \"auto\", got {}",
+                        describe_json(other)
+                    ));
+                }
+            }
+            m.interp = match s.interp.as_deref() {
+                None | Some("linear") => crate::anim::Interp::Linear,
+                Some("smooth") => crate::anim::Interp::Smooth,
+                Some(o) => return Err(format!("{ctx}: interp `{o}`: linear or smooth")),
+            };
+            BatchItem::Op(Op::Clip {
+                name: s.name,
+                def: crate::anim::ClipDef {
+                    skeleton: s.skeleton,
+                    duration: 1.0,
+                    looping,
+                    mocap: Some(Box::new(m)),
+                    ..crate::anim::ClipDef::default()
                 },
             })
         }
         "clip" => {
             let s: ClipSpec = de(&ctx, &body)?;
-            if s.duration.is_nan() || s.duration <= 0.0 {
-                return Err(format!("{ctx}: duration must be positive (seconds)"));
-            }
+            let dur = match (s.duration, &s.over) {
+                (Some(d), _) => {
+                    if d.is_nan() || d <= 0.0 {
+                        return Err(format!("{ctx}: duration must be positive (seconds)"));
+                    }
+                    d
+                }
+                // From the base clip, checked when the clip is built.
+                (None, Some(_)) => f32::INFINITY,
+                (None, None) => {
+                    return Err(format!(
+                        "{ctx}: needs duration (seconds), or `over` to take the base clip's"
+                    ));
+                }
+            };
             let default = match &s.interp {
                 Some(i) => interp_of(&ctx, i)?,
                 None => crate::anim::Interp::Smooth,
@@ -4413,9 +5228,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 for (k, c) in o {
                     let cctx = format!("{ctx}: tracks.{bone}.{k}");
                     let ch = match k.as_str() {
-                        "rotate" | "translate" | "scale" => {
-                            channel(&cctx, k, c, s.duration, default)?
-                        }
+                        "rotate" | "translate" | "scale" => channel(&cctx, k, c, dur, default)?,
                         other => {
                             return Err(format!(
                                 "{ctx}: tracks.{bone}: unknown channel `{other}` (rotate, translate, scale)"
@@ -4430,11 +5243,134 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 }
                 tracks.insert(bone.clone(), t);
             }
+            let mut ik = std::collections::BTreeMap::new();
+            for (bone, v) in &s.ik {
+                ik.insert(
+                    bone.clone(),
+                    ik_entry(&format!("{ctx}: ik.{bone}"), v, dur, default)?,
+                );
+            }
+            let mut poses = Vec::new();
+            for (k, p) in s.poses.iter().enumerate() {
+                let pctx = format!("{ctx}: poses #{k}");
+                let Some([t, n]) = p
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .and_then(|a| <&[Value; 2]>::try_from(a).ok())
+                else {
+                    return Err(format!("{pctx}: expected [t, \"pose name\"]"));
+                };
+                let t = t.as_f64().ok_or(format!("{pctx}: time must be a number"))? as f32;
+                if t.is_nan() || t < -1e-6 || t > dur + 1e-4 {
+                    return Err(format!("{pctx}: time {t} is outside 0..{dur}"));
+                }
+                let Some(n) = n.as_str().filter(|n| !n.is_empty()) else {
+                    return Err(format!(
+                        "{pctx}: the pose is a name (a `pose` item or \"rest\")"
+                    ));
+                };
+                poses.push((t.max(0.0), n.to_string()));
+            }
+            let mut events = Vec::new();
+            for (k, e) in s.events.iter().enumerate() {
+                let ectx = format!("{ctx}: events #{k}");
+                let Some(a) = e.as_array().filter(|a| a.len() == 2 || a.len() == 3) else {
+                    return Err(format!(
+                        "{ectx}: expected [t, \"name\"] or [t, \"name\", data]"
+                    ));
+                };
+                let t = a[0]
+                    .as_f64()
+                    .ok_or(format!("{ectx}: time must be a number"))?
+                    as f32;
+                if t.is_nan() || t < -1e-6 || t > dur + 1e-4 {
+                    return Err(format!("{ectx}: time {t} is outside 0..{dur}"));
+                }
+                let Some(n) = a[1].as_str().filter(|n| !n.trim().is_empty()) else {
+                    return Err(format!("{ectx}: the name must be a non-empty string"));
+                };
+                events.push(crate::anim::ClipEvent {
+                    time: t.max(0.0),
+                    name: n.to_string(),
+                    data: a.get(2).cloned(),
+                });
+            }
+            if s.over.is_none() && (s.additive || s.weight.is_some() || !s.bones.is_empty()) {
+                return Err(format!(
+                    "{ctx}: additive, weight and bones are for a layer: give `over` (the base clip)"
+                ));
+            }
+            let weight = match &s.weight {
+                None => None,
+                Some(Value::Number(n)) => {
+                    let w = n.as_f64().unwrap_or(1.0) as f32;
+                    Some(crate::anim::Channel::Keys {
+                        keys: vec![(0.0, [w, w, w, 0.0])],
+                        interp: crate::anim::Interp::Linear,
+                    })
+                }
+                Some(v) => Some(channel(
+                    &format!("{ctx}: weight"),
+                    "scale",
+                    v,
+                    dur,
+                    default,
+                )?),
+            };
+            let root_motion = match &s.root_motion {
+                None | Some(Value::Bool(false)) => None,
+                Some(Value::Bool(true)) => Some(crate::anim::RootMotionDef {
+                    bone: String::new(),
+                    axes: "xz".into(),
+                    yaw: false,
+                }),
+                Some(Value::Object(o)) => {
+                    for k in o.keys() {
+                        if !matches!(k.as_str(), "bone" | "axes" | "yaw") {
+                            return Err(format!(
+                                "{ctx}: root_motion: unknown field `{k}` (bone, axes, yaw)"
+                            ));
+                        }
+                    }
+                    let axes = o.get("axes").and_then(Value::as_str).unwrap_or("xz");
+                    if axes.is_empty() || !axes.chars().all(|c| matches!(c, 'x' | 'y' | 'z')) {
+                        return Err(format!(
+                            "{ctx}: root_motion axes `{axes}`: letters x, y, z (\"xz\")"
+                        ));
+                    }
+                    Some(crate::anim::RootMotionDef {
+                        bone: o
+                            .get("bone")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        axes: axes.to_string(),
+                        yaw: o.get("yaw").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{ctx}: root_motion: true or {{bone, axes, yaw}}, got {}",
+                        describe_json(other)
+                    ));
+                }
+            };
+            let mut morphs = std::collections::BTreeMap::new();
+            for (part, shapes) in &s.morphs {
+                let mut m = std::collections::BTreeMap::new();
+                for (shape, v) in shapes {
+                    m.insert(
+                        shape.clone(),
+                        morph_channel(&format!("{ctx}: morphs.{part}.{shape}"), v, dur, default)?,
+                    );
+                }
+                morphs.insert(part.clone(), m);
+            }
             BatchItem::Op(Op::Clip {
                 name: s.name,
                 def: crate::anim::ClipDef {
                     skeleton: s.skeleton,
-                    duration: s.duration,
+                    duration: if dur.is_finite() { dur } else { 0.0 },
                     looping: s.looping.unwrap_or(true),
                     tracks,
                     mirror: s
@@ -4450,6 +5386,83 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                             )
                         })
                         .collect(),
+                    ik,
+                    interp: (!poses.is_empty()).then_some(default),
+                    poses,
+                    over: s.over,
+                    additive: s.additive,
+                    weight,
+                    bones: s.bones,
+                    root_motion,
+                    events,
+                    morphs,
+                    mocap: None,
+                },
+            })
+        }
+        "pose" => {
+            let s: PoseSpec = de(&ctx, &body)?;
+            let mut bones = std::collections::BTreeMap::new();
+            for (bone, b) in s.bones {
+                let bctx = format!("{ctx}: bones.{bone}");
+                let scale = match &b.scale {
+                    None => None,
+                    Some(v) if v.is_number() => {
+                        let f = v.as_f64().unwrap_or(1.0) as f32;
+                        Some([f, f, f])
+                    }
+                    Some(v) => Some(de::<[f32; 3]>(&format!("{bctx}.scale"), v)?),
+                };
+                let rotate = match &b.rotate {
+                    Some(r) => Some(r.quat().map_err(|e| format!("{bctx}.rotate: {e}"))?),
+                    None => None,
+                };
+                if rotate.is_none() && b.translate.is_none() && scale.is_none() {
+                    return Err(format!("{bctx}: give rotate, translate or scale"));
+                }
+                bones.insert(
+                    bone,
+                    crate::anim::PoseBone {
+                        rotate,
+                        translate: b.translate,
+                        scale,
+                    },
+                );
+            }
+            let mut ik = std::collections::BTreeMap::new();
+            for (bone, v) in &s.ik {
+                let d = ik_entry(
+                    &format!("{ctx}: ik.{bone}"),
+                    v,
+                    1.0,
+                    crate::anim::Interp::Linear,
+                )?;
+                if matches!(d.target, crate::anim::IkTarget::Keys(_)) {
+                    return Err(format!(
+                        "{ctx}: ik.{bone}: a pose's target is a point [x, y, z] or an anchor, not keys"
+                    ));
+                }
+                ik.insert(bone.clone(), d);
+            }
+            if let Some((p, sh, _)) = s
+                .morphs
+                .iter()
+                .flat_map(|(p, m)| m.iter().map(move |(sh, w)| (p, sh, w)))
+                .find(|x| !x.2.is_finite())
+            {
+                return Err(format!("{ctx}: morphs.{p}.{sh}: the weight must be finite"));
+            }
+            if bones.is_empty() && ik.is_empty() && s.morphs.is_empty() {
+                return Err(format!("{ctx}: give bones, ik or morphs"));
+            }
+            BatchItem::Op(Op::Pose {
+                name: s.name,
+                def: crate::anim::PoseDef {
+                    skeleton: s.skeleton,
+                    bones,
+                    mirror: s.mirror,
+                    ik,
+                    morphs: s.morphs,
                 },
             })
         }
@@ -4531,9 +5544,13 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     s.name
                 ));
             }
-            if s.materials.is_empty() && s.style.is_none() {
+            if s.materials.is_empty()
+                && s.style.is_none()
+                && matches!(s.show, OneOrMany::None)
+                && matches!(s.hide, OneOrMany::None)
+            {
                 return Err(format!(
-                    "{ctx}: give `materials` ({{\"body*\": {{\"color\": \"#c33\"}}}}) and/or `style`"
+                    "{ctx}: give `materials` ({{\"body*\": {{\"color\": \"#c33\"}}}}), `style` and/or `show` / `hide` part lists"
                 ));
             }
             if let Some(v) = &s.style
@@ -4578,6 +5595,8 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 materials,
                 style: s.style,
+                show: s.show.into_vec(),
+                hide: s.hide.into_vec(),
             })
         }
         "marker" => {
@@ -5035,6 +6054,9 @@ pub fn example(ty: &str) -> Option<Value> {
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
         }
+        "garment" => {
+            json!({"type": "garment", "name": "shirt", "on": "eve", "preset": "tshirt", "region": {"neck": "v"}, "offset": 0.006})
+        }
         "group" => {
             json!({"type": "group", "name": "tile_row", "inputs": ["tile", "tile_1", "tile_2", "tile_3"]})
         }
@@ -5075,13 +6097,30 @@ pub fn example(ty: &str) -> Option<Value> {
         }
         "skeleton" => json!({"type": "skeleton", "name": "rig", "mirror": "x", "bones": {
             "hip": {"head": [0, 0.5, 0], "tail": [0, 0.6, 0], "radius": 0.08},
-            "leg_l": {"parent": "hip", "head": [0.1, 0.5, 0], "tail": [0.1, 0.05, 0], "radius": 0.04}}}),
+            "leg_l": {"parent": "hip", "head": [0.1, 0.5, 0], "radius": 0.04, "limits": {"x": [-60, 90]}},
+            "shin_l": {"parent": "leg_l", "head": [0.1, 0.27, 0.02], "radius": 0.035, "limits": {"x": [-150, 0]}},
+            "foot_l": {"parent": "shin_l", "head": [0.1, 0.05, 0], "tail": [0.1, 0.0, 0.1]},
+            "head": {"parent": "hip", "head": [0, 0.7, 0], "tail": [0, 0.8, 0],
+                     "look_at": {"target": [0, 0.75, 2], "axis": "z", "weight": 0.8}}}}),
         "bind" => json!({"type": "bind", "name": "body_skin", "skeleton": "rig", "parts": ["body"],
             "mode": "smooth", "blend": 0.04}),
         "clip" => json!({"type": "clip", "name": "walk", "skeleton": "rig", "duration": 1.0,
-            "tracks": {"leg_l": {"rotate": [[0, {"x": 25}], [0.5, {"x": -25}], [1, {"x": 25}]]},
-                       "hip": {"translate": {"wave": {"axis": "y", "amount": 0.02, "period": 0.5}}}},
-            "mirror": {"leg_r": {"from": "leg_l", "phase": 0.5}}}),
+            "tracks": {"hip": {"translate": {"wave": {"axis": "y", "amount": 0.02, "period": 0.5}}}},
+            "ik": {"foot_l": {"target": [[0, [0.1, 0.05, 0.12]], [0.5, [0.1, 0.05, -0.12]], [1, [0.1, 0.05, 0.12]]],
+                       "chain": 2, "pole": [0.1, 0.3, 1.0], "weight": 1, "rotate": [[0, {"x": 0}]]}},
+            "mirror": {"foot_r": {"from": "foot_l", "phase": 0.5}},
+            "poses": [[0, "rest"], [0.5, "crouch"], [1, "rest"]],
+            "root_motion": {"bone": "hip", "axes": "xz"},
+            "events": [[0.0, "footstep_l"], [0.5, "footstep_r", {"volume": 0.8}]]}),
+        "mocap" => json!({"type": "mocap", "name": "walk_mc", "skeleton": "eve_rig",
+            "file": "mocap/walk.bvh", "map": {"chest": "Spine2"}, "range": [0.0, 2.0], "fps": 30,
+            "loop": "blend", "blend": 0.25, "root_motion": "in_place",
+            "feet": {"plant": true, "contact_height": 0.03, "contact_speed": 0.15},
+            "facing": "auto"}),
+        "pose" => json!({"type": "pose", "name": "crouch", "skeleton": "rig", "mirror": true,
+            "bones": {"hip": {"translate": [0, -0.3, 0]}, "thigh_l": {"rotate": {"x": -60}},
+                      "spine": {"rotate": {"x": 15}}},
+            "ik": {"foot_l": {"target": [0.1, 0.05, 0.1], "pole": [0.1, 0.4, 1.0]}}}),
         "sway" => json!({"type": "sway", "name": "wind", "skeleton": "oak_rig", "kind": "wind",
             "direction": [1, 0, 0.3], "strength": 0.6, "gust": 0.4, "flutter": 0.5, "duration": 4}),
         "variant" => json!({"type": "variant", "name": "red_team",
@@ -5152,6 +6191,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "smooth" => schemars::schema_for!(SmoothSpec),
         "decimate" => schemars::schema_for!(DecimateSpec),
         "shell" => schemars::schema_for!(ShellSpec),
+        "garment" => schemars::schema_for!(GarmentSpec),
         "panel" => schemars::schema_for!(PanelSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),
@@ -5164,6 +6204,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "skeleton" => schemars::schema_for!(SkeletonSpec),
         "bind" => schemars::schema_for!(BindSpec),
         "clip" => schemars::schema_for!(ClipSpec),
+        "mocap" => schemars::schema_for!(MocapSpec),
+        "pose" => schemars::schema_for!(PoseSpec),
         "sway" => schemars::schema_for!(SwaySpec),
         "place" => schemars::schema_for!(PlaceSpec),
         "boolean" => schemars::schema_for!(BooleanSpec),

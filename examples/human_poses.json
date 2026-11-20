@@ -1,0 +1,920 @@
+[
+ {
+  "type": "pose",
+  "name": "stand",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "shoulder_l": {
+    "rotate": {
+     "z": -36,
+     "x": -28,
+     "y": 22
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 14
+    }
+   },
+   "wrist_l": {
+    "rotate": {
+     "x": 6
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "t",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "shoulder_l": {
+    "rotate": {
+     "z": 42
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "crouch",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "hip": {
+    "translate": [
+     0,
+     -0.36,
+     0.05
+    ]
+   },
+   "spine": {
+    "rotate": {
+     "x": 25
+    }
+   },
+   "chest": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "neck": {
+    "rotate": {
+     "x": -20
+    }
+   },
+   "thigh_l": {
+    "rotate": {
+     "x": -105
+    }
+   },
+   "knee_l": {
+    "rotate": {
+     "x": 125
+    }
+   },
+   "ankle_l": {
+    "rotate": {
+     "x": -25
+    }
+   },
+   "shoulder_l": {
+    "rotate": {
+     "z": -25,
+     "x": 55
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 40
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "sit",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "hip": {
+    "translate": [
+     0,
+     -0.4,
+     -0.05
+    ]
+   },
+   "thigh_l": {
+    "rotate": {
+     "x": -90
+    }
+   },
+   "knee_l": {
+    "rotate": {
+     "x": 90
+    }
+   },
+   "shoulder_l": {
+    "rotate": {
+     "z": -35,
+     "x": 30
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 45
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 20
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 15
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "wave",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "shoulder_l": {
+    "rotate": {
+     "z": -36,
+     "x": -28,
+     "y": 22
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 14
+    }
+   },
+   "wrist_l": {
+    "rotate": {
+     "x": 6
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "shoulder_r": {
+    "rotate": {
+     "z": -65,
+     "y": 90
+    }
+   },
+   "elbow_r": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "wrist_r": {
+    "rotate": {
+     "x": -10
+    }
+   },
+   "index_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "middle_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "middle_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "middle_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "ring_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "ring_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "ring_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "pinky_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "pinky_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "pinky_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "thumb_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "thumb_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "thumb_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "point",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "shoulder_l": {
+    "rotate": {
+     "z": -36,
+     "x": -28,
+     "y": 22
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 14
+    }
+   },
+   "wrist_l": {
+    "rotate": {
+     "x": 6
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 18
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 12
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 10
+    }
+   },
+   "shoulder_r": {
+    "rotate": {
+     "z": -15,
+     "x": 80,
+     "y": 20
+    }
+   },
+   "elbow_r": {
+    "rotate": {
+     "x": 5
+    }
+   },
+   "wrist_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_1_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_2_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "index_3_r": {
+    "rotate": {
+     "x": 0
+    }
+   },
+   "middle_1_r": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "middle_2_r": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "middle_3_r": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "ring_1_r": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "ring_2_r": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "ring_3_r": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "pinky_1_r": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "pinky_2_r": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "pinky_3_r": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "thumb_1_r": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "thumb_2_r": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "thumb_3_r": {
+    "rotate": {
+     "x": 20
+    }
+   }
+  }
+ },
+ {
+  "type": "pose",
+  "name": "fist",
+  "skeleton": "eve_rig",
+  "mirror": true,
+  "bones": {
+   "shoulder_l": {
+    "rotate": {
+     "z": -36,
+     "x": -28,
+     "y": 22
+    }
+   },
+   "elbow_l": {
+    "rotate": {
+     "x": 14
+    }
+   },
+   "wrist_l": {
+    "rotate": {
+     "x": 6
+    }
+   },
+   "index_1_l": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "index_2_l": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "index_3_l": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "middle_1_l": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "middle_2_l": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "middle_3_l": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "ring_1_l": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "ring_2_l": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "ring_3_l": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "pinky_1_l": {
+    "rotate": {
+     "x": 85
+    }
+   },
+   "pinky_2_l": {
+    "rotate": {
+     "x": 100
+    }
+   },
+   "pinky_3_l": {
+    "rotate": {
+     "x": 70
+    }
+   },
+   "thumb_1_l": {
+    "rotate": {
+     "x": 35
+    }
+   },
+   "thumb_2_l": {
+    "rotate": {
+     "x": 30
+    }
+   },
+   "thumb_3_l": {
+    "rotate": {
+     "x": 30
+    }
+   }
+  }
+ }
+]

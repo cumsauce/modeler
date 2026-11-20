@@ -85,7 +85,6 @@ pub(crate) fn timeline_plugin(app: &mut App) {
         .add_systems(
             Update,
             (
-                camera_sees_bones,
                 pick_clip,
                 refresh_cache,
                 dock_input,
@@ -104,18 +103,6 @@ fn setup_bone_gizmos(mut store: ResMut<GizmoConfigStore>) {
     cfg.render_layers = RenderLayers::layer(BONE_LAYER);
     cfg.depth_bias = -1.0; // drawn over the mesh
     cfg.line.width = 2.5;
-}
-
-/// The window camera sees the bone layer as well as the scene's.
-fn camera_sees_bones(
-    mut commands: Commands,
-    cams: Query<Entity, (With<MainCamera>, Without<RenderLayers>)>,
-) {
-    for e in &cams {
-        commands
-            .entity(e)
-            .insert(RenderLayers::from_layers(&[0, BONE_LAYER]));
-    }
 }
 
 fn chip(bg: f32) -> (Node, BackgroundColor) {
@@ -378,7 +365,7 @@ fn lanes_of(clip: &Clip, skel: &Skeleton) -> Vec<Lane> {
                 .flatten()
             {
                 match ch {
-                    Channel::Keys { keys: k, .. } => {
+                    Channel::Keys { keys: k, .. } | Channel::Euler { keys: k, .. } => {
                         for (t, _) in k {
                             for r in 0..reps {
                                 keys.push((c.wrap(t - shift) + r as f32 * c.duration, *mirrored));
@@ -390,6 +377,10 @@ fn lanes_of(clip: &Clip, skel: &Skeleton) -> Vec<Lane> {
             }
             add(*bone, keys, wave);
         }
+        // IK-driven bones move every frame: a line, like wave lanes.
+        for (bone, _) in c.ik_bones() {
+            add(bone, Vec::new(), true);
+        }
         layer = c.base.as_deref();
     }
     if clip.layer.is_some() {
@@ -398,7 +389,16 @@ fn lanes_of(clip: &Clip, skel: &Skeleton) -> Vec<Lane> {
         }
     }
     lanes.sort_by_key(|(b, _)| *b);
-    lanes.into_iter().map(|(_, l)| l).collect()
+    let mut out: Vec<Lane> = lanes.into_iter().map(|(_, l)| l).collect();
+    // One lane per animated morph weight, after the bones.
+    for (part, shape, keys, wave) in clip.morph_lanes() {
+        out.push(Lane {
+            bone: format!("{part}:{shape}"),
+            keys: keys.into_iter().map(|t| (t, false)).collect(),
+            wave,
+        });
+    }
+    out
 }
 
 fn on_dock_click(
@@ -697,5 +697,47 @@ fn draw_bones(
         gizmos.line(a, b, col);
         let r = ((b - a).length() * 0.06).clamp(0.004, 0.05);
         gizmos.sphere(Isometry3d::from_translation(a), r, col);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The human walk (IK ankles, mirrored tracks) with a layered clip that
+    /// keys an expression morph: lanes build with IK lines and a morph lane.
+    #[test]
+    fn lanes_show_ik_and_morphs() {
+        let Ok(text) = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/human_walk.json"),
+        ) else {
+            return;
+        };
+        let mut items: Vec<serde_json::Value> =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"));
+        items[0]["shapes"] =
+            serde_json::json!({"smile": {"expression": {"mouth-corner-puller": 1}}});
+        items.push(serde_json::json!({"type": "clip", "name": "talk", "skeleton": "eve_rig",
+            "over": "walk", "additive": true, "morphs": {"eve": {"smile": [[0, 0], [0.5, 1], [1, 0]]}}}));
+        let mut s = modeler::commands::Session::default();
+        s.apply_values(None, items)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (walk, sk) =
+            modeler::anim::clip(&s.model, Some("walk")).unwrap_or_else(|e| panic!("{e}"));
+        let lanes = lanes_of(&walk, &sk);
+        assert!(
+            lanes.iter().any(|l| l.bone == "ankle_l" && l.wave),
+            "IK lane"
+        );
+        let (talk, sk) =
+            modeler::anim::clip(&s.model, Some("talk")).unwrap_or_else(|e| panic!("{e}"));
+        let lanes = lanes_of(&talk, &sk);
+        assert!(
+            lanes
+                .iter()
+                .any(|l| l.bone.ends_with(":smile") && !l.keys.is_empty()),
+            "morph lane"
+        );
+        assert!(lanes.iter().any(|l| l.bone == "hip"), "the base's lanes");
     }
 }

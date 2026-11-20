@@ -1230,6 +1230,7 @@ impl Session {
         full: bool,
     ) -> CmdResult {
         let before = self.part_fingerprints();
+        let mocaps = crate::mocap::item_names(&items);
         // Atomic: a failing item rolls the whole call back.
         // The model without its history (the history only appends, so a
         // mark rolls it back): cloning the whole tree here was most of a
@@ -1256,6 +1257,15 @@ impl Session {
                 .into());
             }
         };
+        // A mocap clip's retarget report (mapping, scale, contacts, slide).
+        let mut text = text;
+        for n in &mocaps {
+            if let Ok((c, _)) = crate::anim::clip(&self.model, Some(n))
+                && let Some(r) = &c.report
+            {
+                text = format!("{text}\n{r}");
+            }
+        }
         if full {
             return Ok(format!("{text}\n{}", self.summary()));
         }

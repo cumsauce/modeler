@@ -127,6 +127,137 @@ pub fn cubemap_rgba16f(size: usize) -> Vec<u8> {
     faces.concat()
 }
 
+/// Pixels of a face, row by row, mapped through `f(direction)`.
+fn face_rgba16f(face: usize, size: usize, f: &(dyn Fn([f32; 3]) -> [f32; 3] + Sync)) -> Vec<u8> {
+    let mut px = Vec::with_capacity(size * size * 8);
+    for y in 0..size {
+        for x in 0..size {
+            let s = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+            let t = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+            let c = f(cube_dir(face, s, t));
+            for v in [c[0], c[1], c[2], 1.0] {
+                px.extend_from_slice(&f16_bits(v.max(0.0)).to_le_bytes());
+            }
+        }
+    }
+    px
+}
+
+/// The nine order-2 spherical-harmonic basis values of unit direction `d`.
+fn sh9(d: [f32; 3]) -> [f32; 9] {
+    let [x, y, z] = d;
+    [
+        0.282_095,
+        0.488_603 * y,
+        0.488_603 * z,
+        0.488_603 * x,
+        1.092_548 * x * y,
+        1.092_548 * y * z,
+        0.315_392 * (3.0 * z * z - 1.0),
+        1.092_548 * x * z,
+        0.546_274 * (x * x - y * y),
+    ]
+}
+
+/// The sharp studio projected on order-2 spherical harmonics (exact
+/// quadrature over a cube of texels, so no sampling noise), pre-convolved
+/// with the clamped cosine and divided by pi: evaluating it at a normal
+/// gives what a white Lambertian surface facing that way reflects.
+fn irradiance_sh() -> [[f32; 3]; 9] {
+    const N: usize = 128;
+    let mut acc = [[0.0f64; 3]; 9];
+    for face in 0..6 {
+        for y in 0..N {
+            for x in 0..N {
+                let s = (x as f32 + 0.5) / N as f32 * 2.0 - 1.0;
+                let t = (y as f32 + 0.5) / N as f32 * 2.0 - 1.0;
+                // Solid angle of the texel (area / r^3 on the unit cube).
+                let r2 = 1.0 + s * s + t * t;
+                let w = (4.0 / (N * N) as f32) / (r2 * r2.sqrt());
+                let d = norm(cube_dir(face, s, t));
+                let c = radiance(d, 0.0);
+                for (k, b) in sh9(d).iter().enumerate() {
+                    for ch in 0..3 {
+                        acc[k][ch] += f64::from(c[ch] * b * w);
+                    }
+                }
+            }
+        }
+    }
+    // Cosine-lobe convolution per band (pi, 2pi/3, pi/4), then / pi.
+    let band = [
+        1.0,
+        2.0 / 3.0,
+        2.0 / 3.0,
+        2.0 / 3.0,
+        0.25,
+        0.25,
+        0.25,
+        0.25,
+        0.25,
+    ];
+    let mut out = [[0.0f32; 3]; 9];
+    for k in 0..9 {
+        for ch in 0..3 {
+            out[k][ch] = (acc[k][ch] * band[k]) as f32;
+        }
+    }
+    out
+}
+
+/// The studio's diffuse (irradiance / pi) cubemap, Rgba16Float, faces of
+/// `size` in face order. Computed exactly on the CPU, so it is smooth and
+/// identical on every run (a GPU Monte-Carlo filter leaves per-texel noise
+/// that shows as mottling on flat-coloured surfaces).
+pub fn diffuse_cubemap_rgba16f(size: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let sh = irradiance_sh();
+    let eval = move |d: [f32; 3]| {
+        let b = sh9(norm(d));
+        let mut c = [0.0f32; 3];
+        for k in 0..9 {
+            for ch in 0..3 {
+                c[ch] += sh[k][ch] * b[k];
+            }
+        }
+        c
+    };
+    let faces: Vec<Vec<u8>> = (0..6)
+        .into_par_iter()
+        .map(|f| face_rgba16f(f, size, &eval))
+        .collect();
+    faces.concat()
+}
+
+/// The studio's prefiltered specular cubemap, Rgba16Float with a full mip
+/// chain (`size` a power of two): mip k holds the reflection for
+/// perceptual roughness k / (mips - 1), the mapping Bevy's shader reads,
+/// blurred analytically (`radiance` with `roughness_blur`), so it is
+/// noise-free and deterministic. Layout is wgpu's default layer-major
+/// order: face 0's mips from largest to 1x1, then face 1's, and so on.
+/// Returns the data and the mip count.
+pub fn specular_cubemap_rgba16f(size: usize) -> (Vec<u8>, u32) {
+    use rayon::prelude::*;
+    let mips = size.max(1).ilog2() + 1;
+    let per_face: Vec<Vec<u8>> = (0..6)
+        .into_par_iter()
+        .map(|f| {
+            let mut out = Vec::new();
+            for m in 0..mips {
+                let rough = if mips > 1 {
+                    m as f32 / (mips - 1) as f32
+                } else {
+                    0.0
+                };
+                let blur = roughness_blur(rough);
+                out.extend(face_rgba16f(f, (size >> m).max(1), &|d| radiance(d, blur)));
+            }
+            out
+        })
+        .collect();
+    (per_face.concat(), mips)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +289,24 @@ mod tests {
         // 1.0 in half precision.
         assert_eq!(f16_bits(1.0), 0x3c00);
         assert_eq!(f16_bits(0.5), 0x3800);
+    }
+
+    #[test]
+    fn filtered_maps_have_the_right_size_and_light() {
+        let (spec, mips) = specular_cubemap_rgba16f(16);
+        assert_eq!(mips, 5);
+        assert_eq!(spec.len(), 6 * (256 + 64 + 16 + 4 + 1) * 8);
+        let diffuse = diffuse_cubemap_rgba16f(4);
+        assert_eq!(diffuse.len(), 6 * 16 * 8);
+        // The SH irradiance is brighter facing up (the scrim) than down, and
+        // smooth: a white surface never reflects more than the brightest box.
+        let sh = irradiance_sh();
+        let eval = |d: [f32; 3]| {
+            let b = sh9(d);
+            (0..9).map(|k| sh[k][1] * b[k]).sum::<f32>()
+        };
+        let (up, down) = (eval([0.0, 1.0, 0.0]), eval([0.0, -1.0, 0.0]));
+        assert!(up > down * 2.0 && up < 7.0, "{up} {down}");
+        assert!(down > 0.0, "{down}");
     }
 }

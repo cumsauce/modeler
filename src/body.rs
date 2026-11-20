@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use bevy::math::{Quat, Vec3};
+use bevy::math::{Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::sdf::{SdfDef, Sect, Shape};
@@ -23,7 +23,15 @@ fn none<T>(v: &Option<T>) -> bool {
     v.is_none()
 }
 
-pub const PRESETS: &[&str] = &["biped", "quadruped", "bird", "fish", "serpent", "car"];
+pub const PRESETS: &[&str] = &[
+    "biped",
+    "quadruped",
+    "bird",
+    "fish",
+    "serpent",
+    "car",
+    "human",
+];
 
 /// A per-joint edit: its sections scaled, it (and every joint below it)
 /// moved by `offset` meters.
@@ -75,6 +83,81 @@ pub struct BodyDef {
     /// Set by the graph (never read or saved), as on sdf.
     #[serde(default, skip_deserializing, skip_serializing_if = "none")]
     pub target_tris: Option<u32>,
+    // ---- `human` (the template preset) only
+    /// 0 female .. 1 male (default 0.5).
+    #[serde(default, skip_serializing_if = "none")]
+    pub gender: Option<f32>,
+    /// Years (> 1), or MakeHuman's 0..1 (default 25 years).
+    #[serde(default, skip_serializing_if = "none")]
+    pub age: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub muscle: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub proportions: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub breast_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub breast_firmness: Option<f32>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub ethnicity: Option<BTreeMap<String, f32>>,
+    /// Detail targets by name, -1..1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shape: BTreeMap<String, f32>,
+    /// Expression units, 0..1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub expression: BTreeMap<String, f32>,
+    /// Catmull-Clark levels over the quad cage (0..2).
+    #[serde(default, skip_serializing_if = "none")]
+    pub detail: Option<u32>,
+    /// Extras to make (eyes, teeth, tongue; default all).
+    #[serde(default, skip_serializing_if = "none")]
+    pub parts: Option<Vec<String>>,
+    /// Named morph targets (exported as glTF morph targets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, crate::human::ShapeKey>,
+    /// `rig: "full"`: the whole template skeleton instead of the game rig.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rig_full: bool,
+    /// Iris colour of the built-in eye material (RGBA 0..1).
+    #[serde(default, skip_serializing_if = "none")]
+    pub eye_color: Option<[f32; 4]>,
+    /// Pupil size of the built-in eye material (1 = normal).
+    #[serde(default, skip_serializing_if = "none")]
+    pub pupil: Option<f32>,
+    /// Body measurements to hit (meters), solved with the measure targets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub measure: BTreeMap<String, f32>,
+}
+
+/// The human-only fields, for errors on other presets.
+fn human_fields(d: &BodyDef) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for (k, set) in [
+        ("gender", d.gender.is_some()),
+        ("age", d.age.is_some()),
+        ("muscle", d.muscle.is_some()),
+        ("weight", d.weight.is_some()),
+        ("proportions", d.proportions.is_some()),
+        ("breast_size", d.breast_size.is_some()),
+        ("breast_firmness", d.breast_firmness.is_some()),
+        ("ethnicity", d.ethnicity.is_some()),
+        ("shape", !d.shape.is_empty()),
+        ("expression", !d.expression.is_empty()),
+        ("detail", d.detail.is_some()),
+        ("parts", d.parts.is_some()),
+        ("shapes", !d.shapes.is_empty()),
+        ("rig: \"full\"", d.rig_full),
+        ("eye_color", d.eye_color.is_some()),
+        ("pupil", d.pupil.is_some()),
+        ("measure", !d.measure.is_empty()),
+    ] {
+        if set {
+            v.push(k);
+        }
+    }
+    v
 }
 
 /// (default height, what it measures, default head_ratio).
@@ -85,6 +168,7 @@ pub fn defaults(preset: &str) -> (f32, &'static str, f32) {
         "bird" => (0.25, "standing height", 0.2),
         "fish" => (0.4, "length", 0.25),
         "serpent" => (2.0, "length", 0.03),
+        "human" => (1.7, "standing height", 1.0 / 7.5),
         _ => (4.3, "length", 0.12),
     }
 }
@@ -96,6 +180,47 @@ impl BodyDef {
                 "preset: `{}` is not a body preset (use {})",
                 self.preset,
                 PRESETS.join(", ")
+            ));
+        }
+        if self.preset == "human" {
+            for (k, set) in [
+                ("head_ratio", self.head_ratio.is_some()),
+                ("build", self.build.is_some()),
+                ("leg_length", self.leg_length.is_some()),
+                ("tail", self.tail.is_some()),
+                ("snout", self.snout.is_some()),
+                ("joints", !self.joints.is_empty()),
+                ("blend", self.blend.is_some()),
+                ("resolution", self.resolution.is_some()),
+            ] {
+                if set {
+                    return Err(format!(
+                        "{k}: not a field of the human preset (it takes gender, age, muscle, weight, height, proportions, ethnicity, shape, expression, shapes, detail, parts, warps, tris)"
+                    ));
+                }
+            }
+            if self
+                .height
+                .is_some_and(|h| !h.is_finite() || !(0.3..=3.0).contains(&h))
+            {
+                return Err("height: a human's stature, 0.3..3 m".into());
+            }
+            if let Some(t) = self.tris
+                && t < 100
+            {
+                return Err(format!("tris: at least 100 for a human, got {t}"));
+            }
+            if self.bake && self.tris.is_none() {
+                return Err("bake: needs `tris`".into());
+            }
+            return crate::human::validate(self);
+        }
+        let hf = human_fields(self);
+        if !hf.is_empty() {
+            return Err(format!(
+                "{}: only the human preset takes {}",
+                hf.join(", "),
+                if hf.len() == 1 { "it" } else { "them" }
             ));
         }
         let pos = |f: &str, v: Option<f32>, lo: f32, hi: f32| -> Result<(), String> {
@@ -150,6 +275,35 @@ impl BodyDef {
                 s += &format!(" {k}={v}");
             }
         }
+        for (k, v) in [
+            ("gender", self.gender),
+            ("age", self.age),
+            ("muscle", self.muscle),
+            ("weight", self.weight),
+            ("proportions", self.proportions),
+            ("breast_size", self.breast_size),
+            ("breast_firmness", self.breast_firmness),
+        ] {
+            if let Some(v) = v {
+                s += &format!(" {k}={v}");
+            }
+        }
+        if let Some(d) = self.detail {
+            s += &format!(" detail={d}");
+        }
+        if !self.shape.is_empty() {
+            s += &format!(" shape[{}]", self.shape.len());
+        }
+        if !self.expression.is_empty() {
+            s += &format!(" expression[{}]", self.expression.len());
+        }
+        if !self.shapes.is_empty() {
+            let k: Vec<&str> = self.shapes.keys().map(String::as_str).collect();
+            s += &format!(" shapes[{}]", k.join(", "));
+        }
+        if self.rig_full {
+            s += " rig=full";
+        }
         for w in &self.warps {
             s += &format!(" warp({})", w.summary());
         }
@@ -196,6 +350,8 @@ enum At {
     Mid(usize, usize, f32),
     /// A joint plus an offset (scaled with the body).
     Off(usize, Vec3),
+    /// Between two joints plus an offset (scaled with the body).
+    MidOff(usize, usize, f32, Vec3),
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +373,19 @@ struct Dot {
     blend: f32,
 }
 
+/// An ellipsoid (axis-aligned radii) joined after the chains: muscle
+/// masses, skull, cheekbones.
+#[derive(Clone, Copy)]
+struct Ell {
+    at: At,
+    r: Vec3,
+    /// Smooth radius (scaled with the body); `None` = the item's blend.
+    blend: Option<f32>,
+    /// Joined before the chains (torso masses the limbs then blend into),
+    /// rather than after them.
+    early: bool,
+}
+
 struct Wheel {
     j: usize,
     r: f32,
@@ -227,11 +396,23 @@ struct Wheel {
 struct Pre {
     joints: Vec<(String, Option<usize>, Vec3)>,
     chains: Vec<Vec<Pt>>,
+    /// Smooth radius of a chain's join (scaled with the body), by chain
+    /// index; the rest use `blend`.
+    chain_blends: Vec<(usize, f32)>,
+    /// Joint radii (scaled with the body) for joints that no chain section
+    /// sits on (the biped's ellipsoid torso).
+    rads: Vec<(usize, f32)>,
     dots: Vec<Dot>,
+    ells: Vec<Ell>,
     wheels: Vec<Wheel>,
     /// Flat floor cut (car underside), y.
     floor: Option<f32>,
     blend: f32,
+    /// Resample chains finely before meshing: the sdf samples a straight
+    /// oval chain only every ~0.75 radii, so a radius that swells and
+    /// narrows (ribcage, waist, calf) would show a crease ring at every
+    /// sample.
+    dense: bool,
 }
 
 impl Pre {
@@ -247,6 +428,7 @@ impl Pre {
             At::J(i) => self.pos(i),
             At::Mid(a, b, t) => self.pos(a).lerp(self.pos(b), t),
             At::Off(i, d) => self.pos(i) + d,
+            At::MidOff(a, b, t, d) => self.pos(a).lerp(self.pos(b), t) + d,
         }
     }
     fn chain(&mut self, pts: Vec<Pt>) {
@@ -256,13 +438,15 @@ impl Pre {
         self.chains
             .iter()
             .map(|c| {
-                c.iter()
-                    .map(|p| {
-                        let q = self.at(p.at);
-                        if p.n == 2.0 {
-                            Sect::Oval(q.x, q.y, q.z, p.r)
+                let pts: Vec<(Vec3, [f32; 2], f32)> =
+                    c.iter().map(|p| (self.at(p.at), p.r, p.n)).collect();
+                let pts = if self.dense { densify(&pts) } else { pts };
+                pts.into_iter()
+                    .map(|(q, r, n)| {
+                        if n == 2.0 {
+                            Sect::Oval(q.x, q.y, q.z, r)
                         } else {
-                            Sect::Super(q.x, q.y, q.z, p.r, 0.0, p.n)
+                            Sect::Super(q.x, q.y, q.z, r, 0.0, n)
                         }
                     })
                     .collect()
@@ -276,6 +460,12 @@ impl Pre {
             let (a, b) = crate::sdf::chain_extent(&c, true, dir);
             lo = lo.min(a);
             hi = hi.max(b);
+        }
+        for e in &self.ells {
+            let c = self.at(e.at).dot(dir);
+            let r = (e.r * dir).length();
+            lo = lo.min(c - r);
+            hi = hi.max(c + r);
         }
         for w in &self.wheels {
             let c = self.pos(w.j);
@@ -293,18 +483,20 @@ impl Pre {
         for c in &mut self.chains {
             for p in c {
                 p.r = [p.r[0] * s, p.r[1] * s];
-                match &mut p.at {
-                    At::Off(_, d) => *d *= s,
-                    At::J(_) | At::Mid(..) => {}
-                }
+                scale_at(&mut p.at, s);
             }
         }
         for d in &mut self.dots {
             d.r *= s;
             d.blend *= s;
-            if let At::Off(_, o) = &mut d.at {
-                *o *= s;
+            scale_at(&mut d.at, s);
+        }
+        for e in &mut self.ells {
+            e.r *= s;
+            if let Some(b) = &mut e.blend {
+                *b *= s;
             }
+            scale_at(&mut e.at, s);
         }
         for w in &mut self.wheels {
             w.r *= s;
@@ -314,6 +506,12 @@ impl Pre {
             *f *= s;
         }
         self.blend *= s;
+        for c in &mut self.chain_blends {
+            c.1 *= s;
+        }
+        for r in &mut self.rads {
+            r.1 *= s;
+        }
     }
     fn shift_y(&mut self, dy: f32) {
         for j in &mut self.joints {
@@ -336,6 +534,65 @@ impl Pre {
             i += 1;
         }
         out
+    }
+}
+
+/// A chain's points resampled along a uniform Catmull-Rom (positions and
+/// radii; ends extrapolated straight with level radii, as the sdf does),
+/// about a fifth of the local radius apart.
+fn densify(p: &[(Vec3, [f32; 2], f32)]) -> Vec<(Vec3, [f32; 2], f32)> {
+    let n = p.len();
+    if n < 3 {
+        return p.to_vec();
+    }
+    let get = |i: isize| -> (Vec3, Vec2) {
+        let c = |k: usize| (p[k].0, Vec2::from(p[k].1));
+        if i < 0 {
+            (2.0 * p[0].0 - p[1].0, c(1).1)
+        } else if i as usize >= n {
+            (2.0 * p[n - 1].0 - p[n - 2].0, c(n - 2).1)
+        } else {
+            c(i as usize)
+        }
+    };
+    let cr = |a: f32, b: f32, c: f32, d: f32, t: f32| {
+        0.5 * (2.0 * b
+            + (c - a) * t
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * t * t
+            + (3.0 * b - a - 3.0 * c + d) * t * t * t)
+    };
+    let mut out = Vec::new();
+    for s in 0..n - 1 {
+        let i = s as isize;
+        let q = [get(i - 1), get(i), get(i + 1), get(i + 2)];
+        let rmin = q[1].1.min_element().min(q[2].1.min_element()).max(1e-4);
+        let len = q[1].0.distance(q[2].0);
+        let k = ((len / (0.5 * rmin).max(0.03)).ceil() as usize).clamp(1, 12);
+        for j in 0..k {
+            let t = j as f32 / k as f32;
+            let pos = Vec3::new(
+                cr(q[0].0.x, q[1].0.x, q[2].0.x, q[3].0.x, t),
+                cr(q[0].0.y, q[1].0.y, q[2].0.y, q[3].0.y, t),
+                cr(q[0].0.z, q[1].0.z, q[2].0.z, q[3].0.z, t),
+            );
+            let lo = 0.5 * q[1].1.min(q[2].1);
+            let r = Vec2::new(
+                cr(q[0].1.x, q[1].1.x, q[2].1.x, q[3].1.x, t),
+                cr(q[0].1.y, q[1].1.y, q[2].1.y, q[3].1.y, t),
+            )
+            .max(lo);
+            let e = p[s].2 + (p[s + 1].2 - p[s].2) * t;
+            out.push((pos, r.to_array(), e));
+        }
+    }
+    out.push(p[n - 1]);
+    out
+}
+
+fn scale_at(a: &mut At, s: f32) {
+    match a {
+        At::Off(_, d) | At::MidOff(_, _, _, d) => *d *= s,
+        At::J(_) | At::Mid(..) => {}
     }
 }
 
@@ -366,138 +623,295 @@ struct P {
 
 const SIDES: [(f32, &str); 2] = [(1.0, "_l"), (-1.0, "_r")];
 
-/// A person about 1.75 m, head 1/7.5 of the height, arms relaxed a little
-/// out from the body, facing +z (left = +x).
+/// An adult mannequin built to the ANSUR II male medians (2012 US Army
+/// Anthropometric Survey, NATICK/TR-15/007; stature 175.5 cm), head 1/7.5
+/// of the height, arms relaxed a little out from the body, facing +z
+/// (left = +x). Values are metres at that stature; `lower` scales the
+/// figure to `height`, so every landmark keeps its fraction of stature.
+///
+/// Built from smooth pieces blended together rather than long chains: a
+/// chain whose radius narrows and swells again (a waist, a knee) meshes
+/// with a crease ring at every sample, while ellipsoids and single tapered
+/// segments joined by smooth unions give soft valleys. Ribcage, abdomen and
+/// pelvis are ellipsoids; each limb bone is one tapered segment plus a
+/// muscle mass (deltoid, biceps, forearm, quadriceps, calf).
 fn biped(p: &P) -> Pre {
     let (k, b, l) = (p.k, p.b, p.leg);
     let bx = 1.0 + (b - 1.0) * 0.5;
     let mut m = Pre {
-        blend: 0.024,
+        blend: 0.022,
+        dense: true,
         ..Pre::default()
     };
-    let hy = 0.93 * l;
-    let up = hy - 0.93;
-    let hip = m.j("hip", None, v(0.0, 0.95 + up, -0.006));
-    let spine = m.j("spine", Some(hip), v(0.0, 1.10 + up, -0.012));
-    let chest = m.j("chest", Some(spine), v(0.0, 1.28 + up, 0.01));
-    let neck = m.j("neck", Some(chest), v(0.0, 1.475 + up, -0.022));
-    let head = m.j("head", Some(neck), m.pos(neck) + k * v(0.0, 0.115, 0.027));
+    // Muscle masses grow in girth (x, z) with `build`, not in length.
+    let g = |x: f32, y: f32, z: f32| v(x * b, y, z * b);
+    let ell = |at: At, r: Vec3, blend: Option<f32>| Ell {
+        at,
+        r,
+        blend,
+        early: true,
+    };
+    // Trochanter (hip joint level) at 0.512 of stature.
+    let hy = 0.9 * l;
+    let up = hy - 0.9;
+    let hip = m.j("hip", None, v(0.0, 0.96 + up, -0.005));
+    let spine = m.j("spine", Some(hip), v(0.0, 1.09 + up, -0.015));
+    let chest = m.j("chest", Some(spine), v(0.0, 1.27 + up, 0.0));
+    let neck = m.j("neck", Some(chest), v(0.0, 1.48 + up, -0.035));
+    let head = m.j("head", Some(neck), m.pos(neck) + k * v(0.0, 0.12, 0.035));
     let jaw = m.j(
         "jaw",
         Some(head),
-        m.pos(head) + k * v(0.0, -0.058, 0.04 + 0.012 * p.snout),
+        m.pos(head) + k * v(0.0, -0.06, 0.05 + 0.01 * (p.snout - 1.0)),
     );
-    // Torso: pelvis, waist, ribcage, up into the neck.
-    m.chain(vec![
-        pt(At::J(hip), 0.158 * b, 0.11 * b),
-        pt(At::J(spine), 0.133 * b, 0.092 * b),
-        pt(At::J(chest), 0.152 * b, 0.112 * b),
-        pt(At::Mid(chest, neck, 0.5), 0.165 * b, 0.1 * b),
-        pt(At::Mid(chest, neck, 0.78), 0.12 * b, 0.075 * b),
-        pt(At::J(neck), 0.054 * bx, 0.056 * bx),
-        pt(At::Off(head, k * v(0.0, -0.03, -0.01)), 0.05 * k, 0.05 * k),
-    ]);
-    // Skull: chin up to the crown; jaw and nose forward.
-    m.chain(vec![
-        pt(
-            At::Off(head, k * v(0.0, -0.045, 0.004)),
-            0.058 * k,
-            0.07 * k,
-        ),
-        pt(At::J(head), 0.074 * k, 0.09 * k),
-        pt(At::Off(head, k * v(0.0, 0.07, -0.012)), 0.074 * k, 0.09 * k),
-    ]);
-    m.chain(vec![
-        pt(At::Off(head, k * v(0.0, -0.01, 0.02)), 0.064 * k, 0.05 * k),
-        pt(At::J(jaw), 0.036 * k, 0.026 * k),
-    ]);
-    m.chain(vec![
-        pt(At::Off(head, k * v(0.0, 0.0, 0.05)), 0.016 * k, 0.02 * k),
-        pt(
-            At::Off(head, k * v(0.0, -0.012, 0.08 + 0.012 * p.snout)),
-            0.012 * k,
-            0.011 * k,
-        ),
-    ]);
-    // Face: brow ridge, lips, chin; per side cheek, ear, eye socket and
-    // eyeball. All sized well above the default voxel.
-    let h = |x: f32, y: f32, z: f32| At::Off(head, k * v(x, y, z));
-    m.chain(vec![
-        pt(h(-0.044, 0.03, 0.066), 0.012 * k, 0.011 * k),
-        pt(h(0.0, 0.032, 0.078), 0.014 * k, 0.012 * k),
-        pt(h(0.044, 0.03, 0.066), 0.012 * k, 0.011 * k),
-    ]);
-    m.chain(vec![
-        pt(h(-0.024, -0.04, 0.074), 0.008 * k, 0.007 * k),
-        pt(h(0.0, -0.037, 0.084), 0.011 * k, 0.009 * k),
-        pt(h(0.024, -0.04, 0.074), 0.008 * k, 0.007 * k),
-    ]);
-    m.chain(vec![pt(h(0.0, -0.068, 0.062), 0.022 * k, 0.016 * k)]);
+    // Torso. Pelvis: hip breadth 34.4 with the thighs, buttock depth 24.6.
+    // Waist (navel, 0.601): 29.5 x 21 (a lean mannequin; `build` 1.15
+    // reaches the soldier median). Ribcage: an egg widest low, chest
+    // breadth 28.9 and depth 25.3 at the nipples (0.734), its top at the
+    // clavicles.
+    let tb = Some(0.065 * bx);
+    m.ells.push(ell(
+        At::Off(hip, v(0.0, -0.025, 0.008)),
+        g(0.155, 0.09, 0.105),
+        None,
+    ));
+    m.ells.push(ell(
+        At::Off(spine, v(0.0, -0.03, 0.0)),
+        g(0.148, 0.12, 0.105),
+        tb,
+    ));
+    m.ells.push(ell(
+        At::Off(chest, v(0.0, -0.02, -0.01)),
+        g(0.142, 0.185, 0.125),
+        tb,
+    ));
+    m.rads.push((hip, 0.13 * b));
+    m.rads.push((spine, 0.15 * b));
+    m.rads.push((chest, 0.17 * b));
     for (s, _) in SIDES {
-        m.chain(vec![pt(h(0.042 * s, -0.014, 0.05), 0.024 * k, 0.022 * k)]);
+        // Glutes, pectoral plate, shoulder blade, latissimus.
+        m.ells.push(ell(
+            At::Off(hip, v(0.072 * s, -0.06, -0.058)),
+            g(0.07, 0.085, 0.082),
+            Some(0.045 * bx),
+        ));
+        m.ells.push(ell(
+            At::Off(chest, v(0.06 * s, 0.03, 0.06)),
+            g(0.07, 0.055, 0.05),
+            Some(0.04 * bx),
+        ));
+        m.ells.push(ell(
+            At::Off(chest, v(0.07 * s, 0.06, -0.07)),
+            g(0.06, 0.08, 0.045),
+            Some(0.035 * bx),
+        ));
+        m.ells.push(ell(
+            At::Off(chest, v(0.09 * s, -0.03, -0.03)),
+            g(0.056, 0.1, 0.07),
+            Some(0.04 * bx),
+        ));
+    }
+    // Upper chest and shoulder girdle, out under the deltoids.
+    m.ells.push(ell(
+        At::Off(chest, v(0.0, 0.11, -0.012)),
+        g(0.165, 0.06, 0.095),
+        Some(0.04 * bx),
+    ));
+    // Neck: 12.6 across (39.5 around), 13.8 at its base.
+    m.chain(vec![
+        pt(At::Mid(chest, neck, 0.75), 0.064 * bx, 0.062 * bx),
+        pt(At::Off(head, k * v(0.0, -0.045, -0.03)), 0.06 * k, 0.06 * k),
+    ]);
+    m.rads.push((neck, 0.063 * bx));
+    // Head about its joint: crown +0.155, eyes +0.04 (half the head),
+    // nose base -0.018, chin -0.078; cranium 15.4 wide x 20.0 long,
+    // cheekbones 14.3, pupils 6.4 apart, ears from brow to nose base.
+    let h = |x: f32, y: f32, z: f32| At::Off(head, k * v(x, y, z));
+    let hb = |x: f32| Some(x * k);
+    m.ells
+        .push(ell(h(0.0, 0.055, -0.02), k * v(0.077, 0.1, 0.095), None));
+    m.ells.push(ell(
+        h(0.0, 0.0, 0.028),
+        k * v(0.062, 0.062, 0.056),
+        hb(0.02),
+    ));
+    m.chain(vec![
+        pt(h(0.0, -0.005, 0.03), 0.048 * k, 0.045 * k),
+        pt(At::J(jaw), 0.022 * k, 0.02 * k),
+    ]);
+    m.rads.push((head, 0.1 * k));
+    m.rads.push((jaw, 0.04 * k));
+    // Brow and nose.
+    m.chain(vec![
+        pt(h(-0.04, 0.056, 0.07), 0.012 * k, 0.01 * k),
+        pt(h(0.0, 0.06, 0.08), 0.012 * k, 0.01 * k),
+        pt(h(0.04, 0.056, 0.07), 0.012 * k, 0.01 * k),
+    ]);
+    m.chain(vec![
+        pt(h(0.0, 0.045, 0.082), 0.009 * k, 0.009 * k),
+        pt(
+            h(0.0, 0.0, 0.09 + 0.008 * (p.snout - 1.0)),
+            0.01 * k,
+            0.01 * k,
+        ),
+    ]);
+    m.ells.push(ell(
+        h(0.0, -0.014, 0.07),
+        k * v(0.018, 0.013, 0.018),
+        hb(0.02),
+    ));
+    // Closed mouth: one soft mass for the lips.
+    m.ells.push(ell(
+        h(0.0, -0.042, 0.06),
+        k * v(0.026, 0.02, 0.02),
+        hb(0.02),
+    ));
+    for (s, _) in SIDES {
+        // Mandible from the angle under the ear to the chin.
         m.chain(vec![
-            pt(h(0.072 * s, 0.014, -0.006), 0.01 * k, 0.019 * k),
-            pt(h(0.077 * s, -0.004, -0.01), 0.01 * k, 0.02 * k),
-            pt(h(0.072 * s, -0.024, -0.002), 0.009 * k, 0.012 * k),
+            pt(h(0.058 * s, -0.02, -0.015), 0.017 * k, 0.017 * k),
+            pt(h(0.016 * s, -0.066, 0.05), 0.015 * k, 0.015 * k),
         ]);
+        m.chain(vec![
+            pt(h(0.077 * s, 0.05, -0.016), 0.008 * k, 0.016 * k),
+            pt(h(0.081 * s, 0.02, -0.022), 0.009 * k, 0.018 * k),
+            pt(h(0.076 * s, -0.012, -0.012), 0.008 * k, 0.011 * k),
+        ]);
+        // Shallow sockets; the eyeballs sit nearly flush.
         m.dots.push(Dot {
-            at: h(0.031 * s, 0.012, 0.078),
-            r: 0.019 * k,
+            at: h(0.032 * s, 0.044, 0.096),
+            r: 0.02 * k,
             subtract: true,
-            blend: 0.008 * k,
+            blend: 0.018 * k,
         });
         m.dots.push(Dot {
-            at: h(0.031 * s, 0.011, 0.064),
-            r: 0.014 * k,
+            at: h(0.032 * s, 0.04, 0.066),
+            r: 0.013 * k,
             subtract: false,
-            blend: 0.003 * k,
+            blend: 0.012 * k,
         });
     }
     for (s, sfx) in SIDES {
         let n = |b: &str| format!("{b}{sfx}");
+        // Shoulder joint under the acromion (biacromial 41.5), bideltoid
+        // 50.9 the widest point; elbow at 0.617, wrist at 0.483 (level with
+        // the crotch), fingertips at 0.373.
+        let cl = m.j(&n("clavicle"), Some(chest), v(0.03 * s, 1.43 + up, 0.0));
         let sh = m.j(
             &n("shoulder"),
-            Some(chest),
-            v(0.18 * s * bx, 1.43 + up, -0.025),
+            Some(cl),
+            v(0.175 * s * bx, 1.42 + up, -0.02),
         );
-        let el = m.j(&n("elbow"), Some(sh), v(0.203 * s * bx, 1.175 + up, -0.045));
-        let wr = m.j(&n("wrist"), Some(el), v(0.222 * s * bx, 0.962 + up, -0.012));
-        let hd = m.j(&n("hand"), Some(wr), v(0.228 * s * bx, 0.89 + up, 0.004));
+        let el = m.j(&n("elbow"), Some(sh), v(0.255 * s * bx, 1.11 + up, -0.04));
+        let wr = m.j(&n("wrist"), Some(el), v(0.288 * s * bx, 0.885 + up, -0.01));
+        let hd = m.j(&n("hand"), Some(wr), v(0.294 * s * bx, 0.825 + up, 0.0));
         m.chain(vec![
-            pt(At::Mid(neck, sh, 0.25), 0.05 * b, 0.04 * b),
-            pt(At::J(sh), 0.05 * b, 0.05 * b),
+            pt(At::J(cl), 0.022 * b, 0.022 * b),
+            pt(
+                At::Off(sh, v(-0.02 * s, 0.018, 0.012)),
+                0.024 * b,
+                0.022 * b,
+            ),
         ]);
         m.chain(vec![
-            pt(At::J(sh), 0.048 * b, 0.05 * b),
-            pt(At::Mid(sh, el, 0.45), 0.044 * b, 0.046 * b),
+            pt(
+                At::Off(neck, v(0.035 * s, -0.01, -0.02)),
+                0.035 * b,
+                0.03 * b,
+            ),
+            pt(At::Off(sh, v(-0.04 * s, 0.025, -0.01)), 0.04 * b, 0.022 * b),
+        ]);
+        m.ells.push(ell(
+            At::Off(sh, v(0.026 * s * b, -0.025, 0.0)),
+            g(0.052, 0.075, 0.058),
+            Some(0.035 * bx),
+        ));
+        // Upper arm 10 across (relaxed biceps 32 around).
+        m.chain_blends.push((m.chains.len(), 0.018 * bx));
+        m.chain(vec![
+            pt(At::J(sh), 0.045 * b, 0.048 * b),
             pt(At::J(el), 0.034 * b, 0.036 * b),
-            pt(At::Mid(el, wr, 0.3), 0.036 * b, 0.037 * b),
+        ]);
+        m.ells.push(ell(
+            At::MidOff(sh, el, 0.5, v(0.0, 0.0, 0.005)),
+            g(0.045, 0.09, 0.048),
+            Some(0.018 * bx),
+        ));
+        // Forearm 9 across, widest a third below the elbow; wrist 6.2 x 4.6
+        // (palms facing the thighs: the width runs front to back).
+        m.chain(vec![
+            pt(At::J(el), 0.038 * b, 0.04 * b),
             pt(At::J(wr), 0.021, 0.028),
-            pt(At::J(hd), 0.016, 0.04),
-            pt(At::Off(hd, v(0.003 * s, -0.068, 0.006)), 0.011, 0.028),
         ]);
-        let th = m.j(&n("thigh"), Some(hip), v(0.09 * s * bx, hy - 0.02, 0.0));
-        let kn = m.j(&n("knee"), Some(th), v(0.095 * s * bx, 0.5 * l, 0.018));
-        let an = m.j(&n("ankle"), Some(kn), v(0.1 * s * bx, 0.085, -0.025));
-        let ball = m.j(&n("ball"), Some(an), v(0.105 * s * bx, 0.03, 0.12));
-        let toe = m.j(&n("toe"), Some(ball), v(0.11 * s * bx, 0.026, 0.185));
+        m.ells.push(ell(
+            At::Mid(el, wr, 0.3),
+            g(0.04, 0.08, 0.044),
+            Some(0.03 * bx),
+        ));
+        m.ells.push(ell(
+            At::Off(el, v(0.0, 0.0, -0.024)),
+            v(0.018, 0.024, 0.016),
+            Some(0.012),
+        ));
+        // Hand 19.3 long, 8.8 broad: palm, fingers, thumb mass in front. The
+        // hand bone's envelope reaches the fingertips.
+        m.rads.push((hd, 0.06));
         m.chain(vec![
-            pt(At::J(th), 0.085 * b, 0.09 * b),
-            pt(At::Mid(th, kn, 0.45), 0.071 * b, 0.075 * b),
-            pt(At::J(kn), 0.05 * b, 0.053 * b),
-            pt(At::Mid(kn, an, 0.3), 0.052 * b, 0.057 * b),
-            pt(At::J(an), 0.031, 0.035),
+            pt(At::J(wr), 0.02, 0.03),
+            pt(At::J(hd), 0.016, 0.044),
+            pt(At::Off(hd, v(0.002 * s, -0.05, 0.004)), 0.014, 0.042),
+            pt(At::Off(hd, v(0.004 * s, -0.11, 0.008)), 0.01, 0.03),
+            pt(At::Off(hd, v(0.004 * s, -0.124, 0.008)), 0.009, 0.015),
         ]);
-        // Buttock.
-        m.chain(vec![pt(
-            At::Off(th, v(-0.012 * s, 0.045, -0.04)),
-            0.062 * b,
-            0.062 * b,
-        )]);
         m.chain(vec![
-            pt(At::Off(an, v(0.0, -0.035, -0.03)), 0.034, 0.04),
-            pt(At::J(ball), 0.044, 0.028),
-            pt(At::J(toe), 0.04, 0.022),
+            pt(At::Off(wr, v(0.002 * s, -0.03, 0.022)), 0.016, 0.016),
+            pt(At::Off(hd, v(0.008 * s, -0.03, 0.05)), 0.011, 0.011),
+            pt(At::Off(hd, v(0.01 * s, -0.06, 0.056)), 0.009, 0.009),
+        ]);
+        // Leg: hip joints 8.5 off centre, knees and ankles closer in. Thigh
+        // 18.5 x 21 at the top, 13 above the knee; calf 12.5 high on the
+        // shin; ankle 7.5 across the malleoli at 0.042.
+        let th = m.j(&n("thigh"), Some(hip), v(0.095 * s * bx, hy, 0.0));
+        let kn = m.j(&n("knee"), Some(th), v(0.08 * s * bx, 0.48 * l, 0.012));
+        let an = m.j(&n("ankle"), Some(kn), v(0.075 * s * bx, 0.085, -0.03));
+        let ball = m.j(&n("ball"), Some(an), v(0.085 * s * bx, 0.022, 0.11));
+        let toe = m.j(&n("toe"), Some(ball), v(0.09 * s * bx, 0.02, 0.165));
+        m.chain(vec![
+            pt(At::J(th), 0.072 * b, 0.09 * b),
+            pt(At::J(kn), 0.062 * b, 0.06 * b),
+        ]);
+        m.ells.push(ell(
+            At::MidOff(th, kn, 0.3, v(0.014 * s, 0.0, 0.01)),
+            g(0.086, 0.19, 0.1),
+            Some(0.03 * bx),
+        ));
+        m.chain(vec![
+            pt(At::J(kn), 0.048 * b, 0.05 * b),
+            pt(At::J(an), 0.033, 0.035),
+        ]);
+        m.ells.push(ell(
+            At::MidOff(kn, an, 0.3, v(0.0, 0.0, -0.015)),
+            g(0.062, 0.11, 0.06),
+            Some(0.03 * bx),
+        ));
+        m.ells.push(ell(
+            At::Off(kn, v(0.0, 0.008, 0.035)),
+            v(0.024, 0.028, 0.015),
+            Some(0.012),
+        ));
+        // Foot 27.1 long, 10.2 broad, heel 7.2.
+        m.ells.push(ell(
+            At::Off(an, v(0.0, -0.052, -0.035)),
+            v(0.034, 0.033, 0.04),
+            Some(0.02),
+        ));
+        m.chain(vec![
+            pt(At::Off(an, v(0.0, -0.045, -0.02)), 0.035, 0.032),
+            pt(At::J(ball), 0.05, 0.022),
+        ]);
+        m.chain(vec![
+            pt(At::J(ball), 0.048, 0.021),
+            pt(At::Off(toe, v(0.0, 0.0, 0.006)), 0.035, 0.016),
         ]);
     }
     if p.tail > 0.0 {
@@ -870,8 +1284,42 @@ fn car(p: &P) -> Pre {
     m
 }
 
+/// Local sculpt warps on a body are symmetric about x = 0 by default (as
+/// under an sdf `mirror`): each is followed by its x-reflection (centre,
+/// direction and normal), unless it says `mirror: false`, sits on the
+/// centre line, or its centre is still an unresolved anchor.
+pub(crate) fn mirror_local_warps(warps: Vec<crate::deform::Deform>) -> Vec<crate::deform::Deform> {
+    let mut out = Vec::with_capacity(warps.len());
+    for w in warps {
+        let twin = match &w.at {
+            Some(crate::deform::WarpAt::Point(p))
+                if crate::deform::LOCAL_MODES.contains(&w.mode.as_str())
+                    && w.mirror != Some(false)
+                    && p[0].abs() > 1e-4 =>
+            {
+                let mut t = w.clone();
+                t.at = Some(crate::deform::WarpAt::Point([-p[0], p[1], p[2]]));
+                if let Some(d) = &mut t.direction {
+                    d[0] = -d[0];
+                }
+                if let Some(n) = &mut t.normal {
+                    n[0] = -n[0];
+                }
+                Some(t)
+            }
+            _ => None,
+        };
+        out.push(w);
+        out.extend(twin);
+    }
+    out
+}
+
 /// Lowers a body item to an sdf and its joints.
 pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
+    if def.preset == "human" {
+        return Err("the human preset is a template, not a field (no sdf lowering)".into());
+    }
     let (h0, _, hr0) = defaults(&def.preset);
     let p = P {
         k: def.head_ratio.map_or(1.0, |h| h / hr0),
@@ -940,21 +1388,37 @@ pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
                     w.w *= k;
                 }
             }
+            for e in &mut m.ells {
+                if matches!(e.at, At::J(j) | At::Off(j, _) if j == i) {
+                    e.r *= k;
+                }
+            }
+            for r in &mut m.rads {
+                if r.0 == i {
+                    r.1 *= k;
+                }
+            }
         }
     }
     let g = m.extent(Vec3::Y).0;
     m.shift_y(-g);
     // The sdf.
     let blend = def.blend.unwrap_or(m.blend);
-    let mut shapes: Vec<Shape> = m
-        .sects()
-        .into_iter()
-        .map(|c| Shape {
-            shape: "chain".into(),
-            points: Some(c),
-            ..Shape::default()
-        })
-        .collect();
+    let ell_shape = |e: &Ell| Shape {
+        shape: "ellipsoid".into(),
+        blend: e.blend,
+        at: Some(m.at(e.at).to_array()),
+        size: Some(e.r.to_array().to_vec()),
+        ..Shape::default()
+    };
+    let mut shapes: Vec<Shape> = m.ells.iter().filter(|e| e.early).map(ell_shape).collect();
+    shapes.extend(m.sects().into_iter().enumerate().map(|(i, c)| Shape {
+        shape: "chain".into(),
+        blend: m.chain_blends.iter().find(|b| b.0 == i).map(|b| b.1),
+        points: Some(c),
+        ..Shape::default()
+    }));
+    shapes.extend(m.ells.iter().filter(|e| !e.early).map(ell_shape));
     for d in &m.dots {
         shapes.push(Shape {
             shape: "sphere".into(),
@@ -1023,22 +1487,33 @@ pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
     // when only a light decimated mesh is kept.
     let (ex, ey, ez) = (m.extent(Vec3::X), m.extent(Vec3::Y), m.extent(Vec3::Z));
     let e = Vec3::new(ex.1 - ex.0, ey.1 - ey.0, ez.1 - ez.0);
-    let mut res = e.max_element() / 135.0;
+    // The biped's face features (nose, lips, eyes) need about 1/160.
+    let div = if def.preset == "biped" { 160.0 } else { 135.0 };
+    let mut res = e.max_element() / div;
     if let Some(t) = def.target_tris.or(def.tris.filter(|_| !def.bake)) {
         let area = 0.55 * 2.0 * (e.x * e.y + e.y * e.z + e.z * e.x);
         let want = (40.0 * t as f32).max(6000.0);
         res = res.max((2.2 * area / want).sqrt().min(e.max_element() / 60.0));
     }
+    // The sdf evaluates each shape only within a band of the item's blend
+    // around it, so a shape blended wider than the item would show a seam
+    // where the band cuts it off: give every shape its blend explicitly and
+    // the item the widest.
+    let mut widest = blend;
+    for sh in &mut shapes {
+        let k = *sh.blend.get_or_insert(blend);
+        widest = widest.max(k);
+    }
     let sdf = SdfDef {
         shapes,
-        blend: Some(blend),
+        blend: Some(widest),
         resolution: Some(def.resolution.unwrap_or(res)),
         tris: def.tris,
         bake: def.bake,
         target_tris: def.target_tris,
-        warps: crate::sdf::resolve_joint_anchors(&def.warps, |n| {
+        warps: mirror_local_warps(crate::sdf::resolve_joint_anchors(&def.warps, |n| {
             m.joints.iter().find(|j| j.0 == n).map(|j| j.2.to_array())
-        }),
+        })),
         ..SdfDef::default()
     };
     // Joint radii: the largest section at the joint.
@@ -1060,6 +1535,11 @@ pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
                     r = r.max(w.r);
                 }
             }
+            for x in &m.rads {
+                if x.0 == i {
+                    r = r.max(x.1);
+                }
+            }
             Joint {
                 name: n.clone(),
                 parent: par.map(|p| m.joints[p].0.clone()),
@@ -1077,11 +1557,17 @@ pub fn lower(def: &BodyDef) -> Result<Lowered, String> {
 /// wags. Blend over the root joint's radius instead (at least the median),
 /// so ±35 degrees at a chain root stays smooth, also on a decimated mesh.
 pub fn bind_blend(def: &BodyDef) -> Option<f32> {
+    if def.preset == "human" {
+        return None;
+    }
     let low = lower(def).ok()?;
     let root = low.joints.iter().find(|j| j.parent.is_none())?;
     let mut r: Vec<f32> = low.joints.iter().map(|j| j.radius).collect();
     r.sort_by(f32::total_cmp);
-    Some(root.radius.max(r[r.len() / 2]))
+    // The biped blends wider: its armpits and crotch are narrow webs
+    // between limbs that swing apart.
+    let k = if def.preset == "biped" { 1.5 } else { 1.0 };
+    Some(k * root.radius.max(r[r.len() / 2]))
 }
 
 /// Meshes a `body` item: the solid with its joints attached (anchors).
@@ -1113,9 +1599,62 @@ pub fn joint_names(preset: &str) -> Vec<String> {
         preset: preset.into(),
         ..BodyDef::default()
     };
-    lower(&def)
-        .map(|l| l.joints.into_iter().map(|j| j.name).collect())
+    rig_joints(&def)
+        .map(|l| l.into_iter().map(|j| j.name).collect())
         .unwrap_or_default()
+}
+
+/// The joints of a body item (its skeleton and anchors), any preset.
+pub fn rig_joints(def: &BodyDef) -> Result<Vec<Joint>, String> {
+    if def.preset == "human" {
+        return crate::human::joints(def);
+    }
+    lower(def).map(|l| l.joints)
+}
+
+/// The skeleton bones a body item makes: (name, parent, head, tail,
+/// radius). The human template gives real tails; the sdf presets leave
+/// them to the children.
+pub fn rig_bones(def: &BodyDef) -> Result<Vec<crate::anim::auto::RawBone>, String> {
+    if def.preset == "human" {
+        return crate::human::rig_raw(def);
+    }
+    Ok(lower(def)?
+        .joints
+        .iter()
+        .map(|j| {
+            (
+                j.name.clone(),
+                j.parent.clone(),
+                j.at,
+                None,
+                Some(j.radius.max(1e-3)),
+            )
+        })
+        .collect())
+}
+
+/// Every part a body item makes (the human template makes extras).
+pub fn build_all(
+    name: &str,
+    def: &BodyDef,
+    lookup: &crate::sdf::Lookup,
+) -> Result<Vec<crate::Part>, crate::ModelerError> {
+    if def.preset == "human" {
+        def.validate()
+            .map_err(|e| crate::ModelerError::Invalid(format!("body `{name}`: {e}")))?;
+        return crate::human::build_with(name, def, Some(lookup))
+            .map_err(|e| crate::ModelerError::Invalid(format!("body `{name}`: {e}")));
+    }
+    build(name, def, lookup).map(|p| vec![p])
+}
+
+/// The part names a body item writes.
+pub fn outputs(name: &str, def: &BodyDef) -> Vec<String> {
+    if def.preset == "human" {
+        return crate::human::outputs(name, def);
+    }
+    vec![name.to_string()]
 }
 
 #[cfg(test)]
@@ -1129,9 +1668,209 @@ mod tests {
         }
     }
 
+    /// Width (x) and depth (z) of the surface in a thin slab at height
+    /// `y`, over the connected run of vertices around `x0` (or the whole
+    /// slab when `x0` is `None`).
+    fn slab(part: &crate::Part, y: f32, x0: Option<f32>, half: bool) -> (f32, f32) {
+        // Where the triangle edges cross the plane.
+        let mut pts: Vec<Vec3> = Vec::new();
+        for t in part.indices.as_chunks::<3>().0 {
+            let w = t.map(|i| part.world_vert(i as usize));
+            for (a, b) in [(w[0], w[1]), (w[1], w[2]), (w[2], w[0])] {
+                if (a.y - y) * (b.y - y) < 0.0 {
+                    pts.push(a.lerp(b, (y - a.y) / (b.y - a.y)));
+                }
+            }
+        }
+        if let Some(x0) = x0 {
+            // The loop nearest x0: points chained within 1.5 cm.
+            let Some(c) = (0..pts.len())
+                .min_by(|&a, &b| (pts[a].x - x0).abs().total_cmp(&(pts[b].x - x0).abs()))
+            else {
+                return (0.0, 0.0);
+            };
+            let mut keep = vec![false; pts.len()];
+            keep[c] = true;
+            let mut stack = vec![c];
+            while let Some(i) = stack.pop() {
+                for j in 0..pts.len() {
+                    if !keep[j] && pts[i].distance(pts[j]) < 0.015 {
+                        keep[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            pts = pts
+                .iter()
+                .zip(&keep)
+                .filter(|k| *k.1)
+                .map(|k| *k.0)
+                .collect();
+        }
+        if half {
+            pts.retain(|p| p.x > 0.0);
+        }
+        let (mut a, mut b) = (Vec3::MAX, Vec3::MIN);
+        for p in &pts {
+            a = a.min(*p);
+            b = b.max(*p);
+        }
+        (b.x - a.x, b.z - a.z)
+    }
+
+    /// The default biped measured against the ANSUR II male medians (2012
+    /// US Army Anthropometric Survey, NATICK/TR-15/007; stature 175.5 cm),
+    /// with a leaner waist for a mannequin. Fractions of stature.
+    #[test]
+    fn the_default_biped_matches_anthropometric_medians() {
+        let part = build("guy", &def("biped"), &|n: &str| {
+            Err(crate::ModelerError::Invalid(n.into()))
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let verts: Vec<Vec3> = (0..part.verts.len()).map(|i| part.world_vert(i)).collect();
+        let (lo, hi) = part.bounds();
+        let st = hi.y - lo.y;
+        let f = |x: f32| x * st / 1.755;
+        let mut fails = Vec::new();
+        let mut table = String::from("landmark | target w x d | model w x d | error %\n");
+        // The torso and arms are measured with the arms moved out (they
+        // hang against the torso); a thigh is the half of the pair at x > 0
+        // (the thighs touch at the top).
+        let mut spread_def = def("biped");
+        for (j, x) in [("shoulder_l", 0.3), ("shoulder_r", -0.3)] {
+            spread_def.joints.insert(
+                j.into(),
+                JointEdit {
+                    offset: Some([x, 0.0, 0.0]),
+                    ..JointEdit::default()
+                },
+            );
+        }
+        let spread = build("guy", &spread_def, &|n: &str| {
+            Err(crate::ModelerError::Invalid(n.into()))
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        // (name, height, seed x, target width, target depth, tolerance,
+        // arms out, half)
+        type Row = (&'static str, f32, Option<f32>, f32, f32, f32, bool, bool);
+        let rows: [Row; 12] = [
+            (
+                "head (breadth, length)",
+                1.664,
+                Some(0.0),
+                0.154,
+                0.2,
+                0.04,
+                false,
+                false,
+            ),
+            ("neck", 1.505, Some(0.0), 0.126, 0.126, 0.06, false, false),
+            ("bideltoid", 1.39, None, 0.509, 0.0, 0.04, false, false),
+            (
+                "chest at nipples",
+                1.289,
+                Some(0.0),
+                0.3,
+                0.253,
+                0.04,
+                true,
+                false,
+            ),
+            (
+                "waist at navel",
+                1.055,
+                Some(0.0),
+                0.295,
+                0.21,
+                0.04,
+                true,
+                false,
+            ),
+            (
+                "hips at buttocks",
+                0.885,
+                Some(0.0),
+                0.344,
+                0.246,
+                0.04,
+                true,
+                false,
+            ),
+            ("thigh top", 0.8, Some(0.09), 0.185, 0.21, 0.06, false, true),
+            (
+                "lower thigh",
+                0.56,
+                Some(0.085),
+                0.13,
+                0.13,
+                0.06,
+                false,
+                true,
+            ),
+            ("calf", 0.36, Some(0.078), 0.125, 0.125, 0.06, false, true),
+            ("upper arm", 1.26, Some(0.526), 0.1, 0.1, 0.06, true, false),
+            ("forearm", 1.03, Some(0.57), 0.09, 0.09, 0.06, true, false),
+            ("wrist", 0.905, Some(0.587), 0.046, 0.062, 0.08, true, false),
+        ];
+        for (name, y, x0, w, d, tol, arms_out, half) in rows {
+            let src = if arms_out { &spread } else { &part };
+            let (mw, md) = slab(src, f(y), x0.map(f), half);
+            let (ew, ed) = (mw / f(w) - 1.0, if d > 0.0 { md / f(d) - 1.0 } else { 0.0 });
+            table += &format!(
+                "{name} | {w:.3} x {d:.3} | {:.3} x {:.3} | {:+.1} / {:+.1}\n",
+                mw * 1.755 / st,
+                md * 1.755 / st,
+                ew * 100.0,
+                ed * 100.0
+            );
+            if ew.abs() > tol || ed.abs() > tol {
+                fails.push(name);
+            }
+        }
+        // Landmark heights.
+        let low = |pred: &dyn Fn(&Vec3) -> bool| {
+            verts
+                .iter()
+                .filter(|p| pred(p))
+                .map(|p| p.y)
+                .fold(f32::MAX, f32::min)
+        };
+        let chin = low(&|p| p.x.abs() < 0.01 && p.z > f(0.05) && p.y > f(1.45));
+        let crotch = low(&|p| p.x.abs() < 0.012 && p.y > f(0.5) && p.y < f(1.0));
+        let tip = low(&|p| p.x > f(0.24) && p.y > f(0.5));
+        let wide = verts
+            .iter()
+            .filter(|p| p.y > f(1.33))
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .map_or(0.0, |p| p.y);
+        // The fingertips get 2.5%: the medians' span (1.032) and fingertip
+        // height can't both hold for an arm hanging in the preset's slight
+        // A-pose (kept off the thighs for the rig).
+        for (name, got, want, tol) in [
+            ("chin", chin, 1.523, 0.015),
+            ("crotch", crotch, 0.845, 0.015),
+            ("fingertip", tip, 0.654, 0.025),
+            ("widest shoulder", wide, 1.39, 0.015),
+        ] {
+            let e = (got - f(want)) / st;
+            table += &format!(
+                "{name} height | {want:.3} | {:.3} | {:+.1} (of stature)\n",
+                got * 1.755 / st,
+                e * 100.0
+            );
+            if e.abs() > tol {
+                fails.push(name);
+            }
+        }
+        eprintln!("{table}");
+        assert!(fails.is_empty(), "off the medians: {fails:?}\n{table}");
+    }
+
     #[test]
     fn every_preset_is_closed_grounded_and_sized() {
-        for &p in PRESETS {
+        // The human template has its own tests (src/human/tests.rs) and
+        // needs its data file.
+        for &p in PRESETS.iter().filter(|p| **p != "human") {
             let d = def(p);
             let t0 = std::time::Instant::now();
             let part = build(p, &d, &|n: &str| {
@@ -1155,6 +1894,85 @@ mod tests {
             assert!((got - h).abs() < 0.04 * h, "{p}: {what} {got} vs {h}");
             eprintln!("{p}: {lo} .. {hi}, {} tris", part.tri_count());
         }
+    }
+
+    /// Highest point of the vertices on one side (|x| > 0.1) of a biped
+    /// built with `warps`, and the widest reach on that side.
+    fn side_ext(warps: serde_json::Value, sign: f32) -> (f32, f32) {
+        let mut d = def("biped");
+        d.warps = serde_json::from_value(warps).unwrap_or_else(|e| panic!("{e}"));
+        let part = build("g", &d, &|n: &str| {
+            Err(crate::ModelerError::Invalid(n.into()))
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (mut y, mut x) = (f32::MIN, 0.0f32);
+        for v in &part.verts {
+            if v[0] * sign > 0.1 && v[1] > 1.2 {
+                y = y.max(v[1]);
+                x = x.max(v[0].abs());
+            }
+        }
+        (y, x)
+    }
+
+    #[test]
+    fn local_warps_on_a_body_are_symmetric_unless_told_not_to() {
+        use serde_json::json;
+        let w = |m: serde_json::Value| {
+            let mut w = json!({"mode": "inflate", "at": "shoulder_l", "radius": 0.15,
+                               "amount": 0.05});
+            if !m.is_null() {
+                w["mirror"] = m;
+            }
+            json!([w])
+        };
+        let (y0l, x0l) = side_ext(json!([]), 1.0);
+        let (y0r, x0r) = side_ext(json!([]), -1.0);
+        assert!((y0l - y0r).abs() < 2e-3 && (x0l - x0r).abs() < 2e-3);
+        // Default: both shoulders grow, equally.
+        let (yl, xl) = side_ext(w(json!(null)), 1.0);
+        let (yr, xr) = side_ext(w(json!(null)), -1.0);
+        assert!(
+            yl - y0l > 0.015 || xl - x0l > 0.015,
+            "left {yl} {xl} from {y0l} {x0l}"
+        );
+        assert!(
+            (yl - yr).abs() < 2e-3 && (xl - xr).abs() < 2e-3,
+            "{yl} {yr} {xl} {xr}"
+        );
+        // mirror: false keeps it on the left.
+        let (yl, xl) = side_ext(w(json!(false)), 1.0);
+        let (yr, xr) = side_ext(w(json!(false)), -1.0);
+        assert!(
+            yl - y0l > 0.015 || xl - x0l > 0.015,
+            "left {yl} {xl} from {y0l} {x0l}"
+        );
+        assert!(
+            (yr - y0r).abs() < 2e-3 && (xr - x0r).abs() < 2e-3,
+            "{yr} {xr}"
+        );
+    }
+
+    #[test]
+    fn a_centre_line_warp_is_applied_once() {
+        let mk = |at: &str| -> Vec<crate::deform::Deform> {
+            serde_json::from_value(serde_json::json!([{"mode": "inflate", "at": at,
+                "radius": 0.2, "amount": 0.03}]))
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let mut d = def("biped");
+        d.warps = mk("chest");
+        let n = lower(&d).unwrap_or_else(|e| panic!("{e}")).sdf.warps.len();
+        assert_eq!(n, 1, "a centre-line warp must not be doubled");
+        d.warps = mk("shoulder_l");
+        let low = lower(&d).unwrap_or_else(|e| panic!("{e}")).sdf.warps;
+        assert_eq!(low.len(), 2);
+        let (Some(crate::deform::WarpAt::Point(a)), Some(crate::deform::WarpAt::Point(b))) =
+            (&low[0].at, &low[1].at)
+        else {
+            panic!("anchors not resolved")
+        };
+        assert!((a[0] + b[0]).abs() < 1e-6 && a[1] == b[1] && a[2] == b[2]);
     }
 
     #[test]

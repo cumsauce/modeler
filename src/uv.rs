@@ -388,6 +388,7 @@ fn metric_box_groups(part: &mut Part) -> Vec<u8> {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut remap: HashMap<(usize, u8), u32> = HashMap::new();
     let mut groups = Vec::new();
+    let mut src: Vec<usize> = Vec::new();
     for t in 0..tris {
         let c = [idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2)];
         if c.iter().any(|&k| k >= count) {
@@ -414,6 +415,7 @@ fn metric_box_groups(part: &mut Part) -> Vec<u8> {
                 }
                 uvs.push(uv);
                 groups.push(key.1);
+                src.push(k);
                 (verts.len() - 1) as u32
             });
             indices.push(id);
@@ -423,6 +425,26 @@ fn metric_box_groups(part: &mut Part) -> Vec<u8> {
     part.normals = normals;
     part.uvs = uvs;
     part.indices = indices;
+    // Per-vertex data that came with the mesh follows the split vertices.
+    if let Some(sk) = &part.skin
+        && sk.joints.len() == count
+        && sk.weights.len() == count
+    {
+        part.skin = Some(std::sync::Arc::new(crate::human::SkinWeights {
+            bones: sk.bones.clone(),
+            joints: src.iter().map(|&k| sk.joints[k]).collect(),
+            weights: src.iter().map(|&k| sk.weights[k]).collect(),
+        }));
+    }
+    if let Some(ms) = &part.morphs
+        && ms.iter().all(|m| m.1.len() == count)
+    {
+        part.morphs = Some(std::sync::Arc::new(
+            ms.iter()
+                .map(|(n, d)| (n.clone(), src.iter().map(|&k| d[k]).collect()))
+                .collect(),
+        ));
+    }
     groups
 }
 

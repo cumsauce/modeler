@@ -230,6 +230,7 @@ fn slow(op: &Op) -> bool {
             | Op::Smooth { .. }
             | Op::Round { .. }
             | Op::Shell { .. }
+            | Op::Garment { .. }
             | Op::Panel { .. }
             | Op::LSystem { .. }
             | Op::Terrain { .. }
@@ -321,6 +322,7 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 | Op::Skeleton { .. }
                 | Op::Bind { .. }
                 | Op::Clip { .. }
+                | Op::Pose { .. }
                 | Op::Sway { .. }
         ) {
             continue;
@@ -396,6 +398,8 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
             hashes.insert(n.clone(), hash_of(n.as_bytes(), &[key]));
         }
     }
+    // Garments hide the body faces they cover (vertices kept).
+    crate::garment::mask_covered(ops, &mut named);
     // Procedural materials map their parts last, so cuts and copies made
     // after the material op are mapped too (one tile = its real size).
     for (_, part) in named.iter_mut() {
@@ -861,6 +865,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
+        | Op::Pose { .. }
         | Op::Sway { .. } => {}
         Op::Primitive {
             name,
@@ -1147,8 +1152,10 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         }
         Op::Body { name, def } => {
             let look = |n: &str| lookup_shared(named, n);
-            let part = crate::body::build(name, def, &look)?;
-            upsert(named, name, part);
+            for part in crate::body::build_all(name, def, &look)? {
+                let n = part.name.clone();
+                upsert(named, &n, part);
+            }
         }
         Op::Silhouette { name, def } => {
             let def = def.live();
@@ -1212,6 +1219,13 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         Op::Deform { name, input, def } => {
             let src = lookup_shared(named, input)?;
             let part = crate::deform::deform(name, &src, def)?;
+            upsert(named, name, part);
+        }
+        Op::Garment { name, def } => {
+            let src = lookup_shared(named, &def.on)?;
+            let (part, covers) = crate::garment::build(name, def, &src)
+                .map_err(|e| format!("garment `{name}`: {e}"))?;
+            crate::garment::remember(op, &src, covers);
             upsert(named, name, part);
         }
         Op::Shell {
@@ -1537,6 +1551,14 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 let out = format!("{name}.{p}");
                 part.name = out.clone();
                 part.visible = true;
+                // The instance's rig is `name.<skeleton>` / `name.<bind>`, so
+                // two instances (or a host skeleton) never share a name.
+                if let Some(b) = &part.rig {
+                    let mut b = (**b).clone();
+                    b.skeleton = format!("{name}.{}", b.skeleton);
+                    b.bind = format!("{name}.{}", b.bind);
+                    part.rig = Some(Arc::new(b));
+                }
                 part.translation = (it + ir * (is * Vec3::from(part.translation))).to_array();
                 part.rotation = (ir * quat_of(part.rotation)).to_array();
                 part.scale = (is * Vec3::from(part.scale)).to_array();
@@ -1564,7 +1586,7 @@ thread_local! {
 
 /// Loads a catalog prefab for instancing, refusing runaway nesting (a prefab
 /// that instances itself, directly or not).
-fn load_prefab_guarded(name: &str) -> Result<Arc<crate::Model>, ModelerError> {
+pub(crate) fn load_prefab_guarded(name: &str) -> Result<Arc<crate::Model>, ModelerError> {
     let depth = PREFAB_DEPTH.with(|d| d.get());
     if depth >= 8 {
         return Err(
@@ -1652,6 +1674,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Skeleton { name, .. }
         | Op::Bind { name, .. }
         | Op::Clip { name, .. }
+        | Op::Pose { name, .. }
         | Op::Sway { name, .. } => name,
         Op::Primitive { name, .. }
         | Op::Extrude { name, .. }
@@ -1676,6 +1699,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Round { name, .. }
         | Op::Deform { name, .. }
         | Op::Shell { name, .. }
+        | Op::Garment { name, .. }
         | Op::Panel { name, .. }
         | Op::Transform { name, .. }
         | Op::Boolean { name, .. }
@@ -1705,6 +1729,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
+        | Op::Pose { .. }
         | Op::Sway { .. } => Vec::new(),
         Op::RadialArray {
             name,
@@ -1751,6 +1776,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
         Op::Scatter {
             name, input, def, ..
         } => crate::scatter::output_names(name, input, def),
+        Op::Body { name, def } => crate::body::outputs(name, def),
         Op::LSystem { name, def } => {
             let mut v = vec![name.clone()];
             if def.has_leaves() {
@@ -1776,6 +1802,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Skeleton { .. } => "skeleton",
         Op::Bind { .. } => "bind",
         Op::Clip { .. } => "clip",
+        Op::Pose { .. } => "pose",
         Op::Sway { .. } => "sway",
         Op::Primitive { .. } => "primitive",
         Op::Extrude { .. } => "extrude",
@@ -1800,6 +1827,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Round { .. } => "round",
         Op::Deform { .. } => "deform",
         Op::Shell { .. } => "shell",
+        Op::Garment { .. } => "garment",
         Op::Panel { .. } => "panel",
         Op::Transform { .. } => "transform",
         Op::Boolean { .. } => "boolean",
@@ -1826,6 +1854,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Skeleton { .. }
         | Op::Bind { .. }
         | Op::Clip { .. }
+        | Op::Pose { .. }
         | Op::Sway { .. }
         | Op::Primitive { frame: None, .. }
         | Op::Extrude { .. }
@@ -1866,6 +1895,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Shell { input, .. } | Op::Split { input, .. } | Op::Panel { input, .. } => {
             vec![input]
         }
+        Op::Garment { def, .. } => vec![def.on.as_str()],
         Op::Scatter { input, on, def, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
             v.push(on);
@@ -1992,8 +2022,31 @@ pub fn describe(ops: &[Op]) -> String {
                     format!(" bones={:?}", def.bones)
                 }
             ),
+            Op::Pose { name, def } => format!(
+                "#{i} pose `{name}` skeleton=`{}` bones={}{}{}",
+                def.skeleton,
+                def.bones.keys().cloned().collect::<Vec<_>>().join(","),
+                if def.mirror { " mirror" } else { "" },
+                if def.ik.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ik={}", def.ik.keys().cloned().collect::<Vec<_>>().join(","))
+                }
+            ),
+            Op::Clip { name, def } if def.mocap.is_some() => {
+                let m = def.mocap.as_ref();
+                format!(
+                    "#{i} mocap `{name}` skeleton=`{}` from {}{}{}",
+                    def.skeleton,
+                    m.and_then(|m| m.file.as_deref())
+                        .map_or("inline bvh".to_string(), |f| format!("`{f}`")),
+                    if def.looping { " loop" } else { "" },
+                    m.and_then(|m| m.root_motion.as_deref())
+                        .map_or(" in_place".to_string(), |a| format!(" root_motion={a}"))
+                )
+            }
             Op::Clip { name, def } => format!(
-                "#{i} clip `{name}` skeleton=`{}` {}s{} tracks={}{}",
+                "#{i} clip `{name}` skeleton=`{}` {}s{} tracks={}{}{}",
                 def.skeleton,
                 def.duration,
                 if def.looping { " loop" } else { "" },
@@ -2009,14 +2062,31 @@ pub fn describe(ops: &[Op]) -> String {
                             .collect::<Vec<_>>()
                             .join(",")
                     )
+                },
+                if def.ik.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ik={}",
+                        serde_json::to_string(&def.ik).unwrap_or_default()
+                    )
                 }
+            ),
+            Op::Garment { name, def } => format!(
+                "#{i} garment `{name}` on `{}` {}",
+                def.on,
+                serde_json::to_string(def).unwrap_or_default()
             ),
             Op::Variant {
                 name,
                 materials,
                 style,
+                show,
+                hide,
             } => format!(
-                "#{i} variant `{name}` looks=[{}]{}",
+                "#{i} variant `{name}`{}{} looks=[{}]{}",
+                if show.is_empty() { String::new() } else { format!(" show={show:?}") },
+                if hide.is_empty() { String::new() } else { format!(" hide={hide:?}") },
                 materials
                     .iter()
                     .map(|l| format!(

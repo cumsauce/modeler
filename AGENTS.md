@@ -175,6 +175,7 @@ type, so there is no need to memorise field names.
 | `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
 | `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
+| `garment` | name, on, [preset], [region {zones, arms, legs, neck, above, below, planes, boxes}], [offset 0.006], [thickness 0.003], [ease], [hem {flare, length}], [skirt {top, hem, flare}], [hide_skin true], [bind] (clothing cut from a body's surface) |
 | `panel` | name, input, face, [rows 1], [cols 1], [inset / border 0.01], [depth 0.005], [gap / seam 0.01] (recessed panels in a face) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
@@ -193,12 +194,14 @@ type, so there is no need to memorise field names.
 | `tri_mesh` | name, verts, indices, [normals], [uvs] (baked raw triangles) |
 | `collider` | name, parts (globs), shape (box / hull / mesh / none), [body static / dynamic / kinematic], [sensor], [hidden] |
 | `marker` | name, kind, [translation], [yaw], [size], [data], [attach], [preview], [components] |
-| `variant` | name, [materials {part or glob: material item fields}], [style {token patch}] (a cosmetic skin; geometry unchanged) |
+| `variant` | name, [materials {part or glob: material item fields}], [style {token patch}], [show], [hide] (a cosmetic skin or an outfit; geometry unchanged) |
 | `light` | name, kind (point / spot / directional), [color], [intensity], [range], [translation], [direction], [inner_degrees], [outer_degrees], [shadows], [attach] |
 | `decal` | name, pbr (a `decal`-domain material), size [w, h] or [w, h, depth], [on], [at], [toward down], [translation], [direction], [roll], [attach], [kind clustered / forward], [params] |
 | `skeleton` | name, bones {name: {head, [tail], [parent], [radius]}} (points or anchors), [mirror x] or [from: lsystem / skin op, bone_length, max_depth, max_bones] |
 | `bind` | name, skeleton, parts, [bone] (rigid) or [mode smooth / auto], [blend], [paint] |
-| `clip` | name, skeleton, duration, tracks {bone: {rotate / translate / scale: keys or wave}}, [mirror {bone: {from, phase}}], [loop true], [interp smooth] |
+| `clip` | name, skeleton, duration, tracks {bone: {rotate / translate / scale: keys, wave or {euler}}}, [mirror {bone: {from, phase}}], [ik], [poses [[t, pose]]], [over clip], [additive], [weight], [bones], [root_motion], [events [[t, name, data?]]], [loop true], [interp smooth] |
+| `pose` | name, skeleton, bones {bone: {rotate, translate, scale}}, [mirror], [ik {end bone: {target, pole, chain, rotate}}] (a static pose clips key whole) |
+| `mocap` | name, skeleton, file (a project BVH) or bvh (inline text), [map "auto" / {bone: joint} / {"only": {...}}], [range [t0, t1]], [fps 30], [loop false / true / "blend" + blend 0.25], [scale], [root_motion "in_place" / true / {axes}], [feet {plant, contact_height 0.03, contact_speed 0.15}], [hands], [mirror], [speed 1], [facing deg / "auto"], [interp linear] (motion capture retargeted into an ordinary clip) |
 | `sway` | name, skeleton, [kind wind / spring], [over clip], [bones], [duration 4], [fps 30], wind: [direction], [strength], [gust], [flutter], [frequency], [seed]; spring: [stiffness], [damping], [gravity] |
 | `uvs` | part, projection (box / planar / cylindrical / spherical / metric = box in meters / face = one upright image per side, alias label; planar maps along the thinnest axis) |
 | `repeat` | var, count or values, items (a loop, expanded before anything else) |
@@ -668,7 +671,12 @@ surfaces, not hundreds of scattered copies.
   the smooth falloff, 0.8 x linear, 0.4 x sharp), so for a bigger change
   use a larger `radius` or several warps. Under the item's `mirror` a
   local warp is symmetric by default (placed at x < 0 it acts on both
-  sides); `"mirror": false` on the warp keeps it one-sided. An `at` of
+  sides); `"mirror": false` on the warp keeps it one-sided. A `body` has no
+  field mirror, but its local warps are symmetric the same way: each is
+  applied at `at` and at its x-reflection (direction / normal reflected),
+  once if it is on the centre line (`"mirror": false` keeps it on one side),
+  so `shoulder_l` inflates both shoulders and asymmetric joint overrides
+  still work. An `at` of
   `"part:anchor"` works on sdf, skin and body and makes that part a
   dependency. A fuller chest:
   `{"type": "body", "name": "guy", "preset": "biped", "warps": [{"mode":
@@ -718,7 +726,7 @@ surfaces, not hundreds of scattered copies.
   skin of named joints with oval sections, standing on y = 0, facing +z
   (left = +x):
   - presets: `biped` (a person, `height` = standing height, default
-    1.75, head 1/7.5 of it), `quadruped` (a cat: `height` = shoulder
+    1.75, head 1/7.5 of it), `human` (a template mesh, below), `quadruped` (a cat: `height` = shoulder
     height, 0.25), `bird` (standing height 0.25), `fish` (length 0.4),
     `serpent` (length 2), `car` (length 4.3; build = width, leg_length =
     wheel size, snout / tail = front / rear overhang, head_ratio = cabin
@@ -732,7 +740,9 @@ surfaces, not hundreds of scattered copies.
     sizes the sections at that joint, offset (meters) moves it with every
     joint below it; the body is grounded again afterwards. An unknown
     name lists the preset's joints (biped: hip, spine, chest, neck, head,
-    jaw, shoulder/elbow/wrist/hand, thigh/knee/ankle/ball/toe `_l`/`_r`;
+    jaw, clavicle/shoulder/elbow/wrist/hand, thigh/knee/ankle/ball/toe
+    `_l`/`_r`; the clavicles sit between chest and shoulder so a rig can
+    shrug;
     quadruped: hip, spine, chest, neck, head, snout, ear, shoulder,
     elbow, wrist, paw, thigh, knee, hock, foot, tail_1..4; ...).
   - it brings a skeleton `<name>_rig` with exactly those joints (unless
@@ -740,14 +750,213 @@ surfaces, not hundreds of scattered copies.
     (default true with the rig), an implicit smooth bind `<name>_bind` of
     the part to it, so clips work at once; a `bind` item on that rig
     replaces it, `bind: false` turns it off.
-  - the car is a boxy superellipse body with a rounder cabin; the biped's
-    face has brow, cheeks, eye sockets, ears, lips and chin, and its arm
-    span is about its height. The default voxel is 1/135 of the size.
+  - the car is a boxy superellipse body with a rounder cabin. The biped
+    follows the ANSUR II male medians (2012 US Army anthropometric
+    survey; widths, depths and landmark heights as fractions of stature,
+    a leaner waist; `build` 1.15 reaches the median waist), checked by
+    the `the_default_biped_matches_anthropometric_medians` test: its
+    torso and muscles are ellipsoids blended over single tapered limb
+    segments, with a mannequin face (brow, nose, shallow sockets, lips,
+    jaw, ears) and arm span 1.03 x height. The default voxel is 1/135 of
+    the size (the biped's 1/160).
   - the joint names are anchors on the part: `"cat:paw_l"` works as a
     move / rotation pivot, a primitive `frame` and a skeleton head or
     tail, and follows moves of the part.
   - `tris` keeps it light: `{"type": "body", "name": "cat", "preset":
     "quadruped", "tris": 6000}`.
+  - **`preset: "human"`** is a parametric *template*, not a field: an
+    authored quad base mesh (MakeHuman's CC0 core assets) plus a basis
+    of morph targets, re-derived like any op. `{"type": "body", "name":
+    "eve", "preset": "human", "gender": 0, "age": 30, "muscle": 0.5,
+    "weight": 0.5, "height": 1.63, "proportions": 0.5, "ethnicity":
+    {"african": 0.2, "asian": 0.3, "caucasian": 0.5}, "shape":
+    {"nose-width1": 0.3, "head-fat": -0.4}, "expression":
+    {"mouth-corner-puller": 0.6}, "detail": 1, "parts": ["eyes",
+    "teeth", "tongue"]}`.
+    - `gender` 0 female .. 1 male (default 0.5); `age` in years (> 1;
+      default 25) or MakeHuman's 0..1 (baby 1 y = 0, child 11 y =
+      0.1875, young 25 y = 0.5, old 90 y = 1); `muscle`, `weight`
+      (body fat), `breast_size`, `breast_firmness` 0..1 (default 0.5);
+      `proportions` 0..1 (0.5 neutral, above idealized, below uncommon);
+      `ethnicity` weights (normalized, default equal). These blend the
+      macro targets multilinearly between the nodes their files are
+      named after. `height` is the final stature in meters: the template's
+      own height targets are searched for it (they keep its proportions,
+      a tall adult is not a scaled child), then it is scaled exactly;
+      without `height` the figure keeps the template's natural size
+      (about 1.59 m female, 1.73 m male at 25 y).
+    - `shape`: any detail target by its MakeHuman modifier name
+      (`nose-width1`, `head-fat`, `l-foot-scale`, `measure-waist-circ`,
+      `r-eye-bag-decr-incr` where a target has several pairs: `{target}-
+      {min}-{max}`), -1..1 between its decrease and increase files
+      (one-sided keys 0..1); `expression`: face units 0..1
+      (`mouth-open`, `mouth-corner-puller` = smile, `mouth-elevation`,
+      `eye-left-closure`, `eyebrows-left-inner-up`, ... 34 units).
+      Unknown names error with close matches.
+    - `detail` 0..2 is Catmull-Clark over the quad cage (0: 26,756
+      triangles; 1: 107,024; 2: 428,096), skin weights, morph deltas and
+      uvs carried through the same stencils; the subdivided body is
+      scaled back to the cage's stature (exactly `height`) on y = 0, and
+      the rig's joints are read from that subdivided surface. `tris`
+      decimates the body last (without `bake` it starts from the
+      coarsest level with at least `tris` triangles, and a budget at or
+      above that count is not decimated): weights, morphs and joints come
+      from the nearest dense vertex, and the **template uvs are kept**
+      (each light triangle takes its uvs from the nearest dense
+      triangle's uv island, seams split vertices; a few triangles
+      straddling a seam stretch there). Local `warps` (inflate / push /
+      pinch / flatten / smooth) are vertex displacements on the cage,
+      symmetric about x = 0 like the other presets, centred on a point, a
+      joint name (`"chest"`, `"eve:chest"`), another part's anchor
+      (`"desk:top"`, a joint of another body) or anchor words on the
+      body's own box (`"top-front"`); field warps (twist, bend, taper,
+      displace) are refused. Warps don't move the rig.
+    - `measure: {"chest": 1.0, "waist": 0.85, "hips": 1.0, "neck": 0.38,
+      "upper_arm": 0.31, "thigh": 0.58, "calf": 0.37}` (meters; also
+      `underbust`, `wrist`, `knee`, `ankle`) solves MakeHuman's
+      `measure-*-circ` targets one by one (a bisection on each slider,
+      two rounds) so a tape round the body reads that girth: the convex
+      perimeter where a plane through the target's most-moved vertices
+      (level for the torso, square to the limb for arms and legs, left
+      side) cuts the skin that target shapes. It lands within 0.01% when
+      the slider can reach the girth; each slider spans what MakeHuman's
+      does (the waist only about +14% over the default), and a girth
+      beyond is clamped to the slider's end: raise `weight` / `muscle`
+      first. The tape is this preset's own, not ANSUR's landmarks.
+      Defaults run ~12-18% under ANSUR II torso medians
+      (`default_adults_against_ansur_medians`): use `measure` or
+      `weight` for a target build.
+    - The body is closed: the lips meet, and behind them is a closed
+      inner mouth cavity, so an open mouth (the `mouth-open` unit or the
+      `jaw` bone) shows the teeth and tongue inside it. Extras are
+      separate parts: `<name>_eyes` (spheres fitted to the template's eye
+      helpers, looking along +z, each on its `eye_l` / `eye_r` bone),
+      `<name>_teeth` (upper on `head`, lower on `jaw`, holes capped),
+      `<name>_tongue` (on `jaw`; expression units carry it with the lower
+      teeth); `parts: []` for none. Teeth (enamel, light clearcoat) and
+      tongue (wet pink) wear built-in card-domain looks over their own
+      uvs, like the eyes; a `material` item replaces them. No eyelashes or eyebrows (the
+      template's are hair cards, not kept).
+    - **Eyes look right without a material**: `<name>_eyes` wears a
+      built-in card-domain material (`human_eye`, embedded in the part):
+      the eye's uvs are azimuthal about the pupil (uv [0.5, 0.5] is the
+      front pole; iris radius 0.08 in uv), drawn as sclera with faint
+      veins, an `eye_color` iris (`"#3a6ea5"` or [r, g, b]; default a mid
+      brown) with noise fibres, a dark limbus ring, a `pupil`-scaled pupil
+      (1 = normal, 0.4..2.2) and a clearcoat cornea. A `material` item on
+      the eyes replaces it (`human::eye_graph` is the node recipe, for
+      `material_ops` with domain `card`, tile 1).
+    - The rig is a game rig of 58 bones named like the biped's: hip,
+      spine, chest, neck, head, jaw, eye_l/r, clavicle, shoulder, elbow,
+      wrist, hand (a knuckle joint the fingers hang from), thumb_1..3,
+      index / middle / ring / pinky_1..3, thigh, knee, ankle, ball, toe
+      `_l`/`_r` (bone named by the joint at its head, real tails from the
+      template). Its weights start from the template's own (not
+      envelopes), merged from MakeHuman's 163-bone skeleton into the kept
+      ancestors (twist bones into their limb bone, face bones, extra
+      spine, toes onto `ball`), then reworked for deformation: between
+      the legs each thigh's weight fades to zero toward the midline over
+      4 cm below the hip joints (the rest goes to `hip`), the body's
+      weights diffuse 8 half-steps over the skin (digits excluded, so
+      fingers keep their own) and more round the armpits, elbows, wrists
+      and knees; the mouth helpers ride one bone each. `verify animation`
+      stretch, game rig vs `rig: "full"` (the source weights): walk
+      (thigh +-30, knee 50, shoulder 25) 1.58 vs 2.90, arms out to
+      horizontal (shoulder z 45) 1.98 vs 2.74, knee 120 1.48 vs 2.22,
+      wrist 60 1.27 vs 1.63, neck turn 60 1.46 vs 2.79, spine 30 1.14 vs
+      1.29; still over 2: arms raised 90 over the A-pose 2.71 (4.20),
+      arms forward 90 2.64 (3.93), elbow flexed 120 3.72 (5.12), crouch
+      (thigh -100, knee 120) 2.70 (6.18), fist (fingers 80/90/90) 4.72
+      (4.72), jaw open 20 10.49 (10.66: the lip corners, where the closed
+      mouth slit tears; the `mouth-open` expression opens it cleanly).
+      **Correctives** (on by default for the human, see `bind`) bring
+      those to: elbow 120 1.26 (16-sample sweep 1.26), knee 120 1.24,
+      crouch 2.39, arms up 2.36, arms forward 1.78, arms out 1.67, fist
+      3.06, jaw 4.56, walk 1.58, wrist 1.17, neck 1.45, spine 1.17 (small
+      finger curls get a little worse: all fingers at 18 degrees 1.17 ->
+      1.91). 124 targets, ~22k sparse offsets, about 45 ms of build time,
+      recomputed (and cached) per mesh, weights and rig, since they
+      depend on the shape.
+      `rig: "full"` keeps the whole skeleton (face bones too, names
+      `upperarm01.L` -> `upperarm01_l`) with the source weights. Joint
+      names are anchors (`"eve:wrist_l"`). The bind covers the body and
+      its extras.
+    - **What a rotation means on each bone** (game rig). Legs, spine,
+      neck, head and jaw are world-aligned (identity rest), so biped clips
+      keep their meaning: `thigh_l {"x": 30}` swings the leg back (-x
+      forward), `knee_l {"x": 50}` bends the shin back, `ankle_l {"x":
+      15}` points the toes down, `ball_l {"x": -20}` bends the toes up,
+      `spine {"x": 30}` bends forward, `neck {"y": 60}` turns the head,
+      `jaw {"x": 20}` opens the mouth. Arms and digits have anatomical
+      rest frames (`human::bone_frames`, applied by the rig): local +y
+      runs along the bone and **+x flexes it on both sides** (shoulder:
+      raises the arm forward; elbow: closes; wrist, fingers, thumb: curl
+      toward the palm); y twists about the bone and z abducts, both
+      mirrored left / right like every mirrored track (`shoulder_l {"z":
+      45}` raises the left arm out to the side, `shoulder_r {"z": -45}`
+      the right; `{"z": -36}` on the left brings an A-pose arm down to the
+      side). x 0 is the template's A-pose, whose elbow is already bent
+      ~30 degrees. Limits: knees x 0..150; elbows x from minus their rest
+      bend (straight) to 150 minus it; finger bases x -20..95, finger
+      joints -5..110 with y / z nearly locked; wrists x -70..80. IK on
+      `wrist_l` (chain 2) reaches with the elbow keeping its rest bend
+      plane; for a reach in front of the chest give a `pole` out and back
+      (`[0.5, 0.9, -0.4]` on the left), or the elbow tucks in front of the
+      body; an overhead target straightens the arm toward it.
+    - **Poses** (`examples/human_poses.json`, `pose` items on `eve_rig`,
+      checked in renders, mirror on): `stand` (arms down at the sides,
+      elbows and fingers relaxed: the natural standing pose over the
+      A-pose rest), `t`, `crouch`, `sit` (hip lowered, thighs level: put
+      a seat under it), `wave` (right hand up), `point` (right index
+      forward), `fist`. Key them in clips with `"poses": [[0, "stand"],
+      ...]` or layer a clip over them.
+    - A walk to start from: `examples/human_walk.json` (a plain
+      `apply_ops` batch), generated from published normative gait
+      kinematics by `python3 -I examples/gait_gen.py --out
+      examples/human_walk.json` (`--cadence` for other paces): 112
+      steps/min (1.07 s cycle) in place at 1.19 m/s, stride 1.27 m
+      (0.78 x stature). The table's thigh / knee angles on the rig's own
+      leg lengths give the ankle path; stance rolls heel -> flat foot ->
+      heel rise at 31% about the ball (toes flat up to 40 degrees, then
+      on the tip) -> toe-off at 62%, planted at exactly the walking speed;
+      the pelvis sits where the leading leg has the table's knee (2.8 cm
+      bob, lowest in double support, highest in mid stance), with +-4
+      degrees rotation and obliquity, +-2 cm sway, thorax and head
+      counter-rotating, 10 cm step width, and arms swinging opposite the
+      legs from the `stand` pose. `ankle_l` IK (mirrored to `ankle_r` at
+      phase 0.5) with `rotate` keys for the foot pitch, `ball_l` for the
+      toes; the clip starts at mid stance of the left leg. It passes
+      `verify animation` loop, stretch 2 (1.90x), floor, `foot_slide`
+      `{"speed": [0, 1.1853], "contact_height": 0.012}` (6 mm; the toe tip
+      sits 8 mm up at rest and clears the floor by ~1 cm in mid swing, so
+      the default 3 cm reads swing as planted), `smooth` and `gait` (thigh
+      rms 3.8, knee 7.0, ankle 4.3 degrees). Rig limits it works around:
+      the knee can't straighten past its ~7 degree rest bend (stance knee
+      >= 8 instead of the normal 3-5), and under this pelvis the table's
+      mid-swing pose carries the toe through the floor, so the swing ankle
+      is lifted (thigh peaks 31 instead of 25). A travelling version is
+      not provided: world `ik` targets don't carry `root_motion` travel
+      across the loop seam.
+    - `shapes: {"smile": {"expression": {"mouth-corner-puller": 1}},
+      "wide": {"shape": {"nose-width1": 1}}}`: named morph targets, the
+      item's own base with those values swapped in, as per-vertex deltas;
+      exported as glTF morph targets (`primitives[].targets`, mesh
+      `weights` all 0, `extras.targetNames`). Keying them from a clip is
+      not implemented yet.
+    - Without a `material` item the body wears a built-in skin look
+      (`human_skin`, `human::skin_graph`: card domain over the template
+      uvs, mottled tone, roughness 0.45-0.65 from pores, transmission
+      0.25), so it passes `materials: "pbr"`. No `skin_tone` parameter or
+      zone masks (lips, nails) yet.
+    - The template file is `data/human/human.bin` (14.5 MB; packed by
+      `cargo run --example pack_human -- <makehuman>/makehuman/data`,
+      see `data/human/README.md`). It is looked for at
+      `$MODELER_HUMAN_ASSET`, then beside the running binary
+      (`human.bin` or `data/human/human.bin`; the installed build in
+      `bin/modeler/` needs `bin/modeler/human.bin`), then this
+      repository's `data/human/`, then `data/human/` under the
+      working directory; a missing file is an error naming every path
+      tried. Tests that need it skip with a message.
 - **`silhouette`** carves a solid from two or three orthographic
   outlines, the way a modeler blocks out a car, shoe, gun or plane from
   blueprints: `side` (`[[z, y], ...]`, seen from +x, front = +z), `top`
@@ -833,6 +1042,67 @@ surfaces, not hundreds of scattered copies.
   "above"` / `"below"` makes only that half; `gap` pushes the halves apart
   along the normal (half each way). Hide the input. A plane that misses the
   part errors with the part's extent along the normal.
+- **`garment`** cuts clothing out of the surface of the closed part it is
+  `on` (a `human` body, an sdf creature, or another garment for layers),
+  so it fits any shape parameters and re-derives with them (`src/garment.rs`).
+  A region field over the body's (welded) vertices is clipped along its
+  zero line (even hems, not stair-stepped faces), offset along smooth
+  normals by `offset` meters, relaxed by `ease` (0 skin-tight, 1 bridges
+  hollows, up to 3 merges toes / fingers; never closer than `offset` over
+  its own source point), flared at the border by `hem: {flare, length}`
+  and, with `thickness` > 0 (default 0.003), closed into a shell (inner
+  layer at `offset`, outer at `offset + thickness`, borders stitched): a
+  manifold solid that passes `validate`. `thickness: 0` is one open sheet.
+  - `region`: `zones` (human only: head, neck, torso, hips, arms, hands,
+    legs, feet, from the skin weights), `arms` (none / cap / short / elbow /
+    forearm / wrist, or `[from, to]` along shoulder 0 -> elbow 1 -> wrist 2),
+    `legs` (none / short / knee / calf / ankle or `[from, to]`, hip joint 0
+    -> knee 1 -> ankle 2), `neck` (crew default, `high`, `v` or the v's
+    depth), `above` / `below` (meters or a joint with an offset,
+    `"hip-0.02"`, `"knee_l+0.06"`), `planes` [{normal, point}] (keep the
+    side the normal points to), `boxes` [{min, max}]. Everything given must
+    hold; zones are a union. On a body without skin weights use the
+    heights, planes and boxes.
+  - `preset` (on a `human`; every field overrides it, region fields one by
+    one): `tshirt`, `longsleeve`, `tank`, `trousers`, `shorts`, `skirt`,
+    `dress`, `socks`, `shoes` (an upper eased over the toes plus a flat
+    sole on y = 0, rigid at the ankle), `gloves`, `hood`, `briefs`, `bra`,
+    and hair caps `hair_buzz`, `hair_short`, `hair_bob` (a hairline from
+    the head joint; solid caps, no strand cards yet). Tops sit over
+    bottoms (shirt offset 0.010 over trousers 0.005 + 0.003).
+  - `skirt: {top, hem, flare?}` bridges the legs: a tube from the convex
+    hull of the body's horizontal slices (arms left out), never narrower
+    than the ring above, flaring by `flare` (0.08) to the hem. `skirt` and
+    `dress` use it; a dress adds a bodice from the region.
+  - **Hides the covered skin** (`hide_skin`, default true): body faces
+    the garment covers at least 12 mm from its borders are dropped from
+    the body's index list at the end of evaluation while the garment is
+    visible (vertices kept, so skin weights, morphs and correctives keep
+    their counts; the masked body is marked a sheet so `validate` passes).
+    The body op is unchanged: hide or delete the garment and the skin
+    comes back, and a variant that hides it brings the skin back in that
+    variant.
+  - **Weights**: on a body with skin weights the garment carries the
+    body's own weights at every vertex (exact from the vertex it was cut
+    from, diffused a little over its own edges; shoes move ball / toe
+    weight to the ankle), which a smooth `bind` on the body's rig uses
+    directly. Bind each garment: `{"type": "bind", "name": "shirt_bind",
+    "skeleton": "eve_rig", "parts": ["shirt"], "mode": "smooth",
+    "weights_from": "eve"}` (correctives come from the body). Don't bind a
+    garment rigidly on the body's rig: a bind without `weights_from`
+    replaces the body's implicit bind.
+  - The default look is a built-in tile fabric per preset (`garment_<preset>`
+    graphs: weave noise, mottling); any `material` item replaces it.
+  - Measured (lib tests `garment::tests`): every preset builds in 1-30 ms
+    on the female, male, heavy and child templates (2.4k-14.6k triangles);
+    at rest the shirt, trousers, tank, skirt, dress, hood keep >= 1.3 mm
+    clearance (nearest-vertex metric), socks / gloves dip between toes /
+    fingers, shoes' soles sit inside the foot by design. Through the walk
+    0.4-0.7% of the shirt's and 0.3-1.3% of the trousers' vertices are
+    inside the (hidden) skin, crouch 2% / 13% (the knee fold); with the
+    skin hidden none of it shows. Known: the shirt's armpit folds to 1/15
+    under the walk's arm swing, so `verify animation stretch` fails there.
+  An outfit: `examples/human_outfit.json`.
 - **`shell`** hollows a closed solid: every face moves in by exactly
   `thickness` (erosion by a ball, so convex corners stay sharp), and each
   face named in `open` (top/bottom/left/right/front/back, world axes; or
@@ -1087,7 +1357,10 @@ name: the producer first, then in-place material/visibility/transform edits).
     single-frame shot kept its noise as speckle on glossy/metal parts and
     its smears read as geometry. They are deferred too, single-frame with
     SMAA, so shots are deterministic (an unchanged view `diff`s to 0%).
-    Agent views add SSAO contact shading; the window does not (SSAO froze
+    Agent views add SSAO contact shading in perspective views only (Bevy's SSAO
+    mis-handles orthographic cameras and draws concentric contour rings on
+    smooth surfaces, so ortho shots go without; the shadowed key still gives
+    them depth); the window does not (SSAO froze
     its presentation on Metal, and so does a forward window camera over the
     deferred materials: keep the window camera deferred).
     `material_view` shades its sphere with the same studio. Renders wait for
@@ -1240,7 +1513,14 @@ batches, bytes):
 - `lods: [0.5, 0.2]` (opt-in): every part with at least `lod_min_tris`
   (300) triangles gets simplified copies `<part>.lod1`, `.lod2` (quadric
   simplification that keeps seams and uvs, so they reuse the full part's
-  textures) as sibling nodes. Each node's `extras.lod = {level, near,
+  textures) as sibling nodes. Skinned parts get LODs too: half-edge
+  collapses keep each surviving vertex's own skin weights, morph targets
+  and corrective offsets, a cost term (weight change squared times edge
+  length^4) keeps the density where weights change fastest (the joints),
+  and each LOD node is skinned to the same joints with its own
+  JOINTS_0 / WEIGHTS_0 and carries the correctives (and `shapes`) at
+  every level (sparse, so cheap). The human walk stays at 1.90x stretch
+  on 26.8k / 13.4k / 5.4k triangle levels. Each node's `extras.lod = {level, near,
   far}` gives the camera distances (m) it is meant for: `lod_distances:
   [20, 60]`, or by default 15x and 45x the part's size. Instanced copies
   share the LOD meshes. In Bevy, put a `VisibilityRange` from those
@@ -1385,9 +1665,24 @@ materials" in Material mode. To strew many decals over a surface
   Markers the same way: read `extras.marker` and spawn your own
   components at the node's `Transform`.
 
-**Variants (cosmetic skins):** alternate looks for one model (red / blue
-team, clean / rusty) that game code switches at runtime. Geometry never
-changes; the base model is the variant `default`.
+**Variants (cosmetic skins and outfits):** alternate looks for one model
+(red / blue team, clean / rusty, casual / formal) that game code switches
+at runtime. Geometry never changes; the base model is the variant
+`default`.
+
+- **Outfits**: `show` / `hide` (part names or `*` globs) make a variant
+  an outfit: `{"type": "variant", "name": "casual", "show": ["shirt",
+  "jeans"], "hide": ["armor_*"]}` (hide the outfit's pieces in the base
+  with `hide_part`). The variant re-derives with those visibility edits
+  after every op, so garments' covered-skin masks follow the outfit.
+  `agent_views(variant / variants)`, `verify materials` per variant and
+  the export see it. Export: every part some variant shows is exported,
+  and its node carries `extras.variants_visible: {"default": false,
+  "casual": true, ...}`; only garments visible in every variant hide skin
+  in the exported body (one mesh serves every outfit).
+  `modeler_bevy::ModelerPlugin` reads it into `ModelerVariantVisibility`
+  and sets each node's `Visibility` from the `ModelerVariant` above it
+  (default when none).
 
 - `{"type": "variant", "name": "red_team", "materials": {"body*": {"pbr":
   "paint", "params": {"hue": 0.0}}, "trim": {"color": "#c33", "flat":
@@ -1482,11 +1777,21 @@ params, atomic, undoable). They run after the graph, as `move` does, so the
 geometry recipe stays as it is. One pose evaluator serves every consumer:
 agent views, verify, inspect, export and the window.
 
-- **Bone frames are world-aligned at rest.** A bone has a `head` (its pivot),
-  a `tail` and a parent. Every rest rotation is the identity, so a clip
-  rotation `{"x": 25}` means "pitch 25 degrees about world x from rest", with
-  no bone roll to think about. Clip tracks are offsets from rest, composed
-  down the tree.
+- **Bone frames are world-aligned at rest by default.** A bone has a `head`
+  (its pivot), a `tail` and a parent. By default every rest rotation is the
+  identity, so a clip rotation `{"x": 25}` means "pitch 25 degrees about
+  world x from rest", with no bone roll to think about. A bone may set a
+  rest frame: `rest` (a world rotation in any rotation form) and/or `roll`
+  (degrees about head -> tail, with the frame's +y along the bone; even
+  `roll: 0` aligns the frame to the bone). That bone's clip channels are
+  then in its own frame (`{"x": 25}` turns about its local x), and
+  `mirror: "x"` twins get the mirrored frame, so mirrored tracks stay
+  symmetric. Exports write the rest frame as the joint node's rotation
+  (inverse binds to match). Clip tracks are offsets from rest, composed
+  down the tree. Built skeletons and clips are cached by a content hash of
+  the rig ops and the parts they resolve against (`anim::rig_key`), so a
+  lookup per frame is cheap. Limit: the runtime sway plugin
+  (`modeler_bevy`) still assumes world-aligned rests.
 - **`skeleton`**:
   ```json
   {"type": "skeleton", "name": "rig", "mirror": "x", "bones": {
@@ -1498,6 +1803,17 @@ agent views, verify, inspect, export and the window.
   - `mirror: "x"` makes a `_r` twin of every `_l` bone.
   - `radius` is the envelope for smooth weights (default a fifth of the
     bone's length): about the limb's thickness.
+  - `limits: {"x": [-150, 0], "z": [-10, 10]}` (degrees) constrains a
+    joint. The bone's clip rotation (its offset from rest, in its rest
+    frame) is split into Euler angles in the order rotations `{x, y, z}`
+    apply (x, then y, then z) and each named axis is clamped: after the
+    tracks, again after IK and after `look_at`. Mirror twins get y and z
+    flipped. Exports write them to the joint node's `extras.limits`.
+  - `look_at: {"target": [0, 1.6, 2] | "ball:center" | "head_target",
+    "axis"?: "z" | "-x" | [x, y, z], "weight"?: 0.8}` turns the bone
+    after IK so its `axis` (in its rest frame, default head -> tail)
+    points at the target: a point, a part anchor or another bone's posed
+    head (eyes, a head tracking something).
 - **Auto-rigs (`from`)**: instead of listing bones, `from` names an op.
   - **An `lsystem`**: bones run along its branches (`trunk_0..`,
     `branch7_0..`), one every `bone_length` meters (0.5), down to `max_depth`
@@ -1516,6 +1832,41 @@ agent views, verify, inspect, export and the window.
   - `mode: "auto"` on an lsystem rig gives exact weights along the branches,
     and every leaf card rides its twig's bone rigidly. Bind both:
     `"parts": ["oak", "oak_leaves"]`. On any other rig, `auto` is `smooth`.
+  - `weights_from: "eve"` (smooth): clothing, armour, hair caps modelled
+    over a bound body take each vertex's weights from the closest point of
+    that part's surface (barycentric over the closest triangle), and its
+    correctives too (the body's offsets at that point, same drivers), so
+    the cloth follows the corrected skin; `blend` then smooths the weights
+    over the part's own edges. Such a bind doesn't replace a body's
+    implicit bind on the same rig. A sleeve over the human's arm keeps its
+    offset from the skin within 0.5 mm through the walk and 2.9 mm at the
+    elbow's limit (~107 degrees: LBS shortens an offset across the bend).
+  - `correctives: true | false | {joints: ["elbow_*"], poses: [{bone,
+    axis: "x", degrees: 120}], max: 128}` (smooth; on by default for a
+    mesh with the human template's weights, off elsewhere): pose-driven
+    corrective shapes, so plain linear blend skinning (what glTF and Bevy
+    do) looks like a better deformer. For each key pose (human: elbow /
+    knee 120, shoulder up 90 / forward -90, hip forward -100 / out 45,
+    wrist +-60, finger joints 90, spine / neck twist, spine 30, jaw 20;
+    other rigs: each limited axis at its ends, else x +-90) the reference
+    is the LBS pose with the joint's blend zone relaxed toward the rest
+    edge lengths (vertices split between the bone's subtree and the rest,
+    owned by that subtree and its ancestors, two rings wider), held to
+    LBS elsewhere. The difference, carried back by the inverse blended
+    matrix, is a sparse rest-space morph target. Deep bends get in-between
+    keys (a third / half of the way, warm-started from the previous key)
+    whose weights are tents on the bone's twist angle about the key axis
+    in its rest frame (`from` -> `degrees` -> `to`), so the correction
+    follows the sweep with no pops (elbow: at most 1.3 mm change per 4
+    degrees). Every posing path (views, verify, inspect, the window)
+    applies them before skinning. Exported after the `shapes` as ordinary
+    morph targets with the driver table in the node's and mesh's
+    `extras.correctives` (`[{target, name, bone, axis, degrees, from, to,
+    rest_local}]`); clip `morphs` samplers write 0 in their slots.
+    Bevy allows 256 morph targets per mesh (shapes + correctives), and its
+    morph-texture path (WebGL2) caps vertices x targets x 12 floats at
+    2048^2; the human (14.5k vertices, 124 targets) fits the first, not
+    the second, so on WebGL2 use `correctives: {"max": 24}` or fewer.
 - **`clip`**: keyframed motion.
   ```json
   {"type": "clip", "name": "walk", "skeleton": "rig", "duration": 1.0,
@@ -1530,6 +1881,130 @@ agent views, verify, inspect, export and the window.
   - `mirror` + `phase` copies a track to the other side, mirrored and half a
     cycle later, so a walk is half-authored.
   - `loop` defaults to true.
+  - `morphs` keys morph target weights (a `human` body's `shapes`; the
+    part is the body's name): `{"eve": {"smile": [[0, 0], [0.5, 1]],
+    "jaw_open": 0.3, "breath": {"wave": {"amount": 0.2, "period": 4}}}}`
+    (keys with the clip's `interp`, a constant or a wave; weights are not
+    clamped). Unknown parts and shapes error with the closest name. Deltas
+    apply before skinning, normals turn with the faces, and a clip whose
+    weights are all 0 poses bit-identically to one without. A layer
+    (`over`) replaces its base's weights (by `weight`) or, `additive`,
+    adds; `pose` items take `morphs` too (`{"eve": {"smile": 1}}`) so
+    `poses` keys carry expressions (0 where a pose leaves a shape alone).
+    Talking and blinking over a walk:
+    ```json
+    {"type": "clip", "name": "talk_walk", "skeleton": "eve_rig", "over": "walk", "additive": true,
+     "morphs": {"eve": {"jaw_open": [[0, 0], [0.15, 0.6], [0.3, 0.1], [0.45, 0.7], [0.6, 0]],
+                        "smile": [[0, 0.2], [0.5, 0.6], [1, 0.2]],
+                        "blink": [[0, 0], [0.45, 0], [0.5, 1], [0.55, 0], [1, 0]]}}}
+    ```
+    (with `shapes` `jaw_open`, `smile` and `blink` on the body, made
+    from its expression units). Exports write a glTF `weights` channel
+    per morphed node (every target's weight per keyframe, in
+    `extras.targetNames` order), which Bevy's loader plays; a clip's
+    morphs export only when its skeleton has bound parts. The window
+    plays them and shows a lane per `part:shape`.
+  - **`ik`** plants feet and reaches hands by naming targets instead of
+    keying angles. Each entry is keyed by the END bone whose **head** (its
+    joint) is driven to `target`, solved after the tracks by turning the
+    `chain` bones above it (default 2; the end bone itself only rides,
+    unless `rotate`). On a `body` biped rig give `ankle_l` / `ankle_r` for
+    feet (chain 2 bends `thigh` and `knee`) and `wrist_l` / `wrist_r` for
+    hands (bends `shoulder` and `elbow`).
+    - `target`: `[x, y, z]` world meters, a part anchor (`"crate:top"`),
+      or keys `[[t, [x, y, z]], ...]` interpolated like translate keys.
+    - `pole`: a point or anchor the middle joint bends toward (two-bone
+      chains). Without one the chain keeps the bend the FK pose has, else
+      the rest pose's, so a knee never flips. Longer chains use FABRIK
+      from the FK pose (no pole).
+    - An unreachable target straightens the chain toward it; bones never
+      stretch.
+    - `weight`: 0..1 or keys; 0 is the FK pose exactly, 1 full IK, so a
+      foot can be planted for part of the cycle.
+    - `rotate`: keys of the end bone's world rotation as an offset from its
+      rest frame (`[[0, {"x": 0}]]` keeps a foot level).
+    - `mirror: {"ankle_r": {"from": "ankle_l", "phase": 0.5}}` copies an
+      ik entry (and the track, if any) with target and pole x negated.
+    - Exports sample every IK-moved bone at `fps`; the Animate dock shows
+      them as a line.
+  - **Spins** (`{"euler": [[0, {"y": 0}], [1, {"y": 360}]], "interp"?}`
+    on `rotate`): ordinary rotation keys take the short way, so a full
+    turn can't be keyed; Euler keys interpolate each axis's degrees as
+    numbers (composed x, then y, then z, like `{x, y, z}`), across a
+    loop's seam too, so this one spins at constant speed forever. Mirror,
+    limits and export sampling work as for any rotation.
+  - **Poses**: a `pose` item is a static offset-from-rest per bone,
+    `{"type": "pose", "name": "crouch", "skeleton": "guy_rig", "mirror":
+    true, "bones": {"hip": {"translate": [0, -0.3, 0]}, "thigh_l":
+    {"rotate": {"x": -70}}, "knee_l": {"rotate": {"x": 110}}}, "ik"?:
+    {"ankle_l": {"target": [0.1, 0.085, 0.1]}}}`. `mirror` fills each
+    `_r` bone (and IK entry) from its `_l` twin and back where it isn't
+    given; `ik` is solved once when the pose builds (targets: points or
+    anchors). A clip keys whole poses with `"poses": [[0, "stand"], [0.4,
+    "crouch"], [1, "stand"]]` (`"rest"` is built in): every bone either
+    pose touches gets a key at each pose key, interpolated with the clip's
+    `interp`; an explicit track channel on a bone (rotate, translate or
+    scale) replaces what the poses key on that channel, and a `mirror`
+    onto a bone replaces its pose keys. `agent_views` / `inspect pose` /
+    `verify animation` take a pose's name as a `clip` (a one-second static
+    clip); poses are never listed or exported as clips.
+  - **Layers**: `"over": "walk"` makes this clip a layer on a keyed base
+    clip of the same skeleton (duration defaults to the base's and must be
+    a whole number of its cycles when both loop). Its tracks replace the
+    base's on their bones, blended by `weight` (0..1, a number or keys
+    `[[t, w], ...]`), or with `"additive": true` compose on top: rotation
+    after the base's (about the bone's posed axes), translation added,
+    scale multiplied, scaled by `weight` (0 = the base exactly). `bones`
+    (`*` globs) limits which bones the layer touches. Order at every
+    sample: the base's tracks, the layer's on top, then once on the
+    result: limits, every level's IK (base entries first), look_at; a
+    `sway` over the layered clip comes last. A layer inherits the base's
+    `root_motion` unless it sets its own.
+  - **Root motion**: `"root_motion": true` (bone `hip`, else the first
+    root bone; axes `xz`) or `{"bone": "hip", "axes": "xz", "yaw"?:
+    true}` names a ROOT bone whose translate on those world axes (and turn
+    about y, with `yaw`) is the character's travel. In the modeler (views,
+    verify, the window) the clip plays travelling, as keyed. Exports remove
+    the travel from that bone and write the animation's
+    `extras.root_motion = {bone, axes, yaw, delta: [x, y, z], yaw_degrees,
+    duration, samples: [[t, x, y, z, yaw], ...]}` (from t = 0) for the
+    game to move the entity. `verify animation` judges `loop` in place
+    and `foot_slide` in the world with the travel carried across the seam,
+    so planted feet pass without a `speed`.
+  - **Events**: `"events": [[0, "footstep_l"], [0.5, "footstep_r",
+    {"volume": 0.8}]]` (times within the duration, names non-empty) go to
+    the animation's `extras.events` as `{time, name, data?}`;
+    `scene_summary`'s rig line counts them.
+
+  Stand, crouch, jump with poses (`guy` a `body` biped):
+  ```json
+  {"type": "pose", "name": "crouch", "skeleton": "guy_rig", "mirror": true,
+   "bones": {"hip": {"translate": [0, -0.25, 0]}, "spine": {"rotate": {"x": 15}}},
+   "ik": {"ankle_l": {"target": [0.1, 0.085, 0.05], "pole": [0.1, 0.5, 1.0]}}}
+  {"type": "pose", "name": "air", "skeleton": "guy_rig", "mirror": true,
+   "bones": {"hip": {"translate": [0, 0.5, 0]}, "thigh_l": {"rotate": {"x": -30}},
+             "knee_l": {"rotate": {"x": 50}}, "shoulder_l": {"rotate": {"z": 60}}}}
+  {"type": "clip", "name": "jump", "skeleton": "guy_rig", "duration": 1.2, "loop": false,
+   "poses": [[0, "rest"], [0.3, "crouch"], [0.6, "air"], [0.95, "crouch"], [1.2, "rest"]],
+   "events": [[0.35, "takeoff"], [0.95, "land"]]}
+  ```
+  A wave layered over a walk (only the right arm; the legs keep walking):
+  ```json
+  {"type": "clip", "name": "walk_wave", "skeleton": "guy_rig", "over": "walk",
+   "additive": true, "bones": ["shoulder_r", "elbow_r"], "weight": 1,
+   "tracks": {"shoulder_r": {"rotate": [[0, {"z": 0}], [0.25, {"z": -150}], [1, {"z": -150}]]},
+              "elbow_r": {"rotate": {"wave": {"axis": "z", "amount": 25, "period": 0.5}}}}}
+  ```
+
+    A biped walking in place with planted feet:
+    ```json
+    {"type": "clip", "name": "walk", "skeleton": "guy_rig", "duration": 1.0,
+     "tracks": {"hip": {"translate": {"wave": {"axis": "y", "amount": 0.02, "period": 0.5}}}},
+     "ik": {"ankle_l": {"target": [[0, [0.1, 0.085, 0.2]], [0.5, [0.1, 0.085, -0.2]],
+                                   [0.75, [0.1, 0.2, 0]], [1, [0.1, 0.085, 0.2]]],
+                        "pole": [0.1, 0.5, 1.0], "rotate": [[0, {"x": 0}]]}},
+     "mirror": {"ankle_r": {"from": "ankle_l", "phase": 0.5}}}
+    ```
 - **`sway`**: dynamic motion, baked into a clip of its own name. Every tool
   that plays clips plays it.
   - `kind: "wind"` (the default):
@@ -1552,20 +2027,181 @@ agent views, verify, inspect, export and the window.
   - `duration` defaults to 4 s, or to the `over` clip's duration. With
     `over` it must be a whole number of that clip's cycles.
   - `fps` sets the export rate (30).
+- **`mocap`**: motion capture from a BVH file, retargeted onto a skeleton
+  and lowered to an ordinary clip named `name` (dense rotate keys per mapped
+  bone at `fps`, the root's translation, foot-planting `ik` entries and
+  `footstep_l` / `footstep_r` events), so everything that plays, layers
+  (`over`), exports and verifies clips takes it unchanged. Hand-keyed
+  human motion comes out stiff; use this for people.
+  ```json
+  {"type": "mocap", "name": "walk_mc", "skeleton": "eve_rig", "file": "mocap/walk.bvh",
+   "range": [0.5, 2.5], "loop": "blend", "blend": 0.25, "facing": "auto"}
+  ```
+  - `file` is project-relative and read like `ops_file` (no `..` or
+    symlink out of the project); the server parses it on apply (errors
+    name the line) and stores its hash, and a changed file re-derives the
+    clip. Where the file can't be read (another project), the clip is the
+    rest pose with a note. `bvh` takes the text inline instead.
+  - **BVH**: ROOT / JOINT / End Site, OFFSET, CHANNELS (3 or 6, any order),
+    MOTION rows; rotations compose in the written order as intrinsic
+    rotations; tabs, CRLF, `1e-3` and trailing spaces are fine. Units are
+    inferred from the skeleton's height (m, cm, inches, mm) and only
+    reported: the root's translation is scaled by target / source leg
+    length (thigh joint to the ground; else hip height), so units cancel;
+    `scale` overrides that factor.
+  - **Mapping** (`map: "auto"`, the default) by name, ignoring case,
+    namespaces (`mixamorig:`), `Bip01` prefixes and `_` / `.` / spaces:
+    CMU / Motionbuilder and Mixamo (`Hips, LeftUpLeg, LeftLeg, LeftFoot,
+    LeftToeBase, LeftToe_End, Spine, Spine1, Spine2, Neck, Head,
+    LeftShoulder, LeftArm, LeftForeArm, LeftHand, LeftHandIndex1..3`),
+    3ds Max biped (`Bip01 L Thigh / Calf / Foot / Toe0, Bip01 L Clavicle /
+    UpperArm / Forearm / Hand / Finger0..42`, `Pelvis`), CMU ASF names
+    (`lfemur, ltibia, lfoot, lhumerus, lradius, lwrist, lowerback`) and
+    `thigh_l` / `upperarm_l` styles, onto `hip, spine, chest, neck, head,
+    jaw, clavicle_*, shoulder_*` (upper arm), `elbow_*` (forearm),
+    `wrist_*` (hand), `thigh_*, knee_*` (shin), `ankle_*` (foot), `ball_*,
+    toe_*`, `thumb_1_*..pinky_3_*`. Spine segments between hips and neck go
+    to `spine` (first) and `chest` (last); joints left unmapped (Spine1 of
+    three, `LHipJoint`, ...) ride the mapped bone below them, since the
+    retarget is in world space. `map: {"chest": "Spine2", "jaw": ""}`
+    overrides entries ("" unmaps), `{"only": {...}}` maps just those. The
+    apply result lists the mapping and the unmapped joints.
+  - **Retarget** in world space: the source rest pose (BVH zero pose:
+    T-pose, A-pose, arms down) is turned to face +z, and per mapped bone
+    the rotation taking its rest direction (joint to the mapped child's
+    joint) onto the target's (head to the mapped child's head, else to its
+    tail) is composed with the source bone's world rotation from rest, so
+    each target bone points where its source bone points (twist carried),
+    then converted to the bone's local offset from its own rest frame (the
+    human's arm and finger frames included). Joint `limits` clamp as
+    usual (a limit the source exceeds bends the bone off the source's
+    direction).
+  - **Travel**: `root_motion` `"in_place"` (default) removes the average
+    travel (keeping sway) and stores its speed on the clip
+    (`Clip.speed`, reported); `true` / `{"axes": "xz"}` keeps it and sets
+    the clip's `root_motion` on the root bone. `facing: "auto"` turns the
+    motion so the travel goes to +z, a number turns it that many degrees.
+  - **Feet** (`feet`, on by default): contact spans are where an ankle is
+    within `contact_height` of its lowest and slower than `contact_speed`;
+    each span holds the ankle at its mean position with a 2-bone IK entry
+    (weight blended over 3 frames, foot rotation kept), and where the leg
+    can't reach (longer source legs, a knee that can't straighten past its
+    rest bend) the hips are lowered. `hands` does the same for wrists (off
+    by default). `mirror: true` swaps left and right; `speed` plays it
+    faster; `range` takes seconds of the file.
+  - **Loop**: `loop: true` loops as is (the result reports the seam in
+    degrees / mm); `"blend"` crossfades the last `blend` seconds into the
+    start (the clip gets that much shorter) so the seam is exact.
+  - The apply result reports duration, frames, units and scale, the
+    mapping, the travel, contact spans per foot, the worst planted slide
+    (measured on the solved clip) and the loop seam. `modeler::mocap::bvh::
+    from_clip` writes any clip as BVH (round trips within 2 mm).
 - **Seeing motion**: `agent_views` with `clip` and `times: [0, 0.25, 0.5,
   0.75]` renders a **filmstrip**: each view at each time, tiled with labels.
   This is how to judge a walk. `time` gives a single moment.
   - `style: "bones"` overlays the skeleton.
   - `style: "weights"` with `bone` shows a heat map of that bone's weights.
+  - `style: "trails"` (with `clip`; optional `bones`: names / `*` globs,
+    default the moving end bones (hands, feet, head, tail tips) plus the
+    root, at most 8; optional `time`, where the body is drawn, default 0)
+    draws the model see-through and, per bone, the 3D path its tip (tail;
+    a root's head) travels over the WHOLE clip: one colour per bone (legend
+    in the image), dots at 24 even time steps that grow with time (so
+    spacing shows speed and the growth shows direction), a big dot at
+    t = 0, and the stretches where the tip is within 3 cm of y = 0 thick
+    and white (a planted foot reads at a glance; a sliding one is a long
+    white stretch). The framing includes the trails. The main use is
+    `views: ["right"]` of a walk. `inspect curves` is the numeric twin.
+- **Reading curves**: `inspect(curves: {clip?, bones?: [globs], channels?:
+  ["height", "speed", "angle", "x", "z"], samples?: 120})` (headless, no
+  renderer): per bone and channel the min / max with their times and the
+  mean, the contact spans `[t0, t1]` where the tip is within 3 cm of the
+  ground, and one image of small-multiple line plots (time on x, one row
+  per channel, one coloured line per bone, the clip's key times as faint
+  vertical ticks, planted bars under the plot). `height` = tip world y (m),
+  `speed` = tip speed (m/s), `angle` = the bone's rotation from rest (deg),
+  `x` / `z` = tip position (m). Default channels height, speed, angle;
+  default bones as for trails. The JSON keeps at most 60 points per line.
+  The maths is `src/inspect/motion.rs` (also used by the trails renderer).
 - **Checking motion**: `verify`.
   - `weights: true`: every vertex of a smooth part is weighted, the weights
     sum to 1, and there are at most 4 bones per vertex.
-  - `animation: {clip, samples: 16, collisions, floor, loop, stretch}` runs
-    at each sample time and fails naming the time and bones:
-    - `loop`: the pose at 0 matches the pose at the end;
+  - `animation: {clip, samples: 16, collisions, floor, loop, stretch,
+    foot_slide, balance, smooth, gait, volume}` runs at each sample time and fails
+    naming the time and bones:
+    - `loop`: the pose at 0 matches the pose at the end, and every bone
+      tip's velocity just inside the seam (start vs end) agrees within 50%
+      of the faster side or 2 longest-bone-lengths/s (a reversed or stalled
+      motion at the seam fails);
     - `floor`: nothing sinks below y = 0;
     - `collisions`: a limb through the body;
-    - `stretch`: skinning tears or collapses a triangle.
+    - `stretch`: skinning tears or collapses a triangle;
+    - `volume: true | tolerance` (0.08): each smooth-bound closed part's
+      posed volume over its rest volume stays within the tolerance at every
+      sample (a joint that collapses or balloons); a failure names the part,
+      the ratio, the time and the bone weighted at the most moved vertex,
+      the PASS line gives the worst ratio;
+    - `foot_slide: true | {bones?, contact_height 0.03, tol 0.01, speed?}`:
+      while a foot bone's tip (tail) is within `contact_height` of y = 0
+      its horizontal drift from where the run of planted samples began must
+      stay under `tol`. `speed: [vx, vz]` is the character's ground velocity
+      (m/s) for a walk in place: planted feet must move at `-speed`, and
+      the slide is measured after adding `speed * dt`. With no `speed`, a
+      `mocap` clip's removed travel (`Clip.speed`) is used when the clip has
+      no root motion of its own. `bones` takes names
+      or globs; `true` picks every `toe` bone, else every foot / paw /
+      hoof / ball bone, else the lowest leaf bones. Reports the worst slide
+      (bone, time span) and each foot's planted share of the cycle;
+    - `balance: true | {margin 0, min_share 1, contact_height 0.02}`: at
+      each sample the posed centre of mass (the `inspect mass` report)
+      projected to the ground must lie inside the convex hull of the
+      vertices within `contact_height` of y = 0, grown by `margin`. A
+      sample with nothing on the ground is airborne (reported, not judged).
+      Reports the worst overhang and time and the balanced share; a walk is
+      not statically balanced mid-stride, so give `min_share` below 1;
+    - `smooth: true | {max_accel, max_jerk}`: bone tips are differenced at
+      60+ samples per second of clip (whatever `samples` is). By default a
+      sample whose acceleration is over 8x the bone's median non-zero
+      acceleration and over 5 m/s^2 is a pop ("pop at t=0.42 on `wrist_l`:
+      38.0 m/s^2 against a median 3.1"); `max_accel` (m/s^2) and
+      `max_jerk` (m/s^3) are absolute limits instead. Linear keys kink at
+      every key, so pass `max_accel` for them.
+    - `gait: true | {side?: both / left / right, tolerance?: degrees,
+      speed?: [vx, vz], bones?: {thigh, knee, ankle, toe, wrist, hip,
+      chest}}` (bone names take `{side}` = `l` / `r`; defaults
+      `thigh_{side}` .. and `hip`, `chest`, as the `body` biped and
+      `human` rigs name them): a biped walk measured against normative
+      human gait (Perry & Burnfield, *Gait Analysis*, 2010; knot tables
+      `NORM_THIGH` / `NORM_KNEE` / `NORM_ANKLE` in `src/anim/check.rs`).
+      Each leg's cycle starts at heel strike: the start of a planted span
+      (heel point within 5 mm of the ground, or toe tip within 4 mm of its
+      rest height) that includes the heel. Angles are geometric, from
+      posed joint positions in the plane of travel (so FK, IK and any bone
+      frames measure alike): thigh = hip -> knee from vertical (+
+      forward), knee = flexion between thigh and shank, ankle = shank vs
+      ankle -> ball relative to the rest pose (+ dorsiflexion). Curves
+      pass within a band (thigh 7, knee 10, ankle 7 degrees, about 1 SD;
+      `tolerance` replaces all three) with 3% of the cycle timing slack;
+      a FAIL names the value, percent of the cycle, phase, normal value
+      and what is wrong, plus the worst in stance and in swing ("knee:
+      38 deg at 30% GC (mid stance, left), normal 6 +- 10: the knee is
+      too bent"). Also: `knee_extension` (never below -5), `timing`
+      (cycle 0.9..1.3 s x sqrt(stature / 1.75), stance 55..65% per leg,
+      double support 8..32%), `stride` (speed x cycle over stature
+      0.6..1.0; speed stated, else `foot_slide`'s, else the root motion,
+      else a `mocap` clip's own speed, else measured from the planted feet; forward = the rest feet's
+      facing), `step_width` (5..15 cm scaled), `pelvis` (hip head
+      excursion 2..7 cm scaled, two peaks a cycle), `trunk` (chest lean
+      under 10), `arms` (wrist fore-aft against the same-side ankle:
+      correlation below -0.5, swing 10..50 cm, centred -6..12 cm from the
+      hip joints) and `toe_clearance` (least toe lift over rest in mid
+      swing 0.5..6 cm). Lengths scale with stature (hip joint height /
+      0.53). A rig without the leg bones gets a `skipped` note, not a
+      failure.
+    All of them pose through the clip evaluator, so IK and constraints
+    count. Example: `{"animation": {"clip": "walk", "foot_slide": {"bones":
+    ["toe_*"], "speed": [0, 1.4]}, "balance": {"min_share": 0.5},
+    "smooth": true, "gait": true}}`.
 - **Inspecting a pose**: `inspect(pose: {clip, time, bones?})` gives bone
   world positions, and `measure` / `section` / `mass` / `thickness` then run
   on the posed model.
@@ -1592,11 +2228,29 @@ agent views, verify, inspect, export and the window.
     `strength`, `gust`.
   - Play the baked sway clip *or* keep the live sway (`Sway::live`), not
     both.
+  - It reads `extras.correctives` into `ModelerCorrectives` and sets the
+    driven `MorphWeights` slots every frame from the joints' local
+    rotations (after `AnimationSystems` and the sway), so a game gets the
+    modeler's deformation with no setup; animated shape weights keep
+    their own slots.
   - It also turns `extras.collider` into `ModelerCollider` and
     `extras.marker` into `ModelerMarker`.
   - `cargo run -p modeler_bevy --example viewer -- <assets dir>
     <model.gltf>` looks at an export.
+- **Rigged prefabs**: a `prefab` instance `inst` of a rigged model brings
+  its rig: skeletons `inst.<skeleton>` (body `<name>_rig` included) and
+  clips / sways `inst.<clip>`, built from the prefab's own ops and parts
+  and carried by the instance's translation, rotation and scale (rest
+  frames turn with it; clip translations and radii scale by the mean
+  scale), so `verify animation`, `inspect pose`, `agent_views clip`,
+  `set_camera(play)` and the glTF export (one skin and animation per
+  instance) take `inst.walk`. Its parts keep their prefab bindings: host
+  `bind` items skip them, though a host part may bind to `inst.rig`.
+  Re-saving the prefab re-derives the instance's rig.
 - **Limits**:
+  - A host `move` / `place` of a rigged instance's parts doesn't move its
+    skeleton: place the instance with the `prefab` item's transform.
+    Non-uniform instance scale poses only approximately.
   - Scattered copies of a rigged tree don't get their own skeletons. Rig
     the tree in its own document, export it, and place the copies in the
     game, where the plugin sways each one with its own phase.

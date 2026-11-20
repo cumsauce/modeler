@@ -1,7 +1,8 @@
 //! Cosmetic variants ("skins"): alternate looks for one model (red / blue
 //! team, clean / rusty), switchable in game. A `variant` item names a look:
 //! material overrides on parts (names or `*` globs) and an optional style
-//! token patch. Geometry never changes; the base model is the variant
+//! token patch, and (outfits) `show` / `hide` part lists. Meshes never
+//! change; the base model is the variant
 //! named [`DEFAULT`].
 //!
 //! A variant is applied after the whole graph (like `move`): the parts are
@@ -103,9 +104,81 @@ pub fn find<'a>(
             name: n,
             materials,
             style,
+            ..
         } if n == name => Some((materials.as_slice(), style.as_ref())),
         _ => None,
     })
+}
+
+/// The `show` / `hide` part lists of variant `name` (an outfit).
+pub fn visibility<'a>(model: &'a Model, name: &str) -> Option<(&'a [String], &'a [String])> {
+    model.ops.iter().find_map(|o| match o {
+        Op::Variant {
+            name: n,
+            show,
+            hide,
+            ..
+        } if n == name => Some((show.as_slice(), hide.as_slice())),
+        _ => None,
+    })
+}
+
+/// Per variant (default first), whether part `part` is visible: for the
+/// export's `extras.variants_visible`. `None` when no variant changes
+/// visibility.
+pub fn visible_per_variant(model: &Model, part: &crate::Part) -> Option<Vec<(String, bool)>> {
+    let mut any = false;
+    let mut out = vec![(DEFAULT.to_string(), part.visible)];
+    for n in names(model) {
+        let (show, hide) = visibility(model, &n).unwrap_or((&[], &[]));
+        let v = if show.iter().any(|g| crate::name_matches(g, &part.name)) {
+            true
+        } else if hide.iter().any(|g| crate::name_matches(g, &part.name)) {
+            false
+        } else {
+            part.visible
+        };
+        any |= v != part.visible;
+        out.push((n, v));
+    }
+    any.then_some(out)
+}
+
+/// Re-derives `m` with variant `name`'s shown / hidden parts as
+/// visibility edits after every op, so the graph (and the garments'
+/// covered-skin masks) see the outfit. A no-op without show / hide.
+fn apply_visibility(m: &mut Model, show: &[String], hide: &[String]) -> Result<(), String> {
+    if show.is_empty() && hide.is_empty() {
+        return Ok(());
+    }
+    let mut edits = Vec::new();
+    for p in &m.parts {
+        let want = if show.iter().any(|g| crate::name_matches(g, &p.name)) {
+            true
+        } else if hide.iter().any(|g| crate::name_matches(g, &p.name)) {
+            false
+        } else {
+            continue;
+        };
+        edits.push(Op::Visibility {
+            name: p.name.clone(),
+            input: p.name.clone(),
+            visible: want,
+        });
+    }
+    if m.procedural() {
+        m.ops.extend(edits);
+        m.refresh().map_err(|e| e.to_string())?;
+    } else {
+        for e in edits {
+            if let Op::Visibility { name, visible, .. } = e
+                && let Some(p) = m.part_mut(&name)
+            {
+                p.visible = visible;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// "unknown variant" with the list of known ones.
@@ -175,6 +248,15 @@ pub fn derive_with(
     name: &str,
     restyle: impl FnOnce(&Model, crate::style::Style) -> Result<Model, String>,
 ) -> Result<Model, String> {
+    derive_inner(model, name, restyle, true)
+}
+
+fn derive_inner(
+    model: &Model,
+    name: &str,
+    restyle: impl FnOnce(&Model, crate::style::Style) -> Result<Model, String>,
+    with_visibility: bool,
+) -> Result<Model, String> {
     let mut m = model.clone_without_history();
     m.active_variant = None;
     if name == DEFAULT {
@@ -184,6 +266,9 @@ pub fn derive_with(
         return Err(unknown(model, name));
     };
     let looks = looks.to_vec();
+    let (show, hide) = visibility(model, name)
+        .map(|(a, b)| (a.to_vec(), b.to_vec()))
+        .unwrap_or_default();
     if let Some(patch) = style {
         let mut st = m.style.clone();
         st.merge(patch)
@@ -191,8 +276,87 @@ pub fn derive_with(
         m = restyle(&m, st).map_err(|e| format!("variant `{name}` style: {e}"))?;
         m.active_variant = None;
     }
+    if with_visibility {
+        apply_visibility(&mut m, &show, &hide)?;
+    }
     apply_looks(&mut m, &looks);
     Ok(m)
+}
+
+/// Whether any variant shows or hides parts (an outfit).
+pub fn changes_visibility(model: &Model) -> bool {
+    model.ops.iter().any(
+        |o| matches!(o, Op::Variant { show, hide, .. } if !show.is_empty() || !hide.is_empty()),
+    )
+}
+
+/// The model to export when variants show / hide parts: every part
+/// visible in any variant is visible (game code toggles them by
+/// `extras.variants_visible`), and only garments visible in every variant
+/// hide the skin they cover (one body mesh serves every outfit). `None`
+/// when no variant changes visibility.
+pub fn export_base(model: &Model) -> Result<Option<Model>, String> {
+    if !changes_visibility(model) {
+        return Ok(None);
+    }
+    let mut m = model.clone_without_history();
+    m.active_variant = None;
+    let mut always: Vec<String> = Vec::new();
+    let mut any: Vec<String> = Vec::new();
+    for p in &model.parts {
+        let mut all_v = p.visible;
+        let mut any_v = p.visible;
+        for n in names(model) {
+            let (show, hide) = visibility(model, &n).unwrap_or((&[], &[]));
+            let v = if show.iter().any(|g| crate::name_matches(g, &p.name)) {
+                true
+            } else if hide.iter().any(|g| crate::name_matches(g, &p.name)) {
+                false
+            } else {
+                p.visible
+            };
+            all_v &= v;
+            any_v |= v;
+        }
+        if all_v {
+            always.push(p.name.clone());
+        }
+        if any_v && !p.visible {
+            any.push(p.name.clone());
+        }
+    }
+    for o in &mut m.ops {
+        if let Op::Garment { name, def } = o
+            && !always.contains(name)
+        {
+            def.hide_skin = Some(false);
+        }
+    }
+    for n in any {
+        m.ops.push(Op::Visibility {
+            name: n.clone(),
+            input: n,
+            visible: true,
+        });
+    }
+    m.refresh().map_err(|e| e.to_string())?;
+    Ok(Some(m))
+}
+
+/// Variant `name`'s look (materials, style) over `base` without its
+/// show / hide lists: the export's per-variant material documents.
+pub fn derive_look(base: &Model, name: &str) -> Result<Model, String> {
+    derive_inner(
+        base,
+        name,
+        |m, st| {
+            let mut s = crate::commands::Session::default();
+            s.model = m.clone();
+            s.set_style(st).map_err(|e| e.to_string())?;
+            Ok(s.model.clone_without_history())
+        },
+        false,
+    )
 }
 
 /// [`derive_with`] restyling in a bare session (library materials only):

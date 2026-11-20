@@ -47,14 +47,27 @@ pub(crate) struct PlayRequest {
 }
 
 pub(crate) fn clip_names(model: &modeler::Model) -> Vec<String> {
-    model
+    let mut names: Vec<String> = model
         .ops
         .iter()
         .filter_map(|o| match o {
             modeler::Op::Clip { name, .. } | modeler::Op::Sway { name, .. } => Some(name.clone()),
             _ => None,
         })
-        .collect()
+        .collect();
+    // Prefab instances bring their clips as `inst.<clip>`.
+    if model
+        .ops
+        .iter()
+        .any(|o| matches!(o, modeler::Op::Prefab { .. }))
+    {
+        for n in modeler::anim::clip_names(model) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names
 }
 
 impl Playback {
@@ -204,25 +217,52 @@ pub(crate) fn play_animation(
         return;
     }
     pb.last = Some(stamp);
-    let posed = modeler::anim::posed_parts(model, &c, &skel, t);
+    let pose = c.sample(&skel, t);
+    let mats = skel.skin_matrices(&pose);
+    let weights = c.morph_weights(t);
     for (name, mesh, mut tf) in &mut parts {
-        let Some(p) = posed
-            .iter()
-            .find(|p| p.name == name.as_str() && p.rig.is_some())
-        else {
+        let Some(p) = model.parts.iter().find(|p| p.name == name.as_str()) else {
             continue;
         };
-        if p.rig.as_ref().is_some_and(|b| b.skeleton != skel.name) {
+        let rig = p.rig.as_ref().filter(|b| b.skeleton == skel.name);
+        // Morph weights apply before skinning; a part keyed in this clip
+        // is rewritten even at weight 0 (back to its base shape).
+        let keyed = weights.iter().any(|w| w.0 == p.name);
+        if rig.is_none() && !keyed {
             continue;
         }
         let Some(mut m) = meshes.get_mut(&mesh.0) else {
             continue;
         };
-        m.insert_attribute(Mesh::ATTRIBUTE_POSITION, p.verts.clone());
-        if p.normals.len() == p.verts.len() {
-            m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, p.normals.clone());
+        if m.count_vertices() != p.verts.len() {
+            continue; // a proxy mesh (simplified): its vertices don't line up
         }
-        *tf = Transform::IDENTITY;
+        let w = modeler::anim::part_weights(&weights, &p.name);
+        let morphed = modeler::anim::skin::morphed(p, &w);
+        let (mut verts, mut normals) = (Vec::new(), Vec::new());
+        match rig {
+            Some(rig) => {
+                // Positions and normals straight into the mesh: no part
+                // clone unless morphed.
+                let src = morphed.map(|(verts, normals)| modeler::Part {
+                    verts,
+                    normals,
+                    ..p.as_ref().clone()
+                });
+                let src = src.as_ref().unwrap_or(p);
+                modeler::anim::skin::pose_into(src, rig, &mats, &mut verts, &mut normals);
+                *tf = Transform::IDENTITY;
+            }
+            None => {
+                // Morphed only: the part's own space, its transform kept.
+                (verts, normals) = morphed.unwrap_or_else(|| (p.verts.clone(), p.normals.clone()));
+            }
+        }
+        let has_normals = normals.len() == verts.len();
+        m.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+        if has_normals {
+            m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        }
     }
     pb.posed = true;
 }
