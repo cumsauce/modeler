@@ -5,6 +5,8 @@
 //!
 //! All work in world space (part transforms applied) and metres.
 
+pub mod motion;
+
 use crate::raster::{Canvas, fmt_len, id_color_u8};
 use crate::{Model, ModelerError, Part, Vec3};
 use manifold_csg::Manifold;
@@ -784,8 +786,8 @@ fn body_proportions(p: &Part, def: Option<&crate::body::BodyDef>) -> (String, se
         .collect();
     let at = |n: &str| p.joint(n);
     let parents: BTreeMap<String, Option<String>> = def
-        .and_then(|d| crate::body::lower(d).ok())
-        .map(|l| l.joints.into_iter().map(|j| (j.name, j.parent)).collect())
+        .and_then(|d| crate::body::rig_joints(d).ok())
+        .map(|l| l.into_iter().map(|j| (j.name, j.parent)).collect())
         .unwrap_or_default();
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for i in 0..p.verts.len() {
@@ -868,7 +870,7 @@ fn body_proportions(p: &Part, def: Option<&crate::body::BodyDef>) -> (String, se
         }
     };
     match preset {
-        "biped" => {
+        "biped" | "human" => {
             // Head: crown down to the chin (the first surface above the
             // neck straight under the jaw).
             let chin = match (at("jaw"), at("neck"), at("head")) {
@@ -1003,7 +1005,8 @@ mod proportion_tests {
             "{t}"
         );
         let span = j[0]["ratios"]["arm span/height"].as_f64().unwrap_or(0.0);
-        assert!((span - 1.0).abs() < 0.04, "arm span/height {span}\n{t}");
+        // ANSUR II male median span / stature: 1.032.
+        assert!((span - 1.032).abs() < 0.03, "arm span/height {span}\n{t}");
     }
 
     #[test]

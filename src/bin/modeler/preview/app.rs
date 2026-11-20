@@ -1191,38 +1191,56 @@ fn fast_tangents(part: &Part) -> Vec<[f32; 4]> {
         .collect()
 }
 
+/// A light that belongs to the window camera alone (`WINDOW_LIGHT_LAYER`).
+#[derive(Component)]
+pub(crate) struct WindowLight;
+
+/// The render layer of `WindowLight`s; only the window camera has it.
+pub(crate) const WINDOW_LIGHT_LAYER: usize = 29;
+
 /// Environment light strength (cd/m² per unit of studio radiance).
 pub(crate) const STUDIO_INTENSITY: f32 = 900.0;
 
 /// The procedural photo studio (`modeler::material::env`) as an environment
-/// light, filtered on the GPU: glossy parts reflect soft boxes and a
-/// cyclorama horizon instead of a flat ambient, so roughness and normal maps
-/// read. The same function lights the CPU material sphere.
-pub(crate) fn studio_env(
-    images: &mut Assets<Image>,
-    intensity: f32,
-) -> GeneratedEnvironmentMapLight {
+/// light: glossy parts reflect soft boxes and a cyclorama horizon instead of
+/// a flat ambient, so roughness and normal maps read. Both maps are built on
+/// the CPU, exactly and deterministically (SH irradiance, analytically
+/// blurred specular mips), not by Bevy's GPU Monte-Carlo filter, whose
+/// per-texel noise showed as mottled grain on smooth flat-coloured parts and
+/// varied between renders. The same function lights the CPU material sphere.
+pub(crate) fn studio_env(images: &mut Assets<Image>, intensity: f32) -> EnvironmentMapLight {
     use bevy::render::render_resource::{
         Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
     };
-    const SIZE: u32 = 256;
-    let mut img = Image::new(
-        Extent3d {
-            width: SIZE,
-            height: SIZE,
-            depth_or_array_layers: 6,
-        },
-        TextureDimension::D2,
-        modeler::material::env::cubemap_rgba16f(SIZE as usize),
-        TextureFormat::Rgba16Float,
-        bevy::asset::RenderAssetUsages::default(),
-    );
-    img.texture_view_descriptor = Some(TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::Cube),
-        ..default()
-    });
-    GeneratedEnvironmentMapLight {
-        environment_map: images.add(img),
+    let cube = |size: u32, data: Vec<u8>, mips: u32| {
+        let mut img = Image::new(
+            Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 6,
+            },
+            TextureDimension::D2,
+            // `Image::new` checks the data against mip 0 only: give it that
+            // size, then the whole chain.
+            vec![0; (size * size * 6 * 8) as usize],
+            TextureFormat::Rgba16Float,
+            bevy::asset::RenderAssetUsages::default(),
+        );
+        img.data = Some(data);
+        img.texture_descriptor.mip_level_count = mips;
+        img.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            ..default()
+        });
+        img
+    };
+    const DIFFUSE: u32 = 32;
+    const SPECULAR: u32 = 256;
+    let diffuse = modeler::material::env::diffuse_cubemap_rgba16f(DIFFUSE as usize);
+    let (specular, mips) = modeler::material::env::specular_cubemap_rgba16f(SPECULAR as usize);
+    EnvironmentMapLight {
+        diffuse_map: images.add(cube(DIFFUSE, diffuse, 1)),
+        specular_map: images.add(cube(SPECULAR, specular, mips)),
         intensity,
         ..default()
     }
@@ -1236,12 +1254,18 @@ pub(crate) fn studio_env(
 pub(crate) fn contact_shading() -> impl Bundle {
     (
         Msaa::Off,
-        bevy::pbr::ScreenSpaceAmbientOcclusion {
-            radius: 0.5,
-            ..default()
-        },
+        contact_occlusion(),
         bevy::anti_alias::smaa::Smaa::default(),
     )
+}
+
+/// The SSAO component alone (see `contact_shading`): perspective cameras
+/// only, since Bevy's SSAO mis-handles orthographic projections.
+pub(crate) fn contact_occlusion() -> bevy::pbr::ScreenSpaceAmbientOcclusion {
+    bevy::pbr::ScreenSpaceAmbientOcclusion {
+        radius: 0.5,
+        ..default()
+    }
 }
 
 /// Screen-space reflections: glossy surfaces reflect the other parts on
@@ -1346,6 +1370,12 @@ pub(crate) fn setup_scene(
             Name::new("camera"),
             MainCamera,
             Camera3d::default(),
+            // The scene, the bone gizmos and the window-only lights.
+            RenderLayers::from_layers(&[
+                0,
+                WINDOW_LIGHT_LAYER,
+                crate::preview::timeline::BONE_LAYER,
+            ]),
             studio_env(&mut images, STUDIO_INTENSITY),
             Msaa::Off,
             // TAA, not SMAA: SSR's ray march is jittered per frame, and the
@@ -1367,6 +1397,11 @@ pub(crate) fn setup_scene(
             c.spawn((
                 Name::new("view fill"),
                 crate::preview::agent_rig::StudioLight,
+                // It turns with the human's orbiting camera: on the layer
+                // only that camera sees, so it never lights agent views
+                // (which would then change with the window's drift).
+                WindowLight,
+                RenderLayers::layer(WINDOW_LIGHT_LAYER),
                 DirectionalLight {
                     illuminance: 500.0,
                     ..default()

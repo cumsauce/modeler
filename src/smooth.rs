@@ -562,6 +562,189 @@ fn catmull_clark(
     (v, faces)
 }
 
+/// One Catmull-Clark level of a polygon cage as linear stencils, so any
+/// per-vertex attribute (positions, skin weights, morph deltas) can ride
+/// through the same subdivision: new vertex `i` is `sum(w * old[j])` over
+/// `rows[offsets[i]..offsets[i + 1]]`. The rules are the ones
+/// [`catmull_clark`] uses with no creases: open borders and non-manifold
+/// edges subdivide as curves. New vertices are the old vertex points, then
+/// one per edge, then one per face; each face becomes one quad per corner
+/// (`parent` gives the face it came from), in the same order as
+/// [`catmull_clark`].
+pub struct Stencil {
+    pub offsets: Vec<u32>,
+    pub rows: Vec<(u32, f32)>,
+    pub faces: Vec<Vec<u32>>,
+    pub parent: Vec<u32>,
+    /// Per new face corner: the old face corner (`corner`, the edge to the
+    /// next corner `edge`, or the face centre `centre`) it came from, for
+    /// face-varying data (uvs): (old face, old corner index, kind 0 corner /
+    /// 1 edge after it / 2 centre).
+    pub from: Vec<[(u32, u8, u8); 4]>,
+}
+
+impl Stencil {
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Applies the stencil to per-vertex data of any linear type.
+    pub fn apply<T>(&self, old: &[T]) -> Vec<T>
+    where
+        T: Copy
+            + Default
+            + std::ops::Add<Output = T>
+            + std::ops::Mul<f32, Output = T>
+            + Send
+            + Sync,
+    {
+        use rayon::prelude::*;
+        (0..self.len())
+            .into_par_iter()
+            .map(|i| {
+                let (a, b) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
+                self.rows[a..b]
+                    .iter()
+                    .fold(T::default(), |acc, &(j, w)| acc + old[j as usize] * w)
+            })
+            .collect()
+    }
+}
+
+pub fn catmull_clark_stencil(nv: usize, faces: &[Vec<u32>]) -> Stencil {
+    let mut eid: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut ends: Vec<(u32, u32)> = Vec::new();
+    let mut efaces: Vec<Vec<usize>> = Vec::new();
+    for (fi, f) in faces.iter().enumerate() {
+        for i in 0..f.len() {
+            let (a, b) = (f[i], f[(i + 1) % f.len()]);
+            let k = (a.min(b), a.max(b));
+            let id = *eid.entry(k).or_insert_with(|| {
+                ends.push(k);
+                efaces.push(Vec::new());
+                ends.len() - 1
+            });
+            efaces[id].push(fi);
+        }
+    }
+    let border: Vec<bool> = efaces.iter().map(|f| f.len() != 2).collect();
+    let mut vf: Vec<Vec<usize>> = vec![Vec::new(); nv];
+    for (fi, f) in faces.iter().enumerate() {
+        for &i in f {
+            vf[i as usize].push(fi);
+        }
+    }
+    let mut ve: Vec<Vec<usize>> = vec![Vec::new(); nv];
+    for (e, &(a, b)) in ends.iter().enumerate() {
+        ve[a as usize].push(e);
+        ve[b as usize].push(e);
+    }
+    let mut offsets = vec![0u32];
+    let mut rows: Vec<(u32, f32)> = Vec::new();
+    let mut push = |acc: &mut Vec<(u32, f32)>| {
+        acc.sort_by_key(|a| a.0);
+        let mut last: Option<(u32, f32)> = None;
+        for &(j, w) in acc.iter() {
+            match &mut last {
+                Some(l) if l.0 == j => l.1 += w,
+                _ => {
+                    if let Some(l) = last.take() {
+                        rows.push(l);
+                    }
+                    last = Some((j, w));
+                }
+            }
+        }
+        if let Some(l) = last {
+            rows.push(l);
+        }
+        offsets.push(rows.len() as u32);
+        acc.clear();
+    };
+    let face_pt = |fi: usize, k: f32, acc: &mut Vec<(u32, f32)>| {
+        let f = &faces[fi];
+        let w = k / f.len() as f32;
+        acc.extend(f.iter().map(|&i| (i, w)));
+    };
+    let mut acc: Vec<(u32, f32)> = Vec::new();
+    for i in 0..nv {
+        let be: Vec<usize> = ve[i].iter().copied().filter(|&e| border[e]).collect();
+        let other = |e: usize| {
+            let (a, b) = ends[e];
+            if a as usize == i { b } else { a }
+        };
+        match be.len() {
+            0 if !vf[i].is_empty() && !ve[i].is_empty() => {
+                let n = ve[i].len() as f32;
+                let nf = vf[i].len() as f32;
+                for &fi in &vf[i] {
+                    face_pt(fi, 1.0 / (nf * n), &mut acc);
+                }
+                for &e in &ve[i] {
+                    let (a, b) = ends[e];
+                    acc.push((a, 1.0 / (n * n)));
+                    acc.push((b, 1.0 / (n * n)));
+                }
+                acc.push((i as u32, (n - 3.0) / n));
+            }
+            2 => {
+                acc.push((other(be[0]), 0.125));
+                acc.push((other(be[1]), 0.125));
+                acc.push((i as u32, 0.75));
+            }
+            _ => acc.push((i as u32, 1.0)),
+        }
+        push(&mut acc);
+    }
+    for (e, &(a, b)) in ends.iter().enumerate() {
+        if border[e] {
+            acc.push((a, 0.5));
+            acc.push((b, 0.5));
+        } else {
+            acc.push((a, 0.25));
+            acc.push((b, 0.25));
+            face_pt(efaces[e][0], 0.25, &mut acc);
+            face_pt(efaces[e][1], 0.25, &mut acc);
+        }
+        push(&mut acc);
+    }
+    for fi in 0..faces.len() {
+        face_pt(fi, 1.0, &mut acc);
+        push(&mut acc);
+    }
+    let e_of = |a: u32, b: u32| (nv + eid[&(a.min(b), a.max(b))]) as u32;
+    let mut nf = Vec::with_capacity(faces.len() * 4);
+    let mut parent = Vec::with_capacity(faces.len() * 4);
+    let mut from = Vec::with_capacity(faces.len() * 4);
+    for (fi, f) in faces.iter().enumerate() {
+        let c = (nv + ends.len() + fi) as u32;
+        let n = f.len();
+        for i in 0..n {
+            let (prev, cur, next) = (f[(i + n - 1) % n], f[i], f[(i + 1) % n]);
+            nf.push(vec![cur, e_of(cur, next), c, e_of(prev, cur)]);
+            parent.push(fi as u32);
+            let p = ((i + n - 1) % n) as u8;
+            from.push([
+                (fi as u32, i as u8, 0),
+                (fi as u32, i as u8, 1),
+                (fi as u32, 0, 2),
+                (fi as u32, p, 1),
+            ]);
+        }
+    }
+    Stencil {
+        offsets,
+        rows,
+        faces: nf,
+        parent,
+        from,
+    }
+}
+
 /// Quads split along their shorter diagonal; other polygons fanned.
 fn triangulate(v: &[Vec3], faces: &[Vec<u32>]) -> Vec<[u32; 3]> {
     let mut t = Vec::with_capacity(faces.len() * 2);

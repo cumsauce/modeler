@@ -54,6 +54,10 @@ pub(crate) struct ShotStyle {
     pub(crate) scene_lit: bool,
     /// Draw this cosmetic variant's look (None: the default look).
     pub(crate) variant: Option<String>,
+    /// Motion trails: the model see-through at `pose`, and the path each
+    /// bone's tip travels over the clip (the inner list: bone globs, None
+    /// = the moving end bones and the root).
+    pub(crate) trails: Option<Option<Vec<String>>>,
 }
 
 /// The studio's own lights (sun, fills, agent key), hidden for a
@@ -197,6 +201,7 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
         })
         .insert(RenderTarget::Image(image.clone().into()))
         .id();
+
     commands.insert_resource(AgentRig {
         camera: Some(camera),
         image: Some(image),
@@ -355,11 +360,18 @@ pub(crate) fn process_agent_shot(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    (mut pbr_cache, mut decal_mats, ranged, lod_copies): (
+    (mut pbr_cache, mut decal_mats, ranged, lod_copies, all_lights): (
         ResMut<PbrCache>,
         ResMut<Assets<bevy::pbr::decal::ForwardDecalMaterial<StandardMaterial>>>,
         Query<(Entity, &bevy::camera::visibility::VisibilityRange), With<PreviewPart>>,
         Query<Entity, With<super::stream::PartLod>>,
+        Query<
+            Entity,
+            (
+                Or<(With<DirectionalLight>, With<PointLight>, With<SpotLight>)>,
+                Without<super::app::WindowLight>,
+            ),
+        >,
     ),
     mut cameras: Query<
         (
@@ -380,10 +392,9 @@ pub(crate) fn process_agent_shot(
     built: Res<super::app::SceneBuilt>,
     mut commands: Commands,
 ) {
-    // A camera with a generated environment light draws nothing until its
-    // maps are filtered (the component appears, then the GPU filters over
-    // the next frames), so hold shots until then. If filtering never comes
-    // (no compute support) shoot anyway after ~2 s rather than time out.
+    // Hold shots for a few frames after the environment light appears, so
+    // its cubemaps are uploaded; shoot anyway after ~2 s rather than time
+    // out.
     warm.1 = warm.1.saturating_add(1);
     if env_ready.is_empty() {
         warm.0 = 0;
@@ -433,9 +444,12 @@ pub(crate) fn process_agent_shot(
     let bounds = style.frame.or(bounds);
     // A pose (or a skeleton overlay): the parts posed on the CPU, and the
     // skeleton's segments to draw.
-    let rig_shot = style.pose.is_some() || style.bones || style.weights.is_some();
+    let rig_shot =
+        style.pose.is_some() || style.bones || style.weights.is_some() || style.trails.is_some();
     let mut posed_parts: Option<Vec<Arc<modeler::Part>>> = None;
     let mut bone_segs: Vec<(Vec3, Vec3, f32)> = Vec::new();
+    let mut trail_data: Vec<modeler::inspect::motion::Trail> = Vec::new();
+    let mut trail_step = 0.0f32;
     let mut bounds = bounds;
     if rig_shot {
         let rig = match &style.pose {
@@ -485,6 +499,34 @@ pub(crate) fn process_agent_shot(
                 }
                 bounds = Some((lo, hi));
             }
+            if let Some(globs) = &style.trails {
+                use modeler::inspect::motion;
+                let picked = match motion::pick_bones(c, &skel, globs.as_deref()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        return;
+                    }
+                };
+                trail_data = motion::trails(c, &skel, &picked, motion::TRAIL_DOTS);
+                trail_step = c.duration / motion::TRAIL_DOTS as f32;
+                if focus.is_none() && style.frame.is_none() {
+                    let mut lo = bounds.map_or(Vec3::splat(f32::INFINITY), |b| b.0);
+                    let mut hi = bounds.map_or(Vec3::splat(f32::NEG_INFINITY), |b| b.1);
+                    for p in trail_data.iter().flat_map(|t| &t.pts) {
+                        lo = lo.min(*p);
+                        hi = hi.max(*p);
+                    }
+                    if lo.cmple(hi).all() {
+                        bounds = Some((lo, hi));
+                    }
+                }
+            }
+        } else if style.trails.is_some() {
+            let _ = reply.send(Err(
+                "trails needs a clip: pass `clip` (or have exactly one clip in the model)".into(),
+            ));
+            return;
         }
     }
     let (eye, target, up, new_projection) = agent_view_projection(view, bounds, aspect);
@@ -517,6 +559,22 @@ pub(crate) fn process_agent_shot(
             ClearColorConfig::Custom(Color::WHITE),
         )
     });
+    // Bevy's SSAO is written for perspective cameras: it takes the view
+    // vector from the pixel's position (in an orthographic view that is
+    // wrong by the pixel's angle off the axis) and scales its radius by 1/z.
+    // On a smooth surface that reads as concentric contour rings around the
+    // view centre, so orthographic shots go without it (the shadowed key
+    // still gives them depth); perspective shots keep the contact shading.
+    let ortho = matches!(new_projection, Projection::Orthographic(_));
+    if ortho {
+        commands
+            .entity(camera_entity)
+            .remove::<bevy::pbr::ScreenSpaceAmbientOcclusion>();
+    } else {
+        commands
+            .entity(camera_entity)
+            .insert(super::app::contact_occlusion());
+    }
     *projection = new_projection;
     *transform = Transform::from_translation(eye).looking_at(target, up);
     let cam = *transform;
@@ -665,7 +723,7 @@ pub(crate) fn process_agent_shot(
                 continue;
             }
             if !style.ids {
-                if style.bones {
+                if style.bones || style.trails.is_some() {
                     // See-through, so the skeleton inside reads.
                     let m = materials.add(StandardMaterial {
                         base_color: Color::srgba(0.9, 0.9, 0.95, 0.35),
@@ -720,6 +778,18 @@ pub(crate) fn process_agent_shot(
             legend.push(("bone (head -> tail)".into(), [255, 140, 26, 255]));
             legend.push(("joint (bone head)".into(), [255, 242, 102, 255]));
         }
+        if !trail_data.is_empty() {
+            spawn_trails(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut stand_ins,
+                &mut legend,
+                &trail_data,
+                trail_step,
+                bounds,
+            );
+        }
         commands
             .entity(camera_entity)
             .insert(RenderLayers::layer(ID_LAYER));
@@ -763,6 +833,28 @@ pub(crate) fn process_agent_shot(
         || stale
         || style.variant.is_some()
         || modeler.session.model.active_variant.is_some();
+    // Stand-ins live on their own render layer, and a light only lights (and
+    // shadows) entities that share a layer with it: without this a posed or
+    // otherwise rebuilt shot lost the sun and the studio key (only the
+    // environment lit it, darker and with SSAO's noise unmasked by any direct
+    // light) and read as a different render from the unposed one. The lights
+    // move to the stand-in layer for the shot, so the window's own entities
+    // (still on layer 0) don't cast shadows over their stand-ins, and go back
+    // afterwards. Colour-coded styles stay on the environment only.
+    let relit = ids
+        && !(style.ids
+            || style.curvature
+            || style.silhouette
+            || style.density
+            || style.weights.is_some());
+    let relit_lights: Vec<Entity> = if relit {
+        all_lights.iter().collect()
+    } else {
+        Vec::new()
+    };
+    for e in &relit_lights {
+        commands.entity(*e).insert(RenderLayers::layer(ID_LAYER));
+    }
     // The shot draws the window's own entities: its distance LODs go for
     // this frame (the agent camera would pick a decimated copy by its own
     // distance), so agent views are full detail. Restored after capture.
@@ -808,6 +900,11 @@ pub(crate) fn process_agent_shot(
                 {
                     g.intensity = gi;
                     a.brightness = ab;
+                }
+                for e in &relit_lights {
+                    if let Ok(mut ec) = commands.get_entity(*e) {
+                        ec.insert(RenderLayers::layer(0));
+                    }
                 }
                 for e in &stand_ins {
                     commands.entity(*e).despawn();
@@ -1067,6 +1164,137 @@ fn weights_mesh(part: &modeler::Part, bone: usize) -> Mesh {
         mesh.compute_normals();
     }
     mesh
+}
+
+/// Trails are drawn in this colour where the tip is planted.
+const PLANTED: [u8; 4] = [255, 255, 255, 255];
+
+/// One mesh of square prisms along the given world segments.
+fn prism_mesh(segs: &[(Vec3, Vec3)], r: f32) -> Option<Mesh> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let mut pos: Vec<[f32; 3]> = Vec::new();
+    let mut idx: Vec<u32> = Vec::new();
+    for (a, b) in segs {
+        let Some(dir) = (*b - *a).try_normalize() else {
+            continue;
+        };
+        // Overlap the neighbours by a radius so bends have no gaps.
+        let (a, b) = (*a - dir * r, *b + dir * r);
+        let side = if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let u = dir.cross(side).normalize() * r;
+        let v = dir.cross(u.normalize()) * r;
+        let base = pos.len() as u32;
+        let ring = [u, v, -u, -v];
+        for p in [a, b] {
+            pos.extend(ring.iter().map(|o| (p + *o).to_array()));
+        }
+        for k in 0..4u32 {
+            let k1 = (k + 1) % 4;
+            idx.extend([
+                base + k,
+                base + k1,
+                base + 4 + k1,
+                base + k,
+                base + 4 + k1,
+                base + 4 + k,
+            ]);
+        }
+    }
+    if idx.is_empty() {
+        return None;
+    }
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+    .with_inserted_indices(Indices::U32(idx));
+    mesh.duplicate_vertices();
+    mesh.compute_flat_normals();
+    Some(mesh)
+}
+
+/// The tip paths of a trails shot: a coloured tube per bone, planted
+/// stretches thicker and white, dots at even time steps (growing with
+/// time), a big one at t = 0. Legend lines are appended.
+#[allow(clippy::too_many_arguments)]
+fn spawn_trails(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    stand_ins: &mut Vec<Entity>,
+    legend: &mut Vec<(String, [u8; 4])>,
+    trails: &[modeler::inspect::motion::Trail],
+    step: f32,
+    bounds: Option<(Vec3, Vec3)>,
+) {
+    let diag = bounds.map_or(2.0, |(lo, hi)| (hi - lo).length()).max(0.05);
+    let r = (diag * 0.0035).max(0.0015);
+    let unlit = |materials: &mut Assets<StandardMaterial>, c: [u8; 4]| {
+        materials.add(StandardMaterial {
+            base_color: Color::srgb_u8(c[0], c[1], c[2]),
+            unlit: true,
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        })
+    };
+    let ball = meshes.add(Sphere::new(1.0));
+    let planted_mat = unlit(materials, PLANTED);
+    for (i, t) in trails.iter().enumerate() {
+        let col = modeler::raster::id_color_u8(i);
+        let mat = unlit(materials, col);
+        let (mut free, mut planted) = (Vec::new(), Vec::new());
+        for (k, w) in t.pts.windows(2).enumerate() {
+            if t.planted.get(k).copied().unwrap_or(false) {
+                planted.push((w[0], w[1]));
+            } else {
+                free.push((w[0], w[1]));
+            }
+        }
+        let mut spawn = |mesh: Option<Mesh>, m: &Handle<StandardMaterial>| {
+            if let Some(mesh) = mesh {
+                stand_ins.push(
+                    commands
+                        .spawn((
+                            Mesh3d(meshes.add(mesh)),
+                            MeshMaterial3d(m.clone()),
+                            Transform::IDENTITY,
+                            RenderLayers::layer(ID_LAYER),
+                        ))
+                        .id(),
+                );
+            }
+        };
+        spawn(prism_mesh(&free, r), &mat);
+        spawn(prism_mesh(&planted, r * 1.8), &planted_mat);
+        let n = t.dots.len().max(1) as f32;
+        for (k, p) in t.dots.iter().enumerate() {
+            let rad = if k == 0 {
+                r * 4.5
+            } else {
+                r * (2.0 + 1.5 * k as f32 / n)
+            };
+            stand_ins.push(
+                commands
+                    .spawn((
+                        Mesh3d(ball.clone()),
+                        MeshMaterial3d(mat.clone()),
+                        Transform::from_translation(*p).with_scale(Vec3::splat(rad)),
+                        RenderLayers::layer(ID_LAYER),
+                    ))
+                    .id(),
+            );
+        }
+        let tip = if t.root { " (head)" } else { "" };
+        legend.push((format!("{}{tip}", t.bone), col));
+    }
+    legend.push(("PLANTED: tip below 3 cm".into(), PLANTED));
+    legend.push((
+        format!("dots every {step:.3} s, growing; big = t 0"),
+        [150, 150, 150, 255],
+    ));
 }
 
 /// A bone as a slim double pyramid from head to tail (world space).

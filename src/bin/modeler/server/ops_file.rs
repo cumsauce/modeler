@@ -140,15 +140,18 @@ pub(crate) fn duplicate_warnings(batch: &[Value], from_file: usize) -> Vec<Strin
 mod tests {
     use super::*;
 
-    fn project() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("modeler-ops-file-{}", std::process::id()));
+    /// A project directory of this test's own (tests run in parallel, so a
+    /// shared one lets one test read what another is still writing).
+    fn project(test: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("modeler-ops-file-{}-{test}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join("gen"));
         dir
     }
 
     #[test]
     fn reads_an_array_inside_the_project() {
-        let p = project();
+        let p = project("inside");
         let _ = std::fs::write(p.join("gen/a.json"), r#"[{"type": "primitive"}]"#);
         let Ok(items) = read(Some(&p), "gen/a.json") else {
             panic!("should read");
@@ -158,12 +161,19 @@ mod tests {
 
     #[test]
     fn refuses_outside_the_project_and_no_project() {
-        let p = project();
-        let outside = p.parent().map(|d| d.join("modeler-ops-outside.json"));
+        let p = project("outside");
+        let _ = std::fs::write(p.join("gen/a.json"), r#"[{"type": "primitive"}]"#);
+        let outside = p
+            .parent()
+            .map(|d| d.join(format!("modeler-ops-outside-{}.json", std::process::id())));
         if let Some(o) = &outside {
             let _ = std::fs::write(o, "[]");
         }
-        let err = read(Some(&p), "../modeler-ops-outside.json").err();
+        let err = read(
+            Some(&p),
+            &format!("../modeler-ops-outside-{}.json", std::process::id()),
+        )
+        .err();
         assert!(err.is_some_and(|e| e.contains("outside the project")));
         if let Some(o) = &outside {
             let abs = o.to_string_lossy().to_string();
@@ -177,7 +187,7 @@ mod tests {
 
     #[test]
     fn refuses_non_arrays_and_bad_json() {
-        let p = project();
+        let p = project("shapes");
         let _ = std::fs::write(p.join("gen/obj.json"), r#"{"ops": []}"#);
         let _ = std::fs::write(p.join("gen/bad.json"), "[{");
         assert!(read(Some(&p), "gen/obj.json").is_err_and(|e| e.contains("JSON array")));

@@ -113,7 +113,13 @@ pub fn build(
             let mut frames: Vec<Vec<Quat>> = Vec::with_capacity(steps + 1);
             let driver = |t: f32| -> Vec<(Vec3, Quat)> {
                 match &base {
-                    Some(b) => b.sample(skel, t).iter().map(|(t, r, _)| (*t, *r)).collect(),
+                    // The simulation works in world-aligned frames.
+                    Some(b) => b
+                        .sample(skel, t)
+                        .iter()
+                        .zip(&skel.bones)
+                        .map(|((t, r, _), bone)| (bone.rest * *t, to_world(bone.rest, *r)))
+                        .collect(),
                     None => vec![(Vec3::ZERO, Quat::IDENTITY); skel.bones.len()],
                 }
             };
@@ -145,27 +151,44 @@ pub fn build(
             Layer::Spring(frames)
         }
     };
+    let root_motion = base.as_ref().and_then(|b| b.root_motion.clone());
     Ok(Clip {
-        name: name.to_string(),
-        skeleton: def.skeleton.clone(),
-        duration,
-        looping: true,
-        tracks: Vec::new(),
         base: base.map(Box::new),
         layer: Some(Arc::new(layer)),
         fps: def.fps,
+        root_motion,
+        ..Clip::empty(name, &def.skeleton, duration, true)
     })
 }
 
 /// Applies the layer at `t` (already wrapped into the clip) to `pose`.
-pub fn apply(layer: &Layer, duration: f32, t: f32, pose: &mut super::Pose) {
+/// A rotation in a bone's rest frame, as a world-aligned one.
+fn to_world(rest: Quat, r: Quat) -> Quat {
+    if rest == Quat::IDENTITY {
+        r
+    } else {
+        (rest * r * rest.inverse()).normalize()
+    }
+}
+
+/// A world-aligned rotation, in a bone's rest frame.
+fn to_local(rest: Quat, r: Quat) -> Quat {
+    if rest == Quat::IDENTITY {
+        r
+    } else {
+        (rest.inverse() * r * rest).normalize()
+    }
+}
+
+pub fn apply(layer: &Layer, skel: &Skeleton, duration: f32, t: f32, pose: &mut super::Pose) {
+    let rest = |b: usize| skel.bones.get(b).map_or(Quat::IDENTITY, |x| x.rest);
     match layer {
         Layer::Wind(rig) => {
             let SwayKind::Wind(w) = &rig.kind else { return };
             let mut q = Vec::new();
             rig.wind_rotations(w, t, 0.0, &mut q);
-            for (slot, w) in pose.iter_mut().zip(q) {
-                slot.1 = (w * slot.1).normalize();
+            for (b, (slot, w)) in pose.iter_mut().zip(q).enumerate() {
+                slot.1 = (to_local(rest(b), w) * slot.1).normalize();
             }
         }
         Layer::Spring(frames) => {
@@ -183,7 +206,7 @@ pub fn apply(layer: &Layer, duration: f32, t: f32, pose: &mut super::Pose) {
             let u = x - i as f32;
             for (b, slot) in pose.iter_mut().enumerate() {
                 if let (Some(a), Some(c)) = (frames[i].get(b), frames[j].get(b)) {
-                    slot.1 = a.slerp(*c, u).normalize();
+                    slot.1 = to_local(rest(b), a.slerp(*c, u).normalize());
                 }
             }
         }

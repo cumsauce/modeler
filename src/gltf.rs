@@ -681,10 +681,81 @@ pub(crate) fn build_with(
                         .collect();
                     attributes["TANGENT"] = json!(b.accessor(&tan, n, "VEC4", 5126, false));
                 }
-                meshes.push(json!({
-                    "name": part.name,
-                    "primitives": [{"attributes": attributes, "indices": idx, "material": mat_index}],
-                }));
+                let mut prim =
+                    json!({"attributes": attributes, "indices": idx, "material": mat_index});
+                let mut mesh = json!({"name": part.name});
+                // Morph targets (a human's `shapes`): position offsets with
+                // their names in extras.targetNames, all weights 0 at rest;
+                // then the bind's pose-driven correctives, whose driver
+                // table goes in extras.correctives (a game sets their
+                // weights from the joints; modeler_bevy does).
+                let user: Vec<(String, Vec<[f32; 3]>)> = part
+                    .morphs
+                    .as_ref()
+                    .filter(|m| m.iter().all(|(_, d)| d.len() == n))
+                    .map(|m| m.iter().cloned().collect())
+                    .unwrap_or_default();
+                let corr = exported_correctives(part);
+                if !user.is_empty() || !corr.is_empty() {
+                    let mut targets = Vec::new();
+                    let mut names: Vec<String> = user.iter().map(|x| x.0.clone()).collect();
+                    for d in user.iter().map(|x| &x.1) {
+                        let mut lo = [f32::MAX; 3];
+                        let mut hi = [f32::MIN; 3];
+                        for v in d {
+                            for c in 0..3 {
+                                lo[c] = lo[c].min(v[c]);
+                                hi[c] = hi[c].max(v[c]);
+                            }
+                        }
+                        let a = b.accessor(&le_f32s(d), n, "VEC3", 5126, false);
+                        b.accessors[a as usize]["min"] = json!(lo);
+                        b.accessors[a as usize]["max"] = json!(hi);
+                        targets.push(json!({"POSITION": a}));
+                    }
+                    // Correctives touch a few hundred vertices each: sparse
+                    // accessors (zeros elsewhere), a few % of a dense one.
+                    for c in &corr {
+                        let mut pairs: Vec<(u32, [f32; 3])> =
+                            c.idx.iter().copied().zip(c.delta.iter().copied()).collect();
+                        pairs.sort_by_key(|p| p.0);
+                        pairs.dedup_by_key(|p| p.0);
+                        let mut lo = [0.0f32; 3];
+                        let mut hi = [0.0f32; 3];
+                        for (_, v) in &pairs {
+                            for k in 0..3 {
+                                lo[k] = lo[k].min(v[k]);
+                                hi[k] = hi[k].max(v[k]);
+                            }
+                        }
+                        let ib: Vec<u8> = pairs.iter().flat_map(|p| p.0.to_le_bytes()).collect();
+                        let vals: Vec<[f32; 3]> = pairs.iter().map(|p| p.1).collect();
+                        let iv = b.view(&ib, None);
+                        let vv = b.view(&le_f32s(&vals), None);
+                        b.accessors.push(json!({
+                            "componentType": 5126,
+                            "count": n,
+                            "type": "VEC3",
+                            "min": lo,
+                            "max": hi,
+                            "sparse": {
+                                "count": pairs.len(),
+                                "indices": {"bufferView": iv, "componentType": 5125},
+                                "values": {"bufferView": vv},
+                            },
+                        }));
+                        targets.push(json!({"POSITION": b.accessors.len() - 1}));
+                    }
+                    names.extend(corr.iter().map(|c| c.name.clone()));
+                    prim["targets"] = json!(targets);
+                    mesh["weights"] = json!(vec![0.0; names.len()]);
+                    mesh["extras"] = json!({"targetNames": names});
+                    if !corr.is_empty() {
+                        mesh["extras"]["correctives"] = corrective_table(part, user.len());
+                    }
+                }
+                mesh["primitives"] = json!([prim]);
+                meshes.push(mesh);
                 meshes.len() - 1
             }
         };
@@ -701,6 +772,14 @@ pub(crate) fn build_with(
         });
         if !opts.is_none() {
             let mut extras = json!({"part": part.name});
+            if !exported_correctives(part).is_empty() {
+                let user = part
+                    .morphs
+                    .as_ref()
+                    .filter(|m| m.iter().all(|(_, d)| d.len() == part.verts.len()))
+                    .map_or(0, |m| m.len());
+                extras["correctives"] = corrective_table(part, user);
+            }
             if let Some(Some(l)) = prepared.lod.get(pi) {
                 extras["lod"] = json!({"level": l.level, "near": l.near, "far": l.far});
             }
@@ -1128,9 +1207,24 @@ pub(crate) fn build_variants(
     if names.is_empty() {
         return build_with(model, buffer_uri, opts, tex_out, embed_ktx2);
     }
+    // Outfits (variants that show / hide parts): export every part any
+    // variant shows, with per-variant visibility in node extras.
+    let outfit_base = crate::variant::export_base(model)?;
+    let original = model;
+    let (model, variants) = match &outfit_base {
+        Some(base) => (base, None),
+        None => (model, variants),
+    };
     let owned;
     let variants = match variants {
         Some(v) => v,
+        None if outfit_base.is_some() => {
+            owned = names
+                .iter()
+                .map(|n| crate::variant::derive_look(model, n).map(|m| (n.clone(), m)))
+                .collect::<Result<Vec<_>, String>>()?;
+            &owned
+        }
         None => {
             owned = names
                 .iter()
@@ -1156,10 +1250,48 @@ pub(crate) fn build_variants(
     }
     let line = merge_variants(&mut doc, &mut bin, &vdocs)?;
     report += &format!("\n{line}");
+    if outfit_base.is_some() {
+        let n = mark_variant_visibility(&mut doc, original);
+        report += &format!(
+            "\n  outfits: {n} node(s) carry extras.variants_visible (visible per variant; parts any variant shows are exported)"
+        );
+    }
     for n in notes {
         report += &format!("\n  {n}");
     }
     Ok((doc, bin, report))
+}
+
+/// Writes `extras.variants_visible: {variant: bool}` (default first) on
+/// every mesh node whose part some variant shows or hides; the node's own
+/// `extras.part` names the part. Returns how many nodes were marked.
+fn mark_variant_visibility(doc: &mut Value, model: &crate::Model) -> usize {
+    let mut n = 0;
+    let Some(nodes) = doc["nodes"].as_array_mut() else {
+        return 0;
+    };
+    for node in nodes {
+        let Some(part) = node["extras"]["part"]
+            .as_str()
+            .or_else(|| node["name"].as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(p) = model.part(&part) else {
+            continue;
+        };
+        let Some(vis) = crate::variant::visible_per_variant(model, p) else {
+            continue;
+        };
+        let mut m = serde_json::Map::new();
+        for (k, v) in vis {
+            m.insert(k, json!(v));
+        }
+        node["extras"]["variants_visible"] = Value::Object(m);
+        n += 1;
+    }
+    n
 }
 
 /// Folds variant documents (same nodes, other materials) into `doc`.
@@ -1460,11 +1592,15 @@ fn rig_nodes(
         // Joint nodes, parents first (the skeleton's order).
         let first = nodes.len();
         for bone in &skel.bones {
-            let local = match bone.parent {
-                Some(p) => bone.head - skel.bones[p].head,
-                None => bone.head,
-            };
-            nodes.push(json!({"name": bone.name, "translation": local.to_array()}));
+            let (local, rl) = bone.rest_local(&skel.bones);
+            let mut node = json!({"name": bone.name, "translation": local.to_array()});
+            if rl != bevy::math::Quat::IDENTITY {
+                node["rotation"] = json!(rl.to_array());
+            }
+            if let Some(l) = &bone.limits {
+                node["extras"] = json!({"limits": l});
+            }
+            nodes.push(node);
         }
         joint_count += skel.bones.len();
         for (i, bone) in skel.bones.iter().enumerate() {
@@ -1497,6 +1633,14 @@ fn rig_nodes(
         }) {
             let rig = crate::anim::sway::rig_of(skel, def, None, name);
             extras["sway"] = serde_json::to_value(&rig).unwrap_or(Value::Null);
+        } else if let Some(rig) = clips.iter().find_map(|(c, _)| match c.layer.as_deref() {
+            // A prefab instance's wind sway, carried into the instance.
+            Some(crate::anim::sway::Layer::Wind(r)) if c.skeleton == skel.name => Some(r),
+            _ => None,
+        }) {
+            let mut rig = rig.clone();
+            rig.period = None;
+            extras["sway"] = serde_json::to_value(&rig).unwrap_or(Value::Null);
         }
         nodes.push(json!({"name": skel.name, "children": roots, "extras": extras}));
         // Rigid parts ride their joint: local = inverse(joint rest) * part.
@@ -1506,12 +1650,36 @@ fn rig_nodes(
             };
             let Some(bone) = rig.bone else { continue };
             let n = part_nodes[pi];
-            let head = skel.bones[bone].head;
-            let t = &nodes[n]["translation"];
-            let local: Vec<f32> = (0..3)
-                .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - head[k])
-                .collect();
-            nodes[n]["translation"] = json!(local);
+            let bn = &skel.bones[bone];
+            let head = bn.head;
+            if bn.rest == bevy::math::Quat::IDENTITY {
+                let t = &nodes[n]["translation"];
+                let local: Vec<f32> = (0..3)
+                    .map(|k| t[k].as_f64().unwrap_or(0.0) as f32 - head[k])
+                    .collect();
+                nodes[n]["translation"] = json!(local);
+            } else {
+                let read = |key: &str, d: &[f32]| -> Vec<f32> {
+                    (0..d.len())
+                        .map(|k| nodes[n][key][k].as_f64().map_or(d[k], |v| v as f32))
+                        .collect()
+                };
+                let (t, r, sc) = (
+                    read("translation", &[0.0; 3]),
+                    read("rotation", &[0.0, 0.0, 0.0, 1.0]),
+                    read("scale", &[1.0; 3]),
+                );
+                let m = bn.inverse_bind()
+                    * Mat4::from_scale_rotation_translation(
+                        bevy::math::Vec3::new(sc[0], sc[1], sc[2]),
+                        bevy::math::Quat::from_xyzw(r[0], r[1], r[2], r[3]),
+                        bevy::math::Vec3::new(t[0], t[1], t[2]),
+                    );
+                let (s2, r2, t2) = m.to_scale_rotation_translation();
+                nodes[n]["translation"] = json!(t2.to_array());
+                nodes[n]["rotation"] = json!(r2.normalize().to_array());
+                nodes[n]["scale"] = json!(s2.to_array());
+            }
             let j = first + bone;
             if let Some(Value::Array(a)) = nodes[j]
                 .as_object_mut()
@@ -1529,7 +1697,7 @@ fn rig_nodes(
             let ibm: Vec<[f32; 16]> = skel
                 .bones
                 .iter()
-                .map(|bone| Mat4::from_translation(-bone.head).to_cols_array())
+                .map(|bone| bone.inverse_bind().to_cols_array())
                 .collect();
             let view = b.view(&le_f32s(&ibm), None);
             b.accessors.push(json!({"bufferView": view, "componentType": 5126, "count": ibm.len(), "type": "MAT4"}));
@@ -1565,7 +1733,8 @@ fn rig_nodes(
                     } else {
                         t
                     };
-                    clip.sample(skel, t)
+                    // Root motion is the game's: the bone stays in place.
+                    clip.sample_in_place(skel, t)
                 })
                 .collect();
             let tview = b.view(&le_f32s(times.iter().map(std::array::from_ref)), None);
@@ -1576,10 +1745,8 @@ fn rig_nodes(
             let input = b.accessors.len() - 1;
             let (mut samplers, mut channels) = (Vec::new(), Vec::new());
             for (bone, tr, rot, sc) in clip.channels(skel) {
-                let rest = match skel.bones[bone].parent {
-                    Some(p) => skel.bones[bone].head - skel.bones[p].head,
-                    None => skel.bones[bone].head,
-                };
+                let (rest, rl) = skel.bones[bone].rest_local(&skel.bones);
+                let ident = rl == bevy::math::Quat::IDENTITY;
                 let mut push = |path: &str, bytes: Vec<u8>, kind: &str| {
                     let v = b.view(&bytes, None);
                     b.accessors.push(json!({"bufferView": v, "componentType": 5126, "count": times.len(), "type": kind}));
@@ -1589,7 +1756,13 @@ fn rig_nodes(
                 if tr {
                     let v: Vec<[f32; 3]> = poses
                         .iter()
-                        .map(|p| (rest + p[bone].0).to_array())
+                        .map(|p| {
+                            if ident {
+                                (rest + p[bone].0).to_array()
+                            } else {
+                                (rest + rl * p[bone].0).to_array()
+                            }
+                        })
                         .collect();
                     push("translation", le_f32s(&v), "VEC3");
                 }
@@ -1598,7 +1771,11 @@ fn rig_nodes(
                     let v: Vec<[f32; 4]> = poses
                         .iter()
                         .map(|p| {
-                            let mut q = p[bone].1;
+                            let mut q = if ident {
+                                p[bone].1
+                            } else {
+                                (rl * p[bone].1).normalize()
+                            };
                             if prev.is_some_and(|pq| pq.dot(q) < 0.0) {
                                 q = -q; // keep the shortest path between samples
                             }
@@ -1613,13 +1790,110 @@ fn rig_nodes(
                     push("scale", le_f32s(&v), "VEC3");
                 }
             }
+            // Morph target weights (a human's `shapes`): one sampler per
+            // morphed mesh node, every target's weight per keyframe, in
+            // the order of its `targets` / `extras.targetNames`.
+            if clip.has_morphs() {
+                let ws: Vec<Vec<(String, usize, f32)>> = times
+                    .iter()
+                    .map(|&t| {
+                        let t = if clip.looping && t >= clip.duration - 1e-6 {
+                            clip.duration - 1e-4
+                        } else {
+                            t
+                        };
+                        clip.morph_weights(t)
+                    })
+                    .collect();
+                for (pi, part) in exported.iter().enumerate() {
+                    let n = part.verts.len();
+                    let Some(m) = part
+                        .morphs
+                        .as_ref()
+                        .filter(|m| !m.is_empty() && m.iter().all(|(_, d)| d.len() == n))
+                    else {
+                        continue;
+                    };
+                    if !ws.iter().any(|w| w.iter().any(|x| x.0 == part.name)) {
+                        continue;
+                    }
+                    // Every target of the mesh, the correctives' slots 0
+                    // (the game's driver sets them after the animation).
+                    let total = m.len() + exported_correctives(part).len();
+                    let mut out: Vec<f32> = Vec::with_capacity(times.len() * total);
+                    for w in &ws {
+                        for k in 0..total {
+                            out.push(
+                                w.iter()
+                                    .find(|x| x.0 == part.name && x.1 == k)
+                                    .map_or(0.0, |x| x.2),
+                            );
+                        }
+                    }
+                    let v = b.view(&le_f32s(out.iter().map(std::array::from_ref)), None);
+                    b.accessors.push(json!({"bufferView": v, "componentType": 5126, "count": out.len(), "type": "SCALAR"}));
+                    samplers.push(json!({"input": input, "output": b.accessors.len() - 1, "interpolation": "LINEAR"}));
+                    channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": part_nodes[pi], "path": "weights"}}));
+                }
+            }
             key_count += times.len() * channels.len();
             if !channels.is_empty() {
+                let mut extras = json!({"loop": clip.looping, "duration": clip.duration});
+                if let Some(rm) = &clip.root_motion {
+                    let axes: String = ['x', 'y', 'z']
+                        .iter()
+                        .zip(rm.axes)
+                        .filter(|(_, on)| *on)
+                        .map(|(c, _)| *c)
+                        .collect();
+                    let mut samples = Vec::with_capacity(times.len());
+                    let mut last_yaw = 0.0f32;
+                    let mut turns = 0.0f32;
+                    for &t in &times {
+                        let (v, y) = clip.travel(skel, t);
+                        // Unwrap the yaw into a running angle.
+                        let mut y = y + turns;
+                        while y - last_yaw > 180.0 {
+                            y -= 360.0;
+                            turns -= 360.0;
+                        }
+                        while y - last_yaw < -180.0 {
+                            y += 360.0;
+                            turns += 360.0;
+                        }
+                        last_yaw = y;
+                        samples.push(json!([t, v.x, v.y, v.z, y]));
+                    }
+                    let (delta, _) = clip.root_delta(skel);
+                    extras["root_motion"] = json!({
+                        "bone": skel.bones[rm.bone].name,
+                        "axes": axes,
+                        "yaw": rm.yaw,
+                        "delta": delta.to_array(),
+                        "yaw_degrees": last_yaw,
+                        "duration": clip.duration,
+                        "samples": samples,
+                    });
+                }
+                if !clip.events.is_empty() {
+                    extras["events"] = Value::Array(
+                        clip.events
+                            .iter()
+                            .map(|e| {
+                                let mut o = json!({"time": e.time, "name": e.name});
+                                if let Some(d) = &e.data {
+                                    o["data"] = d.clone();
+                                }
+                                o
+                            })
+                            .collect(),
+                    );
+                }
                 animations.push(json!({
                     "name": clip.name,
                     "samplers": samplers,
                     "channels": channels,
-                    "extras": {"loop": clip.looping, "duration": clip.duration},
+                    "extras": extras,
                 }));
             }
         }
@@ -1634,4 +1908,210 @@ fn rig_nodes(
         )
     });
     Ok((skins, animations, report))
+}
+
+/// A part's correctives as exported: only on a smooth-skinned part whose
+/// offsets fit its vertex count.
+fn exported_correctives(part: &Part) -> Vec<crate::anim::skin::Corrective> {
+    let n = part.verts.len();
+    match (&part.correctives, &part.rig) {
+        (Some(c), Some(r)) if r.bone.is_none() => c
+            .iter()
+            .filter(|c| c.idx.iter().all(|i| (*i as usize) < n))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `extras.correctives`: one driver per corrective target, `target` its
+/// index among the mesh's morph targets (after the user's shapes).
+fn corrective_table(part: &Part, first: usize) -> Value {
+    Value::Array(
+        exported_correctives(part)
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                json!({
+                    "target": first + k,
+                    "name": c.name,
+                    "bone": c.bone,
+                    "axis": c.axis,
+                    "degrees": c.degrees,
+                    "from": c.from,
+                    "to": c.to,
+                    "rest_local": c.rest_local,
+                })
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod rig_tests {
+    use bevy::math::{Mat4, Quat, Vec3};
+
+    fn local(n: &::gltf::Node) -> Mat4 {
+        Mat4::from_cols_array_2d(&n.transform().matrix())
+    }
+
+    fn world_of(doc: &::gltf::Document, name: &str) -> Mat4 {
+        let nodes: Vec<::gltf::Node> = doc.nodes().collect();
+        let parent = |i: usize| {
+            nodes
+                .iter()
+                .find(|p| p.children().any(|c| c.index() == i))
+                .map(|p| p.index())
+        };
+        let Some(mut i) = nodes.iter().position(|n| n.name() == Some(name)) else {
+            panic!("no node {name}")
+        };
+        let mut m = local(&nodes[i]);
+        while let Some(p) = parent(i) {
+            m = local(&nodes[p]) * m;
+            i = p;
+        }
+        m
+    }
+
+    /// Bones with rest rotations export joint rotations whose world
+    /// matrices undo the inverse binds at rest, rigid parts stay put, and
+    /// rotation channels pose joints as the modeler does.
+    #[test]
+    fn rest_rotations_export_consistently() {
+        let mut s = crate::commands::Session::default();
+        let items = serde_json::json!([
+            {"type": "sdf", "name": "arm", "shapes": [{"shape": "capsule", "from": [0, 1, 0], "to": [1, 1, 0], "radius": 0.08}]},
+            {"type": "primitive", "name": "hand", "kind": "box", "size": [0.1, 0.1, 0.1], "translation": [1.15, 1.0, 0.0], "rotation": {"z": 10}},
+            {"type": "skeleton", "name": "rig", "bones": {
+                "upper": {"head": [0, 1, 0], "radius": 0.08, "rest": {"x": 20, "y": 35}},
+                "lower": {"parent": "upper", "head": [0.5, 1, 0], "tail": [1.1, 1, 0], "radius": 0.08, "roll": 45}}},
+            {"type": "bind", "name": "skin", "skeleton": "rig", "parts": ["arm"]},
+            {"type": "bind", "name": "grip", "skeleton": "rig", "parts": ["hand"], "bone": "lower"},
+            {"type": "material", "name": "arm", "color": "#c08060", "flat": true},
+            {"type": "material", "name": "hand", "color": "#806040", "flat": true},
+            {"type": "clip", "name": "wave", "skeleton": "rig", "duration": 1.0,
+             "tracks": {"lower": {"rotate": [[0, {"x": 0}], [0.5, {"x": 60}], [1, {"x": 0}]]}}}
+        ]);
+        let serde_json::Value::Array(items) = items else {
+            panic!()
+        };
+        s.apply_values_as(None, items, false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let dir = std::env::temp_dir().join(format!("modeler-rest-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.join("arm.glb");
+        super::export_glb(&s.model, &path).unwrap_or_else(|e| panic!("{e}"));
+        let (doc, buffers, _) = ::gltf::import(&path).unwrap_or_else(|e| panic!("{e}"));
+        let Some(skin) = doc.skins().next() else {
+            panic!("a skin")
+        };
+        let ibm: Vec<[[f32; 4]; 4]> = skin
+            .reader(|b| Some(&buffers[b.index()]))
+            .read_inverse_bind_matrices()
+            .map(|r| r.collect())
+            .unwrap_or_default();
+        for (j, m) in skin.joints().zip(&ibm) {
+            let w = world_of(&doc, j.name().unwrap_or(""));
+            let id = w * Mat4::from_cols_array_2d(m);
+            assert!(
+                id.abs_diff_eq(Mat4::IDENTITY, 1e-4),
+                "{:?}: {id:?}",
+                j.name()
+            );
+        }
+        // The rigid hand keeps its place and turn.
+        let hand = world_of(&doc, "hand");
+        let (_, r, t) = hand.to_scale_rotation_translation();
+        assert!((t - Vec3::new(1.15, 1.0, 0.0)).length() < 1e-4, "{t:?}");
+        assert!(r.angle_between(Quat::from_rotation_z(10f32.to_radians())) < 1e-3);
+        // The rotation channel at t = 0.5 poses `lower` as the modeler does.
+        let (c, sk) = crate::anim::clip(&s.model, Some("wave")).unwrap_or_else(|e| panic!("{e}"));
+        let want = sk.world(&c.sample(&sk, 0.5))[1];
+        let Some(anim) = doc.animations().next() else {
+            panic!("an animation")
+        };
+        let Some(ch) = anim.channels().next() else {
+            panic!("a channel")
+        };
+        let rd = ch.reader(|b| Some(&buffers[b.index()]));
+        let times: Vec<f32> = rd.read_inputs().map(|r| r.collect()).unwrap_or_default();
+        let Some(::gltf::animation::util::ReadOutputs::Rotations(rot)) = rd.read_outputs() else {
+            panic!("rotation channel")
+        };
+        let rot: Vec<[f32; 4]> = rot.into_f32().collect();
+        let Some(mid) = times.iter().position(|t| (t - 0.5).abs() < 1e-4) else {
+            panic!("no 0.5 sample")
+        };
+        let lower = doc
+            .nodes()
+            .find(|n| n.name() == Some("lower"))
+            .unwrap_or_else(|| panic!("lower"));
+        let (t, _, s3) = lower.transform().decomposed();
+        let l = Mat4::from_scale_rotation_translation(
+            Vec3::from(s3),
+            Quat::from_array(rot[mid]),
+            Vec3::from(t),
+        );
+        let upper = world_of(&doc, "upper");
+        assert!(
+            (upper * l).abs_diff_eq(want, 1e-4),
+            "{:?} vs {want:?}",
+            upper * l
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bones moved only by IK get animation channels, and joint limits
+    /// land in the joint node's extras.
+    #[test]
+    fn ik_driven_bones_export_channels() {
+        let mut s = crate::commands::Session::default();
+        let items = serde_json::json!([
+            {"type": "sdf", "name": "leg", "shapes": [{"shape": "capsule", "from": [0, 0.95, 0], "to": [0, 0.05, 0], "radius": 0.06}]},
+            {"type": "material", "name": "leg", "color": "#c08060", "flat": true},
+            {"type": "skeleton", "name": "rig", "bones": {
+                "hip": {"head": [0, 1.0, 0], "tail": [0, 1.1, 0]},
+                "thigh": {"parent": "hip", "head": [0, 0.95, 0], "limits": {"x": [-90, 90]}},
+                "knee": {"parent": "thigh", "head": [0, 0.5, 0.05]},
+                "ankle": {"parent": "knee", "head": [0, 0.05, 0], "tail": [0, 0, 0.15]}}},
+            {"type": "bind", "name": "skin", "skeleton": "rig", "parts": ["leg"]},
+            {"type": "clip", "name": "step", "skeleton": "rig", "duration": 1.0,
+             "ik": {"ankle": {"target": [[0, [0, 0.1, 0.2]], [0.5, [0, 0.2, -0.1]], [1, [0, 0.1, 0.2]]]}}}
+        ]);
+        let serde_json::Value::Array(items) = items else {
+            panic!()
+        };
+        s.apply_values_as(None, items, false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let dir = std::env::temp_dir().join(format!("modeler-ik-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.join("leg.glb");
+        super::export_glb(&s.model, &path).unwrap_or_else(|e| panic!("{e}"));
+        let (doc, _, _) = ::gltf::import(&path).unwrap_or_else(|e| panic!("{e}"));
+        let Some(anim) = doc.animations().next() else {
+            panic!("an animation")
+        };
+        let animated: Vec<String> = anim
+            .channels()
+            .filter(|c| c.target().property() == ::gltf::animation::Property::Rotation)
+            .filter_map(|c| c.target().node().name().map(str::to_string))
+            .collect();
+        for b in ["thigh", "knee"] {
+            assert!(animated.iter().any(|n| n == b), "{b} in {animated:?}");
+        }
+        let thigh = doc
+            .nodes()
+            .find(|n| n.name() == Some("thigh"))
+            .unwrap_or_else(|| panic!("thigh"));
+        let extras = thigh
+            .extras()
+            .as_ref()
+            .map(|r| r.get().to_string())
+            .unwrap_or_default();
+        assert!(extras.contains("limits"), "{extras}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

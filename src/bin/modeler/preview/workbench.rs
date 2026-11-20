@@ -59,7 +59,7 @@ pub(crate) fn mode_available(model: &Model, mode: Mode) -> Result<(), &'static s
             if has(|o| {
                 matches!(o, Op::Skeleton { .. })
                     || matches!(o, Op::Body { def, .. } if def.rig != Some(false))
-            }) =>
+            }) || model.parts.iter().any(|p| p.rig.is_some()) =>
         {
             Ok(())
         }

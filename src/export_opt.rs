@@ -464,10 +464,10 @@ fn add_lods(
         if parts[i].indices.len() / 3 < o.lod_min_tris || meshes[i] != MeshRef::Own {
             continue;
         }
-        // Skinned meshes keep one level (the simplifier would drop weights).
-        if parts[i].rig.as_ref().is_some_and(|b| b.bone.is_none()) {
-            continue;
-        }
+        // Skinned meshes simplify too: the collapses keep each kept
+        // vertex's own weights (and morph / corrective offsets), cost more
+        // where weights change (joints keep their density), and the LOD
+        // nodes share the skin (same joints, their own JOINTS_0/WEIGHTS_0).
         chains += 1;
         let mut ids = Vec::new();
         for (k, ratio) in o.lods.iter().enumerate() {
@@ -953,6 +953,50 @@ fn compact(p: &mut Part, weld: bool) {
             .map(|&o| b.weights.get(o).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]))
             .collect();
         p.rig = Some(std::sync::Arc::new(nb));
+    }
+    remap_shapes(p, &kept, &remap);
+}
+
+/// Carries morph targets and correctives through a vertex remap: `kept`
+/// is each new vertex's old index, `remap` each old vertex's new one.
+pub(crate) fn remap_shapes(p: &mut Part, kept: &[usize], remap: &[u32]) {
+    if let Some(m) = &p.morphs {
+        p.morphs = Some(std::sync::Arc::new(
+            m.iter()
+                .map(|(n, d)| {
+                    (
+                        n.clone(),
+                        kept.iter()
+                            .map(|&o| d.get(o).copied().unwrap_or_default())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ));
+    }
+    if let Some(cs) = &p.correctives {
+        let out: Vec<crate::anim::skin::Corrective> = cs
+            .iter()
+            .map(|c| {
+                let mut seen = std::collections::HashSet::new();
+                let (mut idx, mut delta) = (Vec::new(), Vec::new());
+                for (i, d) in c.idx.iter().zip(&c.delta) {
+                    let Some(&nw) = remap.get(*i as usize) else {
+                        continue;
+                    };
+                    if nw != u32::MAX && seen.insert(nw) {
+                        idx.push(nw);
+                        delta.push(*d);
+                    }
+                }
+                crate::anim::skin::Corrective {
+                    idx,
+                    delta,
+                    ..c.clone()
+                }
+            })
+            .collect();
+        p.correctives = Some(std::sync::Arc::new(out));
     }
 }
 

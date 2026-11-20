@@ -1271,6 +1271,17 @@ Style::default()
                     };
                     modeler::silhouette::resolve_references(&mut batch, &read)?;
                 }
+                // Mocap files: sandboxed like ops_file, parsed (errors with
+                // line numbers) and hashed into the item.
+                if batch.iter().any(|v| v.to_string().contains("\"mocap\"")) {
+                    let project = modeler::catalog::project_root();
+                    let read = |file: &str| -> Result<Vec<u8>, String> {
+                        let p =
+                            super::ops_file::resolve_as(project.as_deref(), file, "mocap.file")?;
+                        std::fs::read(&p).map_err(|e| format!("mocap.file `{file}`: {e}"))
+                    };
+                    modeler::mocap::resolve_files(&mut batch, &read)?;
+                }
                 Ok((batch, from_file, inline))
             };
         let (mut snap, doc, prepped) = self.snapshot_with(prep).await?;
@@ -1539,6 +1550,7 @@ Style::default()
             time,
             times,
             bone,
+            bones: trail_bones,
             joints,
             reference,
             variant,
@@ -1581,7 +1593,7 @@ Style::default()
             ));
         }
         let (ids, curvature, bones, weights) = match style.as_deref() {
-            None | Some("shaded") | Some("silhouette") | Some("density") => {
+            None | Some("shaded") | Some("silhouette") | Some("density") | Some("trails") => {
                 (false, false, false, false)
             }
             Some("ids") => (true, false, false, false),
@@ -1591,7 +1603,7 @@ Style::default()
             Some(other) => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "style must be \"shaded\", \"silhouette\", \"density\", \"ids\", \"curvature\", \"bones\" or \"weights\", got `{other}`"
+                        "style must be \"shaded\", \"silhouette\", \"density\", \"ids\", \"curvature\", \"bones\", \"weights\" or \"trails\", got `{other}`"
                     ),
                     None,
                 ));
@@ -1599,6 +1611,13 @@ Style::default()
         };
         let silhouette = style.as_deref() == Some("silhouette");
         let density = style.as_deref() == Some("density");
+        let trails = style.as_deref() == Some("trails");
+        if trail_bones.is_some() && !trails {
+            return Err(ErrorData::invalid_params(
+                "bones belongs to style \"trails\" (the tip paths to draw); for the skeleton overlay use style \"bones\"",
+                None,
+            ));
+        }
         if let Some(r) = reference {
             return self
                 .reference_view(r, width, height, focus, clip, time)
@@ -1625,7 +1644,7 @@ Style::default()
             }
             (Some(ts), _) => ts.iter().map(|t| Some(*t)).collect(),
             (None, Some(t)) => vec![Some(t)],
-            (None, None) if clip.is_some() => vec![Some(0.0)],
+            (None, None) if clip.is_some() || trails => vec![Some(0.0)],
             (None, None) => vec![None],
         };
         if views.len() * pose_times.len() > 9 {
@@ -1660,6 +1679,7 @@ Style::default()
             frame: None,
             dims,
             scene_lit,
+            trails: trails.then(|| trail_bones.clone()),
         };
         let mut parsed = Vec::with_capacity(views.len());
         for v in views {
@@ -1766,7 +1786,7 @@ Style::default()
                 .await?;
             let tl = t.map(|t| format!(" t={t}")).unwrap_or_default();
             let key = format!(
-                "{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}|{frame:?}|{var:?}"
+                "{view}|{width}x{height}|{focus:?}|{style_key}|{clip:?}{tl}|{bone:?}{trail_bones:?}|{frame:?}|{var:?}"
             );
             let tl = match var {
                 Some(v) => format!("{tl} [{v}]"),
@@ -1872,6 +1892,7 @@ Style::default()
             thickness,
             pose,
             proportions,
+            curves,
         }): Parameters<InspectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if measure.is_none()
@@ -1880,9 +1901,10 @@ Style::default()
             && thickness.is_none()
             && pose.is_none()
             && proportions.is_none()
+            && curves.is_none()
         {
             return Err(ErrorData::invalid_params(
-                "give measure, section, mass, thickness, proportions and/or pose, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
+                "give measure, section, mass, thickness, proportions, curves and/or pose, e.g. {\"measure\": [[\"handle\", \"cup\"]]}",
                 None,
             ));
         }
@@ -1927,6 +1949,19 @@ Style::default()
                     json.insert("section".into(), j);
                     let _ = png_tx.send(png);
                 }
+                if let Some(cu) = curves {
+                    let (t, j, png) = modeler::inspect::motion::report(
+                        model,
+                        cu.clip.as_deref(),
+                        cu.bones.as_deref(),
+                        cu.channels.as_deref(),
+                        cu.samples,
+                    )
+                    .map_err(|e| (e, None))?;
+                    text.push(t);
+                    json.insert("curves".into(), j);
+                    let _ = png_tx.send(png);
+                }
                 if let Some(m) = mass {
                     let (t, j) = modeler::inspect::mass_of(
                         model,
@@ -1952,7 +1987,7 @@ Style::default()
             })
             .await?;
         let mut result = result;
-        if let Ok(png) = png_rx.try_recv() {
+        while let Ok(png) = png_rx.try_recv() {
             result
                 .content
                 .push(Content::image(B64.encode(png), "image/png"));
@@ -2257,7 +2292,7 @@ impl rmcp::ServerHandler for Tools {
 - 1 unit = 1 meter, always (Y up, ground at y = 0): build at real-world scale.
 - Call scene_summary first (and after anything confusing): parts, bounds, ops, params, annotations and warnings. An empty warnings list means none fired.
 - The human's comments (annotations) are requests: scene_summary lists the open ones. When you have dealt with one, resolve it with add_annotation {resolve: id, text: what you did}; don't delete it.
-- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, variant, skeleton, bind, clip, sway). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
+- Build with apply_ops: one call, an array of items tagged by \"type\" (primitive, extrude, revolve, sweep, loft, path_array, lsystem, scatter, text, terrain, hull, blob, sdf, skin, body, silhouette, smooth, decimate, split, round, deform, shell, panel, group, transform, boolean, radial_array, linear_array, mirror, material, prefab, move, place, hide_part, show_part, rename, delete, tri_mesh, uvs, repeat, light, decal, collider, marker, variant, skeleton, bind, clip, mocap, sway, garment). describe_op(kind) returns an example and the schema for each. Items are upserts by name + type (re-issue to tweak); item order doesn't matter (hide/show, rename and move/place run after every op, in written order, seeing every part the batch makes). A batch is atomic: any failing item rolls the whole call back. shell hollows a solid (thickness, open faces). garment cuts clothing out of a body's surface ({\"type\": \"garment\", \"name\", \"on\": body, \"preset\": tshirt | trousers | shoes | skirt | dress | ... | hair_short, or region {zones, arms, legs, above, below, planes}}), hides the skin it covers, and outfits are variants with show / hide part lists. Avoid knife edges: box/cylinder/wedge primitives take round: r (meters, rounded edges, still a closed solid); round fillet takes edges: top/bottom/vertical/horizontal; panel recesses a rows x cols grid of panels into a face (face, inset, depth, gap). place drops parts onto a surface, or with toward back/front/left/right mounts them against a wall. path_array with on: \"ground\" drops a row onto uneven ground (posts upright; follow: \"slope\" pitches copies along it; between: true stretches copies post to post: fence rails). decal projects a material_ops image (domain \"decal\", opacity cuts the shape) onto surfaces: {\"type\": \"decal\", \"name\", \"pbr\", \"size\": [w, h], \"on\": part, \"toward\", \"at\"} (graffiti, posters, stains, road lines).
 - Don't place things by arithmetic: place {parts, on, at: [x, z] or an anchor \"desk:top-front\"} drops parts onto a surface (and follows it when params change); move pivots take anchors like \"screen:bottom-front\" (left/right, bottom/top, back/front). Name patterns take * anywhere (\"*_raw\"). place each: true drops every matched part on its own (keys onto a sloped deck). rotation may be [x,y,z,w], {axis, degrees} or {x, y, z} degrees. A primitive with frame \"paper\" / \"paper:top-front\" is positioned in that part's own coordinates and follows it; linear_array local: true steps along the source's rotated axes.
 - Signs and labels: uvs projection \"face\" (alias \"label\") stretches one upright, unmirrored image over each side of a part (planar now maps along the thinnest axis); a card material with an opacity cutout on such a closed plate draws single-sided (open sheets such as leaf cards stay double-sided). ops_file items apply first and inline ops after, so an inline item with the same type + name wins (the result warns about every op given twice). An empty repeat is a noted no-op.
 - Loops: {\"type\": \"repeat\", \"var\": \"r\", \"count\": 4 | \"values\": [..], \"items\": [..]} copies items with {r} replaced in strings (\"key{r}\") and $r as a number in expressions; repeats nest.
@@ -2272,7 +2307,7 @@ impl rmcp::ServerHandler for Tools {
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
-- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings; smooth: true makes the path a curve through a few control points, twist / scale_end taper it); loft skins a closed solid through sections that change shape and size ({sections: [{profile, y | at, scale?, rotation?}, ...], smooth: true} for a bottle, circle into square, blade; with a path, sections sit at t along it; scale 0 at an end makes a point); path_array copies a part along a path (name_0.., count or spacing, align: +x along the path, roll_step 90 for chain links; hide the source); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_angle/curl/fold/stalk, wood in name and leaves in name_leaves; leaves are cards by default (flat quads with uvs 0..1, leaf_cross for a crossed pair): give name_leaves a material_ops material with domain \"card\" whose output sets opacity in a leaf shape (an alpha cutout; AGENTS.md has a leaf), or several leaves per image with a bigger leaf_size for dense crowns; leaf_mode \"solid\" models closed blades in leaf_shape instead; terrain makes level ground: a closed noise-heightfield slab at real size (style hills/ridges/dunes/mesa/flat, size, height, scale, seed; flatten pads [{at: [x, z], radius}] level building plots, paths [{points, width, depth}] carve roads and rivers; place things onto it); scatter strews copies over a surface ({input: part | [parts] | [[set]] | \"inst.*\", on, count | density, seed, scale [min, max], rotate random_y/random/none, align 0..1, min_spacing, max_slope, region}: rocks, forests of lsystem trees; copies name_0.. sit on the surface, hide the source); hull = convex hull of parts; blob melts solids together with a smooth fillet (blend meters; op union/subtract/intersect; creatures, mushrooms); split cuts a solid by a plane {normal, point} into capped name_above / name_below (gap pushes them apart); round fillets/chamfers/smooths a solid's edges; deform reshapes a mesh: displace (noise along normals: amount, scale, seed, noise fbm/ridged = rocks, cliffs), twist/bend (degrees along axis, bend toward a direction) and taper (scale_end): horns = taper then bend, material (pbr: a procedural material's height becomes real relief: bark, scales, bricks); sdf models organic solids from analytic shapes (sphere, ellipsoid, box, capsule = rounded cone, cylinder, torus, chain of [x, y, z, r], part, group) joined in order by smooth union/subtract/intersect (blend), mirror: \"x\" to model one side, warps (twist/bend/taper/displace) on the whole field, plus local sculpt warps on sdf / skin / body ({mode: inflate (amount m) | push (direction, amount) | pinch (0..1 toward at) | flatten (normal, 0..1 to the plane through at) | smooth (local blur), at: point or anchor (a joint name such as \"head\", \"part:top\"), radius, falloff}; zero effect outside radius; they never fold: push / pinch / flatten are capped (push about 0.53 x radius), so use a larger radius or several warps for more; under the item mirror they are symmetric unless the warp says mirror: false; smooth takes size, the blur reach): creatures, mushrooms, bones; silhouette {side [[z, y]], top [[x, z]], front? [[x, y]], smooth, round, blend} carves a solid from orthographic outlines (intersected extrusions, edges rounded by blend; a car body, a shoe, a gun), also an sdf shape {shape: \"silhouette\", side, top, front, round, at}; from_reference {image, view, height | size, flip?, regions?, holes?} traces an outline from a project PNG (front from +z, side / right from +x with image right = -z, left from -x, top = plan; a changed PNG re-traces on the next re-derive); skin wraps a skeleton (chains of [x, y, z, radius] or joint names) in one smooth surface: tentacles, roots, hands; chain / skin points may be ovals [x, y, z, [rx, ry], roll?] (rx sideways, ry along the tube's up, roll degrees; a sixth entry n makes a superellipse: 2 ellipse, 3-5 rounded box) so torsos, snouts and tails aren't round tubes; sdf / skin / body take tris: N (and bake) to decimate in the same item (no sdf + decimate + hide triple); body starts a creature or vehicle from a preset (biped 1.75 m, quadruped = a cat 0.25 m at the shoulder, bird, fish, serpent, car) sized by height, head_ratio, build, leg_length, tail, snout and per-joint {scale, offset} edits, standing on y = 0 facing +z: it brings a <name>_rig skeleton with the same joint names and an implicit smooth <name>_bind (a bind item on that rig replaces it; bind: false turns it off), and those names are anchors (\"cat:paw_l\") for move pivots, frames and skeleton heads; smooth relaxes (Taubin, no shrink), remeshes (even triangles of edge m) or subdivides (Catmull-Clark of a coarse cage, crease degrees keep edges); decimate lightens a dense part (ratio or tris; non-destructive: the input stays in the graph, hide it) and with bake: true writes the dense surface into the light part's normal and height maps; check organic parts with verify self_intersections / thickness, inspect thickness and agent_views style \"curvature\"; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
+- sweep runs a profile along a 3D path (pipes, rails, handles; closed for rings; smooth: true makes the path a curve through a few control points, twist / scale_end taper it); loft skins a closed solid through sections that change shape and size ({sections: [{profile, y | at, scale?, rotation?}, ...], smooth: true} for a bottle, circle into square, blade; with a path, sections sit at t along it; scale 0 at an end makes a point); path_array copies a part along a path (name_0.., count or spacing, align: +x along the path, roll_step 90 for chain links; hide the source); lsystem grows branching things (trees, bushes, ferns, roots, coral) from a preset (tree/pine/bush/fern/weed/roots, vary seed) or axiom + rules (parametric too: \"A(l, w) : l > 0.1\": \"!(w)F(l)[&(40)A(l*0.6, w*0.7)]A(l*0.9, w)\"), leaf_angle/curl/fold/stalk, wood in name and leaves in name_leaves; leaves are cards by default (flat quads with uvs 0..1, leaf_cross for a crossed pair): give name_leaves a material_ops material with domain \"card\" whose output sets opacity in a leaf shape (an alpha cutout; AGENTS.md has a leaf), or several leaves per image with a bigger leaf_size for dense crowns; leaf_mode \"solid\" models closed blades in leaf_shape instead; terrain makes level ground: a closed noise-heightfield slab at real size (style hills/ridges/dunes/mesa/flat, size, height, scale, seed; flatten pads [{at: [x, z], radius}] level building plots, paths [{points, width, depth}] carve roads and rivers; place things onto it); scatter strews copies over a surface ({input: part | [parts] | [[set]] | \"inst.*\", on, count | density, seed, scale [min, max], rotate random_y/random/none, align 0..1, min_spacing, max_slope, region}: rocks, forests of lsystem trees; copies name_0.. sit on the surface, hide the source); hull = convex hull of parts; blob melts solids together with a smooth fillet (blend meters; op union/subtract/intersect; creatures, mushrooms); split cuts a solid by a plane {normal, point} into capped name_above / name_below (gap pushes them apart); round fillets/chamfers/smooths a solid's edges; deform reshapes a mesh: displace (noise along normals: amount, scale, seed, noise fbm/ridged = rocks, cliffs), twist/bend (degrees along axis, bend toward a direction) and taper (scale_end): horns = taper then bend, material (pbr: a procedural material's height becomes real relief: bark, scales, bricks); sdf models organic solids from analytic shapes (sphere, ellipsoid, box, capsule = rounded cone, cylinder, torus, chain of [x, y, z, r], part, group) joined in order by smooth union/subtract/intersect (blend), mirror: \"x\" to model one side, warps (twist/bend/taper/displace) on the whole field, plus local sculpt warps on sdf / skin / body ({mode: inflate (amount m) | push (direction, amount) | pinch (0..1 toward at) | flatten (normal, 0..1 to the plane through at) | smooth (local blur), at: point or anchor (a joint name such as \"head\", \"part:top\"), radius, falloff}; zero effect outside radius; they never fold: push / pinch / flatten are capped (push about 0.53 x radius), so use a larger radius or several warps for more; under the item mirror (and always on a body, about x = 0) they are symmetric unless the warp says mirror: false; smooth takes size, the blur reach): creatures, mushrooms, bones; silhouette {side [[z, y]], top [[x, z]], front? [[x, y]], smooth, round, blend} carves a solid from orthographic outlines (intersected extrusions, edges rounded by blend; a car body, a shoe, a gun), also an sdf shape {shape: \"silhouette\", side, top, front, round, at}; from_reference {image, view, height | size, flip?, regions?, holes?} traces an outline from a project PNG (front from +z, side / right from +x with image right = -z, left from -x, top = plan; a changed PNG re-traces on the next re-derive); skin wraps a skeleton (chains of [x, y, z, radius] or joint names) in one smooth surface: tentacles, roots, hands; chain / skin points may be ovals [x, y, z, [rx, ry], roll?] (rx sideways, ry along the tube's up, roll degrees; a sixth entry n makes a superellipse: 2 ellipse, 3-5 rounded box) so torsos, snouts and tails aren't round tubes; sdf / skin / body take tris: N (and bake) to decimate in the same item (no sdf + decimate + hide triple); body starts a creature or vehicle from a preset (biped 1.75 m, quadruped = a cat 0.25 m at the shoulder, bird, fish, serpent, car; preset \"human\" is a CC0 template mesh with morph targets instead: gender 0..1, age (years), muscle, weight, height (m), shape {detail target: -1..1}, expression {unit: 0..1}, shapes {name: {expression, shape}} = glTF morph targets, detail 0..2 subdivision, extras <name>_eyes / _teeth / _tongue, a 58-bone biped-named rig with the template's own weights) sized by height, head_ratio, build, leg_length, tail, snout and per-joint {scale, offset} edits, standing on y = 0 facing +z: it brings a <name>_rig skeleton with the same joint names and an implicit smooth <name>_bind (a bind item on that rig replaces it; bind: false turns it off), and those names are anchors (\"cat:paw_l\") for move pivots, frames and skeleton heads; smooth relaxes (Taubin, no shrink), remeshes (even triangles of edge m) or subdivides (Catmull-Clark of a coarse cage, crease degrees keep edges); decimate lightens a dense part (ratio or tris; non-destructive: the input stays in the graph, hide it) and with bake: true writes the dense surface into the light part's normal and height maps; check organic parts with verify self_intersections / thickness, inspect thickness and agent_views style \"curvature\"; group merges disjoint parts into one (array or move a set; use it instead of unioning parts that don't touch).
 - Booleans run on Manifold: closed outputs, exact coplanar and curved cuts. Both inputs must be closed solids (disc/plane/washer error).
 - params {\"h\": 2} plus values \"$h\" or \"=$h/2 + 0.1\": changing a param later re-derives every op that reads it, in one undo step.
 - prefab items instance a catalog model; its visible parts become name.part.
@@ -2288,7 +2323,7 @@ impl rmcp::ServerHandler for Tools {
 - Cosmetic variants (skins: red/blue team, clean/rusty): {\"type\": \"variant\", \"name\": \"red_team\", \"materials\": {\"body*\": {\"pbr\": \"paint\", \"params\": {..}}, \"trim\": {\"color\": \"#c33\", \"flat\": true}}, \"style\"?: {token patch}} overrides only the matched parts' materials (geometry never changes; the base look is \"default\"). See them with agent_views variant / variants: true, set_camera variant (window); verify materials checks every variant; exports write KHR_materials_variants plus node extras.variants (modeler_bevy's ModelerVariant swaps them in game); a prefab item takes variant.
 - collider rules (parts globs, shape box/hull/mesh/none, body, sensor) and marker items (spawns, triggers with size, data JSON) export as node extras for game code; they ride prefabs and moves.
 - light items (point/spot/directional, Bevy units: lumens/lux, attach to a part) export as KHR_lights_punctual; agent_views lighting: \"scene\" renders with only the model's lights.
-- Animation: rig after the shape and materials. skeleton (bones {name: {head, tail, parent, radius}}: points or anchors \"leg_l:top\", world-aligned rest, mirror \"x\" makes *_r twins; or from: an lsystem / skin op to auto-rig), bind (rigid with bone, smooth weights, auto = exact for lsystem rigs: bind [\"oak\", \"oak_leaves\"]), clip (tracks per bone: rotate/translate/scale keys [[t, value]] as offsets from rest, or {wave}; mirror {leg_r: {from: leg_l, phase: 0.5}} half-authors a walk), sway (wind: direction, strength, gust, flutter; spring over: a clip for tails and ears; bakes into a looping clip). Judge motion with an agent_views filmstrip (clip + times [0, 0.25, 0.5, 0.75], style bones / weights) and verify animation {clip} (loop, floor, collisions, stretch) plus weights: true; export writes skins and animations, and crates/modeler_bevy runs the sway live in a game.
+- Animation: rig after the shape and materials. skeleton (bones {name: {head, tail, parent, radius}}: points or anchors \"leg_l:top\", world-aligned rest unless a bone sets rest (a rotation) or roll (degrees about head -> tail, +y along the bone): then its clip rotations turn about its local axes, mirror \"x\" makes *_r twins; or from: an lsystem / skin op to auto-rig; a bone may set limits {x: [min, max], y, z} (degrees, Euler x then y then z of its clip rotation, clamped after tracks and IK) and look_at {target: point | anchor | bone, axis?, weight?} for eyes and heads), bind (rigid with bone, smooth weights, auto = exact for lsystem rigs: bind [\"oak\", \"oak_leaves\"]), clip (tracks per bone: rotate/translate/scale keys [[t, value]] as offsets from rest, or {wave}; mirror {leg_r: {from: leg_l, phase: 0.5}} half-authors a walk; ik {ankle_l: {target: [x, y, z] | anchor | keys [[t, [x, y, z]]], chain: 2, pole?, weight?: 0..1 or keys, rotate?: keys}} drives the named bone's HEAD (its joint) to a world target by bending the chain bones above it, after the tracks: plant feet and reach hands by target instead of keying angles (body bipeds: ankle_l / ankle_r for feet, wrist_l / wrist_r for hands); mirror copies ik entries too, target x negated; rotate {euler: [[0, {y: 0}], [1, {y: 360}]]} keys cumulative degrees for spins; poses [[0, \"rest\"], [0.4, \"crouch\"]] keys whole pose items (pose {skeleton, bones {bone: {rotate, translate, scale}}, mirror?, ik? solved once}; explicit tracks override per channel; agent_views / inspect / verify take a pose name as a clip); over: \"walk\" layers on a keyed base (additive? composes, else replaces; weight 0..1 or keys; bones globs; duration defaults to the base's), then limits, IK (base first) and look_at run once; root_motion: true | {bone, axes \"xz\", yaw?} plays travelling here but exports in place with extras.root_motion {delta, samples} for the game; events [[t, name, data?]] export to extras.events; morphs {part: {shape: keys [[t, w]] | number | {wave: {amount, period}}}} keys morph target weights (a human body's shapes; part = its name), applied before skinning, layered by over (additive adds), also in pose items (morphs {eve: {smile: 1}}) and exported as glTF weights channels), sway (wind: direction, strength, gust, flutter; spring over: a clip for tails and ears; bakes into a looping clip). mocap {skeleton, file: \"mocap/walk.bvh\" (a BVH in the project; a changed file re-derives), map?: \"auto\" | {our bone: BVH joint}, range?, fps?, loop?: true | \"blend\" + blend s, root_motion?: \"in_place\" (default; speed kept on the clip) | true, feet?: {plant, contact_height, contact_speed}, mirror?, speed?, facing?: deg | \"auto\"} imports motion capture as an ordinary clip: names mapped automatically (CMU / Motionbuilder, Mixamo, 3ds Max biped, fingers), retargeted in world space from the file's rest pose to the rig's (bones point where the source bones point), root scaled by leg length, feet planted with IK; the apply result reports the mapping, units, contacts, slide and loop seam. Prefer it to hand-keyed clips for people. Judge motion with an agent_views filmstrip (clip + times [0, 0.25, 0.5, 0.75], style bones / weights) , agent_views style \"trails\" + clip (the path each bone tip travels over the clip, dots at even time steps, planted stretches in white; bones globs) and inspect curves {clip, bones?, channels?: [height, speed, angle, x, z]} (per-bone min / max, planted spans and one plot image, headless), and verify animation {clip} (loop incl. seam velocity, floor, collisions, stretch, foot_slide {bones?, speed?}, balance, smooth, gait: a biped walk against normative human gait kinematics (thigh / knee / ankle curves by percent of the cycle from heel strike, stance share, cadence, stride, pelvis bob, arm phase, toe clearance; each failure names the value, phase and normal value); build human walks from measured references (examples/gait_gen.py), not by eye) plus weights: true; export writes skins and animations, and crates/modeler_bevy runs the sway live in a game.
 - scene(open/switch/list/close) keeps several documents open; a prefab item naming an open doc instances it live (re-synced on switch); prefab style: \"scene\" re-themes a piece with the scene's tokens.
 - Every mutation autosaves the session; save_prefab names and indexes it (model name from set_model_name). export_model skips hidden parts.
 - Render waits time out after 15s with an error.

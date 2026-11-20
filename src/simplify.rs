@@ -67,6 +67,11 @@ fn len(a: [f64; 3]) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// How much a change of skin weights along a collapsed edge costs, against
+/// the quadric (area x squared distance): weight difference (L1, 0..2)
+/// squared times the edge length to the fourth.
+const SKIN_COST: f64 = 4.0;
+
 /// A collapse candidate, ordered cheapest first (BinaryHeap is a max-heap).
 struct Cand {
     cost: f64,
@@ -124,6 +129,10 @@ struct State<'a> {
     ver: Vec<u32>,
     /// Each triangle's unit normal before any collapse.
     orig: Vec<[f64; 3]>,
+    /// Smooth skin weights per position (a skinned part), so collapses
+    /// that move a vertex onto different weights cost more: the joints,
+    /// where weights change fastest, keep their density.
+    skin: Option<Vec<[(u16, f32); 4]>>,
 }
 
 impl State<'_> {
@@ -162,7 +171,22 @@ impl State<'_> {
         let mut q = self.quad[u as usize];
         quadric_add(&mut q, &self.quad[v as usize]);
         // A tiny length term breaks ties on flat regions toward short edges.
-        quadric_eval(&q, pv).max(0.0) + 1e-9 * dot(e, e)
+        let e2 = dot(e, e);
+        let skin = self.skin.as_ref().map_or(0.0, |w| {
+            let (a, b) = (&w[u as usize], &w[v as usize]);
+            let mut d = 0.0f64;
+            for (j, x) in a.iter() {
+                let y = b.iter().find(|q| q.0 == *j).map_or(0.0, |q| q.1);
+                d += f64::from((x - y).abs());
+            }
+            for (j, y) in b.iter() {
+                if !a.iter().any(|q| q.0 == *j) {
+                    d += f64::from(*y);
+                }
+            }
+            SKIN_COST * d * d * e2 * e2
+        });
+        quadric_eval(&q, pv).max(0.0) + 1e-9 * e2 + skin
     }
 
     fn cand(&self, u: u32, v: u32) -> Cand {
@@ -380,7 +404,20 @@ pub fn simplify_creased(part: &Part, ratio: f32, crease: Option<f32>) -> Part {
             n.map(|x| x / l)
         })
         .collect();
+    let skin = part
+        .rig
+        .as_ref()
+        .filter(|b| b.bone.is_none() && b.joints.len() == part.verts.len())
+        .map(|b| {
+            let mut w = vec![[(0u16, 0.0f32); 4]; np];
+            for (wi, &p) in wpos.iter().enumerate().rev() {
+                let (j, x) = (b.joints[wi], b.weights[wi]);
+                w[p as usize] = [(j[0], x[0]), (j[1], x[1]), (j[2], x[2]), (j[3], x[3])];
+            }
+            w
+        });
     let mut st = State {
+        skin,
         part,
         wpos,
         pos,
@@ -447,7 +484,34 @@ pub fn simplify_creased(part: &Part, ratio: f32, crease: Option<f32>) -> Part {
             out.indices.push(remap[wi]);
         }
     }
+    let mut kept = vec![0usize; out.verts.len()];
+    for (o, &nw) in remap.iter().enumerate() {
+        if nw != u32::MAX {
+            kept[nw as usize] = o;
+        }
+    }
+    carry_vertex_data(&mut out, part, &kept, &remap);
     out
+}
+
+/// After a vertex subset/remap of `src` into `out` (`kept`: each new
+/// vertex's old index; `remap`: each old vertex's new one or `u32::MAX`):
+/// carries smooth skin weights, morph targets and correctives, so a
+/// simplified skinned part keeps its skin (half-edge collapses never
+/// interpolate, so every kept vertex keeps its own weights exactly).
+pub fn carry_vertex_data(out: &mut Part, src: &Part, kept: &[usize], remap: &[u32]) {
+    if let Some(b) = &src.rig
+        && b.bone.is_none()
+        && b.joints.len() == src.verts.len()
+    {
+        let mut nb = (**b).clone();
+        nb.joints = kept.iter().map(|&o| b.joints[o]).collect();
+        nb.weights = kept.iter().map(|&o| b.weights[o]).collect();
+        out.rig = Some(std::sync::Arc::new(nb));
+    }
+    out.morphs = src.morphs.clone();
+    out.correctives = src.correctives.clone();
+    crate::export_opt::remap_shapes(out, kept, remap);
 }
 
 /// Constraint planes for edges sharper than `deg` degrees (two faces only;
