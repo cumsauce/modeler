@@ -209,11 +209,23 @@ fn tip_of(skel: &Skeleton, segs: &[(Vec3, Vec3)], i: usize) -> Vec3 {
 
 /// Tips of `bones` at each of `times`: `[time][bone]`.
 fn sample_tips(clip: &Clip, skel: &Skeleton, bones: &[usize], times: &[f32]) -> Vec<Vec<Vec3>> {
+    // A travelling loop plays on from where it ended: past the seam (and
+    // before 0) the tips carry whole loops of root motion, so speeds don't
+    // jump at the seam.
+    let (delta, d) = if clip.root_motion.is_some() && clip.looping && clip.duration > 0.0 {
+        (clip.root_delta(skel).0, clip.duration)
+    } else {
+        (Vec3::ZERO, 0.0)
+    };
     times
         .iter()
         .map(|&t| {
+            let loops = if d > 0.0 { t.div_euclid(d) } else { 0.0 };
             let segs = skel.posed_segments(&clip.sample(skel, t));
-            bones.iter().map(|&b| tip_of(skel, &segs, b)).collect()
+            bones
+                .iter()
+                .map(|&b| tip_of(skel, &segs, b) + delta * loops)
+                .collect()
         })
         .collect()
 }

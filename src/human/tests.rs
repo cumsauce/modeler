@@ -108,7 +108,19 @@ fn weights_detail_and_extras_are_sound() {
         let d = human(|d| d.detail = Some(detail));
         let parts = build("h", &d).unwrap_or_else(|e| panic!("{e}"));
         let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["h", "h_eyes", "h_teeth", "h_tongue"]);
+        assert_eq!(
+            names,
+            [
+                "h",
+                "h_eyes",
+                "h_teeth",
+                "h_tongue",
+                "h_brows",
+                "h_lashes",
+                "h_hair",
+                "h_hair_cap"
+            ]
+        );
         for p in &parts {
             let s = p
                 .skin
@@ -119,7 +131,11 @@ fn weights_detail_and_extras_are_sound() {
                 let t: f32 = w.iter().sum();
                 assert!((t - 1.0).abs() < 1e-3, "{}: weights sum {t}", p.name);
             }
-            // Closed: every edge (welded by position) has two faces.
+            // Closed: every edge (welded by position) has two faces
+            // (brows, lashes and hair are open card sheets).
+            if p.cards {
+                continue;
+            }
             let key = |i: u32| p.verts[i as usize].map(|c| (c * 1e5).round() as i64);
             let mut e: HashMap<([i64; 3], [i64; 3]), i32> = HashMap::new();
             for t in p.indices.as_chunks::<3>().0 {
@@ -935,7 +951,7 @@ pub(crate) fn pose_sheet() -> Vec<(&'static str, serde_json::Value)> {
         ),
         (
             "arms_fwd",
-            json!({"shoulder_l": {"x": -90}, "shoulder_r": {"x": -90}}),
+            json!({"shoulder_l": {"x": 90}, "shoulder_r": {"x": 90}}),
         ),
         ("elbow", json!({"elbow_l": flex("elbow_l", 120.0)})),
         ("knee", json!({"knee_l": {"x": 120}})),
@@ -1083,6 +1099,37 @@ fn corrective_stretch_report() {
     }
     poses.push(("fist_r", serde_json::Value::Object(fr)));
     poses.push(("curl18_r", serde_json::Value::Object(small)));
+    use serde_json::json;
+    for (n, v) in [
+        (
+            "sit",
+            json!({"thigh_l": {"x": -90}, "thigh_r": {"x": -90}, "knee_l": {"x": 90}, "knee_r": {"x": 90}}),
+        ),
+        ("fore_twist", json!({"elbow_l": {"y": 80}})),
+        ("fore_twist_n", json!({"elbow_l": {"y": -80}})),
+        ("upper_twist", json!({"shoulder_l": {"y": 70}})),
+        ("thigh_twist", json!({"thigh_l": {"y": 40}})),
+        ("neck_turn", json!({"neck": {"y": 60}})),
+        ("nod", json!({"neck": {"x": 30}, "head": {"x": 15}})),
+        (
+            "spine_twist",
+            json!({"spine": {"y": 22}, "chest": {"y": 23}}),
+        ),
+        (
+            "shrug",
+            json!({"clavicle_l": {"z": 30}, "clavicle_r": {"z": -30}}),
+        ),
+        (
+            "thumb_opp",
+            json!({"thumb_1_l": {"x": 45}, "thumb_2_l": {"x": 30}, "thumb_3_l": {"x": 40}}),
+        ),
+        (
+            "stand_straight",
+            json!({"knee_l": {"x": -11}, "knee_r": {"x": -11}}),
+        ),
+    ] {
+        poses.push((n, v));
+    }
     let names: Vec<&str> = poses.iter().map(|p| p.0).collect();
     let run = |on: bool| {
         let mut s = crate::commands::Session::default();
@@ -1179,14 +1226,91 @@ fn corrective_stretch_report() {
             "SWEEP on={on}: max vertex step per 4 deg {:.2} mm; 16 samples: {d}",
             step * 1000.0
         );
-        (pose_stretch(&s, &names), c)
+        // Volume per pose at the peak (candy-wrapper check).
+        let mut vols = Vec::new();
+        for n in &names {
+            let (clip, skel) =
+                crate::anim::clip(&s.model, Some(n)).unwrap_or_else(|e| panic!("{e}"));
+            let posed = crate::anim::posed_parts(&s.model, &clip, &skel, 0.5);
+            let v = crate::anim::skin::volume_ratios(&s.model.parts, &posed, &skel)
+                .into_iter()
+                .find(|x| x.0 == "eve")
+                .map_or(1.0, |x| x.1);
+            vols.push(v);
+        }
+        let st = pose_stretch(&s, &names);
+        (
+            st.into_iter()
+                .zip(vols)
+                .map(|((n, a), v)| (n, a, v))
+                .collect::<Vec<_>>(),
+            c,
+        )
     };
     let (off, n0) = run(false);
     let (on, n1) = run(true);
     assert_eq!(n0, 0);
     assert!(n1 > 10, "{n1} correctives");
-    for ((n, a), (_, b)) in off.iter().zip(&on) {
-        eprintln!("STRETCH {n:10} off {a:.2} on {b:.2}");
+    for ((n, a, va), (_, b, vb)) in off.iter().zip(&on) {
+        eprintln!("STRETCH {n:14} off {a:.2} on {b:.2}   volume off {va:.4} on {vb:.4}");
+    }
+    // Targets met (see the AGENTS.md table): everything but the raised
+    // arms' armpit, the sitting groin and the jaw stays under 2.
+    let got = |n: &str| on.iter().find(|x| x.0 == n).map_or(9.0, |x| x.1);
+    for n in [
+        "walk",
+        "arms_t",
+        "arms_fwd",
+        "elbow",
+        "knee",
+        "crouch",
+        "wrist",
+        "neck",
+        "spine",
+        "fist",
+        "curl18_r",
+        "fore_twist",
+        "fore_twist_n",
+        "upper_twist",
+        "thigh_twist",
+        "neck_turn",
+        "nod",
+        "spine_twist",
+        "shrug",
+        "thumb_opp",
+        "stand_straight",
+    ] {
+        assert!(got(n) < 2.01, "{n}: {}", got(n));
+    }
+    assert!(
+        got("curl18_r") < 1.4,
+        "small curls regressed: {}",
+        got("curl18_r")
+    );
+    for (n, cap) in [("arms_up", 2.2), ("sit", 2.2), ("jaw", 4.7)] {
+        assert!(got(n) < cap, "{n}: {}", got(n));
+    }
+    // WebGL2's 24 targets: the priority order keeps one key per joint.
+    let mut s = crate::commands::Session::default();
+    let mut items = vec![
+        serde_json::json!({"type": "body", "name": "eve", "preset": "human", "parts": []}),
+        serde_json::json!({"type": "bind", "name": "eve_bind", "skeleton": "eve_rig",
+            "parts": ["eve"], "correctives": {"max": 24}}),
+    ];
+    items.extend(clip_items("eve_rig", &poses));
+    s.apply_values(None, items)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let kept: Vec<String> = s
+        .model
+        .parts
+        .iter()
+        .find(|p| p.name == "eve")
+        .and_then(|p| p.correctives.clone())
+        .map(|c| c.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    eprintln!("MAX24 kept {}: {}", kept.len(), kept.join(" "));
+    for (n, v) in pose_stretch(&s, &names) {
+        eprintln!("MAX24 {n:14} {v:.2}");
     }
 }
 
@@ -1443,4 +1567,318 @@ fn sleeve_follows_the_skin() {
         worst = worst.max(tight);
     }
     eprintln!("SLEEVE worst {:.2} mm", worst * 1000.0);
+}
+
+/// Every game-rig joint has limits from the ROM table; the knee and the
+/// elbow straighten (anatomical zero is inside the range), and no named
+/// pose or walk key of `examples/` is clamped by them.
+#[test]
+fn limits_follow_the_rom_table_and_keep_the_examples() {
+    use bevy::math::{EulerRot, Quat};
+    let Some(_) = asset_or_skip() else { return };
+    let frames = bone_frames(&human(|_| {})).unwrap_or_else(|e| panic!("{e}"));
+    for (n, _, l) in &frames {
+        eprintln!("LIMITS {n:12} {:?}", l.as_ref().map(|l| (l.x, l.y, l.z)));
+    }
+    let get = |n: &str| {
+        frames
+            .iter()
+            .find(|f| f.0 == n)
+            .and_then(|f| f.2.clone())
+            .unwrap_or_else(|| panic!("no limits on {n}"))
+    };
+    for b in [
+        "thigh_l",
+        "knee_r",
+        "ankle_l",
+        "ball_r",
+        "spine",
+        "chest",
+        "neck",
+        "head",
+        "jaw",
+        "clavicle_l",
+        "shoulder_r",
+        "wrist_l",
+        "thumb_1_l",
+        "index_2_r",
+    ] {
+        let _ = get(b);
+    }
+    let knee = get("knee_l").x.unwrap_or([0.0, 0.0]);
+    assert!(knee[0] < -4.0 && knee[1] > 130.0, "knee {knee:?}");
+    let mut worst = (0.0f32, String::new());
+    for f in ["human_poses.json", "human_walk.json"] {
+        let path = format!("{}/examples/{f}", env!("CARGO_MANIFEST_DIR"));
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{e}")))
+                .unwrap_or_else(|e| panic!("{e}"));
+        for it in items {
+            let bones = it
+                .get("bones")
+                .or_else(|| it.get("tracks"))
+                .and_then(|b| b.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (b, v) in bones {
+                let Some(r) = v.get("rotate") else { continue };
+                let keys: Vec<serde_json::Value> = match r {
+                    serde_json::Value::Array(a) => {
+                        a.iter().filter_map(|k| k.get(1).cloned()).collect()
+                    }
+                    o => vec![o.clone()],
+                };
+                let Some(l) = frames.iter().find(|f| f.0 == b).and_then(|f| f.2.clone()) else {
+                    continue;
+                };
+                for k in keys {
+                    let d = |a: &str| k.get(a).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    let q = Quat::from_euler(
+                        EulerRot::ZYX,
+                        d("z").to_radians(),
+                        d("y").to_radians(),
+                        d("x").to_radians(),
+                    );
+                    let c = crate::anim::ik::clamp(q, &l);
+                    let e = q.angle_between(c).to_degrees();
+                    if e > worst.0 {
+                        worst = (e, format!("{f} {} {b} {k}", it["name"]));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "LIMITS worst clamp of an example key: {:.2} deg {}",
+        worst.0, worst.1
+    );
+    assert!(worst.0 < 0.5, "{} deg: {}", worst.0, worst.1);
+}
+
+/// Diagnostic: stretch of a pose with subsets of the correctives
+/// (`CORR_POSE`, `CORR_KEEP` = comma globs over target names).
+#[test]
+#[ignore]
+fn corrective_subset_probe() {
+    let Some(_) = asset_or_skip() else { return };
+    let mut poses = pose_sheet();
+    let mut fr = serde_json::Map::new();
+    let mut small = serde_json::Map::new();
+    for f in ["index", "middle", "ring", "pinky"] {
+        for k in 1..=3 {
+            fr.insert(format!("{f}_{k}_r"), serde_json::json!({"x": 90}));
+            small.insert(format!("{f}_{k}_r"), serde_json::json!({"x": 18}));
+        }
+    }
+    poses.push(("fist_r", serde_json::Value::Object(fr)));
+    poses.push(("curl18_r", serde_json::Value::Object(small)));
+    use serde_json::json;
+    poses.push(("m2_18", json!({"middle_2_r": {"x": 18}})));
+    poses.push(("th_r", json!({"thigh_r": {"x": -100}})));
+    poses.push(("up_r", json!({"shoulder_r": {"z": -90}})));
+    poses.push(("up_r60", json!({"shoulder_r": {"z": -60}})));
+    poses.push((
+        "up_cl",
+        json!({"shoulder_r": {"z": -75}, "clavicle_r": {"z": -15}}),
+    ));
+    poses.push((
+        "up_cl2",
+        json!({"shoulder_r": {"z": -90}, "clavicle_r": {"z": -20}}),
+    ));
+    poses.push((
+        "thk_r",
+        json!({"thigh_r": {"x": -100}, "knee_r": {"x": 120}}),
+    ));
+    poses.push((
+        "th_lr",
+        json!({"thigh_r": {"x": -100}, "thigh_l": {"x": -100}}),
+    ));
+    poses.push(("m2_30", json!({"middle_2_r": {"x": 30}})));
+    poses.push((
+        "m23_18",
+        json!({"middle_2_r": {"x": 18}, "middle_3_r": {"x": 18}}),
+    ));
+    poses.push((
+        "m12_18",
+        json!({"middle_2_r": {"x": 18}, "middle_1_r": {"x": 18}}),
+    ));
+    poses.push((
+        "mr2_18",
+        json!({"middle_2_r": {"x": 18}, "ring_2_r": {"x": 18}}),
+    ));
+    let mut s = crate::commands::Session::default();
+    let mut items = vec![
+        serde_json::json!({"type": "body", "name": "eve", "preset": "human", "parts": []}),
+        serde_json::json!({"type": "bind", "name": "eve_bind", "skeleton": "eve_rig",
+            "parts": ["eve"], "correctives": true}),
+    ];
+    items.extend(clip_items("eve_rig", &poses));
+    s.apply_values(None, items)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let pose = std::env::var("CORR_POSE").unwrap_or("curl18_r".into());
+    for keep in std::env::var("CORR_KEEP").unwrap_or("*".into()).split(';') {
+        let mut m = crate::commands::Session::default();
+        m.model = s.model.clone();
+        for p in m.model.parts.iter_mut() {
+            if p.name == "eve" {
+                let mut q = (**p).clone();
+                if let Some(c) = &q.correctives {
+                    let v: Vec<_> = c
+                        .iter()
+                        .filter(|c| keep.split(',').any(|g| crate::name_matches(g, &c.name)))
+                        .cloned()
+                        .collect();
+                    q.correctives = Some(std::sync::Arc::new(v));
+                }
+                *p = std::sync::Arc::new(q);
+            }
+        }
+        for pose in pose.split(',') {
+            if std::env::var("CORR_EDGE").is_ok() {
+                use bevy::math::Vec3;
+                let (c, k) =
+                    crate::anim::clip(&m.model, Some(pose)).unwrap_or_else(|e| panic!("{e}"));
+                let rest = m
+                    .model
+                    .parts
+                    .iter()
+                    .find(|p| p.name == "eve")
+                    .cloned()
+                    .unwrap_or_else(|| panic!());
+                let mut plain = m.model.clone();
+                for p in plain.parts.iter_mut() {
+                    if p.name == "eve" {
+                        let mut q = (**p).clone();
+                        q.correctives = None;
+                        *p = std::sync::Arc::new(q);
+                    }
+                }
+                for t in [0.25f32, 0.5] {
+                    let pa = crate::anim::posed_parts(&m.model, &c, &k, t);
+                    let pb = crate::anim::posed_parts(&plain, &c, &k, t);
+                    let get = |v: &Vec<std::sync::Arc<crate::Part>>| {
+                        v.iter()
+                            .find(|p| p.name == "eve")
+                            .map(|p| p.verts.clone())
+                            .unwrap_or_default()
+                    };
+                    let (va, vb) = (get(&pa), get(&pb));
+                    let mut worst = (0.0f32, 0usize, 0usize);
+                    for tri in rest.indices.as_chunks::<3>().0 {
+                        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                            let (a, b) = (a as usize, b as usize);
+                            let l0 = (rest.world_vert(a) - rest.world_vert(b)).length();
+                            if l0 < 1e-6 {
+                                continue;
+                            }
+                            let l1 = (Vec3::from(va[a]) - Vec3::from(va[b])).length();
+                            let r = (l1 / l0).max(l0 / l1.max(1e-9) * 0.4);
+                            if r > worst.0 {
+                                worst = (r, a, b);
+                            }
+                        }
+                    }
+                    let (_, a, b) = worst;
+                    let d = |i: usize| {
+                        rest.correctives
+                            .iter()
+                            .flat_map(|c| c.iter())
+                            .map(|c| {
+                                let dd = c.dense(rest.verts.len());
+                                (c.name.clone(), Vec3::from(dd[i]))
+                            })
+                            .filter(|x| x.1.length() > 0.0)
+                            .collect::<Vec<_>>()
+                    };
+                    eprintln!(
+                        "EDGE t {t}: ratio {:.2} verts {a} {b} l0 {:.5} lbs {:.5} corr {:.5}; rest a {:?} b {:?}; da {:?} db {:?}",
+                        worst.0,
+                        (rest.world_vert(a) - rest.world_vert(b)).length(),
+                        (Vec3::from(vb[a]) - Vec3::from(vb[b])).length(),
+                        (Vec3::from(va[a]) - Vec3::from(va[b])).length(),
+                        rest.world_vert(a),
+                        rest.world_vert(b),
+                        d(a),
+                        d(b)
+                    );
+                }
+            }
+            let r = pose_stretch(&m, &[pose]);
+            eprintln!("PROBE {pose} keep {keep}: {:.2}", r[0].1);
+        }
+    }
+}
+
+/// The shoulder's +x raises the arm forward (+z), its +z (left) sideways.
+#[test]
+fn shoulder_axes_point_the_anatomical_way() {
+    use bevy::math::{Quat, Vec3};
+    let Some(_) = asset_or_skip() else { return };
+    let mut s = crate::commands::Session::default();
+    let mut items =
+        vec![serde_json::json!({"type": "body", "name": "eve", "preset": "human", "parts": []})];
+    items.extend(clip_items(
+        "eve_rig",
+        &[("fwd", serde_json::json!({"shoulder_l": {"x": 60}}))],
+    ));
+    s.apply_values(None, items)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (_, skel) = crate::anim::clip(&s.model, Some("fwd")).unwrap_or_else(|e| panic!("{e}"));
+    let (Some(sh), Some(el)) = (skel.bone("shoulder_l"), skel.bone("elbow_l")) else {
+        panic!("no arm")
+    };
+    let mut pose = skel.rest();
+    pose[sh].1 = Quat::from_rotation_x(60f32.to_radians());
+    let m = skel.skin_matrices(&pose);
+    let e0 = skel.bones[el].head;
+    let e1 = m[sh].transform_point3(e0);
+    eprintln!("shoulder x +60: elbow {e0} -> {e1}");
+    assert!(e1.z > e0.z + 0.05, "{e0} -> {e1}");
+    let _ = Vec3::ZERO;
+}
+
+/// The template's own `mouth-open` expression unit stretches the edges at
+/// the lip corners 6.5x at 0.5 and 12x at 1 (the mouth slit is closed in
+/// the template, so the corner edges are tiny): the jaw corrective
+/// (relaxed, 4.6x at 20 degrees) cannot use it as a target that tears
+/// less.
+#[test]
+#[ignore]
+fn mouth_open_unit_stretch() {
+    let Some(_) = asset_or_skip() else { return };
+    let b0 = build("eve", &human(|d| d.parts = Some(vec![])))
+        .unwrap_or_else(|e| panic!("{e}"))
+        .remove(0);
+    for v in [0.5f32, 1.0] {
+        let b1 = build(
+            "eve",
+            &human(|d| {
+                d.parts = Some(vec![]);
+                d.expression.insert("mouth-open".into(), v);
+            }),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+        .remove(0);
+        let mut worst = (0.0f32, Vec3::ZERO);
+        let mut maxd = 0.0f32;
+        for t in b0.indices.as_chunks::<3>().0 {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (a as usize, b as usize);
+                let l0 = Vec3::from(b0.verts[a]).distance(Vec3::from(b0.verts[b]));
+                let l1 = Vec3::from(b1.verts[a]).distance(Vec3::from(b1.verts[b]));
+                if l0 > 1e-6 && l1 / l0 > worst.0 {
+                    worst = (l1 / l0, Vec3::from(b0.verts[a]));
+                }
+            }
+        }
+        for (p, q) in b0.verts.iter().zip(&b1.verts) {
+            maxd = maxd.max(Vec3::from(*p).distance(Vec3::from(*q)));
+        }
+        eprintln!(
+            "MOUTH {v}: worst edge {:.2} at {} max move {:.1} mm",
+            worst.0,
+            worst.1,
+            maxd * 1000.0
+        );
+    }
 }

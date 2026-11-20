@@ -6,11 +6,15 @@ license = "MIT OR Apache-2.0"
 description = "Bevy plugin for modeler exports: live wind and spring sway, colliders, markers and decals from glTF extras"
 
 [dependencies]
-bevy = { version = "=0.20.0", default-features = false, features = ["bevy_gltf", "bevy_pbr", "bevy_light"] }
+bevy = { version = "=0.20.0", default-features = false, features = ["bevy_gltf", "bevy_pbr", "bevy_light", "gltf_animation", "morph_animation"] }
 modeler_anim = { path = "../modeler_anim" }
 serde_json = "1"
 
 [dev-dependencies]
+# The character test builds a real export with the modeler itself.
+modeler = { path = "../.." }
+serde_json = "1"
+png = "0.18"
 # The viewer example: the same feature set as the modeler (no audio or
 # gamepads), so the workspace builds Bevy once.
 bevy = { version = "=0.20.0", default-features = false, features = [

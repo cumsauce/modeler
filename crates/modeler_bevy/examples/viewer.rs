@@ -4,7 +4,9 @@
 //! cargo run -p modeler_bevy --example viewer -- <assets dir> <model.gltf inside it>
 //! ```
 //!
-//! Keys: Space plays the next animation clip (and pauses the live sway),
+//! Keys: Space plays the next animation clip with a 0.2 s crossfade (through
+//! `ModelerAnimator`; root motion moves the model, clip events are printed,
+//! and a baked sway clip pauses the live sway),
 //! W toggles the live wind, Up / Down change its strength, Left / Right turn
 //! it, V cycles the cosmetic variants (`KHR_materials_variants`, through
 //! `ModelerVariant`). Drag with the mouse to orbit.
@@ -16,14 +18,18 @@
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use modeler_bevy::{ModelerPlugin, ModelerVariant, Sway, Wind};
+use modeler_bevy::{
+    ModelerAnimator, ModelerClipEvent, ModelerClips, ModelerPlugin, ModelerRootMotion,
+    ModelerVariant, Wind,
+};
+use std::time::Duration;
 
 #[derive(Resource)]
 struct Model {
     gltf: Handle<Gltf>,
     spawned: bool,
     clip: Option<usize>,
-    graph: Option<(Handle<AnimationGraph>, Vec<AnimationNodeIndex>, Vec<String>)>,
+    names: Vec<String>,
     /// The scene root (where `ModelerVariant` goes).
     root: Option<Entity>,
 }
@@ -49,7 +55,7 @@ fn main() {
         .add_plugins(ModelerPlugin)
         .insert_resource(FileName(file))
         .add_systems(Startup, setup)
-        .add_systems(Update, (spawn_scene, hook_player, keys, orbit, smoke_test))
+        .add_systems(Update, (spawn_scene, keys, orbit, smoke_test, print_events))
         .run();
 }
 
@@ -61,7 +67,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, file: Res<FileName>) 
         gltf: assets.load(file.0.clone()),
         spawned: false,
         clip: None,
-        graph: None,
+        names: Vec::new(),
         root: None,
     });
     commands.spawn((
@@ -84,7 +90,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, file: Res<FileName>) 
     ));
     commands.spawn((
         Text::new(
-            "Space: next clip  V: next variant  W: wind on/off  Up/Down: strength  Left/Right: direction",
+            "Space / 1-9: clip (crossfade)  V: next variant  W: wind on/off  Up/Down: strength  Left/Right: direction",
         ),
         Node {
             position_type: PositionType::Absolute,
@@ -114,35 +120,33 @@ fn spawn_scene(
     else {
         return;
     };
-    let root = commands.spawn(WorldAssetRoot(scene)).id();
+    // `ModelerClips` gives every animation player the graph and transitions;
+    // `ModelerRootMotion` moves the entity by the playing clip's travel.
+    let clips = ModelerClips::from_gltf(g, &mut graphs);
+    model.names = clips.names().iter().map(|n| n.to_string()).collect();
+    println!("clips: {:?}", model.names);
+    let root = commands
+        .spawn((
+            WorldAssetRoot(scene),
+            clips,
+            ModelerRootMotion::default(),
+            Transform::default(),
+            Visibility::default(),
+        ))
+        .id();
     model.root = Some(root);
     if let Ok(v) = std::env::var("VIEWER_VARIANT") {
         commands.entity(root).insert(ModelerVariant::new(v));
     }
-    let mut names: Vec<String> = g.named_animations.keys().map(|k| k.to_string()).collect();
-    names.sort();
-    let clips: Vec<Handle<AnimationClip>> = names
-        .iter()
-        .filter_map(|n| g.named_animations.get(n.as_str()).cloned())
-        .collect();
-    let (graph, nodes) = AnimationGraph::from_clips(clips);
-    println!("clips: {names:?}");
-    model.graph = Some((graphs.add(graph), nodes, names));
     model.spawned = true;
 }
 
-fn hook_player(
-    mut commands: Commands,
-    model: Res<Model>,
-    players: Query<Entity, Added<AnimationPlayer>>,
-) {
-    let Some((graph, _, _)) = &model.graph else {
-        return;
-    };
-    for e in &players {
-        commands
-            .entity(e)
-            .insert(AnimationGraphHandle(graph.clone()));
+fn print_events(mut events: MessageReader<ModelerClipEvent>) {
+    for e in events.read() {
+        println!(
+            "event `{}` of `{}` at {:.2}s {:?}",
+            e.name, e.clip, e.time, e.data
+        );
     }
 }
 
@@ -151,27 +155,36 @@ fn keys(
     input: Res<ButtonInput<KeyCode>>,
     mut model: ResMut<Model>,
     mut wind: ResMut<Wind>,
-    mut players: Query<&mut AnimationPlayer>,
-    mut sways: Query<&mut Sway>,
+    mut anim: ModelerAnimator,
     mut commands: Commands,
     variant: Query<&ModelerVariant>,
     parts: Query<&modeler_bevy::ModelerVariants>,
 ) {
-    if input.just_pressed(KeyCode::Space)
-        && let Some((_, nodes, names)) = &model.graph
-        && !nodes.is_empty()
-    {
-        let next = model.clip.map_or(0, |c| (c + 1) % nodes.len());
-        for mut p in &mut players {
-            p.stop_all();
-            p.play(nodes[next]).repeat();
+    let digits = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    let pick = digits
+        .iter()
+        .position(|k| input.just_pressed(*k))
+        .filter(|i| *i < model.names.len())
+        .or_else(|| {
+            (input.just_pressed(KeyCode::Space) && !model.names.is_empty())
+                .then(|| model.clip.map_or(0, |c| (c + 1) % model.names.len()))
+        });
+    if let (Some(next), Some(root)) = (pick, model.root) {
+        let name = model.names[next].clone();
+        if anim.play(root, &name, Duration::from_millis(200)) {
+            println!("playing `{name}` (crossfade 0.2 s)");
+            model.clip = Some(next);
         }
-        // The baked sway clip replaces the live sway while it plays.
-        for mut s in &mut sways {
-            s.live = s.rig.clip.as_deref() != Some(names[next].as_str());
-        }
-        println!("playing `{}`", names[next]);
-        model.clip = Some(next);
     }
     if input.just_pressed(KeyCode::KeyV)
         && let Some(root) = model.root
@@ -219,7 +232,7 @@ fn smoke_test(
     time: Res<Time>,
     mut frame: Local<u32>,
     mut start: Local<Option<Vec<Quat>>>,
-    sways: Query<&Sway>,
+    sways: Query<&modeler_bevy::Sway>,
     decals: Query<&modeler_bevy::ModelerDecal>,
     joints: Query<&Transform>,
     mut exit: MessageWriter<AppExit>,

@@ -20,6 +20,9 @@
 //! through by the same stencils) and `shapes` export as glTF morph targets.
 
 pub mod asset;
+pub mod hair;
+pub mod landmarks;
+pub mod look;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -941,8 +944,9 @@ fn crotch_ramp(a: &HumanAsset, r: &Rig, mut sw: Vec<Sw>) -> Vec<Sw> {
     let pos: Vec<Vec3> = a.verts.iter().map(|v| Vec3::from(*v)).collect();
     let jp = joint_points(a, &pos);
     let (hl, hr) = (jp[r.bones[tl].head], jp[r.bones[tr].head]);
-    let width = 0.04;
+    let width = 0.08;
     let top = (hl.y + hr.y) * 0.5;
+    let zc = (hl.z + hr.z) * 0.5;
     let fade = 0.05;
     for f in a.faces.iter().filter(|f| f.group == 0) {
         for &v in &f.v {
@@ -950,8 +954,12 @@ fn crotch_ramp(a: &HumanAsset, r: &Rig, mut sw: Vec<Sw>) -> Vec<Sw> {
             if p.y > top || p.x.abs() > width {
                 continue;
             }
-            // Full effect below the joint by `fade`, none at the joint.
-            let depth = ((top - p.y) / fade).clamp(0.0, 1.0);
+            // Full effect below the joint by `fade`, none at the joint;
+            // between the legs only, fading out toward the front groin
+            // crease (which a wide ramp would let the thigh tear).
+            let front = ((p.z - zc - 0.03) / 0.04).clamp(0.0, 1.0);
+            let depth =
+                ((top - p.y) / fade).clamp(0.0, 1.0) * (1.0 - front * front * (3.0 - 2.0 * front));
             let t = (p.x.abs() / width).clamp(0.0, 1.0);
             let keep = t * t * (3.0 - 2.0 * t);
             let w = &mut sw[v as usize];
@@ -1331,6 +1339,59 @@ pub fn rig_raw(def: &crate::body::BodyDef) -> Result<Vec<crate::anim::auto::RawB
         .collect())
 }
 
+/// Normal active range of motion per joint, from anatomical zero, as
+/// `(row, x, y, z)` degree ranges in the game rig's sign conventions for
+/// the LEFT side (the right side is the x mirror). Sources: American
+/// Academy of Orthopaedic Surgeons, *Joint Motion: Method of Measuring and
+/// Recording* (1965) and Norkin & White, *Measurement of Joint Motion: A
+/// Guide to Goniometry* (normal adult ROM tables):
+///
+/// | joint | motion (AAOS normal) | rig |
+/// |---|---|---|
+/// | hip | flexion 120, extension 30, abduction 45, adduction 30, int/ext rotation 45 | thigh x -120..45 (+15 extension: the rig's hip bone is pelvis and lumbar in one, so pelvic tilt shows up at the thigh; a mocap walk needs ~40), z -30..45, y +-45 |
+/// | knee | flexion 135-150, hyperextension 0-5 | knee x -5..150 (+ = shin back), rotation (flexed) y +-15 |
+/// | ankle | dorsiflexion 20 (35 weight-bearing, a deep squat), plantarflexion 50, inversion 35, eversion 15 | ankle x -35..50, z -35..15 |
+/// | toes (MTP) | flexion 40, extension 70 | ball x -70..40 |
+/// | thoracolumbar | flexion 80, extension 25, lateral 35, rotation 45 | spine + chest: x -15..50 / -10..30, z +-20 / +-15, y +-25 / +-25 |
+/// | cervical | flexion 45-50, extension 60-75, lateral 45, rotation 80 | neck x -45..35, y +-65, z +-35; head (nod) x -25..15, y +-15, z +-10 |
+/// | jaw | opening ~40-50 mm (about 30 degrees), protrusion / lateral a few mm | jaw x -2..30, y +-8, z +-5 |
+/// | clavicle (sternoclavicular) | elevation 40, depression 10, protraction / retraction 15-30 | clavicle z -10..40, y +-25, x +-10 |
+/// | shoulder | flexion 180, extension 60, abduction 180, adduction 30 (across the body), int rotation 70, ext rotation 90 | shoulder x -60..180 (+ = forward), z -30..180, y +-90 |
+/// | elbow | flexion 150, hyperextension 0-5; forearm pronation 80, supination 80 (the merged twist) | elbow x -3..150, y +-85, z +-10 |
+/// | wrist | flexion 80, extension 70, radial deviation 20, ulnar deviation 30 | wrist x -70..80, z +-30, y +-10 |
+/// | finger MCP | flexion 90, hyperextension 45 (active ~20), abduction 20 | x -20..95, y +-20 |
+/// | finger PIP | flexion 100 (110 in many hands) | x -5..115 (a tight fist) |
+/// | finger DIP | flexion 70-90, hyperextension 10 | x -10..90 |
+/// | thumb CMC | flexion 15, extension 20, palmar abduction 70 | x -20..50, y +-35, z +-45 |
+/// | thumb MCP | flexion 50 | x -10..55 |
+/// | thumb IP | flexion 80, hyperextension 15 | x -15..80 |
+///
+/// Spine and neck motion is shared by two bones each (their sums are the
+/// table's totals); the knee, elbow, fingers and shoulder abduction are
+/// shifted by the template's rest bend in [`bone_frames`].
+pub const ROM: &[(&str, [f32; 2], [f32; 2], [f32; 2])] = &[
+    ("hip", [-120.0, 45.0], [-45.0, 45.0], [-30.0, 45.0]),
+    ("knee", [-5.0, 150.0], [-15.0, 15.0], [-10.0, 10.0]),
+    ("ankle", [-35.0, 50.0], [-15.0, 15.0], [-35.0, 15.0]),
+    ("toe", [-70.0, 40.0], [-10.0, 10.0], [-10.0, 10.0]),
+    ("spine", [-15.0, 50.0], [-25.0, 25.0], [-20.0, 20.0]),
+    ("chest", [-10.0, 30.0], [-25.0, 25.0], [-15.0, 15.0]),
+    ("neck", [-45.0, 35.0], [-65.0, 65.0], [-35.0, 35.0]),
+    ("head", [-25.0, 15.0], [-15.0, 15.0], [-10.0, 10.0]),
+    ("jaw", [-2.0, 30.0], [-8.0, 8.0], [-5.0, 5.0]),
+    ("clavicle", [-10.0, 10.0], [-25.0, 25.0], [-10.0, 40.0]),
+    ("shoulder", [-60.0, 180.0], [-90.0, 90.0], [-30.0, 180.0]),
+    ("elbow", [-3.0, 150.0], [-85.0, 85.0], [-10.0, 10.0]),
+    ("wrist", [-70.0, 80.0], [-10.0, 10.0], [-30.0, 30.0]),
+    ("hand", [-15.0, 15.0], [-10.0, 10.0], [-10.0, 10.0]),
+    ("mcp", [-20.0, 95.0], [-20.0, 20.0], [-10.0, 10.0]),
+    ("pip", [-5.0, 115.0], [-5.0, 5.0], [-5.0, 5.0]),
+    ("dip", [-10.0, 90.0], [-5.0, 5.0], [-5.0, 5.0]),
+    ("thumb_cmc", [-20.0, 50.0], [-35.0, 35.0], [-45.0, 45.0]),
+    ("thumb_mcp", [-10.0, 55.0], [-10.0, 10.0], [-10.0, 10.0]),
+    ("thumb_ip", [-15.0, 80.0], [-5.0, 5.0], [-5.0, 5.0]),
+];
+
 /// Rest frames and joint limits of the game rig (bone name, rest rotation
 /// = the bone's local axes in world space, limits in degrees about those
 /// axes). Legs, spine, neck, head and jaw stay world-aligned (identity),
@@ -1339,9 +1400,14 @@ pub fn rig_raw(def: &crate::body::BodyDef) -> Result<Vec<crate::anim::auto::RawB
 /// out and forward, where no world axis is a hinge: local +y runs along
 /// the bone (head to tail) and a positive local x rotation flexes it (the
 /// elbow closes, the wrist and fingers curl toward the palm, the shoulder
-/// raises the arm forward), on both sides. Limits: knees x 0..150 (world
-/// x, +x bends the shin back), elbows x 0..150, fingers x -10..100 with y
-/// and z nearly locked, so IK can't bend them backward.
+/// raises the arm forward), on both sides.
+///
+/// Limits are the normal active ranges of motion of [`ROM`], measured from
+/// true anatomical zero (straight leg, straight arm, straight finger, arm
+/// at the side), then shifted into the rest frame: the template's A-pose
+/// already bends the knee, elbow, fingers and abducts the arm, so the
+/// straight joint sits at minus that rest bend (a knee rest bend of 7
+/// degrees gives x -12..143 from rest: -5..150 from straight).
 pub fn bone_frames(
     def: &crate::body::BodyDef,
 ) -> Result<Vec<(String, bevy::math::Quat, Option<crate::anim::Limits>)>, String> {
@@ -1363,9 +1429,66 @@ pub fn bone_frames(
         y: Some(y),
         z: Some(z),
     };
+    // A ROM row shifted by the rest angle about each axis (degrees, in
+    // the bone's own frame and sign convention).
+    let rom = |name: &str, rest: [f32; 3]| -> crate::anim::Limits {
+        let r = ROM
+            .iter()
+            .find(|r| r.0 == name)
+            .map_or([[-180.0, 180.0]; 3], |r| [r.1, r.2, r.3]);
+        lim(
+            [r[0][0] - rest[0], r[0][1] - rest[0]],
+            [r[1][0] - rest[1], r[1][1] - rest[1]],
+            [r[2][0] - rest[2], r[2][1] - rest[2]],
+        )
+    };
+    // Signed angle (degrees) from direction `a` to `b` about `axis`.
+    let signed = |a: Vec3, b: Vec3, axis: Vec3| -> f32 {
+        let (a, b) = (a - axis * a.dot(axis), b - axis * b.dot(axis));
+        if a.length_squared() < 1e-12 || b.length_squared() < 1e-12 {
+            return 0.0;
+        }
+        a.cross(b).dot(axis).atan2(a.dot(b)).to_degrees()
+    };
+    let dir = |n: &str| -> Option<Vec3> {
+        let b = bones.iter().find(|b| b.0 == n)?;
+        (b.3? - b.2).try_normalize()
+    };
     let mut out = Vec::new();
     for (s, sign) in [("_l", 1.0f32), ("_r", -1.0)] {
         let n = |b: &str| format!("{b}{s}");
+        let side = |l: crate::anim::Limits| if sign > 0.0 { l } else { l.mirrored() };
+        // Legs are world-aligned: hip flexion is -x (the thigh swings
+        // forward), abduction +z on the left; the knee bends the shin back
+        // about +x; the ankle's +x points the toes down (plantarflexion).
+        if let (Some(th), Some(sh)) = (dir(&n("thigh")), dir(&n("knee"))) {
+            let flex = signed(Vec3::NEG_Y, th, Vec3::X);
+            let abd = signed(Vec3::NEG_Y, th, Vec3::Z) * sign;
+            out.push((
+                n("thigh"),
+                Quat::IDENTITY,
+                Some(side(rom("hip", [flex, 0.0, abd]))),
+            ));
+            let bend = signed(th, sh, Vec3::X);
+            out.push((
+                n("knee"),
+                Quat::IDENTITY,
+                Some(side(rom("knee", [bend, 0.0, 0.0]))),
+            ));
+            out.push((
+                n("ankle"),
+                Quat::IDENTITY,
+                Some(side(rom("ankle", [0.0; 3]))),
+            ));
+            out.push((n("ball"), Quat::IDENTITY, Some(side(rom("toe", [0.0; 3])))));
+        }
+        if at(&n("clavicle")).is_some() {
+            out.push((
+                n("clavicle"),
+                Quat::IDENTITY,
+                Some(side(rom("clavicle", [0.0; 3]))),
+            ));
+        }
         let (Some(sh), Some(el), Some(wr), Some(ha)) = (
             at(&n("shoulder")),
             at(&n("elbow")),
@@ -1385,16 +1508,20 @@ pub fn bone_frames(
             out.push((
                 n("elbow"),
                 q,
-                Some(lim(
-                    [-rest_bend - 3.0, 150.0 - rest_bend],
-                    [-90.0, 90.0],
-                    [-10.0, 10.0],
-                )),
+                Some(side(rom("elbow", [rest_bend, 0.0, 0.0]))),
             ));
         }
-        // Shoulder: the same hinge axis, +x raises the arm forward.
+        // Shoulder: the same hinge axis, +x raises the arm forward, +z
+        // (left) raises it sideways.
+        // The A-pose arm is already abducted: the arm at the side is at
+        // minus that angle.
+        let abd = signed(Vec3::NEG_Y, el - sh, Vec3::Z) * sign;
         if let Some(q) = frame(el - sh, k_elbow) {
-            out.push((n("shoulder"), q, None));
+            out.push((
+                n("shoulder"),
+                q,
+                Some(side(rom("shoulder", [0.0, 0.0, abd]))),
+            ));
         }
         // The palm faces in (toward the thigh): its normal points to -x on
         // the left, +x on the right, kept square to the knuckle line.
@@ -1413,8 +1540,7 @@ pub fn bone_frames(
                 continue;
             };
             if let Some(q) = frame(t - h, curl(t - h)) {
-                let l = (b == "wrist").then(|| lim([-70.0, 80.0], [-80.0, 80.0], [-30.0, 30.0]));
-                out.push((n(b), q, l));
+                out.push((n(b), q, Some(side(rom(b, [0.0; 3])))));
             }
         }
         for f in ["index", "middle", "ring", "pinky", "thumb"] {
@@ -1435,23 +1561,42 @@ pub fn bone_frames(
                 let Some(q) = frame(d, axis) else {
                     continue;
                 };
-                let l = if f == "thumb" {
-                    None
-                } else if k == 1 {
-                    Some(lim([-20.0, 95.0], [-25.0, 25.0], [-10.0, 10.0]))
+                // The rest curl from the parent bone, about this bone's
+                // own flexion axis.
+                let parent = bones
+                    .iter()
+                    .find(|x| x.0 == b)
+                    .and_then(|x| x.1.clone())
+                    .and_then(|p| dir(&p));
+                // (The thumb's CMC sits across the palm at rest: its zero
+                // is the rest pose itself.)
+                let rest = if f == "thumb" && k == 1 {
+                    0.0
                 } else {
-                    Some(lim([-5.0, 110.0], [-5.0, 5.0], [-5.0, 5.0]))
+                    parent.map_or(0.0, |p| signed(p, d, q * Vec3::X))
                 };
-                out.push((b, q, l));
+                let row = match (f, k) {
+                    ("thumb", 1) => "thumb_cmc",
+                    ("thumb", 2) => "thumb_mcp",
+                    ("thumb", _) => "thumb_ip",
+                    (_, 1) => "mcp",
+                    (_, 2) => "pip",
+                    _ => "dip",
+                };
+                out.push((b, q, Some(side(rom(row, [rest, 0.0, 0.0])))));
             }
         }
     }
-    for k in ["knee_l", "knee_r"] {
-        out.push((
-            k.to_string(),
-            Quat::IDENTITY,
-            Some(lim([0.0, 150.0], [-15.0, 15.0], [-10.0, 10.0])),
-        ));
+    for (b, row) in [
+        ("spine", "spine"),
+        ("chest", "chest"),
+        ("neck", "neck"),
+        ("head", "head"),
+        ("jaw", "jaw"),
+    ] {
+        if at(b).is_some() {
+            out.push((b.to_string(), Quat::IDENTITY, Some(rom(row, [0.0; 3]))));
+        }
     }
     Ok(out)
 }
@@ -2258,7 +2403,7 @@ pub fn build_with(
     let mut body = make(name, &["body"]);
     body.joints = Some(joint_list.clone());
     // A built-in skin look; any `material` item on the body replaces it.
-    builtin_look(&mut body, "human_skin", skin_graph([0.80, 0.62, 0.52]));
+    builtin_look(&mut body, "human_skin", look::skin_for(def)?);
     let mut out = vec![body];
     for e in &extras {
         let pn = format!("{name}_{e}");
@@ -2348,6 +2493,21 @@ pub fn build_with(
         let b = &out[0];
         out[0] = decimated(b, t, def.bake)?;
     }
+    // Landmarks as anchors, then brows, lashes and hair (hair.rs).
+    let lm = landmarks::get()?;
+    let cage_fit: Vec<Vec3> = if levels.is_empty() {
+        ev.pos.clone()
+    } else {
+        ev.pos
+            .iter()
+            .map(|p| *p * fitted.scale + Vec3::Y * fitted.dy)
+            .collect()
+    };
+    let mut js = out[0].joints.as_deref().cloned().unwrap_or_default();
+    js.extend(lm.positions(&cage_fit));
+    out[0].joints = Some(Arc::new(js));
+    let extra = hair::build(name, def, &out[0], &cage_fit, &lm)?;
+    out.extend(extra);
     Ok(out)
 }
 
@@ -2581,6 +2741,7 @@ pub fn outputs(name: &str, def: &crate::body::BodyDef) -> Vec<String> {
         Some(p) => v.extend(p.iter().map(|e| format!("{name}_{e}"))),
         None => v.extend(EXTRAS.iter().map(|e| format!("{name}_{e}"))),
     }
+    v.extend(hair::outputs(def).iter().map(|e| format!("{name}_{e}")));
     v
 }
 
@@ -2608,6 +2769,7 @@ pub fn validate(def: &crate::body::BodyDef) -> Result<(), String> {
             ));
         }
     }
+    hair::validate(def)?;
     let a = asset::load()?;
     let mut scratch = vec![Vec3::ZERO; a.verts.len()];
     add_details(&mut scratch, &a, &p.shape, &p.expression, p.ethnicity)?;

@@ -1716,6 +1716,7 @@ fn rig_nodes(
             }
         }
         // Clips of this skeleton.
+        let anim_start = animations.len();
         for (clip, _) in clips.iter().filter(|(c, _)| c.skeleton == skel.name) {
             let fps = clip.fps.unwrap_or(30.0);
             let mut times: Vec<f32> = (0..=((clip.duration * fps).ceil() as usize))
@@ -1896,6 +1897,16 @@ fn rig_nodes(
                     "extras": extras,
                 }));
             }
+        }
+        // The clips' playback data (loop, duration, root motion, events) on
+        // the skeleton root too: Bevy's loader does not expose animation
+        // extras, so `modeler_bevy` reads this table (`ModelerClipTable`).
+        let table: serde_json::Map<String, Value> = animations[anim_start..]
+            .iter()
+            .filter_map(|a| Some((a["name"].as_str()?.to_string(), a["extras"].clone())))
+            .collect();
+        if !table.is_empty() {
+            nodes[root]["extras"]["clips"] = Value::Object(table);
         }
     }
     let report = (!used.is_empty()).then(|| {

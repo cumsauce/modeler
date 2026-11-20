@@ -752,3 +752,137 @@ fn a_human_talks_over_a_walk_through_apply_ops() {
     .unwrap_or_default();
     assert!(e.contains("did you mean `smile`"), "{e}");
 }
+
+// ---- Root motion with IK ----
+
+/// A travelling walk whose left ankle is driven by world-space IK keys for
+/// one loop: planted at z = 0 from t = 0.75 (of the previous loop) to
+/// 0.25, swinging to z = 1.2 (one loop's travel ahead) for the next
+/// stance; the right ankle mirrors it half a loop later.
+fn rm_ik_session() -> crate::commands::Session {
+    session(json!([rig(),
+        {"type": "clip", "name": "walk", "skeleton": "rig", "duration": 1, "interp": "linear",
+         "root_motion": true,
+         "tracks": {"hip": {"translate": [[0, [0, -0.1, 0]], [1, [0, -0.1, 1.2]]]}},
+         "ik": {"foot_l": {"chain": 2, "pole": [0.1, 0.5, 1.0], "rotate": [[0, {"x": 0}]], "target": [
+             [0, [0.1, 0.05, 0.0]], [0.25, [0.1, 0.05, 0.0]], [0.5, [0.1, 0.15, 0.6]],
+             [0.75, [0.1, 0.05, 1.2]], [1, [0.1, 0.05, 1.2]]]}},
+         "mirror": {"foot_r": {"from": "foot_l", "phase": 0.5}}}]))
+}
+
+#[test]
+fn travelling_ik_targets_stay_planted_across_the_seam() {
+    let s = rm_ik_session();
+    let (c, k) = clip(&s, "walk");
+    let foot = bone(&k, "foot_l");
+    let (delta, _) = c.root_delta(&k);
+    assert!((delta.z - 1.2).abs() < 1e-3, "delta {delta:?}");
+    // Travelling playback: the clip at the wrapped time plus a loop's
+    // delta per completed loop, as the window and a game play it.
+    let world = |tt: f32| {
+        let loops = tt.div_euclid(c.duration);
+        let pose = c.sample(&k, tt.rem_euclid(c.duration));
+        k.world(&pose)[foot].w_axis.truncate() + delta * loops
+    };
+    for cycle in 1..=3 {
+        let at = cycle as f32 * 1.2;
+        for i in 0..=20 {
+            let tt = cycle as f32 - 0.25 + 0.5 * i as f32 / 20.0;
+            let p = world(tt);
+            assert!(
+                (p.z - at).abs() < 2e-3 && (p.y - 0.05).abs() < 2e-3,
+                "loop {cycle}, t {tt}: planted foot at {p:?}, want z {at}"
+            );
+        }
+    }
+    // The right foot (a mirror half a loop later) plants half a stride
+    // ahead of the left, in mid loop.
+    let r = bone(&k, "foot_r");
+    for tt in [0.3, 0.5, 0.7] {
+        let p = k.world(&c.sample(&k, tt))[r].w_axis.truncate();
+        assert!(
+            (p.z - 0.6).abs() < 2e-3 && (p.x + 0.1).abs() < 2e-3,
+            "right {p:?} at {tt}"
+        );
+    }
+}
+
+#[test]
+fn travelling_ik_in_place_loops_exactly() {
+    let s = rm_ik_session();
+    let (c, k) = clip(&s, "walk");
+    let segs = |t: f32| k.posed_segments(&c.sample_in_place(&k, t));
+    let (a, b) = (segs(0.0), segs(c.duration - 1e-4));
+    for ((h0, t0), (h1, t1)) in a.iter().zip(&b) {
+        assert!((*h0 - *h1).length() < 2e-3 && (*t0 - *t1).length() < 2e-3);
+    }
+    // In place, the planted foot moves back at the travel speed.
+    let foot = bone(&k, "foot_l");
+    let z = |t: f32| segs(t)[foot].0.z;
+    assert!(
+        (z(0.2) - z(0.0) + 0.24).abs() < 2e-3,
+        "{} {}",
+        z(0.0),
+        z(0.2)
+    );
+    let spec: super::check::AnimationSpec = serde_json::from_value(json!({
+        "loop": true, "foot_slide": {"contact_height": 0.005, "tol": 0.03, "bones": ["foot_*"]},
+        "smooth": true}))
+    .unwrap_or_else(|e| panic!("{e}"));
+    for (n, ok, d) in super::check::animation(&s.model, &spec, &[]) {
+        if n.ends_with("loop") || n.ends_with("foot_slide") {
+            assert!(ok, "{n}: {d}");
+        }
+    }
+}
+
+// ---- Garments bind themselves ----
+
+#[test]
+fn garments_follow_the_rig_with_no_bind_item() {
+    if crate::human::asset::load().is_err() {
+        eprintln!("skipped: no data/human/human.bin");
+        return;
+    }
+    let s = session(json!([
+        {"type": "body", "name": "eve", "preset": "human"},
+        {"type": "garment", "name": "shirt", "on": "eve", "preset": "tshirt"},
+        {"type": "clip", "name": "raise", "skeleton": "eve_rig", "duration": 1,
+         "tracks": {"spine": {"rotate": [[0, {"x": 0}], [0.5, {"x": 35}], [1, {"x": 0}]]}}}]));
+    let defs = super::bind_defs(&s.model.ops);
+    assert!(defs.iter().any(|(n, _)| n == "shirt_bind"), "{defs:?}");
+    let shirt = s
+        .model
+        .parts
+        .iter()
+        .position(|p| p.name == "shirt")
+        .unwrap_or_else(|| panic!("no shirt"));
+    assert!(s.model.parts[shirt].rig.is_some(), "the shirt is not bound");
+    let (c, k) = clip(&s, "raise");
+    let posed = super::posed_parts(&s.model, &c, &k, 0.5);
+    let rest = &s.model.parts[shirt];
+    let moved = rest
+        .verts
+        .iter()
+        .zip(&posed[shirt].verts)
+        .enumerate()
+        .map(|(i, (_, b))| (rest.world_vert(i) - Vec3::from(*b)).length())
+        .fold(0.0f32, f32::max);
+    assert!(
+        moved > 0.02,
+        "the shirt doesn't follow the spine ({moved} m)"
+    );
+    // An explicit bind of the part replaces the automatic one.
+    let mut s2 = s;
+    s2.apply_values(
+        None,
+        vec![
+            json!({"type": "bind", "name": "mine", "skeleton": "eve_rig",
+            "parts": ["shirt"], "mode": "smooth", "weights_from": "eve"}),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let defs = super::bind_defs(&s2.model.ops);
+    assert!(!defs.iter().any(|(n, _)| n == "shirt_bind"));
+    assert!(defs.iter().any(|(n, _)| n == "mine"));
+}

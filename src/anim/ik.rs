@@ -32,6 +32,11 @@ pub struct Ik {
     pub mirrored: bool,
     /// Time shift (s), as for mirrored tracks.
     pub shift: f32,
+    /// The world offset the target (and pole) gains per loop: the clip's
+    /// root-motion delta for keyed targets of a travelling clip (whose
+    /// keys are then stored with that trend taken out, so they repeat),
+    /// else zero.
+    pub cycle: Vec3,
 }
 
 fn rot_of(m: &Mat4) -> Quat {
@@ -70,14 +75,15 @@ pub fn clamp(q: Quat, l: &Limits) -> Quat {
 }
 
 /// Runs limits, IK and look_at on `pose` at clip time `t`.
-pub(super) fn post(clip: &Clip, skel: &Skeleton, t: f32, pose: &mut Pose) {
-    post_levels(&[clip], skel, t, pose);
+pub(super) fn post(clip: &Clip, skel: &Skeleton, t: f32, pose: &mut Pose, off: Vec3) {
+    post_levels(&[clip], skel, t, pose, off);
 }
 
 /// Runs limits, then every level's IK entries (a layered clip's bases
 /// first, each at its own wrapped time), then look_at, once on the final
-/// FK pose.
-pub(super) fn post_levels(levels: &[&Clip], skel: &Skeleton, t: f32, pose: &mut Pose) {
+/// FK pose. `off` moves every target and pole (in-place sampling of a
+/// root-motion clip passes minus the travel).
+pub(super) fn post_levels(levels: &[&Clip], skel: &Skeleton, t: f32, pose: &mut Pose, off: Vec3) {
     if pose.len() < skel.bones.len() {
         return;
     }
@@ -90,14 +96,26 @@ pub(super) fn post_levels(levels: &[&Clip], skel: &Skeleton, t: f32, pose: &mut 
         let (d, lp) = (clip.duration, clip.looping);
         for ik in &clip.ik {
             let tt = clip.wrap(t + ik.shift);
-            let target = super::vec_at(&ik.target, tt, d, lp, 0.0);
+            // A travelling target is its repeating part plus the body's
+            // progress through this loop (a mirrored entry is the other
+            // foot relative to the body at the same moment, so it shares
+            // the progress, not the shifted one).
+            let prog = if d > 0.0 { clip.wrap(t) / d } else { 0.0 };
+            let target = super::vec_at(&ik.target, tt, d, lp, 0.0) + ik.cycle * prog + off;
             let weight = ik
                 .weight
                 .as_ref()
                 .map(|c| super::vec_at(c, tt, d, lp, 1.0).x.clamp(0.0, 1.0))
                 .unwrap_or(1.0);
             let rotate = ik.rotate.as_ref().map(|c| super::rot_at(c, tt, d, lp));
-            solve(ik, skel, pose, target, weight, rotate);
+            if ik.cycle == Vec3::ZERO && off == Vec3::ZERO {
+                solve(ik, skel, pose, target, weight, rotate);
+            } else {
+                // The pole travels with the body (its mean progress).
+                let mut k = ik.clone();
+                k.pole = k.pole.map(|p| p + ik.cycle * prog + off);
+                solve(&k, skel, pose, target, weight, rotate);
+            }
         }
     }
     for k in 0..skel.bones.len() {

@@ -85,7 +85,8 @@ impl Playback {
                 return Ok("playback stopped (rest pose)".into());
             }
             Some(c) => {
-                if !names.iter().any(|n| n == c) {
+                // A pose (a static clip) or a mocap clip plays by name too.
+                if !names.iter().any(|n| n == c) && modeler::anim::clip(model, Some(c)).is_err() {
                     return Err(format!(
                         "play: no clip `{c}` (clips: {})",
                         if names.is_empty() {
@@ -265,4 +266,57 @@ pub(crate) fn play_animation(
         }
     }
     pb.posed = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(items: serde_json::Value) -> modeler::Model {
+        let mut s = modeler::commands::Session::default();
+        let serde_json::Value::Array(items) = items else {
+            panic!("items")
+        };
+        s.apply_values(None, items)
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.model
+    }
+
+    #[test]
+    fn plays_clips_poses_and_layers_by_name() {
+        let m = model(serde_json::json!([
+            {"type": "skeleton", "name": "rig", "bones": {
+                "a": {"head": [0, 0, 0], "tail": [0, 1, 0]},
+                "b": {"parent": "a", "head": [0, 1, 0], "tail": [0, 2, 0]}}},
+            {"type": "clip", "name": "wave", "skeleton": "rig", "duration": 1,
+             "tracks": {"b": {"rotate": [[0, {"z": 0}], [0.5, {"z": 40}], [1, {"z": 0}]]}}},
+            {"type": "clip", "name": "nod", "skeleton": "rig", "duration": 1, "over": "wave",
+             "additive": true, "tracks": {"a": {"rotate": [[0, {"x": 0}], [0.5, {"x": 10}], [1, {"x": 0}]]}}},
+            {"type": "pose", "name": "bent", "skeleton": "rig", "bones": {"b": {"rotate": {"z": 70}}}}
+        ]));
+        let mut pb = Playback::default();
+        for name in ["wave", "nod", "bent"] {
+            let r = PlayRequest {
+                clip: Some(name.into()),
+                ..Default::default()
+            };
+            let msg = pb.request(&m, &r).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(msg.contains(name), "{msg}");
+            assert_eq!(pb.clip.as_deref(), Some(name));
+            // What play_animation then samples.
+            let (c, k) = modeler::anim::clip(&m, Some(name)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(c.sample(&k, c.wrap(0.5)).iter().all(|p| p.1.is_finite()));
+        }
+        let bad = PlayRequest {
+            clip: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(pb.request(&m, &bad).is_err());
+        // Stopping goes back to rest.
+        let stop = PlayRequest {
+            clip: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(pb.request(&m, &stop).is_ok() && pb.clip.is_none());
+    }
 }
