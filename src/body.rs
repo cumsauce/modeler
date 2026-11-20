@@ -129,6 +129,18 @@ pub struct BodyDef {
     /// Body measurements to hit (meters), solved with the measure targets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub measure: BTreeMap<String, f32>,
+    /// Skin tone: 0 (light) .. 1 (dark) along a melanin ramp, or a colour.
+    #[serde(default, skip_serializing_if = "none")]
+    pub skin_tone: Option<crate::human::look::SkinTone>,
+    /// Hair: a style name or `{style, length, color, part, fringe, volume, cards, tris, seed}`.
+    #[serde(default, skip_serializing_if = "none")]
+    pub hair: Option<crate::human::hair::HairIn>,
+    /// Eyebrows: `false` or `{thickness, arch, color}` (on by default).
+    #[serde(default, skip_serializing_if = "none")]
+    pub brows: Option<crate::human::hair::Toggle<crate::human::hair::BrowsDef>>,
+    /// Eyelashes: `false` or `{length, curl, color}` (on by default).
+    #[serde(default, skip_serializing_if = "none")]
+    pub lashes: Option<crate::human::hair::Toggle<crate::human::hair::LashesDef>>,
 }
 
 /// The human-only fields, for errors on other presets.
@@ -152,6 +164,10 @@ fn human_fields(d: &BodyDef) -> Vec<&'static str> {
         ("eye_color", d.eye_color.is_some()),
         ("pupil", d.pupil.is_some()),
         ("measure", !d.measure.is_empty()),
+        ("skin_tone", d.skin_tone.is_some()),
+        ("hair", d.hair.is_some()),
+        ("brows", d.brows.is_some()),
+        ("lashes", d.lashes.is_some()),
     ] {
         if set {
             v.push(k);

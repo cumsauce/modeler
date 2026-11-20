@@ -46,7 +46,7 @@ pub struct GarmentDef {
     pub thickness: Option<f32>,
     /// Where it covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<Region>,
+    pub region: Option<Box<Region>>,
     /// 0 skin-tight .. 1 bridges hollows like loose cloth (up to 3: merges
     /// toes or fingers, shoes and mittens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +64,11 @@ pub struct GarmentDef {
     /// Skirt / dress hem height (meters, or a joint "knee_l-0.05") for the
     /// leg-bridging tube.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skirt: Option<Skirt>,
+    pub skirt: Option<Box<Skirt>>,
+    /// How loose it hangs: tight, regular, loose, baggy (or skin = follow
+    /// every contour). Presets pick one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<String>,
 }
 
 /// Where a garment covers: everything given must hold (zones are a union).
@@ -146,8 +150,19 @@ pub struct Hem {
 pub struct Skirt {
     /// The waistband height (meters or "joint+m").
     pub top: Level,
-    /// The hem height.
-    pub hem: Level,
+    /// The hem height (or give `length`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hem: Option<Level>,
+    /// mini, knee (default), midi or maxi, when `hem` is not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<String>,
+    /// a_line (default) or straight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Depth (meters) of the soft vertical folds at the hem, fading to 0 at
+    /// the waist (default 0.006; 0 = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folds: Option<f32>,
     /// How far the hem flares out beyond the legs' hull (default 0.08).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flare: Option<f32>,
@@ -165,6 +180,7 @@ pub const FIELDS: &[&str] = &[
     "hide_skin",
     "bind",
     "skirt",
+    "fit",
 ];
 
 pub const PRESETS: &[&str] = &[
@@ -177,6 +193,9 @@ pub const PRESETS: &[&str] = &[
     "dress",
     "socks",
     "shoes",
+    "sneakers",
+    "boots",
+    "flats",
     "gloves",
     "hood",
     "briefs",
@@ -210,13 +229,15 @@ fn preset(name: &str) -> Result<(GarmentDef, [&'static str; 2], f32), String> {
                 _ => word("none"),
             };
             r.above = lv("hip-0.02");
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             // Over the waistband of trousers (0.005 + 0.003).
             d.offset = Some(0.010);
             d.ease = Some(0.25);
+            d.fit = Some("regular".into());
+            // The hem stands off and clears a waistband under it.
             d.hem = Some(Hem {
-                flare: 0.004,
-                length: None,
+                flare: 0.012,
+                length: Some(0.08),
             });
             (["#d9d4c8", "#ebe7dc"], 0.9)
         }
@@ -228,16 +249,17 @@ fn preset(name: &str) -> Result<(GarmentDef, [&'static str; 2], f32), String> {
                 word("short")
             };
             r.below = lv("hip+0.07");
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.005);
             d.ease = Some(0.6);
+            d.fit = Some("regular".into());
             (["#27354f", "#3d5276"], 0.85)
         }
         "briefs" => {
             let mut r = reg(&["hips"]);
             r.legs = Some(Extent::Range([0.0, 0.12]));
             r.below = lv("hip+0.04");
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.003);
             d.ease = Some(0.3);
             (["#2c2c30", "#3a3a40"], 0.8)
@@ -247,7 +269,7 @@ fn preset(name: &str) -> Result<(GarmentDef, [&'static str; 2], f32), String> {
             r.arms = word("none");
             r.above = lv("chest+0.03");
             r.below = lv("chest+0.17");
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.003);
             d.ease = Some(0.8);
             (["#2c2c30", "#3a3a40"], 0.7)
@@ -255,26 +277,27 @@ fn preset(name: &str) -> Result<(GarmentDef, [&'static str; 2], f32), String> {
         "socks" => {
             let mut r = reg(&["feet"]);
             r.legs = Some(Extent::Range([1.55, 2.0]));
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.002);
             d.ease = Some(0.2);
             (["#e8e6e0", "#f4f2ec"], 0.95)
         }
-        "shoes" => {
-            let mut r = reg(&["feet"]);
-            r.legs = Some(Extent::Range([1.88, 2.0]));
-            r.above = Some(Level::Num(0.012));
-            d.region = Some(r);
-            // Outside a trouser hem; eased hard so the toes merge.
-            d.offset = Some(0.011);
-            d.ease = Some(3.0);
-            d.thickness = Some(0.004);
-            (["#2a211c", "#3b2e26"], 0.55)
+        "shoes" | "sneakers" | "boots" | "flats" => {
+            // Built as shoe volumes in `shoe::build`; the region only says
+            // which body part they are on.
+            d.region = Some(Box::new(reg(&["feet"])));
+            d.offset = Some(0.008);
+            d.thickness = Some(0.0);
+            match name {
+                "boots" => (["#3a2618", "#5a3c26"], 0.55),
+                "flats" => (["#1e1a1c", "#2c2628"], 0.4),
+                _ => (["#e8e8ea", "#f6f6f6"], 0.7),
+            }
         }
         "gloves" => {
             let mut r = reg(&["hands"]);
             r.arms = Some(Extent::Range([1.8, 2.0]));
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.002);
             d.ease = Some(0.2);
             (["#3a2a20", "#4a362a"], 0.6)
@@ -285,37 +308,45 @@ fn preset(name: &str) -> Result<(GarmentDef, [&'static str; 2], f32), String> {
                 normal: [0.0, 0.0, -1.0],
                 point: [0.0, 0.0, f32::NAN],
             }];
-            d.region = Some(r);
+            d.region = Some(Box::new(r));
             d.offset = Some(0.012);
             d.ease = Some(1.0);
             (["#5a6a4a", "#6a7a58"], 0.9)
         }
         "skirt" => {
-            d.skirt = Some(Skirt {
+            d.skirt = Some(Box::new(Skirt {
                 top: Level::Joint("hip+0.07".into()),
-                hem: Level::Joint("knee_l+0.06".into()),
+                hem: None,
+                length: None,
+                profile: None,
+                folds: None,
                 flare: None,
-            });
+            }));
             d.offset = Some(0.008);
             (["#6b2e3a", "#84404d"], 0.85)
         }
         "dress" => {
-            let mut r = reg(&["torso"]);
+            let mut r = reg(&["torso", "hips"]);
             r.arms = word("none");
-            r.above = lv("hip+0.03");
-            d.region = Some(r);
-            d.skirt = Some(Skirt {
+            // The bodice ends on a level line where the skirt begins.
+            r.above = lv("hip+0.09");
+            d.region = Some(Box::new(r));
+            d.skirt = Some(Box::new(Skirt {
                 top: Level::Joint("hip+0.09".into()),
-                hem: Level::Joint("knee_l-0.04".into()),
+                hem: None,
+                length: Some("knee".into()),
+                profile: None,
+                folds: None,
                 flare: None,
-            });
-            d.offset = Some(0.006);
-            d.ease = Some(0.7);
+            }));
+            d.offset = Some(0.008);
+            d.ease = Some(0.4);
+            d.fit = Some("regular".into());
             (["#2f4b6b", "#3e6088"], 0.85)
         }
         "hair_buzz" | "hair_short" | "hair_bob" => {
             // The hairline planes are placed from the head joint in build.
-            d.region = Some(reg(&["head"]));
+            d.region = Some(Box::new(reg(&["head"])));
             let (off, ease) = match name {
                 "hair_buzz" => (0.0015, 0.0),
                 "hair_short" => (0.010, 0.8),
@@ -347,10 +378,10 @@ fn resolved(def: &GarmentDef) -> Result<(GarmentDef, [&'static str; 2], f32), St
     macro_rules! over {
         ($($f:ident),*) => { $( if def.$f.is_some() { base.$f = def.$f.clone(); } )* };
     }
-    over!(offset, thickness, ease, hem, hide_skin, bind, skirt);
+    over!(offset, thickness, ease, hem, hide_skin, bind, skirt, fit);
     if let Some(r) = &def.region {
         // Region fields override the preset's one by one.
-        let mut b = base.region.take().unwrap_or_default();
+        let mut b = base.region.take().map(|b| *b).unwrap_or_default();
         if !r.zones.is_empty() {
             b.zones = r.zones.clone();
         }
@@ -364,7 +395,7 @@ fn resolved(def: &GarmentDef) -> Result<(GarmentDef, [&'static str; 2], f32), St
         if !r.boxes.is_empty() {
             b.boxes = r.boxes.clone();
         }
-        base.region = Some(b);
+        base.region = Some(Box::new(b));
     }
     Ok((base, cols, rough))
 }
@@ -396,6 +427,19 @@ pub fn validate(def: &GarmentDef) -> Result<(), String> {
         }
         if let Some(e) = &r.legs {
             extent(e, false)?;
+        }
+    }
+    if let Some(f) = &d.fit {
+        fit::preset(f, "top")?;
+    }
+    if let Some(sk) = &d.skirt {
+        if let Some(l) = &sk.length {
+            skirt_length_word(l)?;
+        }
+        if let Some(p) = &sk.profile
+            && !matches!(p.as_str(), "a_line" | "straight")
+        {
+            return Err(format!("skirt.profile: unknown `{p}` (a_line or straight)"));
         }
     }
     Ok(())
@@ -505,6 +549,39 @@ fn zone_of_bone(b: &str) -> Zone {
         "ankle" | "ball" | "toe" => Zone::Foot,
         _ => Zone::Torso,
     }
+}
+
+/// A welded vertex's weight per [`Zone`].
+fn zone_weights(body: &Part, w: &Welded, g: usize) -> [f32; 8] {
+    let mut wz = [0.0f32; 8];
+    let Some(sk) = &body.skin else {
+        return wz;
+    };
+    let raw = w.first[g] as usize;
+    let j = sk.joints.get(raw).copied().unwrap_or_default();
+    let wt = sk.weights.get(raw).copied().unwrap_or_default();
+    for k in 0..4 {
+        if let Some(b) = sk.bones.get(j[k] as usize) {
+            wz[zone_of_bone(b) as usize] += wt[k];
+        }
+    }
+    wz
+}
+
+/// The hem height of a skirt length word.
+fn skirt_length_word(l: &str) -> Result<[f32; 3], String> {
+    // Weights of the hip, knee and ankle heights.
+    Ok(match l {
+        "mini" => [0.4, 0.6, 0.0],
+        "knee" => [0.0, 0.92, 0.08],
+        "midi" => [0.0, 0.5, 0.5],
+        "maxi" => [0.0, 0.0, 1.0],
+        other => {
+            return Err(format!(
+                "skirt.length: unknown `{other}` (mini, knee, midi or maxi)"
+            ));
+        }
+    })
 }
 
 /// An arm / leg extent as [from, to] along the limb (0 root joint, 1 the
@@ -753,7 +830,7 @@ fn field(body: &Part, w: &Welded, r: &Region) -> Result<Vec<f32>, String> {
                 let side = if p.x >= 0.0 { &js[0] } else { &js[1] };
                 let (u, _) = limb_param(p, side[0], side[1], side[2]);
                 let wl = wz[z as usize];
-                let gate = (1.0 - wl) * 4.0;
+                let gate = (0.5 - wl).max(0.0) * 8.0;
                 s = s.min((a1 - u) + gate);
                 // The start of a cuff / sock is cut everywhere: whatever
                 // sits before it on the limb chain (a crotch, a shoulder)
@@ -1006,7 +1083,7 @@ fn emit(
     out: &mut Mesh,
     p: &[Vec3],
     tris: &[[u32; 3]],
-    thickness: f32,
+    thickness: &[f32],
     src: Option<&[(u32, u32, f32)]>,
 ) {
     let base = out.pos.len() as u32;
@@ -1019,14 +1096,14 @@ fn emit(
     for t in tris {
         out.tris.push(t.map(|i| i + base));
     }
-    if thickness <= 0.0 {
+    if thickness.iter().all(|t| *t <= 0.0) {
         return;
     }
     let n = vertex_normals(p, tris);
     let inner = out.pos.len() as u32;
     for i in 0..p.len() {
         // The outer layer moves out; the source sheet stays the inside.
-        out.pos[(base as usize) + i] = p[i] + n[i] * thickness;
+        out.pos[(base as usize) + i] = p[i] + n[i] * thickness[i];
     }
     out.pos.extend_from_slice(p);
     push_src(out);
@@ -1108,14 +1185,25 @@ fn ray_hull(h: &[Vec2], c: Vec2, a: f32) -> f32 {
 
 /// The skirt tube: rings from `top` to `hem` around the hull of the body's
 /// slices (arms and hands left out on a human).
+struct TubeOpts {
+    flare: f32,
+    offset: f32,
+    /// Vertical fold depth at the hem.
+    folds: f32,
+    /// A thicker band at the top (a skirt on its own).
+    waistband: bool,
+    /// Points (x, z) of the bodice's lower border the top ring continues.
+    top_ring: Option<Vec<Vec2>>,
+}
+
 fn skirt_tube(
     body: &Part,
     w: &Welded,
     top: f32,
     hem: f32,
-    flare: f32,
-    offset: f32,
+    o: &TubeOpts,
 ) -> Result<(Vec<Vec3>, Vec<[u32; 3]>, f32), String> {
+    let (flare, offset) = (o.flare, o.offset);
     if top <= hem + 0.05 {
         return Err(format!(
             "skirt: top {top:.3} m must be at least 5 cm above the hem {hem:.3} m"
@@ -1140,7 +1228,7 @@ fn skirt_tube(
         None => vec![false; w.pos.len()],
     };
     let rings = ((top - hem) / 0.02).ceil().max(3.0) as usize;
-    let segs = 64usize;
+    let segs = 96usize;
     // The hull at the crotch and above: below it the legs part, the
     // skirt keeps falling from the widest hull.
     let mut prof: Vec<(f32, Vec2, Vec<f32>)> = Vec::new();
@@ -1205,14 +1293,75 @@ fn skirt_tube(
             }
         }
     }
-    let mut pos = Vec::new();
     let nring = prof.len();
-    for (k, (y, c, r)) in prof.iter().enumerate() {
+    // Final radii: hull + offset + flare (+ waistband), the top ring
+    // continuing the bodice, then cloth never narrowing as it falls.
+    let mut rad: Vec<Vec<f32>> = prof
+        .iter()
+        .enumerate()
+        .map(|(k, (y, _, r))| {
+            let t = k as f32 / (nring - 1).max(1) as f32;
+            let fl = flare * t.powf(2.0);
+            let band = if o.waistband && top - y < 0.035 {
+                0.003
+            } else {
+                0.0
+            };
+            r.iter().map(|rj| rj + offset + fl + band).collect()
+        })
+        .collect();
+    if let Some(ring) = &o.top_ring {
+        let c = prof[0].1;
+        let mut tr = vec![0.0f32; segs];
+        for q in ring {
+            let d = *q - c;
+            let a = d.y.atan2(d.x).rem_euclid(std::f32::consts::TAU);
+            let j = ((a / std::f32::consts::TAU * segs as f32).round() as usize) % segs;
+            tr[j] = tr[j].max(d.length());
+        }
+        if tr.iter().any(|x| *x > 0.0) {
+            // Fill empty bins by the neighbours, then smooth.
+            for _ in 0..segs {
+                if tr.iter().all(|x| *x > 0.0) {
+                    break;
+                }
+                let pr = tr.clone();
+                for j in 0..segs {
+                    if pr[j] <= 0.0 {
+                        let (a, b) = (pr[(j + segs - 1) % segs], pr[(j + 1) % segs]);
+                        tr[j] = a.max(b);
+                    }
+                }
+            }
+            for _ in 0..2 {
+                let pr = tr.clone();
+                for j in 0..segs {
+                    tr[j] = (pr[(j + segs - 1) % segs] + 2.0 * pr[j] + pr[(j + 1) % segs]) / 4.0;
+                }
+            }
+            for (k, (y, _, _)) in prof.iter().enumerate() {
+                let b = (1.0 - (top - y) / 0.1).clamp(0.0, 1.0).powi(2);
+                for j in 0..segs {
+                    let floor = prof[k].2[j] + 0.004;
+                    rad[k][j] = (rad[k][j] * (1.0 - b) + tr[j] * b).max(floor);
+                }
+            }
+        }
+    }
+    for k in 1..nring {
+        for j in 0..segs {
+            rad[k][j] = rad[k][j].max(rad[k - 1][j]);
+        }
+    }
+    // Soft vertical folds, deepest at the hem.
+    let circ: f32 = rad[nring - 1].iter().sum::<f32>() / segs as f32 * std::f32::consts::TAU;
+    let nf = ((circ / 0.11).round() as usize).clamp(6, 16) as f32;
+    let mut pos = Vec::new();
+    for (k, (y, c, _)) in prof.iter().enumerate() {
         let t = k as f32 / (nring - 1).max(1) as f32;
-        let fl = flare * t.powf(1.5);
-        for (j, rj) in r.iter().enumerate() {
+        for (j, rj) in rad[k].iter().enumerate() {
             let a = j as f32 / segs as f32 * std::f32::consts::TAU;
-            let rr = rj + offset + fl;
+            let rr = rj + o.folds * t.powf(1.3) * (a * nf + 0.7 * (a * 3.0).sin()).sin();
             pos.push(Vec3::new(c.x + a.cos() * rr, *y, c.y + a.sin() * rr));
         }
     }
@@ -1298,7 +1447,17 @@ pub fn build(name: &str, def: &GarmentDef, body: &Part) -> Result<(Part, Vec<u32
             },
         ];
     }
-    if let Some(r) = &region {
+    let shoe_kind = def
+        .preset
+        .as_deref()
+        .filter(|p| matches!(*p, "shoes" | "sneakers" | "boots" | "flats"));
+    // The bodice's lower border, for a dress's skirt to continue.
+    let mut bodice_rim: Vec<Vec2> = Vec::new();
+    if let Some(kind) = shoe_kind {
+        let (m, c) = shoe::build(kind, body, &w)?;
+        mesh = m;
+        covers = c;
+    } else if let Some(r) = &region {
         let s = field(body, &w, r)?;
         let (sh, cand) = clip(&w, &s);
         if sh.tris.is_empty() {
@@ -1309,7 +1468,77 @@ pub fn build(name: &str, def: &GarmentDef, body: &Part) -> Result<(Part, Vec<u32
                 body.bounds().1.y
             ));
         }
-        let (p, dist) = shape_sheet(&sh, offset, ease, d.hem.as_ref());
+        let (mut p, dist) = shape_sheet(&sh, offset, ease, d.hem.as_ref());
+        let kind = match def.preset.as_deref() {
+            Some("trousers" | "shorts" | "briefs") => "bottom",
+            _ => "top",
+        };
+        if let Some(mut f) = d
+            .fit
+            .as_deref()
+            .map(|f| fit::preset(f, kind))
+            .transpose()?
+            .flatten()
+        {
+            // Allowances are for an adult; a child's scale with the body.
+            let tall = w.pos.iter().map(|q| q.y).fold(0.0f32, f32::max);
+            let scale = (tall / 1.72).clamp(0.45, 1.2);
+            for e in &mut f.ease {
+                *e *= scale;
+            }
+            let mem: Vec<fit::Membership> = sh
+                .src
+                .iter()
+                .zip(&sh.base)
+                .map(|(&(a, b, t), q)| {
+                    let (za, zb) = (
+                        zone_weights(body, &w, a as usize),
+                        zone_weights(body, &w, b as usize),
+                    );
+                    let z = |k: Zone| za[k as usize] * (1.0 - t) + zb[k as usize] * t;
+                    let trunk = z(Zone::Torso) + z(Zone::Hips) + z(Zone::Neck) + z(Zone::Head);
+                    let arm = z(Zone::Arm) + z(Zone::Hand);
+                    let leg = z(Zone::Leg) + z(Zone::Foot);
+                    let l = q.x >= 0.0;
+                    let (al, ar) = if l { (arm, 0.0) } else { (0.0, arm) };
+                    let (ll, lr) = if l { (leg, 0.0) } else { (0.0, leg) };
+                    let sum = (trunk + arm + leg).max(1e-6);
+                    [trunk / sum, al / sum, ar / sum, ll / sum, lr / sum]
+                })
+                .collect();
+            let chain = |n: [&str; 3]| -> Option<[[Vec3; 3]; 2]> {
+                let side = |s: &str| -> Option<[Vec3; 3]> {
+                    Some([
+                        body.joint(&format!("{}{s}", n[0]))?,
+                        body.joint(&format!("{}{s}", n[1]))?,
+                        body.joint(&format!("{}{s}", n[2]))?,
+                    ])
+                };
+                Some([side("_l")?, side("_r")?])
+            };
+            let axes = fit::Axes {
+                arms: chain(["shoulder", "elbow", "wrist"]),
+                legs: chain(["thigh", "knee", "ankle"]),
+                shoulder_y: body.joint("shoulder_l").map_or(f32::MAX, |j| j.y),
+            };
+            fit::apply(&mut p, &sh.nrm, &sh.tris, &mem, &axes, &f);
+            fit::drape(&mut p, &sh.base, &sh.nrm, &sh.tris, offset, &f);
+            // Trousers span the fork between the legs instead of following
+            // the groin crease in: a long bridging pass there only.
+            if kind == "bottom"
+                && let (Some(a), Some(b)) = (body.joint("thigh_l"), body.joint("thigh_r"))
+            {
+                let c = (a + b) * 0.5 - Vec3::Y * 0.07 * scale;
+                let wgt: Vec<f32> = p
+                    .iter()
+                    .map(|q| {
+                        let d = (*q - c) / Vec3::new(0.11, 0.1, 0.25) / scale;
+                        (1.0 - d.length()).clamp(0.0, 1.0)
+                    })
+                    .collect();
+                fit::bridge(&mut p, &sh.base, &sh.nrm, &sh.tris, offset, &wgt, 150);
+            }
+        }
         // Covered body faces: every corner well inside the garment.
         let mut at: HashMap<u32, f32> = HashMap::new();
         for (i, o) in sh.orig.iter().enumerate() {
@@ -1323,34 +1552,62 @@ pub fn build(name: &str, def: &GarmentDef, body: &Part) -> Result<(Part, Vec<u32
                 covers.push(w.raw_tri[ti as usize]);
             }
         }
-        let mut p = p;
-        if def.preset.as_deref() == Some("shoes") {
-            convex_slices(&mut p, &sh.tris);
+        if let Some(sk) = &d.skirt {
+            let top = level(&sk.top, body)?;
+            bodice_rim = p
+                .iter()
+                .zip(&dist)
+                .filter(|(q, dd)| **dd < 1e-4 && q.y < top + 0.04)
+                .map(|(q, _)| Vec2::new(q.x, q.z))
+                .collect();
         }
-        emit(&mut mesh, &p, &sh.tris, thickness, Some(&sh.src));
-        // Shoes: a flat sole under each foot.
-        if def.preset.as_deref() == Some("shoes") {
-            for side in [1.0f32, -1.0] {
-                let pts: Vec<Vec2> = sh
-                    .base
-                    .iter()
-                    .filter(|q| q.x * side > 0.0 && q.y < 0.05)
-                    .map(|q| Vec2::new(q.x, q.z))
-                    .collect();
-                let h = hull2(pts);
-                if h.len() < 3 {
-                    continue;
+        // Hems, cuffs and collars: a rolled edge, twice the cloth.
+        let th: Vec<f32> = dist
+            .iter()
+            .map(|dd| {
+                if thickness <= 0.0 {
+                    0.0
+                } else {
+                    thickness * (1.0 + 1.2 * (1.0 - dd / 0.012).clamp(0.0, 1.0))
                 }
-                sole(&mut mesh, &h, offset + thickness + 0.002, 0.024);
-            }
-        }
+            })
+            .collect();
+        emit(&mut mesh, &p, &sh.tris, &th, Some(&sh.src));
     }
     if let Some(sk) = &d.skirt {
         let top = level(&sk.top, body)?;
-        let hem = level(&sk.hem, body)?;
-        // Outside the top it is tucked over (a tank, a dress bodice).
-        let (p, t, _) = skirt_tube(body, &w, top, hem, sk.flare.unwrap_or(0.08), offset + 0.008)?;
-        emit(&mut mesh, &p, &t, thickness, None);
+        let hem = match (&sk.hem, &sk.length) {
+            (Some(h), _) => level(h, body)?,
+            (None, l) => {
+                let l = l.as_deref().unwrap_or("knee");
+                let wts = skirt_length_word(l)?;
+                let y = |j: &str| level(&Level::Joint(j.into()), body);
+                let v = wts[0] * y("hip")? + wts[1] * y("knee_l")? + wts[2] * y("ankle_l")?;
+                v + if l == "maxi" { 0.04 } else { 0.0 }
+            }
+        };
+        let straight = sk.profile.as_deref() == Some("straight");
+        let flare = sk.flare.unwrap_or(if straight {
+            0.015
+        } else {
+            0.05 + 0.09 * ((top - hem) / 0.55).min(1.6)
+        });
+        let rim = (!bodice_rim.is_empty()).then(|| bodice_rim.clone());
+        let opts = TubeOpts {
+            flare,
+            offset: offset + 0.002,
+            folds: sk.folds.unwrap_or(0.006),
+            waistband: rim.is_none(),
+            top_ring: rim,
+        };
+        let tube_top = if opts.top_ring.is_some() {
+            top + 0.012
+        } else {
+            top
+        };
+        let (p, t, _) = skirt_tube(body, &w, tube_top, hem, &opts)?;
+        let th = vec![thickness; p.len()];
+        emit(&mut mesh, &p, &t, &th, None);
         // Hide the body between the waistband and the hem (legs included:
         // they are inside the skirt).
         let lo = hem + 0.03;
@@ -1389,8 +1646,8 @@ pub fn build(name: &str, def: &GarmentDef, body: &Part) -> Result<(Part, Vec<u32
             [a * rad, -v.y]
         })
         .collect();
-    part.sheet = thickness <= 0.0;
-    part.skin = carried_skin(body, &w, &mut mesh, def.preset.as_deref() == Some("shoes"));
+    part.sheet = thickness <= 0.0 && shoe_kind.is_none();
+    part.skin = carried_skin(body, &w, &mut mesh, shoe_kind.is_some());
     part.material.base_color = [1.0; 4];
     part.material.roughness = 1.0;
     part.material.metalness = 0.0;
@@ -1424,53 +1681,6 @@ fn arm_mask(body: &Part, w: &Welded) -> Vec<bool> {
         .collect()
 }
 
-/// Pushes every vertex out to the convex hull of its horizontal slice, per
-/// side of x = 0 (a shoe bridges the toes and the arch).
-fn convex_slices(p: &mut [Vec3], tris: &[[u32; 3]]) {
-    let nrm = vertex_normals(p, tris);
-    let bin = 0.008;
-    let mut slices: HashMap<(i32, bool), Vec<usize>> = HashMap::new();
-    for (i, v) in p.iter().enumerate() {
-        slices
-            .entry(((v.y / bin).floor() as i32, v.x >= 0.0))
-            .or_default()
-            .push(i);
-    }
-    let orig: Vec<Vec3> = p.to_vec();
-    for ((k, side), idx) in &slices {
-        // Hull over this slice and its neighbours, so the slices agree.
-        let mut pts = Vec::new();
-        for dk in -1..=1 {
-            if let Some(n) = slices.get(&(k + dk, *side)) {
-                pts.extend(n.iter().map(|i| Vec2::new(orig[*i].x, orig[*i].z)));
-            }
-        }
-        let h = hull2(pts);
-        if h.len() < 3 {
-            continue;
-        }
-        let c = h.iter().copied().sum::<Vec2>() / h.len() as f32;
-        for &i in idx {
-            // Side walls only: a top or sole face would slide to the rim.
-            if nrm[i].y.abs() > 0.7 {
-                continue;
-            }
-            let q = Vec2::new(orig[i].x, orig[i].z) - c;
-            let r = q.length();
-            if r < 1e-6 {
-                continue;
-            }
-            let a = q.y.atan2(q.x);
-            let rh = ray_hull(&h, c, a);
-            if rh > r {
-                let o = c + q / r * rh.min(r + 0.025);
-                p[i].x = o.x;
-                p[i].z = o.y;
-            }
-        }
-    }
-}
-
 /// The body's own skin weights at every garment vertex (exact, from the
 /// vertex it was offset from; a sole takes its nearest upper vertex's),
 /// so a smooth bind carries them instead of a closest-point transfer
@@ -1483,19 +1693,20 @@ fn carried_skin(
     stiff_toes: bool,
 ) -> Option<Arc<crate::human::SkinWeights>> {
     let sk = body.skin.as_ref()?;
-    // A shoe doesn't fold at the toes: ball / toe weights go to the ankle.
+    // A shoe bends at the ball, never at the toes: toe weights go to the
+    // ball.
     let remap: Vec<u16> = sk
         .bones
         .iter()
         .enumerate()
         .map(|(i, b)| {
             let side = b.rsplit('_').next().unwrap_or("");
-            let ankle = format!("ankle_{side}");
-            match (stiff_toes, b.starts_with("ball_") || b.starts_with("toe_")) {
+            let ball = format!("ball_{side}");
+            match (stiff_toes, b.starts_with("toe_")) {
                 (true, true) => sk
                     .bones
                     .iter()
-                    .position(|x| *x == ankle)
+                    .position(|x| *x == ball)
                     .map_or(i as u16, |a| a as u16),
                 _ => i as u16,
             }
@@ -1562,7 +1773,40 @@ fn carried_skin(
     // Diffuse the weights a little over the garment's own edges: cloth
     // bridging a fold (the armpit) links vertices the body keeps apart.
     let (nb, _) = neighbours(mesh.pos.len(), &mesh.tris);
-    for _ in 0..6 {
+    // Where arm and trunk weights meet (the armpit, the shoulder seam) the
+    // cloth spans the gap the body folds into: those vertices, and a few
+    // rings round them, keep diffusing (a gusset of smooth weights), so arm
+    // swing spreads over the junction instead of crushing one row of edges.
+    let zone_share = |j: &[u16; 4], wt: &[f32; 4]| {
+        let (mut arm, mut trunk) = (0.0f32, 0.0f32);
+        for k in 0..4 {
+            match sk.bones.get(j[k] as usize).map(|b| zone_of_bone(b)) {
+                Some(Zone::Arm | Zone::Hand) => arm += wt[k],
+                Some(Zone::Torso | Zone::Neck) => trunk += wt[k],
+                _ => {}
+            }
+        }
+        (4.0 * arm.min(trunk)).min(1.0)
+    };
+    let mut mob: Vec<f32> = (0..mesh.pos.len())
+        .map(|i| {
+            // A shoe bends over its whole forefoot, not along one ring.
+            if stiff_toes {
+                1.0
+            } else {
+                zone_share(&joints[i], &weights[i])
+            }
+        })
+        .collect();
+    for _ in 0..8 {
+        let pm = mob.clone();
+        for i in 0..mob.len() {
+            for &n in &nb[i] {
+                mob[i] = mob[i].max(pm[n as usize] * 0.88);
+            }
+        }
+    }
+    for it in 0..120 {
         let pj = joints.clone();
         let pw = weights.clone();
         for i in 0..mesh.pos.len() {
@@ -1580,8 +1824,12 @@ fn carried_skin(
                     }
                 }
             };
-            add(&pj[i], &pw[i], 0.5);
-            let f = 0.5 / nb[i].len() as f32;
+            let keep = if it < 6 { 0.5 } else { 1.0 - 0.5 * mob[i] };
+            if keep >= 1.0 {
+                continue;
+            }
+            add(&pj[i], &pw[i], keep);
+            let f = (1.0 - keep) / nb[i].len() as f32;
             for &n in &nb[i] {
                 add(&pj[n as usize], &pw[n as usize], f);
             }
@@ -1614,46 +1862,6 @@ fn hairline(_body: &Part, w: &Welded, h: Vec3) -> f32 {
         .map(|p| p.y)
         .fold(h.y, f32::max);
     (top - h.y).max(0.05)
-}
-
-/// A flat sole: the footprint hull grown by `grow`, from y = 0 to `h`.
-fn sole(mesh: &mut Mesh, hull: &[Vec2], grow: f32, h: f32) {
-    let c = hull.iter().copied().sum::<Vec2>() / hull.len() as f32;
-    let ring: Vec<Vec2> = hull
-        .iter()
-        .map(|p| *p + (*p - c).normalize_or_zero() * grow)
-        .collect();
-    let base = mesh.pos.len() as u32;
-    let n = ring.len() as u32;
-    for p in &ring {
-        mesh.pos.push(Vec3::new(p.x, 0.0, p.y));
-    }
-    for p in &ring {
-        mesh.pos.push(Vec3::new(p.x, h, p.y));
-    }
-    let cb = mesh.pos.len() as u32;
-    mesh.pos.push(Vec3::new(c.x, 0.0, c.y));
-    mesh.pos.push(Vec3::new(c.x, h, c.y));
-    mesh.src
-        .extend(std::iter::repeat_n(None, 2 * ring.len() + 2));
-    // Hull is counter-clockwise in (x, z): seen from +y that is clockwise.
-    for k in 0..n {
-        let (a, b) = (base + k, base + (k + 1) % n);
-        let (at, bt) = (a + n, b + n);
-        mesh.tris.push([a, at, b]);
-        mesh.tris.push([b, at, bt]);
-        mesh.tris.push([cb + 1, bt, at]);
-        mesh.tris.push([cb, a, b]);
-    }
-    // Make sure the side faces point out.
-    let [a, b, cc] = mesh.tris[mesh.tris.len() - 4].map(|i| mesh.pos[i as usize]);
-    let out = (a - Vec3::new(c.x, a.y, c.y)).normalize_or_zero();
-    if (b - a).cross(cc - a).dot(out) < 0.0 {
-        let k = mesh.tris.len() - 4 * n as usize;
-        for t in &mut mesh.tris[k..] {
-            t.swap(1, 2);
-        }
-    }
 }
 
 type CoverMemo = HashMap<u64, Arc<Vec<u32>>>;
@@ -1769,6 +1977,9 @@ pub fn set_visible(parts: &mut [Arc<Part>], show: &[String], hide: &[String]) ->
     }
     changed
 }
+
+mod fit;
+mod shoe;
 
 #[cfg(test)]
 mod tests;

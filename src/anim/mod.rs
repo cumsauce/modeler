@@ -1074,27 +1074,55 @@ impl Clip {
     /// tracks layered on them, then once on the result: limits, every
     /// level's IK (base first) and look_at; a sway's dynamics last.
     pub fn sample(&self, skel: &Skeleton, t: f32) -> Pose {
+        self.sample_at(skel, t, None)
+    }
+
+    /// [`Clip::sample`], or with `in_place` (the travel and yaw at `t`)
+    /// the root motion taken out of the root bone before IK runs, and
+    /// every IK target and pole moved back by the travel too, so
+    /// travelling targets stay on the in-place body.
+    fn sample_at(&self, skel: &Skeleton, t: f32, in_place: Option<(Vec3, f32)>) -> Pose {
+        let off = in_place.map_or(Vec3::ZERO, |(v, _)| -v);
         if let Some(l) = &self.layer {
             let mut pose = match &self.base {
-                Some(b) => b.sample(skel, t),
+                Some(b) => b.sample_at(skel, t, in_place),
                 None => skel.rest(),
             };
             if self.base.is_none() && (!self.ik.is_empty() || skel.constrained()) {
-                ik::post(self, skel, t, &mut pose);
+                ik::post(self, skel, t, &mut pose, off);
             }
             sway::apply(l, skel, self.duration, self.wrap(t), &mut pose);
             return pose;
         }
         let mut pose = self.fk(skel, t);
+        if let Some((trav, yaw)) = in_place {
+            self.remove_travel(skel, &mut pose, trav, yaw);
+        }
         let mut levels: Vec<&Clip> = vec![self];
         while let Some(b) = levels.last().and_then(|c| c.base.as_deref()) {
             levels.push(b);
         }
         levels.reverse();
         if levels.iter().any(|c| !c.ik.is_empty()) || skel.constrained() {
-            ik::post_levels(&levels, skel, t, &mut pose);
+            ik::post_levels(&levels, skel, t, &mut pose, off);
         }
         pose
+    }
+
+    /// Takes the travel `trav` (world) and `yaw` (degrees) out of the
+    /// root-motion bone's channels.
+    fn remove_travel(&self, skel: &Skeleton, pose: &mut Pose, trav: Vec3, yaw: f32) {
+        let Some(rm) = &self.root_motion else {
+            return;
+        };
+        let b = &skel.bones[rm.bone];
+        if let Some(slot) = pose.get_mut(rm.bone) {
+            slot.0 -= b.rest.inverse() * trav;
+            if rm.yaw && yaw != 0.0 {
+                let w = Quat::from_rotation_y(-yaw.to_radians()) * (b.rest * slot.1);
+                slot.1 = (b.rest.inverse() * w).normalize();
+            }
+        }
     }
 
     /// The layer weight at `t` (1 without one).
@@ -1124,7 +1152,16 @@ impl Clip {
             let d = self.duration;
             let lp = self.looping;
             let r = track.rotate.as_ref().map(|c| rot_at(c, tt, d, lp));
-            let tr = track.translate.as_ref().map(|c| vec_at(c, tt, d, lp, 0.0));
+            // The root-motion bone's translation travels: across the seam
+            // its wrapped neighbours carry the loop's travel, so the curve
+            // keeps its speed through the seam instead of bending back.
+            let travels = self.root_motion.as_ref().is_some_and(|rm| rm.bone == *bone);
+            let tr = track.translate.as_ref().map(|c| match c {
+                Channel::Keys { keys, interp } if travels && !keys.is_empty() => {
+                    lerp_keys(keys, *interp, tt, d, lp, true)
+                }
+                c => vec_at(c, tt, d, lp, 0.0),
+            });
             let s = track.scale.as_ref().map(|c| vec_at(c, tt, d, lp, 1.0));
             let mr = |r: Quat| {
                 if *mirrored {
@@ -1234,20 +1271,11 @@ impl Clip {
     /// while it moves the entity itself); [`Clip::sample`] without root
     /// motion.
     pub fn sample_in_place(&self, skel: &Skeleton, t: f32) -> Pose {
-        let mut pose = self.sample(skel, t);
-        let Some(rm) = &self.root_motion else {
-            return pose;
-        };
-        let (trav, yaw) = self.travel(skel, t);
-        let b = &skel.bones[rm.bone];
-        if let Some(slot) = pose.get_mut(rm.bone) {
-            slot.0 -= b.rest.inverse() * trav;
-            if rm.yaw && yaw != 0.0 {
-                let w = Quat::from_rotation_y(-yaw.to_radians()) * (b.rest * slot.1);
-                slot.1 = (b.rest.inverse() * w).normalize();
-            }
+        if self.root_motion.is_none() {
+            return self.sample(skel, t);
         }
-        pose
+        let trav = self.travel(skel, t);
+        self.sample_at(skel, t, Some(trav))
     }
 
     /// Root motion over the whole clip: (delta, yaw degrees).
@@ -1953,7 +1981,7 @@ pub fn build_clip_with(
         additive: def.additive,
         weight: def.weight.clone(),
     });
-    Ok(Clip {
+    let mut clip = Clip {
         tracks,
         base: base.map(Box::new),
         ik: iks,
@@ -1962,7 +1990,49 @@ pub fn build_clip_with(
         events,
         morphs,
         ..Clip::empty(name, &def.skeleton, duration, def.looping)
-    })
+    };
+    travel_ik_targets(&mut clip, skel);
+    Ok(clip)
+}
+
+/// Keyed IK targets of a looping root-motion clip are authored in world
+/// space for one loop, travel included (a planted foot keyed at a fixed
+/// point, the next stance a stride ahead). Stores each with the root's
+/// per-loop delta taken out as a straight trend (so the keys repeat) and
+/// the delta in `cycle`, which sampling adds back by the loop's progress
+/// (`ik::post_levels`): playback carries the targets across the seam the
+/// way it carries the root, and in-place sampling takes them out with it.
+fn travel_ik_targets(clip: &mut Clip, skel: &Skeleton) {
+    if clip.root_motion.is_none() || !clip.looping || clip.duration <= 0.0 {
+        return;
+    }
+    let keyed = |k: &ik::Ik| matches!(&k.target, Channel::Keys { keys, .. } if keys.len() > 1);
+    if !clip.ik.iter().any(keyed) {
+        return;
+    }
+    // The root's travel comes from FK alone (IK never moves the root).
+    let mut probe = clip.clone();
+    probe.ik.clear();
+    let (delta, _) = probe.root_delta(skel);
+    if delta.length() < 1e-6 {
+        return;
+    }
+    let d = clip.duration;
+    for k in clip.ik.iter_mut().filter(|k| keyed(k)) {
+        // A mirror copy's keys are flipped in x, trend included.
+        let trend = if k.mirrored {
+            Vec3::new(-delta.x, delta.y, delta.z)
+        } else {
+            delta
+        };
+        if let Channel::Keys { keys, .. } = &mut k.target {
+            for (t, v) in keys.iter_mut() {
+                let p = Vec3::new(v[0], v[1], v[2]) - trend * (*t / d);
+                *v = [p.x, p.y, p.z, v[3]];
+            }
+        }
+        k.cycle = delta;
+    }
 }
 
 /// Resolves a clip's `root_motion` against its skeleton.
@@ -2318,6 +2388,7 @@ fn build_ik(
         rotate,
         mirrored,
         shift,
+        cycle: Vec3::ZERO,
     })
 }
 
@@ -2731,6 +2802,7 @@ fn instance_clip(i: &Instance, c: &Clip) -> Clip {
                     }
                 }
                 k.pole = k.pole.map(m);
+                k.cycle = i.r * (i.s * k.cycle);
                 if i.r != Quat::IDENTITY {
                     k.rotate = k.rotate.map(|c| match c {
                         Channel::Keys { keys, interp } => Channel::Keys {
@@ -2964,10 +3036,51 @@ pub fn bind_defs(ops: &[Op]) -> Vec<(String, BindDef)> {
             }
         }
     }
-    for o in ops {
-        if let Op::Bind { name, def } = o {
-            out.push((name.clone(), def.clone()));
+    // Garments follow the rig of the body they are on (smooth, weights
+    // from what they are on), unless a `bind` item has that name or binds
+    // one of their parts.
+    let explicit: Vec<(&String, &BindDef)> = ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::Bind { name, def } => Some((name, def)),
+            _ => None,
+        })
+        .collect();
+    for (name, def) in crate::garment::implicit_binds(ops) {
+        let covered = explicit.iter().any(|(n, d)| {
+            **n == name
+                || d.parts
+                    .iter()
+                    .any(|p| def.parts.iter().any(|g| crate::name_matches(p, g)))
+        });
+        if !covered && !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, def));
         }
+    }
+    for (name, def) in explicit {
+        out.push((name.clone(), def.clone()));
+    }
+    sources_first(out)
+}
+
+/// Orders binds so one that copies weights from a part (`weights_from`)
+/// comes after the bind of that part (a jacket over a shirt over the
+/// body), otherwise keeping the order (a cycle keeps it too).
+fn sources_first(mut pending: Vec<(String, BindDef)>) -> Vec<(String, BindDef)> {
+    let mut out = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let waits = |i: usize, pending: &[(String, BindDef)]| {
+            pending[i].1.weights_from.as_ref().is_some_and(|f| {
+                pending
+                    .iter()
+                    .enumerate()
+                    .any(|(j, d)| j != i && d.1.parts.iter().any(|p| crate::name_matches(p, f)))
+            })
+        };
+        let i = (0..pending.len())
+            .find(|&i| !waits(i, &pending))
+            .unwrap_or(0);
+        out.push(pending.remove(i));
     }
     out
 }

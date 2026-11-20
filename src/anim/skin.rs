@@ -447,7 +447,7 @@ pub struct CorrectiveSpec {
     /// Custom key poses instead of the built-in ones.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub poses: Vec<CorrectivePose>,
-    /// At most this many targets (default 64).
+    /// At most this many targets (default 160; the most valuable first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<usize>,
 }
@@ -714,30 +714,48 @@ impl Graph {
 }
 
 /// The built-in key poses for the `human` game rig (signs follow the
-/// pose sheet: flexion is +x, shoulders raise about z).
+/// pose sheet: flexion is +x (the shoulder's raises the arm forward),
+/// shoulders raise sideways about z), most valuable
+/// first: a bind's `max` keeps the head of this list (see [`key_poses`]):
+/// the elbows and knees (LBS collapses them worst), the hips (the crotch
+/// and the buttock fold), the shoulders (the armpit), then the spine, the
+/// clavicles (a shrug),
+/// neck, the wrists, the jaw, the thumbs, the fingers last (small, and 24
+/// per pair of hands).
 fn human_poses() -> Vec<(String, char, f32)> {
     let mut v: Vec<(String, char, f32)> = Vec::new();
-    for (s, sg) in [("l", 1.0f32), ("r", -1.0)] {
-        v.push((format!("elbow_{s}"), 'x', 120.0));
-        v.push((format!("knee_{s}"), 'x', 120.0));
-        v.push((format!("shoulder_{s}"), 'z', 90.0 * sg));
-        v.push((format!("shoulder_{s}"), 'x', -90.0));
-        v.push((format!("thigh_{s}"), 'x', -100.0));
-        v.push((format!("thigh_{s}"), 'z', 45.0 * sg));
-        v.push((format!("wrist_{s}"), 'x', 60.0));
-        v.push((format!("wrist_{s}"), 'x', -60.0));
-        for f in ["index", "middle", "ring", "pinky"] {
-            for k in 1..=3 {
-                v.push((format!("{f}_{k}_{s}"), 'x', 90.0));
-            }
+    let sides = [("l", 1.0f32), ("r", -1.0)];
+    let both = |v: &mut Vec<(String, char, f32)>, b: &str, ax: char, d: f32, mirror: bool| {
+        for (s, sg) in sides {
+            v.push((format!("{b}_{s}"), ax, if mirror { d * sg } else { d }));
         }
-    }
+    };
+    // (The shoulder's keys stand alone: their anchored in-betweens left
+    // the armpit at 2.31x (arms up) and 1.86x (forward) where one relaxed
+    // key gives 2.11x and 1.74x; see `SINGLE_KEY`.)
+    both(&mut v, "elbow", 'x', 120.0, false);
+    both(&mut v, "knee", 'x', 120.0, false);
+    both(&mut v, "thigh", 'x', -100.0, false);
+    both(&mut v, "shoulder", 'z', 90.0, true);
+    both(&mut v, "shoulder", 'x', 90.0, false);
+    v.push(("spine".into(), 'x', 30.0));
+    both(&mut v, "thigh", 'z', 45.0, true);
+    both(&mut v, "clavicle", 'z', 30.0, true);
     v.push(("spine".into(), 'y', 45.0));
     v.push(("spine".into(), 'y', -45.0));
-    v.push(("spine".into(), 'x', 30.0));
     v.push(("neck".into(), 'y', 60.0));
     v.push(("neck".into(), 'y', -60.0));
+    both(&mut v, "wrist", 'x', 60.0, false);
+    both(&mut v, "wrist", 'x', -60.0, false);
     v.push(("jaw".into(), 'x', 20.0));
+    both(&mut v, "thumb_1", 'x', 45.0, false);
+    both(&mut v, "thumb_2", 'x', 40.0, false);
+    both(&mut v, "thumb_3", 'x', 60.0, false);
+    for k in 1..=3 {
+        for f in ["index", "middle", "ring", "pinky"] {
+            both(&mut v, &format!("{f}_{k}"), 'x', 90.0, false);
+        }
+    }
     v
 }
 
@@ -819,26 +837,63 @@ fn key_poses(skel: &Skeleton, def: &BindDef) -> Result<Vec<(usize, char, f32)>, 
         }
     }
     // In-betweens: a deep bend gets keys at a third / half of the way, so
-    // the correction follows the sweep instead of scaling one shape.
-    let mut keyed = Vec::new();
+    // the correction follows the sweep instead of scaling one shape. The
+    // full-depth keys come first (in the table's priority order), then the
+    // in-betweens, so a small `max` (WebGL's 24 morph targets) keeps one
+    // shape per joint before it refines any of them; the tents adapt to
+    // whichever keys survive.
+    let mut full = Vec::new();
+    let mut between = Vec::new();
+    let human = spec.poses.is_empty() && out.len() > 8;
     for (i, ax, d) in out {
-        let k = if d.abs() >= 90.0 {
+        let single = human
+            && SINGLE_KEY
+                .iter()
+                .any(|(b, a)| *a == ax && skel.bones[i].name.starts_with(b));
+        let k = if single {
+            1
+        } else if d.abs() >= 90.0 {
             3
         } else if d.abs() >= 40.0 {
             2
         } else {
             1
         };
-        for q in 1..=k {
-            keyed.push((i, ax, d * q as f32 / k as f32));
+        full.push((i, ax, d));
+        for q in 1..k {
+            between.push((i, ax, d * q as f32 / k as f32));
         }
     }
-    keyed.truncate(spec.max.unwrap_or(128).min(256));
+    // The two joints LBS collapses worst (the first four full keys: the
+    // elbows and knees) get their in-betweens right after the ten most
+    // valuable full keys: with `max: 24` the elbow at 120 degrees is 1.3x
+    // with them and 2.8x without.
+    let head = full.len().min(10);
+    let early: Vec<(usize, char, f32)> = between
+        .iter()
+        .copied()
+        .filter(|b| {
+            full[..full.len().min(4)]
+                .iter()
+                .any(|f| f.0 == b.0 && f.1 == b.1)
+        })
+        .collect();
+    let mut keyed: Vec<(usize, char, f32)> = full[..head].to_vec();
+    keyed.extend(early.iter().copied());
+    keyed.extend(full[head..].iter().copied());
+    keyed.extend(between.into_iter().filter(|b| !early.contains(b)));
+    keyed.truncate(spec.max.unwrap_or(160).min(256));
     Ok(keyed)
 }
 
+/// Built-in keys (bone name prefix, axis) that get no in-betweens.
+const SINGLE_KEY: &[(&str, char)] = &[("shoulder_", 'z'), ("shoulder_", 'x')];
+
 /// Relaxation sweeps per key pose.
 const RELAX_ITERS: usize = 150;
+
+/// Bones longer than this (meters) free vertices wholly on their own side.
+const INTO_SUBTREE: f32 = 0.08;
 
 /// The share of a vertex's weight on a joint's two sides for its key to
 /// move it.
@@ -848,6 +903,12 @@ const OWNED: f32 = 0.9;
 /// pulled back toward LBS: picks the least-moving relaxed shape, so the
 /// in-between weights don't slide.
 const ANCHOR: f32 = 0.03;
+
+/// The edge ratio over which a corrective's in-between may not make an
+/// edge worse than LBS, and the rounds of pulling it back.
+const GUARD: f32 = 1.5;
+const GUARD_STRETCH: f32 = 1.9;
+const GUARD_ROUNDS: usize = 10;
 
 static CORR_CACHE: Mutex<Option<HashMap<u64, Arc<Vec<Corrective>>>>> = Mutex::new(None);
 
@@ -979,12 +1040,18 @@ pub fn correctives(
             .iter()
             .map(|(m, owned)| *owned && *m > 0.01 && *m < 0.99)
             .collect();
+        // Limb bones (longer than `INTO_SUBTREE`) also free the rings
+        // wholly on their own side: the armpit and the crotch can then take
+        // skin from the arm and the thigh instead of tearing between two
+        // rigid borders. Digits keep the strict rule (chain keys of one
+        // finger would double up on one vertex).
+        let into_subtree = bone.head.distance(bone.tail) > INTO_SUBTREE;
         for _ in 0..2 {
             let prev = free.clone();
             for (q, f) in free.iter_mut().enumerate() {
                 if !*f
                     && split[q].1
-                    && split[q].0 < 0.99
+                    && (split[q].0 < 0.99 || into_subtree)
                     && g.nbr[q].iter().any(|u| prev[*u as usize])
                 {
                     *f = true;
@@ -1034,6 +1101,109 @@ pub fn correctives(
         };
         (Some(c), dense)
     };
+    // Interpolation guard: a tent blends its key linearly with the one
+    // before it, but a relaxed key can slide skin across a fold (the inside
+    // of a knuckle unfolds), and half of that slide at half the angle
+    // collapses edges LBS kept. At a quarter, half and three quarters of
+    // the way from the previous key, every edge the blend pinches (weighted
+    // as `verify` does) over `GUARD` or stretches over `GUARD_STRETCH`, and
+    // worse than LBS alone, pulls its ends' offsets back toward the previous
+    // key's, a few rounds, so in-betweens never tear what the keys fix.
+    let edges: Vec<(usize, usize, f32)> = {
+        let mut e: Vec<(usize, usize)> = part
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+            .filter(|(a, b)| (*a as usize) < n && (*b as usize) < n)
+            .map(|(a, b)| (a.min(b) as usize, a.max(b) as usize))
+            .collect();
+        e.sort_unstable();
+        e.dedup();
+        e.into_iter()
+            .map(|(a, b)| (a, b, world[a].distance(world[b])))
+            .filter(|e| e.2 > 1e-6)
+            .collect()
+    };
+    // (stretch, pinch weighted as `verify` does)
+    let ratio = |l0: f32, l1: f32| (l1 / l0, l0 / l1.max(1e-9) * 0.4);
+    let damp = |bi: usize, ax: char, d0: f32, d1: f32, prev: &[Vec3], mut d: Vec<Vec3>| {
+        let touched: Vec<bool> = (0..n)
+            .map(|i| d[i] != Vec3::ZERO || prev[i] != Vec3::ZERO)
+            .collect();
+        let local: Vec<&(usize, usize, f32)> = edges
+            .iter()
+            .filter(|e| touched[e.0] || touched[e.1])
+            .collect();
+        if local.is_empty() {
+            return d;
+        }
+        let poses: Vec<(f32, Vec<Mat4>)> = [0.25f32, 0.5, 0.75]
+            .iter()
+            .map(|f| {
+                let mut pose = skel.rest();
+                let a = d0 + (d1 - d0) * f;
+                pose[bi].1 = Quat::from_axis_angle(axis_of(ax), a.to_radians());
+                (*f, skel.skin_matrices(&pose))
+            })
+            .collect();
+        let lbs: Vec<Vec<(f32, f32)>> = poses
+            .iter()
+            .map(|(_, m)| {
+                local
+                    .iter()
+                    .map(|&&(a, b, l0)| {
+                        let pa = blended(m, a).transform_point3(world[a]);
+                        let pb = blended(m, b).transform_point3(world[b]);
+                        ratio(l0, pa.distance(pb))
+                    })
+                    .collect()
+            })
+            .collect();
+        for _ in 0..GUARD_ROUNDS {
+            let mut hit = vec![false; g.pos.len()];
+            let mut any = false;
+            for ((f, m), base) in poses.iter().zip(&lbs) {
+                let at = |i: usize| {
+                    let c = prev[i] + (d[i] - prev[i]) * *f;
+                    blended(m, i).transform_point3(world[i] + c)
+                };
+                for (&&(a, b, l0), r0) in local.iter().zip(base) {
+                    let r = ratio(l0, at(a).distance(at(b)));
+                    if (r.0 > GUARD_STRETCH && r.0 > r0.0 + 0.05)
+                        || (r.1 > GUARD && r.1 > r0.1 + 0.05)
+                    {
+                        hit[g.group[a] as usize] = true;
+                        hit[g.group[b] as usize] = true;
+                        any = true;
+                    }
+                }
+            }
+            if !any {
+                break;
+            }
+            for i in 0..n {
+                if hit[g.group[i] as usize] {
+                    d[i] = prev[i] + (d[i] - prev[i]) * 0.6;
+                }
+            }
+        }
+        d
+    };
+    // The sparse offsets of a key from its (guarded) dense rest-space ones.
+    let resparse = |mut c: Corrective, d: &[Vec3]| -> Option<Corrective> {
+        c.idx.clear();
+        c.delta.clear();
+        for (v, wd) in d.iter().enumerate() {
+            if wd.length() < 1e-4 {
+                continue;
+            }
+            c.idx.push(v as u32);
+            c.delta.push(((rot.inverse() * *wd) / scale).to_array());
+        }
+        (!c.idx.is_empty()).then_some(c)
+    };
     // Chains: the keys of one joint, axis and side, nearest rest first.
     let mut chains: Vec<Vec<(usize, char, f32)>> = Vec::new();
     for p in &poses {
@@ -1056,10 +1226,13 @@ pub fn correctives(
             // A sweep of several keys is pulled toward LBS so its keys
             // share one least-moving solution; a lone key relaxes freely.
             let alpha = if chain.len() > 1 { ANCHOR } else { 0.0 };
+            let mut prev_deg = 0.0f32;
             for &(bi, ax, deg) in chain {
                 let (c, d) = solve(bi, ax, deg, &prev, alpha);
+                let d = damp(bi, ax, prev_deg, deg, &prev, d);
+                got.extend(c.and_then(|c| resparse(c, &d)));
                 prev = d;
-                got.extend(c);
+                prev_deg = deg;
             }
             got
         })
@@ -1309,9 +1482,8 @@ pub fn transfer_correctives(part: &Part, src: &Part) -> Option<Arc<Vec<Correctiv
                 .collect();
             let (mut idx, mut delta) = (Vec::new(), Vec::new());
             for (v, (tri, bc)) in near.iter().enumerate() {
-                let d: Vec3 = (0..3)
-                    .map(|k| dense.get(&tri[k]).copied().unwrap_or(Vec3::ZERO) * bc[k])
-                    .sum();
+                let at = |k: usize| dense.get(&tri[k]).copied().unwrap_or(Vec3::ZERO);
+                let d: Vec3 = (0..3).map(|k| at(k) * bc[k]).sum();
                 if d.length() < 1e-4 {
                     continue;
                 }

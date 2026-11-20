@@ -2245,6 +2245,22 @@ pub struct BodySpec {
     /// "calf": 0.37}): girths solved through MakeHuman's measure targets.
     #[serde(default)]
     measure: Option<std::collections::BTreeMap<String, f32>>,
+    /// human: skin tone, 0 (light) .. 1 (dark) along a melanin ramp, or a
+    /// colour; lips, nails, areolae and flushed areas follow it.
+    #[serde(default)]
+    skin_tone: Option<crate::human::look::SkinTone>,
+    /// human: hair, a style (bald, buzz, short (default), crop, bob, long,
+    /// ponytail, bun, afro, curly) or {style, length, color, part (left /
+    /// right / middle / none), fringe 0..1, volume 0..1, cards, tris, seed}:
+    /// part `<name>_hair` (a feathered scalp cap plus strand cards).
+    #[serde(default)]
+    hair: Option<Box<crate::human::hair::HairIn>>,
+    /// human: eyebrows (`<name>_brows`), false or {thickness, arch -1..1, color}.
+    #[serde(default)]
+    brows: Option<Box<crate::human::hair::Toggle<crate::human::hair::BrowsDef>>>,
+    /// human: eyelashes (`<name>_lashes`), false or {length, curl 0..1, color}.
+    #[serde(default)]
+    lashes: Option<Box<crate::human::hair::Toggle<crate::human::hair::LashesDef>>>,
 }
 
 /// `rig`: true / false, or a human's rig kind ("game" / "full").
@@ -4267,12 +4283,9 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                             if p.is_empty() {
                                 return Err(format!("{ctx}: frame: `{f}` names no part"));
                             }
-                            crate::commands::anchor_point(
-                                words,
-                                bevy::math::Vec3::ZERO,
-                                bevy::math::Vec3::ONE,
-                            )
-                            .map_err(|e| format!("{ctx}: frame: {e}"))?;
+                            // Anchor words and joint / landmark names
+                            // ("eve:brow_l") both resolve on the part.
+                            let _ = words;
                         }
                         Some(f)
                     }
@@ -4710,6 +4723,10 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                     .map_err(|e| format!("{ctx}: eye_color: {e}"))?,
                 pupil: s.pupil,
                 measure: s.measure.unwrap_or_default(),
+                skin_tone: s.skin_tone,
+                hair: s.hair.map(|h| *h),
+                brows: s.brows.map(|h| *h),
+                lashes: s.lashes.map(|h| *h),
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Body {

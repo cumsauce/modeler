@@ -15,6 +15,7 @@ pub mod nodes3;
 pub mod noise;
 pub mod pbr;
 pub mod sdf;
+pub mod zone;
 
 pub use bake::{Channels, bake};
 pub use doc::{Library, MatDoc, MatExpect};

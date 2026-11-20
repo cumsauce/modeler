@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate a normative human walk clip for the `human` body preset.
 
-Run: python3 -I examples/gait_gen.py [--cadence 112] [--out PATH]
+Run: python3 -I examples/gait_gen.py [--cadence 112] [--out PATH] [--travel]
+     [--rest REST.json --body '{"height": 1.65, ...}'] [--name walk]
 
 (writes examples/human_walk.json with --out examples/human_walk.json; prints
 the walk's speed, stride and pelvis bob to stderr)
@@ -25,8 +26,8 @@ src/anim/check.rs), not shaped by eye:
    supports (where the two legs' table poses have to meet).
 3. The pelvis height is whatever keeps the leading stance leg at the table's
    knee angle (handed over from the trailing leg during double support),
-   never higher than either stance leg can reach (the rig's knee stops at
-   its ~7 deg rest bend), low-passed to a few harmonics of the cycle.
+   never higher than either stance leg can reach (IK targets stay within a
+   1.5 deg knee bend of full reach), low-passed to a few harmonics of the cycle.
 4. Swing follows the table's thigh / knee / ankle, joined to the toe-off
    and heel-strike positions and velocities by a cubic Hermite correction.
    On this rig the table's swing, under the lower pelvis, carries the toe
@@ -44,6 +45,11 @@ src/anim/check.rs), not shaped by eye:
 The ankles are driven by `ik` (chain 2) and the foot pitch by the ik entry's
 `rotate`; the right side mirrors the left at phase 0.5. The clip starts at
 30% of the left leg's cycle (mid stance), so no contact sits on the loop seam.
+
+--travel writes a root-motion version: the hip's z and the ankle targets
+carry the walking speed (feet keyed at fixed world points, each stance a
+stride ahead), `root_motion` {bone hip, axes z}. --rest / --body make the
+walk for a body with other parameters (its rest joints from `inspect pose`).
 """
 
 import json
@@ -70,10 +76,10 @@ REST = {
     "ball": (0.195, 0.025, 0.153),
     "toe": (0.197, 0.008, 0.218),     # toe_l tail (the toe tip)
 }
-KNEE_MIN = 7.5     # the rig's knee can't straighten past its rest bend (~6.7)
-KNEE_REACH = 7.0   # IK targets stay within this bend's reach
+KNEE_MIN = 3.0     # stance knee bend floor (normal 3-8 at its straightest)
+KNEE_REACH = 1.5   # IK targets stay within this bend's reach
 MTP_MAX = 40.0     # toe (MTP) dorsiflexion at push-off; beyond it the toes roll
-TOE_CLEAR = 0.009  # mid-swing toe tip lift over its rest height (normal 1-2 cm)
+TOE_CLEAR = 0.012  # mid-swing toe tip lift over its rest height (normal 1-2 cm)
 TOE_OFF = 62.0     # percent of the cycle
 FIT_GAP = (12, 40)  # the planted path is fitted to the table at both double
                     # supports (heel strike and push-off), where legs meet
@@ -159,8 +165,24 @@ def smoothstep(u):
     return u * u * (3 - 2 * u)
 
 
-def build(cadence=112.0, keys=40):
+def load_rest(path):
+    """REST from the JSON of `inspect(pose: {clip, time: 0, bones: [hip,
+    thigh_l, knee_l, ankle_l, ball_l, toe_l]})` on a clip that keys
+    nothing, for a body with other parameters (height, gender, ...)."""
+    with open(path) as fh:
+        d = json.load(fh)
+    bones = {b["bone"]: b for b in d.get("pose", d)["bones"]}
+    head = lambda n: tuple(round(v, 4) for v in bones[n]["head"])
+    return {"pelvis": head("hip"), "hip": head("thigh_l"), "knee": head("knee_l"),
+            "ankle": head("ankle_l"), "ball": head("ball_l"),
+            "toe": tuple(round(v, 4) for v in bones["toe_l"]["tail"])}
+
+
+def build(cadence=112.0, keys=40, travel=False, body=None, name="walk", speed=None):
     period = 120.0 / cadence
+    # A stated walking speed fixes the stride (else it is fitted to the
+    # table's double-support poses).
+    stride_want = speed * period if speed else None
     hip, knee, ankle = REST["hip"], REST["knee"], REST["ankle"]
     l1, l2 = length(sub(knee, hip)), length(sub(ankle, knee))
     # Sagittal (forward = z, up = y) foot points relative to the ankle.
@@ -252,8 +274,9 @@ def build(cadence=112.0, keys=40):
 
     def do_fit():
         best = None
-        for si in range(0, 81):
-            fit["stride"] = 0.9 + si * 0.01
+        strides = [stride_want] if stride_want else [0.9 + si * 0.01 for si in range(0, 81)]
+        for st in strides:
+            fit["stride"] = st
             for zi in range(-40, 41):
                 fit["z_mid"] = fk(mid)[0] + zi * 0.0025
                 e = misfit()
@@ -470,7 +493,10 @@ def build(cadence=112.0, keys=40):
         p = (START + 100.0 * i / keys) % 100.0
         j = int(round(p / 100.0 * fine)) % fine
         y, z, q, br = (smooth_at(j, c) for c in range(4))
-        ik_t.append([key_t(i), [HALF_WIDTH, round(y, 4), round(z, 4)]])
+        # Travelling: the world progress of one loop rides on the keys (a
+        # planted foot keyed at one point, the next stance a stride on).
+        go = speed * key_t(i) if travel else 0.0
+        ik_t.append([key_t(i), [HALF_WIDTH, round(y, 4), round(z + go, 4)]])
         ik_r.append([key_t(i), {"x": round(-q, 2)}])
         ball_k.append([key_t(i), {"x": round(-br, 2)}])
     hip_tr, hip_rot, spine, chest, neck = [], [], [], [], []
@@ -478,7 +504,8 @@ def build(cadence=112.0, keys=40):
     for i in range(keys + 1):
         p = (START + 100.0 * i / keys) % 100.0
         yaw, lst, shift = pelvis_state(p)
-        hip_tr.append([key_t(i), [round(shift, 4), round(ty_at(p), 4), 0.0]])
+        go = round(speed * key_t(i), 4) if travel else 0.0
+        hip_tr.append([key_t(i), [round(shift, 4), round(ty_at(p), 4), go]])
         hip_rot.append([key_t(i), {"y": round(yaw, 2), "z": round(lst, 2)}])
         # Thorax counter-rotates against the pelvis (world +-4 deg) and stays
         # upright over the tilting pelvis; the head faces forward, level.
@@ -519,7 +546,7 @@ def build(cadence=112.0, keys=40):
         mirror[b[:-2] + "_r"] = {"from": b, "phase": 0.5}
     clip = {
         "type": "clip",
-        "name": "walk",
+        "name": name,
         "skeleton": "eve_rig",
         "duration": round(period, 4),
         "tracks": tracks,
@@ -529,22 +556,33 @@ def build(cadence=112.0, keys=40):
         "events": [[round(period * (100.0 - START) / 100.0, 4), "footstep_l"],
                    [round(period * ((150.0 - START) % 100.0) / 100.0, 4), "footstep_r"]],
     }
+    if travel:
+        # Forward travel only: the pelvis's lateral sway is motion, not travel.
+        clip["root_motion"] = {"bone": "hip", "axes": "z"}
     meta = {"speed": round(speed, 4), "stride": round(stride, 4),
             "period": round(period, 4), "foot_flat": rock["flat"], "heel_off": rock["off"],
             "pelvis_bob_cm": round(100 * (max(ty_curve) - min(ty_curve)), 2),
             "max_swing_lift_cm": round(100 * max(env), 2)}
-    return [{"type": "body", "name": "eve", "preset": "human"}, clip], meta
+    body_item = {"type": "body", "name": "eve", "preset": "human"}
+    body_item.update(body or {})
+    return [body_item, clip], meta
 
 
 def main():
     args = sys.argv[1:]
-    cadence = 112.0
-    out = None
-    if "--cadence" in args:
-        cadence = float(args[args.index("--cadence") + 1])
-    if "--out" in args:
-        out = args[args.index("--out") + 1]
-    items, meta = build(cadence)
+
+    def opt(flag, default=None):
+        return args[args.index(flag) + 1] if flag in args else default
+
+    global REST
+    cadence = float(opt("--cadence", 112.0))
+    out = opt("--out")
+    if opt("--rest"):
+        REST = load_rest(opt("--rest"))
+    body = json.loads(opt("--body", "{}"))
+    sp = opt("--speed")
+    items, meta = build(cadence, travel="--travel" in args, body=body,
+                        name=opt("--name", "walk"), speed=float(sp) if sp else None)
     text = json.dumps(items, indent=1)
     if out:
         with open(out, "w") as fh:

@@ -14,6 +14,7 @@ use super::nodes2::{DirBlur, Facing, Gradient, Image, Islands, MeshAo, MeshCurva
 use super::nodes3::{Project, Svg};
 use super::noise::{self, Lattice};
 use super::sdf;
+use super::zone::Zone;
 
 /// A node output: one value per sample.
 #[derive(Debug, Clone)]
@@ -416,6 +417,7 @@ node_types! {
     "project" => Project,
     "islands" => Islands,
     "dir_blur" => DirBlur,
+    "zone" => Zone,
     "output" => Output,
 }
 
@@ -1625,7 +1627,9 @@ impl Eval for Math {
                 "clamp" => x.clamp(y.min(z), y.max(z)),
                 "step" => f32::from(u8::from(x >= y)),
                 "smoothstep" => {
-                    let t = ((x - y) / (z - y).max(1e-12)).clamp(0.0, 1.0);
+                    // Reversed edges (y > z) fall from 1 to 0, as in GLSL.
+                    let w = if (z - y).abs() < 1e-12 { 1e-12 } else { z - y };
+                    let t = ((x - y) / w).clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
                 }
                 "abs" => x.abs(),
@@ -2285,7 +2289,7 @@ impl Eval for Output {
 pub fn refs(body: &Value) -> Vec<(String, String)> {
     const WORDS: &[&str] = &[
         "type", "name", "op", "mode", "kind", "of", "out", "shape", "layering", "path", "alpha",
-        "text", "font", "align", "svg", "fit", "face",
+        "text", "font", "align", "svg", "fit", "face", "zone",
     ];
     let mut out = Vec::new();
     fn walk(v: &Value, key: Option<&str>, out: &mut Vec<(String, String)>) {
@@ -2372,6 +2376,7 @@ pub fn example(ty: &str) -> Option<Value> {
         "project" => json!({"face": "front", "at": [0, 0.6], "depth": 0.05}),
         "islands" => json!({"input": "stone_mask"}),
         "dir_blur" => json!({"input": "n1", "length": 0.02, "angle": 90}),
+        "zone" => json!({"zone": "lips", "soft": 0.002}),
         "output" => {
             json!({"base_color": "col", "roughness": "rough", "metallic": 0, "height": "h",
                    "over": [{"output": "dirt_out", "mask": "dirt_mask"}], "clearcoat": 0.3})

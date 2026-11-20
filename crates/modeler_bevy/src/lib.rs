@@ -20,6 +20,14 @@
 //!   for `kind: "clustered"` where [`ModelerDecals::clustered`] allows, a
 //!   [`ClusteredDecal`] (needs bindless textures: not on Metal / WebGL).
 //!   Without the plugin the quad still draws as a flat sticker.
+//! - `extras.lod` (`lods` in the export): a [`ModelerLod`] and a
+//!   `VisibilityRange` on the node and its mesh entities, so one level shows
+//!   by camera distance ([`ModelerLods`] tunes the crossfade).
+//! - `extras.clips` on a skeleton root: a [`ModelerClipTable`]. With a
+//!   [`ModelerClips`] on the scene root, [`ModelerAnimator::play`] plays a
+//!   clip by name with a crossfade, [`ModelerRootMotion`] moves the root by
+//!   the clip's travel and [`ModelerClipEvent`] messages fire as playback
+//!   crosses its events (see the `clips` module).
 //! - `extras.variants` (cosmetic variants, `variant` items) on every part
 //!   node: a [`ModelerVariants`] component ({variant: glTF material
 //!   index}). Insert [`ModelerVariant`] (`ModelerVariant::new("red_team")`)
@@ -31,6 +39,15 @@
 //!   on the nodes of parts some variant shows or hides: a
 //!   [`ModelerVariantVisibility`] component ({variant: shown}); the same
 //!   [`ModelerVariant`] sets each such node's `Visibility`.
+
+mod clips;
+mod lod;
+
+pub use clips::{
+    ClipEventDef, ClipInfo, ModelerAnimator, ModelerClipEvent, ModelerClipTable, ModelerClips,
+    ModelerRootMotion, Playhead, RootMotionTrack, clip_info_of, clip_table_of, crossed,
+};
+pub use lod::{ModelerLod, ModelerLods, lod_of};
 
 use bevy::app::AnimationSystems;
 use bevy::gltf::GltfExtras;
@@ -49,14 +66,28 @@ impl Plugin for ModelerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Wind>()
             .init_resource::<ModelerDecals>()
+            .init_resource::<ModelerLods>()
+            .init_resource::<clips::Playheads>()
+            .add_message::<ModelerClipEvent>()
             .register_type::<ModelerVariant>()
             .add_systems(
                 Update,
-                (make_decals, apply_variants, apply_variant_visibility),
+                (
+                    make_decals,
+                    apply_variants,
+                    apply_variant_visibility,
+                    lod::attach_lod_ranges,
+                    clips::setup_players,
+                ),
             )
             .add_systems(
                 PostUpdate,
-                (read_extras, run_sway, drive_correctives)
+                (
+                    read_extras,
+                    clips::run_clip_cursors,
+                    run_sway,
+                    drive_correctives,
+                )
                     .chain()
                     .after(AnimationSystems)
                     .before(TransformSystems::Propagate),
@@ -448,11 +479,12 @@ pub fn variant_visibility_of(v: &serde_json::Value) -> Option<ModelerVariantVisi
 /// Shows or hides outfit parts for the [`ModelerVariant`] above them (the
 /// default variant when there is none).
 fn apply_variant_visibility(
-    mut parts: Query<(Entity, &ModelerVariantVisibility, &mut Visibility)>,
+    mut commands: Commands,
+    mut parts: Query<(Entity, &ModelerVariantVisibility, Option<&mut Visibility>)>,
     chosen: Query<&ModelerVariant>,
     parents: Query<&ChildOf>,
 ) {
-    for (e, vis, mut v) in &mut parts {
+    for (e, vis, v) in &mut parts {
         let name = std::iter::once(e)
             .chain(parents.iter_ancestors(e))
             .find_map(|a| chosen.get(a).ok())
@@ -462,8 +494,18 @@ fn apply_variant_visibility(
         } else {
             Visibility::Hidden
         };
-        if *v != want {
-            *v = want;
+        match v {
+            Some(mut v) => {
+                if *v != want {
+                    *v = want;
+                }
+            }
+            // Bevy puts no `Visibility` on a glTF node whose mesh lives on
+            // a child entity (the usual case), so the filter would never
+            // match it: add one.
+            None => {
+                commands.entity(e).insert(want);
+            }
         }
     }
 }
@@ -474,21 +516,42 @@ pub fn variant_material_label(index: usize) -> String {
     format!("Material{index}/std")
 }
 
+/// The glTF file a part's mesh entity was loaded from (set when its material
+/// is first swapped).
+#[derive(Component, Clone, Debug)]
+struct VariantFile(String);
+
 /// Swaps part materials to the chosen variant: for parts under a changed
 /// [`ModelerVariant`], and for parts that just spawned under one.
+///
+/// The variant's `StandardMaterial` is built from the loaded glTF's
+/// `GltfMaterial` with Bevy's own conversion and cached per (file, index).
+/// Loading `file.gltf#Material3/std` instead would be wrong: Bevy drops a
+/// material no primitive uses as soon as the file has loaded, so asking for
+/// it re-reads and re-spawns the whole glTF (measured: a variant switch
+/// replaced every entity of the character).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn apply_variants(
     assets: Option<Res<AssetServer>>,
+    gltfs: Option<Res<Assets<bevy::gltf::Gltf>>>,
+    gltf_mats: Option<Res<Assets<bevy::gltf::GltfMaterial>>>,
+    std_mats: Option<ResMut<Assets<StandardMaterial>>>,
+    mut cache: Local<std::collections::HashMap<(String, usize), Handle<StandardMaterial>>>,
     changed: Query<(Entity, &ModelerVariant), Changed<ModelerVariant>>,
     added: Query<Entity, Added<ModelerVariants>>,
     chosen: Query<&ModelerVariant>,
     parts: Query<&ModelerVariants>,
     parents: Query<&ChildOf>,
     children: Query<&Children>,
-    mut mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
+    mut mats: Query<(&mut MeshMaterial3d<StandardMaterial>, Option<&VariantFile>)>,
+    mut commands: Commands,
 ) {
     // Without an asset server (headless tests) there is nothing to swap.
-    let Some(assets) = assets else { return };
+    let (Some(assets), Some(gltfs), Some(gltf_mats), Some(mut std_mats)) =
+        (assets, gltfs, gltf_mats, std_mats)
+    else {
+        return;
+    };
     let mut todo: Vec<(Entity, String)> = Vec::new();
     for (root, v) in &changed {
         for e in std::iter::once(root).chain(children.iter_descendants(root)) {
@@ -513,18 +576,41 @@ fn apply_variants(
         let targets =
             std::iter::once(node).chain(children.get(node).into_iter().flatten().copied());
         for t in targets {
-            let Ok(mut m) = mats.get_mut(t) else {
+            let Ok((mut m, remembered)) = mats.get_mut(t) else {
                 continue;
             };
-            let Some(path) = assets.get_path(m.0.id()) else {
-                continue;
+            // The file the material came from, remembered because a swapped
+            // material is built here and has no asset path.
+            let file = match remembered {
+                Some(f) => f.0.clone(),
+                None => {
+                    let Some(path) = assets.get_path(m.0.id()) else {
+                        continue;
+                    };
+                    let f = path.without_label().to_string();
+                    commands.entity(t).insert(VariantFile(f.clone()));
+                    f
+                }
             };
-            let want = path
-                .without_label()
-                .clone_owned()
-                .with_label(variant_material_label(index));
-            if assets.get_path(m.0.id()).as_ref() != Some(&want) {
-                m.0 = assets.load(want);
+            let key = (file.clone(), index);
+            if !cache.contains_key(&key) {
+                // `load` of a path that has a live handle (the game's) does
+                // not read the file again.
+                let g: Handle<bevy::gltf::Gltf> = assets.load(file.clone());
+                let Some(mat) = gltfs
+                    .get(&g)
+                    .and_then(|g| g.materials.get(index))
+                    .and_then(|h| gltf_mats.get(h))
+                else {
+                    continue; // not loaded yet: the next change retries
+                };
+                let std = bevy::pbr::gltf::standard_material_from_gltf_material(mat);
+                cache.insert(key.clone(), std_mats.add(std));
+            }
+            if let Some(h) = cache.get(&key)
+                && m.0 != *h
+            {
+                m.0 = h.clone();
             }
         }
     }
@@ -644,6 +730,12 @@ fn read_extras(
         }
         if let Some(c) = correctives_of(&v) {
             commands.entity(e).insert(c);
+        }
+        if let Some(l) = lod_of(&v) {
+            commands.entity(e).insert(l);
+        }
+        if let Some(t) = clip_table_of(&v) {
+            commands.entity(e).insert(t);
         }
         let Some(rig) = v
             .get("sway")

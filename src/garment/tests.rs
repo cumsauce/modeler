@@ -134,10 +134,10 @@ fn region_planes_work_on_any_body() {
     p.translation = [0.0, 0.5, 0.0];
     let def = GarmentDef {
         on: "blob".into(),
-        region: Some(Region {
+        region: Some(Box::new(Region {
             above: Some(Level::Num(0.45)),
             ..Region::default()
-        }),
+        })),
         thickness: Some(0.0),
         ..GarmentDef::default()
     };
@@ -146,10 +146,10 @@ fn region_planes_work_on_any_body() {
     assert!(lo.y > 0.44, "{lo}");
     // Zones need skin weights.
     let mut z = def.clone();
-    z.region = Some(Region {
+    z.region = Some(Box::new(Region {
         zones: vec!["torso".into()],
         ..Region::default()
-    });
+    }));
     assert!(build("x", &z, &p).is_err_and(|e| e.contains("skin weights")));
 }
 
@@ -202,6 +202,30 @@ fn clearance_n(g: &Part, body: &Part) -> (f32, f32) {
     (worst, inside as f32 / g.verts.len().max(1) as f32)
 }
 
+/// The outfit with the current walk from `examples/human_walk_outfit.json`
+/// (generated for the outfit's body; the gait is regenerated there) and an arms-up pose for the stretch check.
+fn with_latest_walk(mut items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/human_walk_outfit.json"
+    );
+    let walk: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_default())
+            .unwrap_or_default();
+    if let Some(clip) = walk
+        .iter()
+        .find(|v| v["type"] == "clip" && v["name"] == "walk")
+    {
+        items.retain(|v| !(v["type"] == "clip" && v["name"] == "walk"));
+        items.push(clip.clone());
+    }
+    items.push(serde_json::json!({
+        "type": "pose", "name": "arms_up", "skeleton": "eve_rig", "mirror": true,
+        "bones": {"shoulder_l": {"rotate": {"z": 75}}, "elbow_l": {"rotate": {"x": 10}}}
+    }));
+    items
+}
+
 #[test]
 fn outfit_example_follows_the_walk_and_crouch() {
     if crate::human::asset::load().is_err() {
@@ -212,6 +236,7 @@ fn outfit_example_follows_the_walk_and_crouch() {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{e}"));
     let items: Vec<serde_json::Value> =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"));
+    let items = with_latest_walk(items);
     let mut s = crate::commands::Session::default();
     let t = std::time::Instant::now();
     s.apply_values_as(None, items, false)
@@ -236,11 +261,32 @@ fn outfit_example_follows_the_walk_and_crouch() {
     assert!(body.tri_count() < full[0].tri_count());
     let spec: crate::commands::VerifySpec = serde_json::from_value(serde_json::json!({
         "validate": true, "materials": "pbr", "weights": true,
-        "animation": {"clip": "walk", "stretch": true}
+        "animation": {"clip": "walk", "stretch": 2.0, "loop": true, "floor": true}
     }))
     .unwrap_or_else(|e| panic!("{e}"));
     let (ok, report) = s.verify(&spec);
     eprintln!("verify ok={ok}\n{report}");
+    let spec_up: crate::commands::VerifySpec = serde_json::from_value(serde_json::json!({
+        "animation": {"clip": "arms_up", "stretch": 3.0}
+    }))
+    .unwrap_or_else(|e| panic!("{e}"));
+    let (ok_up, report_up) = s.verify(&spec_up);
+    eprintln!("arms up ok={ok_up}\n{report_up}");
+    // Garments bind themselves (`implicit_binds`): the example has no
+    // explicit bind items, yet every part is weighted.
+    assert!(
+        !text.contains("\"bind\""),
+        "the example lists explicit binds"
+    );
+    assert!(report.contains("PASS weights"), "{report}");
+    // A `floor` failure of the body itself belongs to the walk clip, not
+    // the clothes: every other check must pass.
+    let fails: Vec<&str> = report
+        .lines()
+        .filter(|l| l.starts_with("FAIL") && !l.contains("floor: `eve`"))
+        .collect();
+    assert!(ok || fails.is_empty(), "{report}");
+    assert!(ok_up, "{report_up}");
     let m = &s.model;
     for (clip, times) in [
         ("walk", vec![0.0, 0.13, 0.27, 0.4, 0.54, 0.67, 0.8, 0.94]),
@@ -277,13 +323,14 @@ fn debug_worst_shirt_edge() {
     let items: Vec<serde_json::Value> =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_default())
             .unwrap_or_default();
+    let items = with_latest_walk(items);
     let mut s = crate::commands::Session::default();
     s.apply_values_as(None, items, false)
         .unwrap_or_else(|e| panic!("{e}"));
     let m = &s.model;
     let rest = m.part("shirt").unwrap_or_else(|| panic!("shirt"));
     let (c, sk) = crate::anim::clip(m, Some("walk")).unwrap_or_else(|e| panic!("{e}"));
-    let posed = crate::anim::posed_parts(m, &c, &sk, 0.871);
+    let posed = crate::anim::posed_parts(m, &c, &sk, 0.737);
     let p = posed
         .iter()
         .find(|p| p.name == "shirt")

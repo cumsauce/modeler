@@ -1352,7 +1352,20 @@ fn gait_check(label: &str, c: &Clip, s: &Skeleton, o: &GaitOpts) -> Vec<(String,
         .count() as f32
         / n as f32;
     let tk = k.sqrt();
-    let (plo, phi) = (0.9 * tk, 1.3 * tk);
+    // The cycle band is for a comfortable speed (~1.35 x sqrt(stature /
+    // reference) m/s). Slower or faster walks change cadence too: cadence
+    // grows about with the square root of speed (Grieve & Gear 1966,
+    // Ergonomics 9(5); Grieve 1968), so outside +-15% of the comfortable
+    // speed the band scales by sqrt(edge / speed), continuous at the edge
+    // (a 0.95 m/s stroll may take a 1.35 s cycle). Unknown speed: as is.
+    let vref = 1.35 * tk;
+    let vf = if speed > 0.3 {
+        let edge = speed.clamp(0.85 * vref, 1.15 * vref);
+        (edge / speed).sqrt()
+    } else {
+        1.0
+    };
+    let (plo, phi) = (0.9 * tk * vf, 1.3 * tk * vf);
     let stance_ok = stance_share.iter().all(|&x| (0.55..=0.65).contains(&x));
     let double_ok = (0.08..=0.32).contains(&double);
     let period_ok = (plo..=phi).contains(&period);
@@ -1374,7 +1387,7 @@ fn gait_check(label: &str, c: &Clip, s: &Skeleton, o: &GaitOpts) -> Vec<(String,
         format!("{label} timing"),
         stance_ok && double_ok && period_ok,
         format!(
-            "cycle {period:.2} s (normal {plo:.2}..{phi:.2} s at stature {stature:.2} m; cadence {:.0} steps/min){}; stance {} (normal 55..65%){}; double support {:.0}% (normal ~20%, 8..32){}; heel strikes {}",
+            "cycle {period:.2} s (normal {plo:.2}..{phi:.2} s at stature {stature:.2} m and {speed:.2} m/s; cadence {:.0} steps/min){}; stance {} (normal 55..65%){}; double support {:.0}% (normal ~20%, 8..32){}; heel strikes {}",
             120.0 / period,
             if period_ok { "" } else { " FAIL" },
             legs.iter()
@@ -2397,6 +2410,53 @@ mod tests {
             .into_iter()
             .filter(|r| r.0.contains("gait"))
             .collect()
+    }
+
+    #[test]
+    fn gait_takes_the_clips_own_speed_by_default() {
+        let s = gait_walk(&|_, v| v, &|_, v| v, &|_, v| v, -1.0);
+        let spec: AnimationSpec = serde_json::from_value(json!({"loop": false, "gait": true}))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (mut c, sk) = crate::anim::clip(&s.model, None).unwrap_or_else(|e| panic!("{e}"));
+        let stride = |c: &Clip| {
+            let r = animation_of(&s.model, c, &sk, &spec, &[]);
+            find(&r, "gait stride").2.clone()
+        };
+        assert!(stride(&c).contains("measured"), "{}", stride(&c));
+        // A mocap clip's removed travel is the speed (and sets the stride).
+        c.speed = Some([0.0, 1.37]);
+        let d = stride(&c);
+        assert!(d.contains("speed 1.37 m/s (the clip's speed"), "{d}");
+        // A stated speed wins over it.
+        let spec2: AnimationSpec =
+            serde_json::from_value(json!({"loop": false, "gait": {"speed": [0, 0.9]}}))
+                .unwrap_or_else(|e| panic!("{e}"));
+        let r = animation_of(&s.model, &c, &sk, &spec2, &[]);
+        let d = &find(&r, "gait stride").2;
+        assert!(d.contains("speed 0.90 m/s (stated"), "{d}");
+        // The cycle band follows the speed outside the comfortable one.
+        let band = |v: f32| {
+            let spec: AnimationSpec =
+                serde_json::from_value(json!({"loop": false, "gait": {"speed": [0, v]}}))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            let r = animation_of(&s.model, &c, &sk, &spec, &[]);
+            let d = find(&r, "gait timing").2.clone();
+            d.split("(normal ")
+                .nth(1)
+                .and_then(|x| x.split(" s").next())
+                .and_then(|x| x.split("..").nth(1))
+                .and_then(|x| x.parse::<f32>().ok())
+                .unwrap_or_else(|| panic!("{d}"))
+        };
+        let (slow, comfy, near, fast) = (band(0.7), band(1.3), band(1.2), band(1.9));
+        assert!(
+            slow > comfy * 1.1 && fast < comfy * 0.97,
+            "{slow} {comfy} {fast}"
+        );
+        assert_eq!(
+            comfy, near,
+            "the band is unchanged near the comfortable speed"
+        );
     }
 
     #[test]
