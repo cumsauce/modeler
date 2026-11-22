@@ -435,7 +435,8 @@ def daemon_mode(socket_path, mode):
     # document, credits history steps to it, and tells it what other agents
     # changed in its document since its last call.
     import threading
-    state = {"session": first, "stop": False}
+    state = {"session": first, "stop": False,
+             "cache": {"init": first.init_result}}
     lock = threading.Lock()
     told_slot = set()  # clients already told this server autosaves to a slot
 
@@ -501,9 +502,27 @@ def daemon_mode(socket_path, mode):
                         return
                     if isinstance(c, dict) and ("raw" in c or "init" in c):
                         # --proxy: MCP JSON-RPC passed through untouched.
+                        req = c.get("raw") or {}
+                        method = req.get("method")
                         with lock:
-                            session, note = live_session()
-                        if "init" in c:
+                            # A new session's initialize / tools/list must not
+                            # reopen a window the human closed: while the server
+                            # is down they are answered from the last live copy,
+                            # and only a tools/call restarts it.
+                            dead = state["session"].proc.poll() is not None
+                            cached = None
+                            if dead and "init" in c:
+                                cached = state["cache"].get("init")
+                            elif dead and method == "tools/list":
+                                cached = state["cache"].get("tools")
+                            if cached is not None:
+                                session, note = state["session"], None
+                            else:
+                                session, note = live_session()
+                                state["cache"]["init"] = session.init_result
+                        if cached is not None:
+                            out = {"result": cached}
+                        elif "init" in c:
                             out = {"result": session.init_result}
                         else:
                             req = c["raw"]
@@ -516,6 +535,8 @@ def daemon_mode(socket_path, mode):
                                     m.setdefault("modeler/project", project)
                                 params["_meta"] = m
                             out = session.raw(req.get("method"), params)
+                            if method == "tools/list" and "result" in out:
+                                state["cache"]["tools"] = out["result"]
                         if pending_note:
                             note = f"{note}\n{pending_note}" if note else pending_note
                             pending_note = None
