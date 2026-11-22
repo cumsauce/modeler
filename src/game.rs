@@ -70,6 +70,32 @@ pub fn markers(model: &Model) -> Result<Vec<Marker>, ModelerError> {
         .collect())
 }
 
+/// `block` markers for derived boxes (centre, local size, yaw degrees).
+fn block_markers(name: &str, boxes: &[crate::stairs::BlockBox]) -> Vec<(Marker, Option<String>)> {
+    boxes
+        .iter()
+        .zip(crate::stairs::block_names(name, boxes.len()))
+        .map(|((c, s, yaw), n)| {
+            (
+                Marker {
+                    name: n,
+                    kind: "block".into(),
+                    position: *c,
+                    rotation: Quat::from_rotation_y(yaw.to_radians()),
+                    size: Some(s.to_array()),
+                    data: None,
+                    preview: None,
+                    components: serde_json::Map::from_iter([(
+                        "Block".to_string(),
+                        Value::Object(Default::default()),
+                    )]),
+                },
+                None,
+            )
+        })
+        .collect()
+}
+
 /// The `room` / `opening` markers of a carve (from its cutters' boxes).
 fn carve_markers(
     model: &Model,
@@ -173,6 +199,12 @@ fn unmoved_markers(
             }
             Op::Carve { name, def } if def.markers => {
                 out.extend(carve_markers(model, name, def));
+            }
+            Op::Stairs { name, def } if def.collider.as_deref() == Some("blocks") => {
+                out.extend(block_markers(name, &crate::stairs::stairs_blocks(def)));
+            }
+            Op::Railing { name, def } if def.collider.as_deref() == Some("blocks") => {
+                out.extend(block_markers(name, &crate::stairs::railing_blocks(def)));
             }
             Op::Prefab {
                 name,

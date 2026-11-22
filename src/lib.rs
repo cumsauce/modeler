@@ -113,6 +113,7 @@ pub mod silhouette;
 pub mod simplify;
 pub mod smooth;
 pub mod spec;
+pub mod stairs;
 pub mod style;
 pub mod svg;
 pub mod terrain;
@@ -1301,6 +1302,18 @@ pub enum Op {
     Carve {
         name: String,
         def: Box<crate::carve::CarveDef>,
+    },
+    /// A flight of stairs, one closed solid, optionally with a `block`
+    /// marker per step ([`crate::stairs`]).
+    Stairs {
+        name: String,
+        def: Box<crate::stairs::StairsDef>,
+    },
+    /// A railing along a path: rails and posts as one part, optionally with
+    /// `block` markers ([`crate::stairs`]).
+    Railing {
+        name: String,
+        def: Box<crate::stairs::RailingDef>,
     },
     Shell {
         name: String,

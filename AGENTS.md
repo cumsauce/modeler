@@ -176,7 +176,9 @@ type, so there is no need to memorise field names.
 | `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
 | `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
-| `carve` | [solid], cutters, [rooms [{name, footprint [[x, z]...], height, base}]], [wall 0.3], [keep inner / outer / both], [merge true], [split_by none / facing / cutter / both], [markers], [collider none / mesh / blocks] (interiors by subtraction: only the faces looking into the rooms, as one-sided sheets) |
+| `carve` | [solid], cutters, [rooms [{name, footprint [[x, z]...], height, base}]], [slabs [{footprint [[[x, z]...]...], top, thickness 0.3}]], [wall 0.3], [keep inner / outer / both], [merge true], [split_by none / facing / cutter / both], [markers], [collider none / mesh / blocks] (interiors by subtraction: only the faces looking into the rooms, as one-sided sheets) |
+| `stairs` | name, from [x, y, z], toward (+x / -x / +z / -z or degrees), rise, [width 1.2], [steps], [run 0.3], [collider none / blocks] (a flight as one closed solid, a `block` marker per step) |
+| `railing` | name, path [[x, y, z]...], [height 1], [post_spacing 1.5], [thickness 0.06], [mid_rail true], [collider none / blocks] (rails and posts as one part) |
 | `garment` | name, on, [preset], [region {zones, arms, legs, neck, above, below, planes, boxes}], [offset 0.006], [thickness 0.003], [ease], [hem {flare, length}], [fit tight / regular / loose / baggy], [skirt {top, hem, length, profile, folds, flare}], [hide_skin true], [bind] (binds itself) (clothing cut from a body's surface) |
 | `panel` | name, input, face, [rows 1], [cols 1], [inset / border 0.01], [depth 0.005], [gap / seam 0.01] (recessed panels in a face) |
 | `group` | name, inputs |
@@ -1155,6 +1157,13 @@ surfaces, not hundreds of scattered copies.
     parts of that name, usable as cutters (`split_by`, markers). `solid` is
     the mass; **omit it** and a box around the cutters is made, `wall`
     meters (0.3) thicker on every side, so a level needs no mass at all.
+  - **`slabs`** put floors inside the carved volume: `{"footprint":
+    [[[x, z], ...], [hole ring]], "top": 4.4, "thickness": 0.3}` (more rings
+    are holes: a stairwell, the open middle of a ring balcony). A slab is
+    added to the carved mass, so its top reads as floor, its underside as
+    ceiling and its edges as wall, with the same merging, splitting by
+    cutter / facing, materials and `blocks` colliders as everything else: a
+    mezzanine, a loft or a catwalk is one item, not a pile of boxes.
   - **Openings are cutters**: a doorway is a box through the wall that
     overlaps both rooms. Where cutters touch or overlap the shared wall is
     gone (the union is carved), so rooms connect by construction. A cutter
@@ -1207,6 +1216,22 @@ surfaces, not hundreds of scattered copies.
     names its room.
   - It is a terminal step: the sheets are open, so they can't feed a
     boolean. Do the cutting first, then material, scatter, decals, lights.
+- **`stairs`** is a flight as ONE closed solid (a staircase profile
+  extruded across `width`, filled down to its foot, so it takes a tile
+  material and passes `validate`): `{"type": "stairs", "name": "to_mezz",
+  "from": [6, 0, 0], "toward": "+x", "rise": 4.4, "width": 4, "steps": 16,
+  "run": 0.4, "collider": "blocks"}`. `from` is the middle of the lowest
+  edge on the floor it climbs from; `toward` is "+x" / "-x" / "+z" / "-z" or
+  degrees about +y (0 = +x, 90 = -z, 180 = -x, 270 = +z); `steps` defaults to
+  a riser of at most 0.2 m and `run` (tread depth) to 0.3. A walker (and a
+  player) climbs risers up to 0.3 m, so keep `rise / steps` under that.
+  `collider: "blocks"` makes a `block` marker per step (`<name>_blk_<i>`,
+  with the game's `Block` component, yawed with the flight). `railing`
+  runs a top rail, posts (every `post_spacing`, at corners and both ends)
+  and an optional mid rail along `path` (y = the floor it stands on) as one
+  merged part, `collider: "blocks"` giving one full-height `block` per run.
+  Leave a gap in a railing where people climb on or off. Both live in
+  `src/stairs.rs`.
 - **`garment`** cuts clothing out of the surface of the closed part it is
   `on` (a `human` body, an sdf creature, or another garment for layers),
   so it fits any shape parameters and re-derives with them (`src/garment.rs`).
@@ -1396,6 +1421,12 @@ surfaces, not hundreds of scattered copies.
   value it came from (`[from repeat r=2]`). A repeat with empty `items`,
   `count` 0 or empty `values` makes nothing (a `note:` in the result, not
   an error).
+- **Props with colliders**: a `prefab` item with `block: true` also makes a
+  `block` marker `<name>_blk` (the game's `Block` component) filling the
+  instance's world bounds, so a crate or a vending machine is solid in
+  games that build colliders from markers. `catalog_describe` prints each
+  entry's `bounds` (x / y / z extents in its own frame, size, centre; the
+  origin is 0, 0, 0), so props are placed and sized without probing.
 - **Prefabs as parts**: `{"type": "prefab", "name": "lamp1", "prefab": "lamp"}`
   instances a saved catalog model; its visible parts become `lamp1.pole`,
   `lamp1.shade`, ... and feed later ops like any part. The part list is
@@ -1485,6 +1516,17 @@ name: the producer first, then in-place material/visibility/transform edits).
   - `self_intersections: true`: no part's surface passes through itself
     (a deform, warp or skin that folded it); fails with the crossing count
     and a point.
+  - `walkable: {"markers": {kinds?, names?, from?, agent?, cell?}}`: every
+    spawn / waypoint / pickup (any marker but block / room / opening, or the
+    given `kinds` / `names` globs) is standable and reachable from the first
+    (or `from`): the one check for "can every spawn reach every pickup".
+    A failure lists the offenders (not standable and why, floating or buried
+    more than 0.5 m off the floor, not reachable) and draws a top-view map.
+    A failed single route also draws that map ('+' reached, '.' standable but
+    not reached, `S` start, `G` goal), and notes when a `from` / `to` y was
+    snapped to a floor more than a step away (the wrong level). The ground
+    is y = 0 unless the model sits wholly more than 5 cm lower (a prop sunk
+    a few mm no longer grows every riser).
   - `walkable: {from, to, via?, agent?, cell?}` (or a list): a character
     can walk from `from` to `to` (feet points, snapped to the floor
     under them) over the visible parts and the ground. `agent` is
@@ -2543,7 +2585,9 @@ agent views, verify, inspect, export and the window.
 
 **Scenes (open documents):** `scene(action, name?)` keeps several models
 open at once, each with its own ops, history and style; every other tool
-acts on the active one. `list` (active marked `*`, which prefabs each
+acts on the active one. `reset` (clear the active document's ops and parts in place: a rebuild
+starts from nothing, undo restores it; closing the only open document
+leaves a fresh empty one), `list` (active marked `*`, which prefabs each
 instances), `open` (an open doc, else the catalog entry, else a new empty
 doc), `switch` (open docs only), `close`. Build a map from pieces: model
 `console` in its own doc, `open` `bridge_map`, and place
@@ -2927,6 +2971,9 @@ work, and every material has its own history tree.
 
 ## Semantics worth knowing
 
+- **Re-applying a batch is safe for materials**: an in-place `material`
+  identical to the newest one on that part is skipped ("unchanged"), so
+  re-issuing a whole batch no longer doubles its material ops.
 - **In-place ops**: a material, transform or visibility op whose output is
   its own input is legal; upsert never replaces an op the new op reads from.
   Re-issuing an in-place transform or visibility edit replaces it (a

@@ -95,6 +95,10 @@ modeler --offscreen
   merged one-sided sheets split into floor / wall / ceiling or per room,
   with room / opening markers and mesh colliders: no hidden outer faces to
   cull. `cargo run --example interior` builds a two-room bunker.
+- **Levels**: `stairs`, `railing` and carve `slabs` build multi-storey
+  interiors (flights, balconies, mezzanines) with `Block` colliders, prefabs
+  take `block: true`, and `verify walkable {markers}` proves every spawn and
+  pickup is reachable, with a map when it isn't.
 - **History tree**: every edit snapshots the model into a tree with a
   cursor — undo/redo, jump anywhere, and editing after a jump branches
   instead of discarding.

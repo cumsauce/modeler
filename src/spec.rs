@@ -2717,6 +2717,24 @@ pub struct GarmentSpec {
     pub def: crate::garment::GarmentDef,
 }
 
+/// A stairs item: `name` plus [`crate::stairs::StairsDef`].
+#[derive(schemars::JsonSchema)]
+pub struct StairsSpec {
+    /// The flight's part name (`name_blk_<i>` for its collider markers).
+    pub name: String,
+    #[serde(flatten)]
+    pub def: crate::stairs::StairsDef,
+}
+
+/// A railing item: `name` plus [`crate::stairs::RailingDef`].
+#[derive(schemars::JsonSchema)]
+pub struct RailingSpec {
+    /// The railing's part name (`name_blk_<i>` for its collider markers).
+    pub name: String,
+    #[serde(flatten)]
+    pub def: crate::stairs::RailingDef,
+}
+
 /// A carve item: `name` plus [`crate::carve::CarveDef`].
 #[derive(schemars::JsonSchema)]
 pub struct CarveSpec {
@@ -3835,6 +3853,8 @@ pub const OP_TYPES: &[&str] = &[
     "shell",
     "garment",
     "carve",
+    "stairs",
+    "railing",
     "panel",
     "transform",
     "move",
@@ -4841,6 +4861,45 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let def: crate::garment::GarmentDef = de(&ctx, &Value::Object(obj))?;
             crate::garment::validate(&def).map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Garment { name, def })
+        }
+        "stairs" | "railing" => {
+            let Some(obj) = body.as_object() else {
+                return Err(format!("{ctx}: expected an object"));
+            };
+            let mut obj = obj.clone();
+            let name = match obj.remove("name") {
+                Some(Value::String(n)) if !n.is_empty() => n,
+                _ => return Err(format!("{ctx}: name: a non-empty string is required")),
+            };
+            obj.remove("type");
+            let fields = if ty == "stairs" {
+                crate::stairs::STAIRS_FIELDS
+            } else {
+                crate::stairs::RAILING_FIELDS
+            };
+            for k in obj.keys() {
+                if !fields.contains(&k.as_str()) {
+                    return Err(format!(
+                        "{ctx}: unknown field `{k}` (fields: name, {})",
+                        fields.join(", ")
+                    ));
+                }
+            }
+            if ty == "stairs" {
+                let def: crate::stairs::StairsDef = de(&ctx, &Value::Object(obj))?;
+                crate::stairs::validate_stairs(&def).map_err(|e| format!("{ctx}: {e}"))?;
+                BatchItem::Op(Op::Stairs {
+                    name,
+                    def: Box::new(def),
+                })
+            } else {
+                let def: crate::stairs::RailingDef = de(&ctx, &Value::Object(obj))?;
+                crate::stairs::validate_railing(&def).map_err(|e| format!("{ctx}: {e}"))?;
+                BatchItem::Op(Op::Railing {
+                    name,
+                    def: Box::new(def),
+                })
+            }
         }
         "carve" => {
             let Some(obj) = body.as_object() else {
@@ -6113,6 +6172,12 @@ pub fn example(ty: &str) -> Option<Value> {
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
         }
+        "stairs" => {
+            json!({"type": "stairs", "name": "to_mezz", "from": [6.0, 0.0, 0.0], "toward": "+x", "rise": 4.4, "width": 4, "steps": 16, "run": 0.4, "collider": "blocks"})
+        }
+        "railing" => {
+            json!({"type": "railing", "name": "mezz_rail", "path": [[-5, 4.4, 5], [5, 4.4, 5], [5, 4.4, -5]], "height": 1.0, "collider": "blocks"})
+        }
         "carve" => {
             json!({"type": "carve", "name": "bunker", "cutters": ["hall", "cell", "door"], "split_by": "facing", "wall": 0.3, "markers": true, "collider": "mesh"})
         }
@@ -6255,6 +6320,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "shell" => schemars::schema_for!(ShellSpec),
         "garment" => schemars::schema_for!(GarmentSpec),
         "carve" => schemars::schema_for!(CarveSpec),
+        "stairs" => schemars::schema_for!(StairsSpec),
+        "railing" => schemars::schema_for!(RailingSpec),
         "panel" => schemars::schema_for!(PanelSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),

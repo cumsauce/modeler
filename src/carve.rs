@@ -1281,9 +1281,9 @@ mod tests {
                 .find(|p| p.name == n)
                 .unwrap_or_else(|| panic!("no {n}"))
         };
-        // Floor: the room's floor minus the slab's footprint, plus the slab's top.
+        // Floor: the whole room floor (still exposed under the slab) plus the slab's top.
         assert!(
-            (area(get("b_floor")) - (100.0 - 30.0 + 30.0)).abs() < 0.05,
+            (area(get("b_floor")) - (100.0 + 30.0)).abs() < 0.05,
             "floor {}",
             area(get("b_floor"))
         );

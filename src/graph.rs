@@ -1184,6 +1184,14 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 .map_err(|e| ModelerError::Invalid(format!("decimate `{name}`: {e}")))?;
             upsert(named, name, part);
         }
+        Op::Stairs { name, def } => {
+            let part = crate::stairs::build_stairs(name, def)?;
+            upsert(named, name, part);
+        }
+        Op::Railing { name, def } => {
+            let part = crate::stairs::build_railing(name, def)?;
+            upsert(named, name, part);
+        }
         Op::Carve { name, def } => {
             let parts = {
                 let view: &Named = named;
@@ -1704,6 +1712,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
         | Op::Carve { name, .. }
+        | Op::Stairs { name, .. }
+        | Op::Railing { name, .. }
         | Op::LSystem { name, .. }
         | Op::Text { name, .. }
         | Op::Terrain { name, .. }
@@ -1834,6 +1844,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
         Op::Carve { .. } => "carve",
+        Op::Stairs { .. } => "stairs",
+        Op::Railing { .. } => "railing",
         Op::LSystem { .. } => "lsystem",
         Op::Text { .. } => "text",
         Op::Terrain { .. } => "terrain",
@@ -1911,6 +1923,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         }
         Op::Garment { def, .. } => vec![def.on.as_str()],
         Op::Carve { def, .. } => crate::carve::reads(def),
+        Op::Stairs { .. } | Op::Railing { .. } => Vec::new(),
         Op::Scatter { input, on, def, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
             v.push(on);
@@ -2089,6 +2102,14 @@ pub fn describe(ops: &[Op]) -> String {
             ),
             Op::Carve { name, def } => format!(
                 "#{i} carve `{name}` {}",
+                serde_json::to_string(def).unwrap_or_default()
+            ),
+            Op::Stairs { name, def } => format!(
+                "#{i} stairs `{name}` {}",
+                serde_json::to_string(def).unwrap_or_default()
+            ),
+            Op::Railing { name, def } => format!(
+                "#{i} railing `{name}` {}",
                 serde_json::to_string(def).unwrap_or_default()
             ),
             Op::Garment { name, def } => format!(
