@@ -208,6 +208,105 @@ pub(crate) fn setup_agent_camera(mut commands: Commands, mut images: ResMut<Asse
     });
 }
 
+/// The eight corners of the box `min..max`.
+fn corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
+    std::array::from_fn(|i| {
+        Vec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        )
+    })
+}
+
+/// Camera right and up for a view from direction `dir` (target to eye).
+fn view_axes(dir: Vec3, up: Vec3) -> (Vec3, Vec3) {
+    let right = up.cross(dir).normalize_or_zero();
+    (right, dir.cross(right).normalize_or_zero())
+}
+
+/// Half-extents (right, up) of the box `min..max` seen along `dir`, about `target`.
+fn projected_half(min: Vec3, max: Vec3, target: Vec3, dir: Vec3, up: Vec3) -> (f32, f32) {
+    let (right, up2) = view_axes(dir, up);
+    corners(min, max)
+        .iter()
+        .fold((1e-3f32, 1e-3f32), |(hx, hy), c| {
+            let rel = *c - target;
+            (hx.max(rel.dot(right).abs()), hy.max(rel.dot(up2).abs()))
+        })
+}
+
+/// The nearest distance (target to eye) at which the whole box fits a
+/// perspective frame of vertical `fov` and `aspect`, with `pad` slack: each
+/// corner's offset over its depth in front of the lens stays inside the
+/// frustum. Much tighter than fitting the bounding sphere.
+fn fit_perspective(
+    min: Vec3,
+    max: Vec3,
+    target: Vec3,
+    dir: Vec3,
+    up: Vec3,
+    fov: f32,
+    aspect: f32,
+    pad: f32,
+) -> f32 {
+    let (right, up2) = view_axes(dir, up);
+    let ty = (fov * 0.5).tan().max(1e-3);
+    let tx = ty * aspect.max(1e-3);
+    corners(min, max).iter().fold(1e-3f32, |d, c| {
+        let rel = *c - target;
+        let z = rel.dot(dir);
+        d.max(z + rel.dot(right).abs() * pad / tx)
+            .max(z + rel.dot(up2).abs() * pad / ty)
+    })
+}
+
+/// Slack around the model in orthographic and perspective frames.
+const ORTHO_MARGIN: f32 = 1.08;
+const PERSPECTIVE_PAD: f32 = 1.06;
+/// The iso view's direction (target to eye).
+fn iso_dir() -> Vec3 {
+    Vec3::new(1.0, 0.75, 1.0).normalize()
+}
+
+/// The camera direction (target to eye) and up of a custom view.
+fn custom_dir_up(c: &CustomCam) -> (Vec3, Vec3) {
+    let dir = yaw_pitch_dir(c.yaw, c.pitch);
+    // Straight up/down: keep a valid up vector.
+    let up = if dir.y.abs() > 0.99 {
+        -Vec3::Z * dir.y.signum()
+    } else {
+        Vec3::Y
+    };
+    (dir, up)
+}
+
+/// The width over height the model naturally has seen from `view`: what a
+/// canvas should be to waste the least background (the cardinal views keep
+/// their "at least half the largest extent" floor).
+pub(crate) fn natural_aspect(view: AgentView, bounds: Option<(Vec3, Vec3)>) -> f32 {
+    let (min, max) = bounds.unwrap_or((Vec3::splat(-1.0), Vec3::splat(1.0)));
+    let center = (min + max) * 0.5;
+    let half = (max - min) * 0.5;
+    let (hx, hy) = match view {
+        AgentView::Custom(c) => {
+            let (dir, up) = custom_dir_up(&c);
+            projected_half(min, max, c.target.map_or(center, Vec3::from), dir, up)
+        }
+        AgentView::Iso => projected_half(min, max, center, iso_dir(), Vec3::Y),
+        view => {
+            let (hw, hh) = match view {
+                AgentView::Front | AgentView::Back => (half.x, half.y),
+                AgentView::Right | AgentView::Left => (half.z, half.y),
+                _ => (half.x, half.z),
+            };
+            let floor = (half.max_element() * 0.5).max(1e-3);
+            (hw.max(floor), hh.max(floor))
+        }
+    };
+    hx / hy
+}
+
 /// Computes the camera placement for one agent view, auto-framed to the
 /// model's world bounds. Returns (eye, target, up, projection).
 pub(crate) fn agent_view_projection(
@@ -219,27 +318,20 @@ pub(crate) fn agent_view_projection(
     let center = (min + max) * 0.5;
     let half = (max - min) * 0.5;
     let radius = half.length().max(1e-3);
-    let margin = 1.2;
+    let margin = ORTHO_MARGIN;
     match view {
         AgentView::Custom(c) => {
             let target = c.target.map_or(center, Vec3::from);
-            // Fit the bounds' sphere around the (possibly off-centre) target.
-            let reach = radius + (center - target).length();
-            let dir = yaw_pitch_dir(c.yaw, c.pitch);
-            // Straight up/down: keep a valid up vector.
-            let up = if dir.y.abs() > 0.99 {
-                -Vec3::Z * dir.y.signum()
-            } else {
-                Vec3::Y
-            };
+            let (dir, up) = custom_dir_up(&c);
             if c.ortho {
-                let mut hh = reach * margin;
-                let mut hw = hh;
+                let (px, py) = projected_half(min, max, target, dir, up);
+                let (mut hw, mut hh) = (px * margin, py * margin);
                 if hw / hh < aspect {
                     hw = hh * aspect;
                 } else {
                     hh = hw / aspect;
                 }
+                let reach = radius + (center - target).length();
                 let dist = c.dist.unwrap_or(reach * 3.0 + 1.0);
                 (
                     target + dir * dist,
@@ -257,13 +349,13 @@ pub(crate) fn agent_view_projection(
                 )
             } else {
                 let fov = c.fov.clamp(5.0, 150.0).to_radians();
-                // The tighter half-angle is vertical unless the frame is tall.
-                let half = if aspect < 1.0 {
-                    ((fov * 0.5).tan() * aspect).atan()
-                } else {
-                    fov * 0.5
-                };
-                let dist = c.dist.unwrap_or(reach * margin / half.sin()).max(1e-3);
+                let reach = radius + (center - target).length();
+                let dist = c
+                    .dist
+                    .unwrap_or_else(|| {
+                        fit_perspective(min, max, target, dir, up, fov, aspect, PERSPECTIVE_PAD)
+                    })
+                    .max(1e-3);
                 (
                     target + dir * dist,
                     target,
@@ -279,17 +371,19 @@ pub(crate) fn agent_view_projection(
             }
         }
         AgentView::Iso => {
-            // The bounding sphere fits the vertical half-fov (22.5°, the
-            // tighter axis) at radius / sin(22.5°) ≈ 2.61 r; 3.0 r adds margin
-            // so tall models' tips aren't cropped.
-            let dist = (radius * 3.0).max(0.05);
-            let dir = Vec3::new(1.0, 0.75, 1.0).normalize();
+            // Fit the model's corners to the frustum (not its bounding sphere,
+            // which wastes most of a long or flat model's frame).
+            let dir = iso_dir();
+            let fov = 45.0_f32.to_radians();
+            let dist =
+                fit_perspective(min, max, center, dir, Vec3::Y, fov, aspect, PERSPECTIVE_PAD)
+                    .max(0.05);
             (
                 center + dir * dist,
                 center,
                 Vec3::Y,
                 Projection::from(PerspectiveProjection {
-                    fov: 45.0_f32.to_radians(),
+                    fov,
                     aspect_ratio: aspect,
                     // Scale-aware so a 2 cm part still fills the frame.
                     near: (dist * 0.01).max(1e-4),
@@ -1353,6 +1447,82 @@ mod tests {
             assert!(h >= 0.875, "{v}: plan frames only {h} m");
         }
         let (_, h) = span(AgentView::Front, min, max);
-        assert!((h - 1.75 * 1.2).abs() < 1e-3);
+        // The frame is the model's half height (0.875) either side, plus the margin.
+        assert!((h - 1.75 * ORTHO_MARGIN).abs() < 1e-3, "front frames {h} m");
+    }
+
+    /// Projects the box's corners through the camera `agent_view_projection`
+    /// builds and returns the fraction of the frame the box's screen box fills
+    /// along its tighter axis (1.0 = touching the edges), and whether every
+    /// corner is inside the frame.
+    fn fill(view: AgentView, min: Vec3, max: Vec3, aspect: f32) -> (f32, bool) {
+        let (eye, target, up, proj) = agent_view_projection(view, Some((min, max)), aspect);
+        let cam = Transform::from_translation(eye).looking_at(target, up);
+        let view_m = cam.to_matrix().inverse();
+        let (mut mx, mut my, mut inside) = (0f32, 0f32, true);
+        for c in corners(min, max) {
+            let p = view_m.transform_point3(c);
+            let (nx, ny) = match &proj {
+                Projection::Perspective(pp) => {
+                    let ty = (pp.fov * 0.5).tan();
+                    (p.x / (-p.z * ty * aspect), p.y / (-p.z * ty))
+                }
+                Projection::Orthographic(o) => {
+                    let ScalingMode::Fixed { width, height } = o.scaling_mode else {
+                        panic!("not fixed")
+                    };
+                    (p.x / (width * 0.5), p.y / (height * 0.5))
+                }
+                _ => panic!("custom projection"),
+            };
+            mx = mx.max(nx.abs());
+            my = my.max(ny.abs());
+            inside &= nx.abs() <= 1.0001 && ny.abs() <= 1.0001;
+        }
+        (mx.max(my), inside)
+    }
+
+    #[test]
+    fn iso_frames_a_long_flat_model_tightly() {
+        // A 6 m x 0.4 m x 1 m table: the bounding sphere would be ~3 m wide.
+        let (min, max) = (Vec3::new(-3.0, 0.0, -0.5), Vec3::new(3.0, 0.4, 0.5));
+        let (f, inside) = fill(AgentView::Iso, min, max, 4.0 / 3.0);
+        assert!(inside, "every corner is in the frame");
+        assert!(f > 0.8, "the model fills only {f} of its frame");
+    }
+
+    #[test]
+    fn iso_and_custom_keep_a_tall_model_in_frame() {
+        let (min, max) = (Vec3::new(-0.3, 0.0, -0.2), Vec3::new(0.3, 1.8, 0.2));
+        for aspect in [0.5, 1.0, 16.0 / 9.0] {
+            let (f, inside) = fill(AgentView::Iso, min, max, aspect);
+            assert!(
+                inside && f > 0.8,
+                "iso at {aspect}: fill {f}, inside {inside}"
+            );
+            let cam = AgentView::Custom(CustomCam {
+                yaw: 30.0,
+                pitch: 20.0,
+                dist: None,
+                target: None,
+                ortho: false,
+                fov: 45.0,
+            });
+            let (f, inside) = fill(cam, min, max, aspect);
+            assert!(
+                inside && f > 0.8,
+                "custom at {aspect}: fill {f}, inside {inside}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_standing_figure_wants_a_tall_canvas() {
+        let (min, max) = (Vec3::new(-0.25, 0.0, -0.12), Vec3::new(0.25, 1.75, 0.21));
+        let a = natural_aspect(AgentView::Front, Some((min, max)));
+        assert!(a <= 0.501, "front aspect {a}");
+        // A plan of it keeps the half-extent floor: near square, not a sliver.
+        let top = natural_aspect(AgentView::Top, Some((min, max)));
+        assert!(top > 0.8, "plan aspect {top}");
     }
 }

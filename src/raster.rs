@@ -106,6 +106,56 @@ impl Canvas {
         (text.chars().count() * 6 + 2) * scale
     }
 
+    /// The part inside the pixel box `[x0, y0, x1, y1]` (inclusive, clamped).
+    pub fn crop(&self, [x0, y0, x1, y1]: [usize; 4]) -> Canvas {
+        let (x1, y1) = (x1.min(self.w - 1), y1.min(self.h - 1));
+        let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in y0..=y1 {
+            let row = (y * self.w + x0) * 4;
+            px.extend_from_slice(&self.px[row..row + w * 4]);
+        }
+        Canvas { w, h, px }
+    }
+
+    /// This image scaled down to `w` x `h` by averaging the source pixels each
+    /// output pixel covers (never up: a larger target returns a copy).
+    pub fn shrunk(&self, w: usize, h: usize) -> Canvas {
+        let (w, h) = (w.clamp(1, self.w), h.clamp(1, self.h));
+        if (w, h) == (self.w, self.h) {
+            return self.clone();
+        }
+        let mut px = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let (sy0, sy1) = (
+                y * self.h / h,
+                ((y + 1) * self.h / h).max(y * self.h / h + 1),
+            );
+            for x in 0..w {
+                let (sx0, sx1) = (
+                    x * self.w / w,
+                    ((x + 1) * self.w / w).max(x * self.w / w + 1),
+                );
+                let mut acc = [0u32; 4];
+                for sy in sy0..sy1.min(self.h) {
+                    for sx in sx0..sx1.min(self.w) {
+                        let i = (sy * self.w + sx) * 4;
+                        for (a, v) in acc.iter_mut().zip(&self.px[i..i + 4]) {
+                            *a += *v as u32;
+                        }
+                    }
+                }
+                let n = ((sy1.min(self.h) - sy0) * (sx1.min(self.w) - sx0)).max(1) as u32;
+                let o = (y * w + x) * 4;
+                for k in 0..4 {
+                    px[o + k] = (acc[k] / n) as u8;
+                }
+            }
+        }
+        Canvas { w, h, px }
+    }
+
     pub fn to_png(&self) -> Result<Vec<u8>, String> {
         encode_png(self.w as u32, self.h as u32, &self.px)
     }
@@ -736,5 +786,74 @@ mod tests {
             top.iter().any(|b| b.label == "left" && b.delta_m > 0.0),
             "{top:?}"
         );
+    }
+}
+
+/// What a model pays to read an image of this size (about w x h / 750
+/// tokens, after the ~1.15 MP downscale a model applies).
+pub fn image_tokens(w: usize, h: usize) -> usize {
+    let (w, h) = (w as f64, h as f64);
+    let k = (1568.0 / w.max(h))
+        .min((1_150_000.0 / (w * h)).sqrt())
+        .min(1.0);
+    ((w * k) * (h * k) / 750.0).round() as usize
+}
+
+/// A PNG scaled down to at most `w` pixels wide (its proportions kept); the
+/// same bytes when it is already that narrow or can't be decoded.
+pub fn fit_png_width(png: &[u8], w: usize) -> Vec<u8> {
+    match decode_png(png) {
+        Ok(c) if c.w > w && w > 0 => shrink_png(png, w as f64 / c.w as f64),
+        _ => png.to_vec(),
+    }
+}
+
+/// A PNG's width and height from its header.
+pub fn png_dims(png: &[u8]) -> Option<(usize, usize)> {
+    let b = png.get(16..24)?;
+    Some((
+        u32::from_be_bytes(b[0..4].try_into().ok()?) as usize,
+        u32::from_be_bytes(b[4..8].try_into().ok()?) as usize,
+    ))
+}
+
+/// A PNG scaled down by `k` (0..1) on both sides; the same bytes when `k` >= 1
+/// or it can't be decoded.
+pub fn shrink_png(png: &[u8], k: f64) -> Vec<u8> {
+    if k >= 0.999 {
+        return png.to_vec();
+    }
+    let Ok(c) = decode_png(png) else {
+        return png.to_vec();
+    };
+    let (w, h) = (
+        ((c.w as f64 * k) as usize).max(64),
+        ((c.h as f64 * k) as usize).max(64),
+    );
+    c.shrunk(w, h).to_png().unwrap_or_else(|_| png.to_vec())
+}
+
+#[cfg(test)]
+mod image_cost_tests {
+    use super::*;
+
+    #[test]
+    fn token_estimate_follows_pixels_and_caps() {
+        assert!((400..420).contains(&image_tokens(640, 480)));
+        // A huge image costs what the downscaled one does.
+        assert!(image_tokens(4000, 3000) <= 1600);
+        assert!(image_tokens(448, 336) < image_tokens(640, 480));
+    }
+
+    #[test]
+    fn crop_and_shrink_keep_what_they_should() {
+        let mut c = Canvas::new(10, 8, [0, 0, 0, 255]);
+        c.set(4, 3, [255, 0, 0, 255]);
+        let k = c.crop([3, 2, 5, 4]);
+        assert_eq!((k.w, k.h), (3, 3));
+        assert_eq!(&k.px[16..20], &[255, 0, 0, 255]);
+        let s = c.shrunk(5, 4);
+        assert_eq!((s.w, s.h), (5, 4));
+        assert_eq!(c.shrunk(20, 20).w, 10, "never scales up");
     }
 }

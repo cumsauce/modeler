@@ -51,6 +51,35 @@ fn fit_budget(w: u32, h: u32, cols: u32, rows: u32) -> (u32, u32) {
     )
 }
 
+/// `detail`: "low" (the default) or "high".
+fn parse_detail(detail: Option<&str>) -> Result<bool, ErrorData> {
+    match detail {
+        None | Some("low") => Ok(false),
+        Some("high") => Ok(true),
+        Some(other) => Err(ErrorData::invalid_params(
+            format!("detail must be \"low\" or \"high\", got `{other}`"),
+            None,
+        )),
+    }
+}
+
+/// A canvas of about `area` pixels with the proportions `aspect` (width over
+/// height), sides in multiples of 8.
+fn canvas_for(aspect: f32, area: f64) -> (u32, u32) {
+    let a = aspect.clamp(0.25, 4.0) as f64;
+    let side = |v: f64| (((v / 8.0).round() as u32) * 8).clamp(64, 1568);
+    (side((area * a).sqrt()), side((area / a).sqrt()))
+}
+
+/// "~N image tokens" for images of these sizes.
+fn cost_note(sizes: impl IntoIterator<Item = (usize, usize)>) -> String {
+    let n: usize = sizes
+        .into_iter()
+        .map(|(w, h)| modeler::raster::image_tokens(w, h))
+        .sum();
+    format!("~{n} image tokens")
+}
+
 impl Tools {
     pub(crate) fn new(tx: mpsc::Sender<Cmd>) -> Self {
         Self {
@@ -178,17 +207,29 @@ impl Tools {
         }
     }
 
-    async fn grab_screenshot(&self) -> Result<CallToolResult, ErrorData> {
+    async fn grab_screenshot(&self, width: usize) -> Result<CallToolResult, ErrorData> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Cmd::Screenshot(reply_tx))
             .await
             .map_err(|_| ErrorData::internal_error("preview app is not running", None))?;
         match Self::await_reply(reply_rx).await {
-            Ok(png) => Ok(CallToolResult::success(vec![
-                Content::image(B64.encode(png), "image/png"),
-                Content::text("current preview render"),
-            ])),
+            Ok(png) => {
+                let png = modeler::raster::fit_png_width(&png, width);
+                let note = match modeler::raster::png_dims(&png) {
+                    Some(d) => format!(
+                        "current preview render, {}x{} ({})",
+                        d.0,
+                        d.1,
+                        cost_note([d])
+                    ),
+                    None => "current preview render".to_string(),
+                };
+                Ok(CallToolResult::success(vec![
+                    Content::image(B64.encode(png), "image/png"),
+                    Content::text(note),
+                ]))
+            }
             Err(message) => Ok(err_result(message)),
         }
     }
@@ -249,6 +290,25 @@ impl Tools {
         rx.try_recv().ok()
     }
 
+    /// The world box of the model (or of `focus`'s parts), for sizing views.
+    async fn frame_bounds(
+        &self,
+        focus: &Option<Vec<String>>,
+    ) -> Result<Option<(Vec3, Vec3)>, ErrorData> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let names = focus.clone();
+        self.run(move |s| {
+            let b = match &names {
+                Some(n) => s.model.bounds_of(n),
+                None => s.model.bounds(),
+            };
+            let _ = tx.send(b);
+            Ok(String::new())
+        })
+        .await?;
+        Ok(rx.try_recv().ok().flatten())
+    }
+
     /// `agent_views reference`: the silhouette in an orthographic view,
     /// compared with one or more reference images from the call's project.
     async fn reference_view(
@@ -256,6 +316,7 @@ impl Tools {
         refs: ReferencesArg,
         width: Option<u32>,
         height: Option<u32>,
+        hi: bool,
         focus: Option<Vec<String>>,
         clip: Option<String>,
         time: Option<f32>,
@@ -283,11 +344,15 @@ impl Tools {
         })
         .await?;
         let bounds = rx.try_recv().ok().flatten();
+        let dflt = if hi { 800 } else { 560 };
         let (w0, h0) = (
-            width.unwrap_or(800).clamp(64, 2048),
-            height.unwrap_or(800).clamp(64, 2048),
+            width.unwrap_or(dflt).clamp(64, 2048),
+            height.unwrap_or(dflt).clamp(64, 2048),
         );
-        let (w, h) = fit_budget(w0, h0, 2, refs.len() as u32);
+        // Low detail returns each overlay only (the silhouette it is made of
+        // is the grey + magenta in it); high adds the plain silhouette beside it.
+        let per_ref = if hi { 2 } else { 1 };
+        let (w, h) = fit_budget(w0, h0, per_ref, refs.len() as u32);
         let mut shots = Vec::new();
         let mut text = Vec::new();
         let mut json = Vec::new();
@@ -363,17 +428,30 @@ impl Tools {
                 .to_png()
                 .map_err(|e| ErrorData::internal_error(e, None))?;
             let n = shots.len();
-            shots.push((png, format!("{view_name} silhouette")));
+            if hi {
+                shots.push((png, format!("{view_name} silhouette")));
+            }
             shots.push((overlay, format!("{view_name} vs {}", r.image)));
-            text.push(format!(
-                "{view_name}: reference `{}`: IoU {:.1}% ({}: the silhouette, {}: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
-                r.image,
-                d.iou * 100.0,
-                n + 1,
-                n + 2,
-                d.model_only * 100.0,
-                d.reference_only * 100.0
-            ));
+            text.push(if hi {
+                format!(
+                    "{view_name}: reference `{}`: IoU {:.1}% ({}: the silhouette, {}: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
+                    r.image,
+                    d.iou * 100.0,
+                    n + 1,
+                    n + 2,
+                    d.model_only * 100.0,
+                    d.reference_only * 100.0
+                )
+            } else {
+                format!(
+                    "{view_name}: reference `{}`: IoU {:.1}% (cell {}: overlay: magenta = model only {:.1}% of pixels, cyan = reference only {:.1}%, grey = both)",
+                    r.image,
+                    d.iou * 100.0,
+                    n + 1,
+                    d.model_only * 100.0,
+                    d.reference_only * 100.0
+                )
+            });
             let (ra, ma) = d.aspects;
             if (ra / ma - 1.0).abs() > 0.05 {
                 text.push(format!(
@@ -401,6 +479,9 @@ impl Tools {
             }));
         }
         let grid = compose_grid(&shots).map_err(|e| ErrorData::internal_error(e, None))?;
+        if let Some(d) = modeler::raster::png_dims(&grid) {
+            text.push(cost_note([d]));
+        }
         let mut res = CallToolResult::success(vec![
             Content::text(text.join("\n")),
             Content::image(B64.encode(grid), "image/png"),
@@ -545,8 +626,11 @@ impl Tools {
             channels,
             size,
             diameter,
+            detail,
         }): Parameters<MaterialViewArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let hi = parse_detail(detail.as_deref())?;
+        let size = size.or(Some(if hi { 256 } else { 192 }));
         let (png_tx, png_rx) = std::sync::mpsc::channel();
         let r = self
             .run(move |s| {
@@ -563,6 +647,9 @@ impl Tools {
             .await?;
         let mut r = r;
         if let Ok(png) = png_rx.try_recv() {
+            if let Some(d) = modeler::raster::png_dims(&png) {
+                r.content.push(Content::text(cost_note([d])));
+            }
             r.content.push(Content::image(B64.encode(png), "image/png"));
         }
         Ok(r)
@@ -676,7 +763,7 @@ impl Tools {
     /// `.saturate(x)`), `"$bevel"` (numbers), `"style": "trim"` on a material
     /// item (a preset), and `defaults` fill fields items omit. Changing a token
     /// or loading another style re-derives every item that reads it (one undo).
-    /// Actions: "show" (tokens + a swatch image), "set" (merge `tokens`),
+    /// Actions: "show" (tokens; `image: true` adds a swatch picture), "set" (merge `tokens`),
     /// "replace", "clear", and the library: "list", "describe", "save" (name,
     /// description, tags, prompt), "load" (becomes the model's style), "delete".
     #[tool]
@@ -689,6 +776,7 @@ impl Tools {
             description,
             tags,
             prompt,
+            image,
             ..
         }): Parameters<StyleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -800,7 +888,13 @@ Style::default()
             .await?;
         let mut r = r;
         if let Ok(png) = png_rx.try_recv() {
-            r.content.push(Content::image(B64.encode(png), "image/png"));
+            if image.unwrap_or(false) {
+                r.content.push(Content::image(B64.encode(png), "image/png"));
+            } else {
+                r.content.push(Content::text(
+                    "(swatch picture omitted: pass image: true to see it)",
+                ));
+            }
         }
         Ok(r)
     }
@@ -1030,17 +1124,20 @@ Style::default()
         .await
     }
 
-    /// Render your document as a PNG (1280x800) from the agents' camera,
-    /// which set_camera yaw / pitch / dist steer; it auto-fits the model.
+    /// Render your document as a PNG from the agents' camera (960 wide by
+    /// default, 1280x800 with `detail: "high"`, or `width`), which set_camera
+    /// yaw / pitch / dist steer; it auto-fits the model.
     /// The human's own view in the window is never moved. With
     /// `set_camera(ui: {capture: "window"})` it captures
     /// the whole window instead. Fails in --headless mode.
     #[tool]
     async fn screenshot(
         &self,
-        Parameters(_): Parameters<DocOnlyArgs>,
+        Parameters(ScreenshotArgs { width, detail, .. }): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.grab_screenshot().await
+        let hi = parse_detail(detail.as_deref())?;
+        let w = width.map_or(if hi { 1280 } else { 960 }, |w| w.clamp(64, 4096)) as usize;
+        self.grab_screenshot(w).await
     }
 
     /// Undo the last mutation (parts, booleans, transforms, materials, renames...).
@@ -1522,7 +1619,9 @@ Style::default()
     /// "bottom" orthographic; "iso" perspective) or cameras you place
     /// ({yaw, pitch, dist?, target?, ortho?, fov?}; yaw 0 = from +z/front, 90 =
     /// from +x/right). Several views come back tiled into ONE labelled image
-    /// (grid: false for separate images), sized to stay under ~1.15 MP.
+    /// (grid: false for separate images), sized to the model and to a pixel
+    /// budget (`detail`: "low" by default, "high" for fine detail; a call's
+    /// images stay under ~1.15 MP together, and the result says what they cost).
     /// style "silhouette" draws flat black parts on white; "density" tints
     /// surfaces by local detail (red sparse, green busy); focus "joints" (or
     /// joints: N) frames close-ups of where parts meet; reference {image,
@@ -1555,6 +1654,7 @@ Style::default()
             reference,
             variant,
             variants,
+            detail,
         }): Parameters<AgentViewsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let vlist: Vec<Option<String>> = match variants {
@@ -1618,9 +1718,10 @@ Style::default()
                 None,
             ));
         }
+        let hi = parse_detail(detail.as_deref())?;
         if let Some(r) = reference {
             return self
-                .reference_view(r, width, height, focus, clip, time)
+                .reference_view(r, width, height, hi, focus, clip, time)
                 .await;
         }
         if weights && bone.is_none() {
@@ -1752,23 +1853,85 @@ Style::default()
             .collect();
         let n = parsed.len() as u32;
         let grid = grid.unwrap_or(n > 1);
-        let (dw, dh) = if grid { (640, 480) } else { (1280, 720) };
-        let (w0, h0) = (
-            width.unwrap_or(dw).clamp(64, 4096),
-            height.unwrap_or(dh).clamp(64, 4096),
-        );
         let (cols, rows) = if grid {
             let c = (n as f64).sqrt().ceil() as u32;
             (c, n.div_ceil(c))
         } else {
             (1, 1)
         };
-        let (width, height) = fit_budget(w0, h0, cols, rows);
+        // Canvases: sized to the model's own proportions when the caller
+        // gave no size (a tall figure doesn't need a wide frame), with a
+        // pixel budget set by `detail`.
+        let auto = width.is_none() && height.is_none();
+        let bounds = if auto {
+            self.frame_bounds(&focus).await?
+        } else {
+            None
+        };
+        let (area_cell, area_one) = if hi {
+            (307_200.0, 921_600.0)
+        } else {
+            (150_528.0, 451_584.0)
+        };
         let mut notes = Vec::new();
-        if (width, height) != (w0, h0) {
-            notes.push(format!(
-                "cells shrunk from {w0}x{h0} to {width}x{height} to stay within the ~1.15 MP image budget"
-            ));
+        let mut sizes: Vec<(u32, u32)> = if auto && grid {
+            // One cell size for the tiles: the geometric mean of the views'
+            // natural proportions.
+            let mean = (parsed
+                .iter()
+                .map(|(v, _, f, ..)| natural_aspect(*v, f.or(bounds)).clamp(0.4, 2.5).ln())
+                .sum::<f32>()
+                / n as f32)
+                .exp();
+            let (w0, h0) = canvas_for(mean, area_cell);
+            let (w, h) = fit_budget(w0, h0, cols, rows);
+            notes.push(format!("cells framed to the model: {w}x{h} each"));
+            vec![(w, h); n as usize]
+        } else if auto {
+            parsed
+                .iter()
+                .map(|(v, _, f, ..)| canvas_for(natural_aspect(*v, f.or(bounds)), area_one))
+                .collect()
+        } else {
+            let (dw, dh) = match (grid, hi) {
+                (true, true) => (640, 480),
+                (true, false) => (448, 336),
+                (false, true) => (1280, 720),
+                (false, false) => (896, 504),
+            };
+            let (w0, h0) = (
+                width.unwrap_or(dw).clamp(64, 4096),
+                height.unwrap_or(dh).clamp(64, 4096),
+            );
+            if grid {
+                let (w, h) = fit_budget(w0, h0, cols, rows);
+                if (w, h) != (w0, h0) {
+                    notes.push(format!(
+                        "cells shrunk from {w0}x{h0} to {w}x{h} to stay within the ~1.15 MP image budget"
+                    ));
+                }
+                vec![(w, h); n as usize]
+            } else {
+                vec![(w0, h0); n as usize]
+            }
+        };
+        if !grid {
+            // Separate images share one budget, and each keeps the long-edge cap.
+            let total: f64 = sizes.iter().map(|(w, h)| *w as f64 * *h as f64).sum();
+            let k = (MAX_PIXELS / total).sqrt().min(1.0);
+            let before = sizes.clone();
+            for (w, h) in &mut sizes {
+                let ke = (MAX_LONG_EDGE / (*w).max(*h) as f64).min(1.0);
+                let ks = k.min(ke);
+                *w = ((*w as f64 * ks) as u32).max(64);
+                *h = ((*h as f64 * ks) as u32).max(64);
+            }
+            if sizes != before && !auto {
+                notes.push(format!(
+                    "images shrunk to {}x{} to stay within the ~1.15 MP total for the call",
+                    sizes[0].0, sizes[0].1
+                ));
+            }
         }
         let style_key = format!(
             "{}{}",
@@ -1776,7 +1939,8 @@ Style::default()
             if dims { "+dims" } else { "" }
         );
         let mut shots = Vec::with_capacity(parsed.len());
-        for (view, t, frame, joint, var) in &parsed {
+        for (idx, (view, t, frame, joint, var)) in parsed.iter().enumerate() {
+            let (width, height) = sizes[idx];
             let mut st = shot_style.clone();
             st.pose = t.map(|t| (clip.clone(), t));
             st.frame = *frame;
@@ -1819,12 +1983,16 @@ Style::default()
             let (img, frac, bb) = modeler::raster::diff(&before, &after)
                 .map_err(|e| ErrorData::internal_error(e, None))?;
             let pct = frac * 100.0;
-            notes.push(match bb {
-                None => format!("{label}: no visible change"),
-                Some([x0, y0, x1, y1]) => format!(
-                    "{label}: {pct:.1}% of pixels changed (magenta = now there, cyan = was there), within px box [{x0}, {y0}]..[{x1}, {y1}]"
-                ),
-            });
+            let Some([x0, y0, x1, y1]) = bb else {
+                // Nothing moved: the note says so, and no picture is spent on it.
+                notes.push(format!("{label}: no visible change (no image)"));
+                continue;
+            };
+            notes.push(format!(
+                "{label}: {pct:.1}% of pixels changed (magenta = now there, cyan = was there), shown cropped to px box [{x0}, {y0}]..[{x1}, {y1}] of the {width}x{height} render"
+            ));
+            let m = 12;
+            let img = img.crop([x0.saturating_sub(m), y0.saturating_sub(m), x1 + m, y1 + m]);
             let out = img
                 .to_png()
                 .map_err(|e| ErrorData::internal_error(e, None))?;
@@ -1844,7 +2012,13 @@ Style::default()
             ));
         }
         head.extend(notes);
-        if grid {
+        if shots.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                head.join("\n"),
+            )]));
+        }
+        // Diffs are cropped to what changed, so they are returned one by one.
+        if grid && !diff {
             let labels: Vec<String> = shots
                 .iter()
                 .enumerate()
@@ -1859,11 +2033,19 @@ Style::default()
                     labels.join(", ")
                 ),
             );
+            if let Some(d) = modeler::raster::png_dims(&png) {
+                head.push(cost_note([d]));
+            }
             return Ok(CallToolResult::success(vec![
                 Content::text(head.join("\n")),
                 Content::image(B64.encode(png), "image/png"),
             ]));
         }
+        head.push(cost_note(
+            shots
+                .iter()
+                .filter_map(|(png, _)| modeler::raster::png_dims(png)),
+        ));
         let mut content = Vec::with_capacity(shots.len() * 2 + 1);
         if !head.is_empty() {
             content.push(Content::text(head.join("\n")));
@@ -1878,7 +2060,8 @@ Style::default()
     /// Measure and probe the model numerically: `measure` pairs (gap,
     /// touching or overlap volume/depth between two parts; one name = its
     /// height above the ground), `section` (cut with the plane axis = at: per
-    /// part area, outlines, holes, thinnest wall, plus an image of the cut)
+    /// part area, outlines, holes, thinnest wall as numbers; `image: true`
+    /// adds a picture of the cut)
     /// and `mass` (mass, centre of mass, and whether it tips over and at what
     /// tilt; density kg/m3 per part, default 1000). Any combination in one call.
     #[tool]
@@ -1886,6 +2069,8 @@ Style::default()
         &self,
         Parameters(InspectArgs {
             doc: _,
+            image,
+            detail,
             measure,
             section,
             mass,
@@ -1987,10 +2172,29 @@ Style::default()
             })
             .await?;
         let mut result = result;
+        let hi = parse_detail(detail.as_deref())?;
+        let mut left_out = 0;
         while let Ok(png) = png_rx.try_recv() {
-            result
-                .content
-                .push(Content::image(B64.encode(png), "image/png"));
+            if image.unwrap_or(false) {
+                let png = if hi {
+                    png
+                } else {
+                    modeler::raster::shrink_png(&png, 0.8)
+                };
+                if let Some(d) = modeler::raster::png_dims(&png) {
+                    result.content.push(Content::text(cost_note([d])));
+                }
+                result
+                    .content
+                    .push(Content::image(B64.encode(png), "image/png"));
+            } else {
+                left_out += 1;
+            }
+        }
+        if left_out > 0 {
+            result.content.push(Content::text(format!(
+                "({left_out} picture(s) of the cut / plot left out: the numbers above answer it; pass image: true to see it)"
+            )));
         }
         Ok(result)
     }
@@ -2303,7 +2507,7 @@ impl rmcp::ServerHandler for Tools {
 - Materials follow lineage: copies and cuts of a part inherit its in-place material wherever the material item sits.
 - A timeout error from your MCP client does not mean the call failed: the server keeps working, so check history or scene_summary before retrying an apply_ops.
 - Several agents may share one server (the driver daemon): each keeps its own active document, results say what other agents changed in yours since your last call, undo refuses to revert another agent's step (undo force: true), apply_ops warns when it replaces another agent's op, and save_prefab refuses a catalog file someone else saved since you loaded it (force: true to overwrite). Agents that share a session (subagents share one client id) must pass doc: <open document name> on every tool that reads or changes a document (apply_ops, verify, inspect, agent_views, scene_summary, ops, op_get, probe_ray, screenshot, set_camera, style, material_ops, annotations, history, undo, redo, jump, diff, cherry_pick, history_prune, set_model_name, save_prefab, export_model); a doc that was idle-closed, parked or is a catalog prefab is reopened automatically (unknown names error), and save_prefab refuses a name another open document holds. new_model never displaces work: unless the current document is empty it starts beside it (both stay open), and a name that is already open is refused.
-- Working efficiently: verify numerically between steps and render once per model at the end with one tiled agent_views (e.g. [\"front\", \"right\", \"top\", \"iso\"]), not after every step. For many identical props in a map (hundreds of desk fans), model one prefab (the fan, with its rotor clip) and place prefab instances, or bake a set into one prefab with arrays: never hundreds of separate items. Prefab instances export by reference in a .bsn.
+- Working efficiently: verify numerically between steps and render once per model at the end with one tiled agent_views (e.g. [\"front\", \"right\", \"top\", \"iso\"]), not after every step. Pictures cost tokens (about w x h / 750 each, and every call says what it spent): views are sized to the model and cheap by default (detail \"low\"); ask for detail \"high\" or inspect image: true only when fine detail is the question, and prefer verify / inspect numbers, which cost almost nothing. For many identical props in a map (hundreds of desk fans), model one prefab (the fan, with its rotor clip) and place prefab instances, or bake a set into one prefab with arrays: never hundreds of separate items. Prefab instances export by reference in a .bsn.
 - transform is absolute unless relative: true (offsets: translation adds, rotation composes, scale multiplies).
 - radial_array defaults to include_source: true (source = item 0, count items evenly spread); axis x/z for horizontal rings.
 - extrude (footprint [[x, z], ...] up y = 0..height; twist, scale_top about [0, 0]) and revolve ([[radius, y], ...] around y; degrees) make closed solids from 2D profiles; inner rings are holes. Profile entries may be arcs {\"arc\": {center, radius, from, to}}; round: r fillets profile corners.
@@ -2314,7 +2518,7 @@ impl rmcp::ServerHandler for Tools {
 - Verify in the same call with apply_ops expect {parts (\"gz.*\" globs), includes, grounded, supported, rests [[a, b]], attached [[a, b]] (touching on any side, no gravity: mechanisms), collisions, stable, bounds {min,max,tol}, validate, rebuild, scope [patterns], coaxial / centered_on [[a, b]], flush [{a, b, face}], symmetric {parts, axis}, equal_spacing {parts}, density {min_features_per_m2, min_area} (big bare surfaces)}, or call verify. Warnings also flag near misses (1-5 mm gaps / off-flush faces, near-symmetry, uneven runs, sizes under 2% apart) and boxy models (style number lint_boxy: 0 silences that). grounded = reaches the ground through touching parts (real geometry); supported = nothing hangs (held through contact below the centre of mass or a joint by parts that are themselves supported); collisions = no part passes through another (grounded/supported count overlaps as joints; grounded names parts held up only by a deep overlap, \"strict\" fails them). A collisions allow entry may be [a, b, depth] or {\"pair\": [a, b], \"depth\": 0.003} to excuse only shallow overlaps; avoid [x, \"*\"] catch-alls. move/place part globs match visible parts only (exact names and a bare * still take hidden ones); move/place results report where the parts went, parts left behind and new overlaps. probe_ray proves openings (headless too). walkable {from, to, via?, agent?: {radius 0.3, height 1.8, step 0.3, max_slope 45}} checks a character can walk the route (stairs, doorways, corridors) and names the blocker: a step too tall, low headroom, a gap too narrow, a steep slope.
 - Organic workflow: start from body or silhouette (or sdf / skin with oval sections), compare with agent_views reference in up to 3 views and read the band deviations, fix them with local warps or joint overrides, check style \"curvature\" and inspect proportions, then set tris (+ bake) last. Level-set results are finished automatically (sharp joins come out straight); give a join meant to be soft a blend, and treat a ragged crease warning as a cue to re-derive or raise tris.
 - inspect answers \"how close / how thick / will it stand\": measure [[a, b]] (gap, touching, or overlap volume and depth), section {axis, at} (cut outlines, areas, thinnest wall, plus an image of the cut) and mass (centre of mass, tips over or not); proportions {parts?} gives a body's bone-chain lengths and ratios (biped head/height ~0.133, leg/height, arm span/height).
-- agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image under ~1.15 MP: [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views; style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} (or a list: front, side, top in one call) compares the silhouette with a PNG: overlay, IoU and the biggest band deviations (\"front: top 0-20%: model 14% wider (+3.1 cm)\"). Look at an image after building.
+- agent_views renders named views or cameras you place ({yaw, pitch, dist?, target?, ortho?}; yaw 0 = front) and tiles several into ONE image sized to the model (detail \"low\", about 800 tokens for four views; \"high\" for fine detail; never over ~1.15 MP per call): [\"front\", \"right\", \"top\", \"iso\"] is one read. style \"ids\" = flat colour per part with a legend; dims = sizes + scale bar; diff = what changed since the last render of the same views (cropped to the change; no picture when nothing moved); style \"silhouette\" (black on white: shape only) and \"density\" (red = sparse, green = busy); focus \"joints\" (or joints: N) frames the contact regions as close-ups; reference {image, view} (or a list: front, side, top in one call) compares the silhouette with a PNG: overlay, IoU and the biggest band deviations (\"front: top 0-20%: model 14% wider (+3.1 cm)\"). Look at an image after building.
 - scatter places clutter where it belongs: near [parts] + near_distance (3D distance to their surfaces; along wall bases), edge_bias (corners, borders), clump {count, radius}, mask path / pad / not_path / not_pad and height [min, max] on terrain; scatter with decal {pbr, size} instead of input strews decals (cracks, stains, leaves).
 - apply_ops results end with a brief summary (parts added/changed/removed + warnings); summary: \"full\" or scene_summary for everything. Each apply_ops call is one undo step; history shows the newest 30 nodes (limit for more).
 - undo/redo/jump move a history-tree cursor; jump restores that node's ops exactly. diff(from, to?) shows what changed; cherry_pick(from, ops?) replays ops from another branch.

@@ -49,14 +49,22 @@ pub(crate) struct InspectArgs {
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) doc: Option<String>,
+    /// Attach the picture of a `section` cut or the `curves` plot (default
+    /// false: the numbers come back as text, and a picture costs ~1k tokens).
+    #[serde(default)]
+    pub(crate) image: Option<bool>,
+    /// "low" (default) or "high": the size of those pictures when asked for.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
     /// Pairs to measure: [["a", "b"], ...] gives the gap, contact or overlap
     /// (volume and depth) between two parts; ["a"] alone gives its height
     /// above the ground.
     #[serde(default)]
     pub(crate) measure: Option<Vec<Vec<String>>>,
     /// A planar cut: {"axis": "x"|"y"|"z", "at": value, "parts"?: [...]}.
-    /// Returns each part's section area, outlines, holes and thinnest wall,
-    /// plus an image of the cut (y = plan, z = front, x = side).
+    /// Returns each part's section area, outlines, holes and thinnest wall
+    /// as numbers; add `image: true` for a picture of the cut too (y = plan,
+    /// z = front, x = side).
     #[serde(default)]
     pub(crate) section: Option<SectionArg>,
     /// Weigh the visible parts: {"density"?: {"part": kg/m3}, "default_density"?:
@@ -227,6 +235,23 @@ pub(crate) struct DocOnlyArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct ScreenshotArgs {
+    /// Run on this open document (by name) instead of your active one; the
+    /// call errors if it isn't open. Agents sharing a session (subagents)
+    /// should always pass it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) doc: Option<String>,
+    /// Pixel width of the returned image (height keeps the render's
+    /// proportions). Default 960; 1280 with `detail: "high"`. Never scales up.
+    #[serde(default)]
+    pub(crate) width: Option<u32>,
+    /// "low" (default, 960 wide) or "high" (the full 1280x800 render).
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct NameArgs {
     /// The new name.
     pub(crate) name: String,
@@ -350,9 +375,12 @@ pub(crate) struct MaterialViewArgs {
     /// Channel thumbnails to show (default: base_color + every driven one).
     #[serde(default)]
     pub(crate) channels: Option<Vec<String>>,
-    /// Sphere image size in px (default 256).
+    /// Sphere image size in px (default 192; 256 with `detail: "high"`).
     #[serde(default)]
     pub(crate) size: Option<usize>,
+    /// "low" (default) or "high": the default sphere size.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
     /// Preview sphere diameter in meters (default 2 tiles, or 0.5 m).
     #[serde(default)]
     pub(crate) diameter: Option<f32>,
@@ -394,6 +422,10 @@ pub(crate) struct StyleArgs {
     pub(crate) doc: Option<String>,
     /// show, set, replace, clear, list, describe, save, load or delete.
     pub(crate) action: String,
+    /// Attach the swatch picture where an action makes one (default false:
+    /// the tokens come back as text).
+    #[serde(default)]
+    pub(crate) image: Option<bool>,
     /// For set / replace: {brief?, colors?: {name: colour}, materials?: {name:
     /// {color, roughness, metalness, pbr, params, scale}}, numbers?: {name: n},
     /// defaults?: {item_type: {field: value}}}. In set, a null value removes a token.
@@ -606,14 +638,22 @@ pub(crate) struct AgentViewsArgs {
     /// ["front", "right", "top", "iso"] or [{"yaw": 30, "pitch": 20}, ...].
     #[serde(default = "default_views")]
     pub(crate) views: Vec<ViewArg>,
-    /// Pixel width per view. Default 1280 (640 per cell in a grid, shrunk so
-    /// the whole image stays under ~1.15 MP, the size a model reads at full
-    /// detail).
+    /// Pixel width per view. Default: sized to the model (the canvas takes
+    /// the model's own proportions, so a tall figure isn't a small figure in
+    /// a wide frame), about 448x336 worth of pixels per grid cell or
+    /// 896x504 for a single view; `detail: "high"` is 640x480 / 1280x720.
+    /// Everything is shrunk so a call's images total under ~1.15 MP.
     #[serde(default)]
     pub(crate) width: Option<u32>,
-    /// Pixel height per view. Default 720 (480 per cell in a grid).
+    /// Pixel height per view (see width).
     #[serde(default)]
     pub(crate) height: Option<u32>,
+    /// "low" (default) or "high": how many pixels a view gets. Low reads
+    /// every proportion and most details at about a third of the tokens;
+    /// ask for high when the question is fine detail (thin parts, small
+    /// text, subtle overlays).
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
     /// Frame only these parts (hidden ones included) instead of the whole
     /// model; or "joints": close-ups of where parts meet (see `joints`).
     #[serde(default)]

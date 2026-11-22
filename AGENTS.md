@@ -81,7 +81,8 @@ python3 mcp_driver.py --daemon --windowed &   # skip if the shared daemon is up
 
 Without `--windowed` the daemon runs `--offscreen`: the full renderer with no
 window. `agent_views` works, and `screenshot` renders the window camera's
-view offscreen (1280x800; `set_camera` and auto-framing steer it as usual).
+view offscreen (1280x800, returned 960 wide unless `detail: "high"` or `width`;
+`set_camera` and auto-framing steer it as usual).
 `--headless` drops rendering entirely.
 
 Then talk to it with `python3 mcp_driver.py --connect --calls <file>` (JSON
@@ -1505,9 +1506,16 @@ name: the producer first, then in-place material/visibility/transform edits).
     `material_view` shades its sphere with the same studio. Renders wait for
     the environment light to finish filtering, so a shot right after startup
     is never blank.
-  - Images are sized to stay under ~1.15 MP (long edge 1568), the size a
-    model reads at full detail; bigger grids shrink their cells (the
-    result says so). A 2x2 grid of 640x480 is ~1.6k tokens.
+  - **Image cost** is pixels and image count (about w x h / 750 tokens per
+    image; JPEG/WebP would not change it). So: a call's images total at
+    most ~1.15 MP (long edge 1568); `detail: "low"` (the default) gives a
+    grid cell about 448x336 worth of pixels (a single view 896x504), and
+    `"high"` the old 640x480 / 1280x720. With no `width` / `height` the
+    canvas takes the model's own proportions (`natural_aspect`: a standing
+    figure gets a tall cell, a table a wide one), and the framing is tight:
+    the cardinal views keep 8% slack, `iso` and custom perspective views fit
+    the box's corners to the frustum (`fit_perspective`), not its bounding
+    sphere. Every image result ends with `~N image tokens`.
   - `style: "ids"`: each part a flat, unlit, distinct colour with a legend
     (and the colour order in the text), to tell which shape is which part.
   - `style: "curvature"`: each part painted by mean curvature (white flat,
@@ -1548,7 +1556,8 @@ name: the producer first, then in-place material/visibility/transform edits).
     scale in orthographic views. Perspective views have no single scale:
     they state the model's box size ("not the view") and a scale bar valid
     only at the look-at point's depth.
-  - `diff: true`: compares with the previous render of the same view, size,
+  - `diff: true` (cropped to what changed, one image per view; none when
+    nothing changed): compares with the previous render of the same view, size,
     focus and style: magenta where something now is, cyan where something
     was, the rest greyed, plus the changed share and pixel box.
 - `inspect(measure?, section?, mass?, thickness?, proportions?)`: numeric senses, any
@@ -1569,8 +1578,9 @@ name: the producer first, then in-place material/visibility/transform edits).
     gap), touching, or overlapping (shared volume and penetration depth),
     plus per-axis box gaps and where an overlap is centred (so an intended joint, like a stay meeting a hub, tells apart from a collision); one name gives its height above the ground.
   - `section: {axis, at, parts?}`: cuts with the plane `axis = at` and
-    reports per part the area, outlines, holes and thinnest wall, plus an
-    image of the cut (y = plan, z = front, x = side). Shows hidden
+    reports per part the area, outlines, holes and thinnest wall as numbers;
+    `image: true` adds the picture of the cut (y = plan, z = front, x = side;
+    640x480 at `detail: "low"`, 800x600 at `"high"`). Shows hidden
     interiors no outside view can: wall thickness, handles poking inside.
   - `mass: {parts?, density?: {part: kg/m3}, default_density?}` (`parts`
     weighs one object of a scene, `*` globs, on its own footprint): per-part and total
@@ -2278,7 +2288,7 @@ agent views, verify, inspect, export and the window.
   ["height", "speed", "angle", "x", "z"], samples?: 120})` (headless, no
   renderer): per bone and channel the min / max with their times and the
   mean, the contact spans `[t0, t1]` where the tip is within 3 cm of the
-  ground, and one image of small-multiple line plots (time on x, one row
+  ground, and (with `image: true`) one image of small-multiple line plots (time on x, one row
   per channel, one coloured line per bone, the clip's key times as faint
   vertical ticks, planted bars under the plot). `height` = tip world y (m),
   `speed` = tip speed (m/s), `angle` = the bone's rotation from rest (deg),
@@ -2596,7 +2606,7 @@ A model carries a **style**: design tokens items read instead of literal
 values, so a generated scene has one cohesive look and restyles in one call
 (`src/style.rs`). Set it first, then build with tokens.
 
-- `style(action, tokens?, name?, ...)`: `show` (tokens + a swatch image),
+- `style(action, tokens?, name?, ...)`: `show` (tokens; `image: true` adds a swatch picture),
   `set` (merge `tokens`; a null removes a token), `replace`, `clear`, and
   the library (`<data>/styles`): `list`, `describe`, `save` (name,
   description, tags, prompt), `load` (becomes the model's style), `delete`.
@@ -2773,7 +2783,7 @@ work, and every material has its own history tree.
   a failure gives the node's 5/50/95% values and, for a node with an
   `input` (levels, remap), the input value that would hit the wanted
   coverage, so the threshold is one edit away).
-- `material_view(material?, node?, channels?, size?, diameter?)`: one
+- `material_view(material?, node?, channels?, size?, diameter?, detail?)`: one
   image, rendered on the CPU from the bake that gets exported (works
   headless): a lit sphere plus channel thumbnails, or one node's output
   (`"g.id"`), with the value range in the text.
