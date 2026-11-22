@@ -1420,8 +1420,21 @@ pub fn describe(name: &str) -> Result<String, ModelerError> {
         .iter()
         .find(|e| e.name == wanted)
         .ok_or_else(|| format!("no prefab named '{wanted}' in the catalog"))?;
+    // Size and origin of what an instance draws (visible parts, prefab's own
+    // frame), so a prop can be placed and given a collider without probing.
+    let bounds = prefab_instance(&entry.name)
+        .ok()
+        .and_then(|m| m.bounds())
+        .map(|(lo, hi)| {
+            let (sz, c) = (hi - lo, (lo + hi) * 0.5);
+            format!(
+                "x [{:.2}, {:.2}] y [{:.2}, {:.2}] z [{:.2}, {:.2}] (size {:.2} x {:.2} x {:.2}, centre {:.2}, {:.2}, {:.2}; the origin is 0, 0, 0)",
+                lo.x, hi.x, lo.y, hi.y, lo.z, hi.z, sz.x, sz.y, sz.z, c.x, c.y, c.z
+            )
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     Ok(format!(
-        "name: {}\ndescription: {}\ntags: {}\nknobs: {}\nprompt: {}\nfile: {}\ncreated: {}",
+        "name: {}\nbounds: {bounds}\ndescription: {}\ntags: {}\nknobs: {}\nprompt: {}\nfile: {}\ncreated: {}",
         entry.name,
         entry.description,
         entry.tags.join(", "),

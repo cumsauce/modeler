@@ -1,0 +1,87 @@
+<title>Modeler Session Issues</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Space+Grotesk:wght@500;700&family=JetBrains+Mono&display=swap">
+<style>
+/* Layout: single readable column, severity chips on each issue */
+:root{--bg:#f6f7f9;--fg:#1b1f24;--muted:#5b6470;--line:#d9dde3;--code:#eceef2;--crit:#b42318;--warn:#a15c07;--info:#2f5fa7;
+--display:"Space Grotesk",system-ui,sans-serif;--body:Inter,system-ui,sans-serif;--mono:"JetBrains Mono",ui-monospace,monospace}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15181c;--fg:#e6e9ee;--muted:#9aa3ae;--line:#2c323a;--code:#20252c;--crit:#f97066;--warn:#f5b04a;--info:#7aa7f0;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#15181c;--fg:#e6e9ee;--muted:#9aa3ae;--line:#2c323a;--code:#20252c;--crit:#f97066;--warn:#f5b04a;--info:#7aa7f0;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:15px/1.6 var(--body);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:40px}
+main{max-width:720px;margin:0 auto;display:grid;gap:28px}
+h1,h2{font-family:var(--display);text-wrap:balance;margin:0}
+h1{font-size:30px}h2{font-size:19px}
+p,ul{margin:0}ul{padding-left:20px;display:grid;gap:4px}
+.meta{color:var(--muted)}
+section{display:grid;gap:10px;border-top:1px solid var(--line);padding-top:20px}
+.chip{font:600 11px var(--body);letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:99px;border:1px solid currentColor;justify-self:start}
+.crit{color:var(--crit)}.warn{color:var(--warn)}.info{color:var(--info)}
+code{font-family:var(--mono);font-size:13px;background:var(--code);padding:1px 4px;border-radius:4px}
+pre{font-family:var(--mono);font-size:12.5px;background:var(--code);padding:12px;border-radius:6px;overflow-x:auto;margin:0}
+</style>
+<main>
+<header style="display:grid;gap:6px">
+<h1>Modeler session issues</h1>
+<p class="meta">Problems hit while building a detailed AK-47 model (53 parts, two procedural materials) through the modeler MCP tools. One crash bug, plus several smaller rough edges.</p>
+</header>
+
+<section>
+<span class="chip crit">Crash</span>
+<h2>1. <code>silhouette</code> ops make the server exit with SIGSEGV</h2>
+<p>Any <code>apply_ops</code> batch that contained <code>silhouette</code> items killed the server. The tool returned:</p>
+<pre>daemon error: server closed stdout (the modeler server exited: code -11: killed by SIGSEGV)</pre>
+<p>It happened twice:</p>
+<ul>
+<li><b>First crash:</b> a mixed batch of about 30 items (primitives, sweeps, a loft, silhouettes with <code>side</code>, <code>top</code> and sometimes <code>front</code> outlines, some with arc ring items, and materials).</li>
+<li><b>Second crash:</b> a batch of only six <code>silhouette</code> items. They used plain point outlines, with no arcs, no <code>front</code>, and no <code>smooth</code>. The same primitives, sweeps and loft from the first batch had already been applied on their own without trouble, so silhouette is the likely cause.</li>
+</ul>
+<p>The parts were small, real-world gun parts: a few centimeters across, with <code>round</code> from 0.002 to 0.008 m. My guess is that the default voxel resolution or the corner rounding fails at that small scale. Example item from the second batch:</p>
+<pre>{"type":"silhouette","name":"gas_block",
+ "side":[[0.345,0.985],[0.375,0.985],[0.375,1.05],[0.355,1.05]],
+ "top":[[-0.015,0.345],[0.015,0.345],[0.015,0.375],[-0.015,0.375]],
+ "round":0.003}</pre>
+<p><b>Workaround:</b> I built each side outline as an <code>extrude</code> with <code>rotation: {z: 90}</code> instead (profile given as [y, z], extruded across x). That worked every time.</p>
+</section>
+
+<section>
+<span class="chip crit">Data loss</span>
+<h2>2. A crash wipes the open document</h2>
+<ul>
+<li>After each restart, <code>scene_summary</code> showed an empty document named <code>model</code>. My document <code>ak47</code>, its name, every op and every part from earlier calls were gone.</li>
+<li>The materials I had made with <code>material_ops</code> also seemed to disappear, so I rebuilt them before going on.</li>
+<li>Saving the document's ops automatically, or keeping a crash journal, would mean one bad op doesn't wipe a whole session's work.</li>
+</ul>
+</section>
+
+<section>
+<span class="chip warn">Docs</span>
+<h2>3. <code>describe_op</code> doesn't cover material nodes</h2>
+<p><code>describe_op</code> only knows <code>apply_ops</code> item types. Asking it about material nodes such as <code>noise</code>, <code>ramp</code>, <code>warp</code> or <code>output</code> returns "unknown type". Yet the <code>material_ops</code> description says "describe_op(kind) has an example and schema for every node type". To find the node list and required fields, I had to send <code>material_ops</code> calls that I expected to fail and read the errors (for example, that <code>noise</code> needs <code>size</code> and <code>remap</code> needs <code>from</code>). The error messages were clear, but a real schema lookup would be faster.</p>
+</section>
+
+<section>
+<span class="chip warn">Usability</span>
+<h2>4. <code>ops_file</code> can't be used without a project</h2>
+<p>I generated a batch of 112 items with a script and passed it through <code>ops_file</code>. Even with an absolute path, the call was refused with "this call has no project to read it from". I had to paste the whole batch inline instead. It would help if <code>ops_file</code> took an absolute path when no project is set, or if the error said how to set a project up.</p>
+</section>
+
+<section>
+<span class="chip info">Minor</span>
+<h2>5. Smaller notes</h2>
+<ul>
+<li><code>material_catalog</code> once switched the active document without saying so, because another agent's document (<code>fs-room-pit</code>) had been active. The tool did report it afterwards, which was helpful.</li>
+<li><b>Too many warnings:</b> the near-flush and near-touch warnings fill the summary on mechanical models, where parts sit a millimeter apart on purpose (57 warnings for 53 parts). A way to turn them down, or to group them, would help.</li>
+<li>Material ops for hidden or helper parts (boolean inputs) are accepted silently. That's fine, but it means the "default material" warnings only show for parts you can see.</li>
+</ul>
+</section>
+
+<section>
+<span class="chip info">What worked well</span>
+<h2>6. What went smoothly</h2>
+<ul>
+<li>Batches either applied fully or not at all, and the error messages named the exact field, so problems were quick to fix.</li>
+<li><code>extrude</code>, <code>loft</code> along a path (a curved magazine), <code>sweep</code>, <code>boolean</code> and <code>repeat</code> all behaved as documented.</li>
+<li>Procedural wood grain (noise stretched along the grain and warped) and the worn-steel material took only two or three calls each.</li>
+</ul>
+</section>
+</main>

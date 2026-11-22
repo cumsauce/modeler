@@ -2717,6 +2717,16 @@ pub struct GarmentSpec {
     pub def: crate::garment::GarmentDef,
 }
 
+/// A carve item: `name` plus [`crate::carve::CarveDef`].
+#[derive(schemars::JsonSchema)]
+pub struct CarveSpec {
+    /// Base name of the sheets (`name`, or `name_floor`, `name_<cutter>`...
+    /// by `split_by`; `name_outer` for the outside skin).
+    pub name: String,
+    #[serde(flatten)]
+    pub def: crate::carve::CarveDef,
+}
+
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PartSpec {
@@ -2788,6 +2798,11 @@ pub struct PrefabSpec {
     /// default look. A .bsn export writes it for game code.
     #[serde(default)]
     variant: Option<String>,
+    /// Also make a `block` marker `<name>_blk` (a `Block` collider) filling
+    /// the instance's world bounds: for props that should be solid in games
+    /// that build colliders from markers. Default false.
+    #[serde(default)]
+    block: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3819,6 +3834,7 @@ pub const OP_TYPES: &[&str] = &[
     "decimate",
     "shell",
     "garment",
+    "carve",
     "panel",
     "transform",
     "move",
@@ -4825,6 +4841,31 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             let def: crate::garment::GarmentDef = de(&ctx, &Value::Object(obj))?;
             crate::garment::validate(&def).map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Garment { name, def })
+        }
+        "carve" => {
+            let Some(obj) = body.as_object() else {
+                return Err(format!("{ctx}: expected an object"));
+            };
+            let mut obj = obj.clone();
+            let name = match obj.remove("name") {
+                Some(Value::String(n)) if !n.is_empty() => n,
+                _ => return Err(format!("{ctx}: name: a non-empty string is required")),
+            };
+            obj.remove("type");
+            for k in obj.keys() {
+                if !crate::carve::FIELDS.contains(&k.as_str()) {
+                    return Err(format!(
+                        "{ctx}: unknown field `{k}` (fields: name, {})",
+                        crate::carve::FIELDS.join(", ")
+                    ));
+                }
+            }
+            let def: crate::carve::CarveDef = de(&ctx, &Value::Object(obj))?;
+            crate::carve::validate(&def).map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Carve {
+                name,
+                def: Box::new(def),
+            })
         }
         "shell" => {
             let s: ShellSpec = de(&ctx, &body)?;
@@ -5973,6 +6014,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                         .map_err(|e| format!("{ctx}: {e}"))?;
                     s.components
                 },
+                block: s.block,
             })
         }
         other => {
@@ -6070,6 +6112,9 @@ pub fn example(ty: &str) -> Option<Value> {
         }
         "shell" => {
             json!({"type": "shell", "name": "carcass", "input": "carcass_raw", "thickness": 0.018, "open": "front"})
+        }
+        "carve" => {
+            json!({"type": "carve", "name": "bunker", "cutters": ["hall", "cell", "door"], "split_by": "facing", "wall": 0.3, "markers": true, "collider": "mesh"})
         }
         "garment" => {
             json!({"type": "garment", "name": "shirt", "on": "eve", "preset": "tshirt", "region": {"neck": "v"}, "offset": 0.006})
@@ -6209,6 +6254,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "decimate" => schemars::schema_for!(DecimateSpec),
         "shell" => schemars::schema_for!(ShellSpec),
         "garment" => schemars::schema_for!(GarmentSpec),
+        "carve" => schemars::schema_for!(CarveSpec),
         "panel" => schemars::schema_for!(PanelSpec),
         "transform" => schemars::schema_for!(TransformSpec),
         "move" => schemars::schema_for!(MoveSpec),

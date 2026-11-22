@@ -231,6 +231,7 @@ fn slow(op: &Op) -> bool {
             | Op::Round { .. }
             | Op::Shell { .. }
             | Op::Garment { .. }
+            | Op::Carve { .. }
             | Op::Panel { .. }
             | Op::LSystem { .. }
             | Op::Terrain { .. }
@@ -1183,6 +1184,16 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 .map_err(|e| ModelerError::Invalid(format!("decimate `{name}`: {e}")))?;
             upsert(named, name, part);
         }
+        Op::Carve { name, def } => {
+            let parts = {
+                let view: &Named = named;
+                crate::carve::build(name, def, &|n| lookup_shared(view, n))?
+            };
+            for p in parts {
+                let n = p.name.clone();
+                upsert(named, &n, p);
+            }
+        }
         Op::Split {
             name,
             input,
@@ -1692,6 +1703,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Smooth { name, .. }
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
+        | Op::Carve { name, .. }
         | Op::LSystem { name, .. }
         | Op::Text { name, .. }
         | Op::Terrain { name, .. }
@@ -1768,6 +1780,7 @@ pub fn outputs(op: &Op) -> Vec<String> {
             (0..n).map(|i| format!("{name}_{i}")).collect()
         }
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
+        Op::Carve { name, def } => crate::carve::output_names(name, def),
         Op::Split { name, keep, .. } => ["above", "below"]
             .iter()
             .filter(|side| keep == "both" || keep == *side)
@@ -1820,6 +1833,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Smooth { .. } => "smooth",
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
+        Op::Carve { .. } => "carve",
         Op::LSystem { .. } => "lsystem",
         Op::Text { .. } => "text",
         Op::Terrain { .. } => "terrain",
@@ -1896,6 +1910,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
             vec![input]
         }
         Op::Garment { def, .. } => vec![def.on.as_str()],
+        Op::Carve { def, .. } => crate::carve::reads(def),
         Op::Scatter { input, on, def, .. } => {
             let mut v: Vec<&str> = input.iter().flatten().map(String::as_str).collect();
             v.push(on);
@@ -2071,6 +2086,10 @@ pub fn describe(ops: &[Op]) -> String {
                         serde_json::to_string(&def.ik).unwrap_or_default()
                     )
                 }
+            ),
+            Op::Carve { name, def } => format!(
+                "#{i} carve `{name}` {}",
+                serde_json::to_string(def).unwrap_or_default()
             ),
             Op::Garment { name, def } => format!(
                 "#{i} garment `{name}` on `{}` {}",

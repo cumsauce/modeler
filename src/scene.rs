@@ -628,7 +628,7 @@ pub fn export_scene(
                 } if *name == m.name => Some(components.clone()),
                 _ => None,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| m.components.clone());
         entities.push(Entity {
             name: m.name.clone(),
             kind: Some(m.kind.clone()),

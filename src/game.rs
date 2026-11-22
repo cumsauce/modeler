@@ -19,6 +19,9 @@ pub struct Marker {
     pub data: Option<Value>,
     /// A catalog prefab to draw here in previews (see `Op::Marker`).
     pub preview: Option<String>,
+    /// Game components a derived marker brings (a carve's `Block`s); explicit
+    /// `marker` items keep theirs on the op.
+    pub components: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +70,45 @@ pub fn markers(model: &Model) -> Result<Vec<Marker>, ModelerError> {
         .collect())
 }
 
+/// The `room` / `opening` markers of a carve (from its cutters' boxes).
+fn carve_markers(
+    model: &Model,
+    name: &str,
+    def: &crate::carve::CarveDef,
+) -> Vec<(Marker, Option<String>)> {
+    let mut boxes: Vec<crate::carve::BoxOf> = Vec::new();
+    for c in &def.cutters {
+        if let Some(p) = model.part(c).filter(|p| !p.verts.is_empty()) {
+            let (lo, hi) = p.bounds();
+            boxes.push((c.clone(), lo, hi));
+        }
+    }
+    boxes.extend(def.rooms.iter().map(crate::carve::room_box));
+    let solid = def
+        .solid
+        .as_ref()
+        .and_then(|s| model.part(s))
+        .map(|p| p.bounds());
+    crate::carve::markers(name, &boxes, solid)
+        .into_iter()
+        .map(|m| {
+            (
+                Marker {
+                    name: m.name,
+                    kind: m.kind.to_string(),
+                    position: m.position,
+                    rotation: Quat::IDENTITY,
+                    size: Some(m.size),
+                    data: Some(m.data),
+                    preview: None,
+                    components: m.components,
+                },
+                None,
+            )
+        })
+        .collect()
+}
+
 fn unmoved_markers(
     model: &Model,
     depth: u32,
@@ -96,17 +138,82 @@ fn unmoved_markers(
                     size: *size,
                     data: data.clone(),
                     preview: preview.clone(),
+                    components: Default::default(),
                 },
                 attach.clone(),
             )),
+            Op::Carve { name, def } if def.collider.as_deref() == Some("blocks") => {
+                let look = |n: &str| {
+                    model
+                        .parts
+                        .iter()
+                        .find(|p| p.name == n)
+                        .cloned()
+                        .ok_or_else(|| ModelerError::MissingInput(n.to_string()))
+                };
+                let boxes = crate::carve::blocks(name, def, &look)?;
+                for m in crate::carve::block_markers(name, &boxes) {
+                    out.push((
+                        Marker {
+                            name: m.name,
+                            kind: m.kind.to_string(),
+                            position: m.position,
+                            rotation: Quat::IDENTITY,
+                            size: Some(m.size),
+                            data: None,
+                            preview: None,
+                            components: m.components,
+                        },
+                        None,
+                    ));
+                }
+                if def.markers {
+                    out.extend(carve_markers(model, name, def));
+                }
+            }
+            Op::Carve { name, def } if def.markers => {
+                out.extend(carve_markers(model, name, def));
+            }
             Op::Prefab {
                 name,
                 prefab,
                 translation,
                 rotation,
                 scale,
+                block,
                 ..
             } => {
+                if *block {
+                    let prefix = format!("{name}.");
+                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                    for p in model
+                        .parts
+                        .iter()
+                        .filter(|p| p.visible && !p.verts.is_empty() && p.name.starts_with(&prefix))
+                    {
+                        let (a, b) = p.bounds();
+                        lo = lo.min(a);
+                        hi = hi.max(b);
+                    }
+                    if lo.x <= hi.x {
+                        out.push((
+                            Marker {
+                                name: format!("{name}_blk"),
+                                kind: "block".into(),
+                                position: (lo + hi) * 0.5,
+                                rotation: Quat::IDENTITY,
+                                size: Some((hi - lo).to_array()),
+                                data: None,
+                                preview: None,
+                                components: serde_json::Map::from_iter([(
+                                    "Block".to_string(),
+                                    Value::Object(Default::default()),
+                                )]),
+                            },
+                            None,
+                        ));
+                    }
+                }
                 let Ok(src) = crate::catalog::prefab_instance(prefab) else {
                     continue;
                 };
@@ -150,6 +257,15 @@ fn rules(model: &Model, depth: u32) -> Vec<Rule> {
                 sensor: *sensor,
                 hidden: *hidden,
             }),
+            Op::Carve { name, def } if def.collider.as_deref() == Some("mesh") => {
+                out.push(Rule {
+                    parts: crate::carve::sheet_names(name, def),
+                    shape: "mesh".into(),
+                    body: "static".into(),
+                    sensor: false,
+                    hidden: false,
+                });
+            }
             Op::Prefab { name, prefab, .. } => {
                 let Ok(src) = crate::catalog::prefab_instance(prefab) else {
                     continue;

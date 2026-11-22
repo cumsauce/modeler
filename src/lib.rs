@@ -76,6 +76,7 @@ pub mod ao;
 pub mod ao_gpu;
 pub mod blob;
 pub mod body;
+pub mod carve;
 pub mod catalog;
 pub mod commands;
 pub mod contact;
@@ -1295,6 +1296,12 @@ pub enum Op {
         #[serde(flatten)]
         def: crate::garment::GarmentDef,
     },
+    /// Interiors by subtraction: rooms (cutters) taken out of a mass, kept as
+    /// one-sided sheets looking into the void ([`crate::carve`]).
+    Carve {
+        name: String,
+        def: Box<crate::carve::CarveDef>,
+    },
     Shell {
         name: String,
         input: String,
@@ -1633,6 +1640,11 @@ pub enum Op {
         /// default look); a `.bsn` export writes it for game code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         variant: Option<String>,
+        /// Also make a `block` marker `<name>_blk` filling the instance's
+        /// world bounds (a `Block` collider for games that build colliders
+        /// from markers).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        block: bool,
     },
     /// A cosmetic variant ("skin"): material overrides on parts (names or
     /// globs) and an optional style token patch, applied over the derived

@@ -2,3 +2,5 @@
 .zcode/
 /models/
 /shots/
+.claude/worktrees/
+/bin/

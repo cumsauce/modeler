@@ -90,6 +90,11 @@ modeler --offscreen
   upserted by output name, so re-issuing one is a parameter tweak, and
   the whole model re-derives. `mirror` bakes the reflection so it
   renders correctly.
+- **Interiors by subtraction**: `carve` takes rooms and doorways (boxes,
+  or outlines) out of a mass and keeps only the faces looking into them, as
+  merged one-sided sheets split into floor / wall / ceiling or per room,
+  with room / opening markers and mesh colliders: no hidden outer faces to
+  cull. `cargo run --example interior` builds a two-room bunker.
 - **History tree**: every edit snapshots the model into a tree with a
   cursor — undo/redo, jump anywhere, and editing after a jump branches
   instead of discarding.

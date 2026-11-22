@@ -826,6 +826,20 @@ impl Session {
         let out = graph::output(&op).to_string();
         let kind = graph::kind(&op);
         let reads = graph::inputs(&op);
+        // Re-issuing the same in-place material as the newest one on that part
+        // changes nothing: don't stack it (re-applying a batch used to double
+        // the material ops).
+        if kind == "material"
+            && reads.contains(&out.as_str())
+            && let Some(last) = self.model.ops.iter().rev().find(|o| {
+                graph::kind(o) == "material"
+                    && graph::output(o) == out
+                    && graph::inputs(o).contains(&out.as_str())
+            })
+            && serde_json::to_string(last).ok() == serde_json::to_string(&op).ok()
+        {
+            return Ok(format!("{label} unchanged"));
+        }
         // A visibility edit is in place by nature (reads and writes the same
         // name), yet re-issuing it must replace the previous one, not stack.
         // So is an in-place transform: re-issuing it to adjust the scale or
@@ -2244,6 +2258,31 @@ impl Session {
                 }
                 Ok(s)
             }
+            "reset" => {
+                // Clear a document (default: the active one) in place, keeping
+                // its name and history: a rebuild starts from nothing.
+                let active = self.model.name.clone();
+                let name = match name {
+                    Some(n) if !n.is_empty() => n.to_string(),
+                    _ => active.clone(),
+                };
+                if name != active {
+                    return Err(format!(
+                        "reset clears the active document `{}`; switch to `{name}` first",
+                        self.model.name
+                    )
+                    .into());
+                }
+                self.model.ops.clear();
+                self.model.parts.clear();
+                self.model.params.clear();
+                self.model.version += 1;
+                self.model.refresh()?;
+                self.commit("reset");
+                Ok(format!(
+                    "reset `{name}`: no ops, no parts (undo restores it)"
+                ))
+            }
             "open" | "switch" => {
                 let name = need()?;
                 if name == self.model.name {
@@ -2322,7 +2361,19 @@ impl Session {
                 let name = need()?;
                 if name == self.model.name {
                     let Some(next) = self.others.pop() else {
-                        return Err("can't close the only open document".into());
+                        // The only document: leave a fresh empty one, so a
+                        // build can start clean without a `v2` rename dance.
+                        let mut fresh =
+                            Model::named(if name == "model" { "model_1" } else { "model" });
+                        fresh.version = self.model.version + 1;
+                        fresh.project = crate::catalog::project_root();
+                        self.model = fresh;
+                        self.pending_pin = None;
+                        crate::catalog::set_open_doc(name, None);
+                        return Ok(format!(
+                            "closed `{name}` (its autosave is dropped; save_prefab first to keep it); started an empty `{}`",
+                            self.model.name
+                        ));
                     };
                     crate::catalog::set_open_doc(&next.name, None);
                     let bump = self.model.version.max(next.version) + 1;
@@ -3653,6 +3704,12 @@ impl Session {
             );
         }
         if let Some(w) = &spec.walkable {
+            if let Some(sel) = w.markers() {
+                record(
+                    "walkable markers",
+                    crate::walk::check_markers(&self.model, sel),
+                );
+            }
             let routes = w.routes();
             for (i, r) in routes.iter().enumerate() {
                 let name = if routes.len() == 1 {

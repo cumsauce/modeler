@@ -403,7 +403,7 @@ pub(crate) struct MaterialCatalogArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SceneArgs {
-    /// list, open (an open doc, a catalog entry, or a new empty one), switch
+    /// list, reset (clear the active document in place), open (an open doc, a catalog entry, or a new empty one), switch
     /// (open docs only), close (also drops a parked autosave) or restore
     /// (no name: list the parked unsaved documents; a name: open it).
     pub(crate) action: String,

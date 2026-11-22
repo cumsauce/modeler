@@ -79,10 +79,41 @@ pub struct WalkSpec {
     pub cell: Option<f32>,
 }
 
-/// `walkable: {...}` or a list of routes.
+/// Which markers a `markers` check walks between.
+#[derive(Clone, Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerSel {
+    /// Marker kinds to include (default: every kind except block, room,
+    /// opening: spawns, waypoints, pickups, spots...).
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Only markers whose name matches one of these (`*` globs).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// The marker everything must be reachable from (default: the first).
+    #[serde(default)]
+    pub from: Option<String>,
+    /// The character (default a human player).
+    #[serde(default)]
+    pub agent: Option<Agent>,
+    /// Grid cell in meters.
+    #[serde(default)]
+    pub cell: Option<f32>,
+}
+
+/// `{"markers": {...}}`: every selected marker is reachable from one.
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerWalk {
+    pub markers: MarkerSel,
+}
+
+/// `walkable: {...}` (one route), a list of routes, or `{"markers": {...}}`
+/// (every spawn / waypoint / pickup reachable from the first).
 #[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum WalkableSpec {
+    Markers(MarkerWalk),
     One(WalkSpec),
     Many(Vec<WalkSpec>),
 }
@@ -92,6 +123,13 @@ impl WalkableSpec {
         match self {
             WalkableSpec::One(w) => vec![w],
             WalkableSpec::Many(v) => v.iter().collect(),
+            WalkableSpec::Markers(_) => Vec::new(),
+        }
+    }
+    pub fn markers(&self) -> Option<&MarkerSel> {
+        match self {
+            WalkableSpec::Markers(m) => Some(&m.markers),
+            _ => None,
         }
     }
 }
@@ -202,7 +240,11 @@ fn build(parts: &[&Part], spec: &WalkSpec, agent: &Agent) -> Result<Grid, String
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    let ground = lo.y.min(0.0);
+    // Sinking up to 5 cm below y = 0 (a prop sunk a little) is still standing
+    // on the ground plane: only a model that sits wholly lower moves the
+    // floor (else every riser grows by the sink, and the gap between the
+    // ground and a floor sheet at y = 0 becomes a phantom walkable layer).
+    let ground = if lo.y >= -0.05 { 0.0 } else { lo.y };
     let mut cell = spec.cell.unwrap_or(agent.radius / 4.0).max(1e-3);
     let pad = agent.radius * 2.0 + cell * 2.0;
     let (w, d) = (hi.x - lo.x + 2.0 * pad, hi.z - lo.z + 2.0 * pad);
@@ -325,7 +367,7 @@ fn build(parts: &[&Part], spec: &WalkSpec, agent: &Agent) -> Result<Grid, String
             floors.retain(|f: &Floor| {
                 !intervals
                     .iter()
-                    .any(|iv| iv.lo >= f.y - 1e-4 && iv.lo < f.y + 1e-3)
+                    .any(|iv| iv.lo >= f.y - 1e-4 && iv.lo < f.y + 0.02)
             });
             (intervals, floors)
         })
@@ -608,6 +650,217 @@ fn leg(
     ))
 }
 
+/// Every floor reachable from `a` (indexed like `offs`), by the same rules
+/// as [`leg`].
+fn flood(g: &Grid, agent: &Agent, a: (usize, usize)) -> (Vec<usize>, Vec<bool>) {
+    let n = g.nx * g.nz;
+    let mut offs = vec![0usize; n + 1];
+    for c in 0..n {
+        offs[c + 1] = offs[c] + g.floors[c].len();
+    }
+    let mut seen = vec![false; offs[n]];
+    seen[offs[a.0] + a.1] = true;
+    let mut q = VecDeque::from([a]);
+    while let Some((c, f)) = q.pop_front() {
+        let fy = g.floors[c][f].y;
+        let (ix, iz) = ((c % g.nx) as isize, (c / g.nx) as isize);
+        for (dx, dz) in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
+            let (jx, jz) = (ix + dx, iz + dz);
+            if jx < 0 || jz < 0 || jx >= g.nx as isize || jz >= g.nz as isize {
+                continue;
+            }
+            let nc = jz as usize * g.nx + jx as usize;
+            let Some((nf, fl)) = g.floors[nc]
+                .iter()
+                .enumerate()
+                .min_by(|x, y| (x.1.y - fy).abs().total_cmp(&(y.1.y - fy).abs()))
+            else {
+                continue;
+            };
+            let nid = offs[nc] + nf;
+            if seen[nid] || (fl.y - fy).abs() > agent.step + 1e-4 || g.blocks[nc][nf].is_some() {
+                continue;
+            }
+            seen[nid] = true;
+            q.push_back((nc, nf));
+        }
+    }
+    (offs, seen)
+}
+
+/// A top-down picture of what a walker reaches: `+` reached, `.` standable
+/// but not reached, blank nothing; `marks` (x, z, char) drawn on top.
+fn reach_map(g: &Grid, offs: &[usize], seen: &[bool], marks: &[(f32, f32, char)]) -> String {
+    let kx = g.nx.div_ceil(80).max(1);
+    let kz = kx * 2;
+    let (cols, rows) = (g.nx.div_ceil(kx), g.nz.div_ceil(kz));
+    let mut grid = vec![vec![' '; cols]; rows];
+    for c in 0..g.nx * g.nz {
+        let (ix, iz) = (c % g.nx, c / g.nx);
+        let cell = &mut grid[iz / kz][ix / kx];
+        for f in 0..g.floors[c].len() {
+            if g.blocks[c][f].is_some() {
+                continue;
+            }
+            if seen[offs[c] + f] {
+                *cell = '+';
+            } else if *cell != '+' {
+                *cell = '.';
+            }
+        }
+    }
+    for &(x, z, ch) in marks {
+        if let Some(c) = g.column(x, z) {
+            grid[(c / g.nx) / kz][(c % g.nx) / kx] = ch;
+        }
+    }
+    let mut out = format!(
+        "map (top view, +x right, -z up; '+' reached, '.' standable but not reached; 1 char = {:.1} x {:.1} m, x from {:.1}, z from {:.1}):\n",
+        kx as f32 * g.cell,
+        kz as f32 * g.cell,
+        g.x0,
+        g.z0
+    );
+    for row in grid {
+        out += row.into_iter().collect::<String>().trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+/// `markers`: every selected marker standable and reachable from the first.
+pub fn check_markers(model: &Model, sel: &MarkerSel) -> Result<String, String> {
+    let agent = sel.agent.clone().unwrap_or_default();
+    if agent.radius <= 0.0 || agent.height <= 0.0 || agent.step < 0.0 {
+        return Err("agent: radius and height must be > 0, step >= 0".into());
+    }
+    let all = crate::game::markers(model).map_err(|e| e.to_string())?;
+    let picked: Vec<_> = all
+        .into_iter()
+        .filter(|m| {
+            let kind_ok = if sel.kinds.is_empty() {
+                !["block", "room", "opening"].contains(&m.kind.as_str())
+            } else {
+                sel.kinds.contains(&m.kind)
+            };
+            kind_ok
+                && (sel.names.is_empty()
+                    || sel.names.iter().any(|p| crate::name_matches(p, &m.name)))
+        })
+        .collect();
+    if picked.is_empty() {
+        return Err("no markers selected (kinds / names match nothing)".into());
+    }
+    let start = match &sel.from {
+        Some(n) => picked
+            .iter()
+            .position(|m| &m.name == n)
+            .ok_or_else(|| format!("from: no selected marker named `{n}`"))?,
+        None => 0,
+    };
+    let parts = visible(model);
+    let spec = WalkSpec {
+        from: picked[start].position.to_array(),
+        to: picked[start].position.to_array(),
+        via: picked.iter().map(|m| m.position.to_array()).collect(),
+        agent: None,
+        cell: sel.cell,
+    };
+    let g = build(&parts, &spec, &agent)?;
+    let mut nodes: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for m in &picked {
+        let p = m.position.to_array();
+        let Some(nd) = snap(&g, p, agent.step) else {
+            bad.push(format!("`{}` {:?} is outside the grid", m.name, p));
+            nodes.push(None);
+            continue;
+        };
+        let fp = g.point(nd);
+        if let Some(b) = g.blocks[nd.0][nd.1] {
+            bad.push(format!(
+                "`{}` {} is not standable: {}",
+                m.name,
+                fmt_p(fp),
+                describe_block(&parts, b, &agent)
+            ));
+            nodes.push(None);
+            continue;
+        }
+        if (fp.y - p[1]).abs() > 0.5 {
+            bad.push(format!(
+                "`{}` is at y {:.2} but the nearest floor there is y {:.2} (floating or buried)",
+                m.name, p[1], fp.y
+            ));
+        }
+        nodes.push(Some(nd));
+    }
+    let Some(sn) = nodes[start] else {
+        return Err(format!(
+            "start `{}` can't be stood on: {}",
+            picked[start].name,
+            bad.join("; ")
+        ));
+    };
+    let (offs, seen) = flood(&g, &agent, sn);
+    let mut marks = Vec::new();
+    for (m, nd) in picked.iter().zip(&nodes) {
+        let Some((c, f)) = *nd else {
+            marks.push((m.position.x, m.position.z, 'X'));
+            continue;
+        };
+        if seen[offs[c] + f] {
+            marks.push((m.position.x, m.position.z, 'o'));
+        } else {
+            bad.push(format!(
+                "`{}` {} is not reachable from `{}`",
+                m.name,
+                fmt_p(g.point((c, f))),
+                picked[start].name
+            ));
+            marks.push((m.position.x, m.position.z, 'X'));
+        }
+    }
+    if bad.is_empty() {
+        return Ok(format!(
+            "all {} markers standable and reachable from `{}` (radius {:.2} / height {:.2} / step {:.2}, cell {:.3})",
+            picked.len(),
+            picked[start].name,
+            agent.radius,
+            agent.height,
+            agent.step,
+            g.cell
+        ));
+    }
+    let shown: Vec<&String> = bad.iter().take(12).collect();
+    let more = bad.len().saturating_sub(shown.len());
+    Err(format!(
+        "{} of {} markers fail:\n  {}{}\n{}(o reachable marker, X failing marker)",
+        bad.len(),
+        picked.len(),
+        shown
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+        if more > 0 {
+            format!("\n  ... {more} more")
+        } else {
+            String::new()
+        },
+        reach_map(&g, &offs, &seen, &marks)
+    ))
+}
+
 /// One route's check: Ok(summary) or Err(why it is blocked).
 pub fn check(model: &Model, spec: &WalkSpec) -> Result<String, String> {
     let agent = spec.agent.clone().unwrap_or_default();
@@ -643,8 +896,33 @@ pub fn check(model: &Model, spec: &WalkSpec) -> Result<String, String> {
     }
     let mut path: Vec<(usize, usize)> = Vec::new();
     for w in nodes.windows(2) {
-        let l = leg(&g, &parts, &agent, w[0].1, w[1].1)
-            .map_err(|e| format!("blocked between {} and {}: {e}", w[0].0, w[1].0))?;
+        let l = leg(&g, &parts, &agent, w[0].1, w[1].1).map_err(|e| {
+            let (offs, seen) = flood(&g, &agent, w[0].1);
+            let a = g.point(w[0].1);
+            let b = g.point(w[1].1);
+            let snapped = |label: &str, req: [f32; 3], got: Vec3| {
+                if (got.y - req[1]).abs() > agent.step + 0.05 {
+                    format!(
+                        "\nnote: {label} y {:.2} snapped to the floor at y {:.2} ({}): if that is the wrong level, check the point is on the surface you mean",
+                        req[1],
+                        got.y,
+                        fmt_p(got)
+                    )
+                } else {
+                    String::new()
+                }
+            };
+            let from_req = points[nodes.iter().position(|n| n.1 == w[0].1).unwrap_or(0)];
+            let to_req = points[nodes.iter().position(|n| n.1 == w[1].1).unwrap_or(0)];
+            format!(
+                "blocked between {} and {}: {e}{}{}\n{}",
+                w[0].0,
+                w[1].0,
+                snapped(&w[0].0, from_req, a),
+                snapped(&w[1].0, to_req, b),
+                reach_map(&g, &offs, &seen, &[(a.x, a.z, 'S'), (b.x, b.z, 'G')])
+            )
+        })?;
         if !path.is_empty() {
             path.pop();
         }
@@ -770,5 +1048,70 @@ mod tests {
         assert!(e.contains("in the way"), "{e}");
         let r = route(&wall(0.9), [0.0, 0.0, 2.0], [0.0, 0.0, -2.0]);
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn a_prop_sunk_a_few_mm_does_not_grow_the_risers() {
+        // 0.30 m risers pass; a pebble sunk 1.6 cm must not turn them into
+        // 0.32 m ones by moving the ground down.
+        let mut items = vec![
+            serde_json::json!({"type": "primitive", "name": "pebble", "kind": "box",
+            "size": [0.1, 0.1, 0.1], "translation": [3, 0.034, 3]}),
+        ];
+        for i in 0..3 {
+            let h = 0.3 * (i + 1) as f32;
+            items.push(
+                serde_json::json!({"type": "primitive", "name": format!("st{i}"),
+            "kind": "box", "size": [1.2, h, 0.4], "translation": [0, h / 2.0, -(i as f32) * 0.4]}),
+            );
+        }
+        items.push(
+            serde_json::json!({"type": "primitive", "name": "top", "kind": "box",
+            "size": [1.2, 0.9, 1.5], "translation": [0, 0.45, -1.55]}),
+        );
+        let s = session(serde_json::Value::Array(items));
+        let r = route(&s, [0.0, 0.0, 1.0], [0.0, 0.9, -1.5]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn a_blocked_route_draws_where_it_got_to() {
+        let s = stairs(0.4, 3);
+        let e = route(&s, [0.0, 0.0, 1.0], [0.0, 1.2, -1.6])
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("map (top view") && e.contains('S') && e.contains('G'),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_markers_mode_finds_a_walled_off_marker() {
+        let s = session(serde_json::json!([
+            {"type": "primitive", "name": "w1", "kind": "box", "size": [6, 2.5, 0.2], "translation": [0, 1.25, 2]},
+            {"type": "primitive", "name": "w2", "kind": "box", "size": [6, 2.5, 0.2], "translation": [0, 1.25, 4]},
+            {"type": "primitive", "name": "w3", "kind": "box", "size": [0.2, 2.5, 2.2], "translation": [-3, 1.25, 3]},
+            {"type": "primitive", "name": "w4", "kind": "box", "size": [0.2, 2.5, 2.2], "translation": [3, 1.25, 3]},
+            {"type": "marker", "name": "spawn_a", "kind": "spawn", "translation": [0, 0, 0]},
+            {"type": "marker", "name": "pick_open", "kind": "arcade", "translation": [-2, 0, 0.5]},
+            {"type": "marker", "name": "pick_sealed", "kind": "arcade", "translation": [0, 0, 3]},
+        ]));
+        let sel = super::MarkerSel::default();
+        let e = super::check_markers(&s.model, &sel)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("pick_sealed") && !e.contains("`pick_open`"),
+            "{e}"
+        );
+        let ok = super::check_markers(
+            &s.model,
+            &super::MarkerSel {
+                names: vec!["spawn_*".into(), "pick_open".into()],
+                ..Default::default()
+            },
+        );
+        assert!(ok.is_ok(), "{ok:?}");
     }
 }
