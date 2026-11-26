@@ -1292,7 +1292,8 @@ pub fn transfer_weights(
     let from = def.weights_from.as_deref().unwrap_or("?");
     let Some(sb) = src.rig.as_ref() else {
         return Err(format!(
-            "weights_from `{from}`: that part is not bound (bind it first)"
+            "weights_from `{from}`: that part is not bound to any skeleton: add a bind of `{from}` to `{}` (a bind item, or a body's own rig; it may be in the same batch, binds order themselves by weights_from)",
+            skel.name
         ));
     };
     if sb.skeleton != skel.name {

@@ -102,11 +102,21 @@ pub fn record(mut e: Entry) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let Ok(line) = serde_json::to_string(&e) else {
+    append(&p, &e);
+}
+
+/// Appends one entry to the log at `p`.
+fn append(p: &std::path::Path, e: &Entry) {
+    let Ok(mut line) = serde_json::to_string(e) else {
         return;
     };
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = writeln!(f, "{line}");
+    line.push('\n');
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
+        // One write per entry: an O_APPEND write lands whole, so servers
+        // appending at the same moment don't interleave (`writeln!` wrote
+        // the line and its newline separately, and two entries once ran
+        // together on one line).
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -114,15 +124,30 @@ pub fn read() -> Vec<Entry> {
     let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
     };
+    parse(&text)
+}
+
+/// Every entry in the log's text, also when two ran together on one line
+/// (older builds could interleave concurrent appends).
+fn parse(text: &str) -> Vec<Entry> {
     text.lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .flat_map(|l| {
+            serde_json::Deserializer::from_str(l)
+                .into_iter::<Entry>()
+                .map_while(Result::ok)
+        })
         .collect()
 }
 
 /// An error's first line with numbers and quoted names blanked, so the same
 /// problem on different parts groups together.
 fn signature(detail: &str) -> String {
-    let first = detail.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    // A verify report's first line may be a PASS: group by what failed.
+    let first = detail
+        .lines()
+        .find(|l| l.trim_start().starts_with("FAIL"))
+        .or_else(|| detail.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("");
     let mut out = String::new();
     let mut quoted = None;
     for c in first.chars() {
@@ -255,6 +280,47 @@ fn clip_line(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_appends_stay_whole_lines_and_merged_lines_are_recovered() {
+        let dir = std::env::temp_dir().join(format!("modeler-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("feedback.jsonl");
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        append(&p, &e("error", "t", &format!("{t}-{i}"), 1));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            let _ = t.join();
+        }
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        assert_eq!(text.lines().count(), 2000);
+        assert!(
+            text.lines()
+                .all(|l| serde_json::from_str::<Entry>(l).is_ok())
+        );
+        let a = serde_json::to_string(&e("error", "a", "x", 1)).unwrap_or_default();
+        let b = serde_json::to_string(&e("slow", "b", "y", 0)).unwrap_or_default();
+        let got = parse(&format!("{a}{b}\n{a}\n"));
+        assert_eq!(
+            got.iter().map(|e| e.tool.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "a"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_failures_group_by_their_fail_line() {
+        let s = signature("PASS animation `walk` loop: fine\nFAIL animation `walk` stretch: 4.2x");
+        assert!(s.starts_with("FAIL animation"), "{s}");
+    }
 
     fn e(kind: &str, tool: &str, detail: &str, streak: u32) -> Entry {
         Entry {

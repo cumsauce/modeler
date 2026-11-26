@@ -652,8 +652,16 @@ pub fn build(
         } else {
             let part = parts.iter().find(|(n, _)| n == from).map(|(_, p)| p);
             let Some(br) = part.and_then(|p| p.branches.as_ref().map(|b| (p, b))) else {
+                let what = match ops.iter().find(|o| crate::graph::output(o) == from) {
+                    Some(Op::Body { .. }) => format!(
+                        ": `{from}` is a body, which brings its own rig `{from}_rig` (use that skeleton, or bones of your own)"
+                    ),
+                    Some(o) => format!(": `{from}` is a {} op", crate::graph::kind(o)),
+                    None if part.is_some() => format!(": `{from}` is a part with no branches"),
+                    None => format!(": there is no part `{from}`"),
+                };
                 return Err(format!(
-                    "{ctx}: from `{from}`: not an lsystem's wood part or a skin op (auto-rigs grow from those)"
+                    "{ctx}: from `{from}`: not an lsystem's wood part or a skin op (auto-rigs grow from those){what}"
                 ));
             };
             let (bones, point) = auto::from_lsystem(from, def, br.0, br.1)
@@ -3314,6 +3322,36 @@ pub fn part_weights(weights: &[(String, usize, f32)], part: &str) -> Vec<(usize,
         .collect()
 }
 
+/// "; parts with similar names: a, b" for a pattern that matched nothing
+/// (else a few of the parts there are), so a renamed body is one edit away.
+fn close_part_names(patterns: &[String], named: &[(String, std::sync::Arc<Part>)]) -> String {
+    let stems: Vec<String> = patterns
+        .iter()
+        .map(|p| p.replace('*', "").to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let close: Vec<&str> = named
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| {
+            let n = n.to_lowercase();
+            stems
+                .iter()
+                .any(|s| n.contains(s.as_str()) || s.contains(n.as_str()))
+        })
+        .take(6)
+        .collect();
+    if !close.is_empty() {
+        return format!("; parts with similar names: {}", close.join(", "));
+    }
+    let some: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).take(8).collect();
+    if some.is_empty() {
+        "; the model has no parts yet".into()
+    } else {
+        format!("; parts include: {}", some.join(", "))
+    }
+}
+
 /// After the graph: builds skeletons and applies every bind to the
 /// finished parts (in place on `named`).
 pub fn apply_binds(
@@ -3337,7 +3375,39 @@ pub fn apply_binds(
     clips_on(ops, named)?;
     let (_, skels) = skeletons_on(ops, named)?;
     let mut defs = bind_defs(ops);
-    defs.sort_by_key(|d| d.1.weights_from.is_some()); // sources bind first
+    // Sources bind first, also down a chain (a coat taking weights from a
+    // shirt that takes them from the body): each bind after the bind of
+    // the part it reads weights from, whatever order the items came in.
+    let depth: Vec<usize> = {
+        let mut d = vec![0usize; defs.len()];
+        for _ in 0..defs.len() {
+            let mut changed = false;
+            for i in 0..defs.len() {
+                let Some(f) = defs[i].1.weights_from.as_deref() else {
+                    continue;
+                };
+                let want = defs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, o)| *j != i && o.1.parts.iter().any(|q| crate::name_matches(q, f)))
+                    .map(|(j, _)| d[j] + 1)
+                    .max()
+                    .unwrap_or(1)
+                    .min(defs.len());
+                if want > d[i] {
+                    d[i] = want;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        d
+    };
+    let mut order: Vec<usize> = (0..defs.len()).collect();
+    order.sort_by_key(|&i| depth[i]);
+    defs = order.into_iter().map(|i| defs[i].clone()).collect();
     for (name, def) in &defs {
         let ctx = format!("bind `{name}`");
         let src = def
@@ -3419,7 +3489,12 @@ pub fn apply_binds(
             .iter()
             .any(|o| matches!(o, Op::Bind { name: n, .. } if n == name));
         if hit == 0 && item {
-            return Err(format!("{ctx}: no part matches {:?}", def.parts).into());
+            return Err(format!(
+                "{ctx}: no part matches {:?}{}",
+                def.parts,
+                close_part_names(&def.parts, named)
+            )
+            .into());
         }
     }
     Ok(())

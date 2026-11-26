@@ -1375,6 +1375,11 @@ pub fn split_prefab_histories() -> Result<(usize, u64, u64), ModelerError> {
     Ok((n, before, after))
 }
 
+/// Whether the call's catalog has a prefab file of that name (no parsing).
+pub fn prefab_file_exists(name: &str) -> bool {
+    catalog_dir().is_ok_and(|d| d.join(format!("{}.json", sanitize(name))).exists())
+}
+
 pub fn load_prefab_file(name: &str) -> Result<Model, ModelerError> {
     let dir = catalog_dir()?;
     let path = dir.join(format!("{}.json", sanitize(name)));

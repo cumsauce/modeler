@@ -3714,8 +3714,35 @@ fn channel(
             ));
         }
     };
+    let (keys_v, interp) = match keys_v {
+        // `{"keys": {"interp": "smooth", "0": v, "0.5": v}}`: a time -> value
+        // map, the form agents reach for, possibly with the interp inside.
+        Value::Object(m) => {
+            let interp = match m.get("interp").and_then(Value::as_str) {
+                Some(s) => interp_of(ctx, s)?,
+                None => interp,
+            };
+            let mut items = Vec::new();
+            for (k, v) in &m {
+                if k == "interp" {
+                    continue;
+                }
+                let Ok(t) = k.trim().parse::<f64>() else {
+                    return Err(format!(
+                        "{ctx}: keys: `{k}` is not a time: give keys as [[t, value], ...] (or {{\"0\": value, \"0.5\": value}})"
+                    ));
+                };
+                items.push(serde_json::json!([t, v]));
+            }
+            (Value::Array(items), interp)
+        }
+        v => (v, interp),
+    };
     let Value::Array(items) = keys_v else {
-        return Err(format!("{ctx}: keys must be an array of [t, value]"));
+        return Err(format!(
+            "{ctx}: keys must be an array of [t, value] (or {{\"0\": value, \"0.5\": value}}), got {}",
+            describe_json(&keys_v)
+        ));
     };
     let mut keys: Vec<(f32, [f32; 4])> = Vec::new();
     for (k, item) in items.iter().enumerate() {
@@ -3741,7 +3768,16 @@ fn channel(
                 [f, f, f, 0.0]
             }
             _ => {
-                let a: [f32; 3] = de(&kctx, val)?;
+                let a: [f32; 3] = de(&kctx, val).map_err(|e| {
+                    format!(
+                        "{e} ({kind} values are [x, y, z]{})",
+                        if kind == "scale" {
+                            " or one number"
+                        } else {
+                            " meters"
+                        }
+                    )
+                })?;
                 [a[0], a[1], a[2], 0.0]
             }
         };
@@ -3751,8 +3787,8 @@ fn channel(
         return Err(format!("{ctx}: needs at least one key"));
     }
     keys.sort_by(|a, b| a.0.total_cmp(&b.0));
-    if keys.windows(2).any(|w| (w[1].0 - w[0].0).abs() < 1e-6) {
-        return Err(format!("{ctx}: two keys at the same time"));
+    if let Some(w) = keys.windows(2).find(|w| (w[1].0 - w[0].0).abs() < 1e-6) {
+        return Err(format!("{ctx}: two keys at the same time ({})", w[0].0));
     }
     Ok(Channel::Keys { keys, interp })
 }
@@ -4149,6 +4185,43 @@ or {\"radius\": 0.03, \"segments\"?: 4}; for edge selection use a `round` item w
 /// the shape agents borrow from the `round` op) becomes the plain `round` +
 /// `segments` fields; anything else there gets a hint instead of serde's bare
 /// "unknown field".
+/// `pbr: {"material": "steel", "params": {..}, "scale": 2}` (also `name`
+/// for `material`), the shape agents reach for, lifted into the item's own
+/// `pbr` / `params` / `scale`.
+fn material_pbr_object(ctx: &str, body: Value) -> Result<Value, String> {
+    let Value::Object(mut o) = body else {
+        return Ok(body);
+    };
+    let Some(Value::Object(p)) = o.get("pbr").cloned() else {
+        return Ok(Value::Object(o));
+    };
+    if let Some(k) = p
+        .keys()
+        .find(|k| !matches!(k.as_str(), "material" | "name" | "params" | "scale"))
+    {
+        return Err(format!(
+            "{ctx}: pbr: unknown field `{k}`: give \"pbr\": \"<material>\" (or {{material, params?, scale?}})"
+        ));
+    }
+    let Some(name) = p.get("material").or_else(|| p.get("name")).cloned() else {
+        return Err(format!(
+            "{ctx}: pbr: name the material: \"pbr\": \"<material>\" (or {{material, params?, scale?}})"
+        ));
+    };
+    o.insert("pbr".into(), name);
+    for k in ["params", "scale"] {
+        if let Some(v) = p.get(k) {
+            if o.contains_key(k) {
+                return Err(format!(
+                    "{ctx}: {k} given both in pbr and on the item: give it once"
+                ));
+            }
+            o.insert(k.into(), v.clone());
+        }
+    }
+    Ok(Value::Object(o))
+}
+
 fn primitive_round_object(ctx: &str, body: Value) -> Result<Value, String> {
     let Value::Object(mut o) = body else {
         return Ok(body);
@@ -5949,6 +6022,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
             })
         }
         "material" => {
+            let body = material_pbr_object(&ctx, body)?;
             let s: MaterialSpec = de(&ctx, &body)?;
             if s.pbr.is_none() && (s.params.is_some() || s.scale.is_some()) {
                 return Err(format!(
@@ -6657,6 +6731,27 @@ mod tests {
             parse_item(0, &v).unwrap_or_else(|e| panic!("{v}: {e}"));
         };
         ok(serde_json::json!({"type": "hide_part", "name": "ground"}));
+        ok(
+            serde_json::json!({"type": "clip", "name": "c", "skeleton": "rig", "duration": 1,
+            "tracks": {"elbow_l": {"rotate": {"keys": {"interp": "linear", "0": {"x": 0}, "1": {"x": 40}}}}}}),
+        );
+        assert!(
+            parse_item(
+                0,
+                &serde_json::json!({"type": "clip", "name": "c", "skeleton": "rig", "duration": 1,
+                "tracks": {"hip": {"translate": [[0, [0, 0, 0, 1]]]}}})
+            )
+            .is_err_and(|e| e.contains("[x, y, z] meters"))
+        );
+        ok(serde_json::json!({"type": "material", "name": "desk",
+            "pbr": {"material": "steel", "params": {"rust": 0.2}, "scale": 2}}));
+        assert!(
+            parse_item(
+                0,
+                &serde_json::json!({"type": "material", "name": "d", "pbr": {"look": 1}})
+            )
+            .is_err_and(|e| e.contains("unknown field `look`"))
+        );
         ok(serde_json::json!({"type": "lsystem", "name": "a", "axiom": "FFL", "iterations": 0}));
         let a: crate::anim::check::AnimationSpec = serde_json::from_value(
             serde_json::json!({"clip": "w", "stretch": true, "floor": true}),

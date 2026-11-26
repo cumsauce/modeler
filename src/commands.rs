@@ -2173,8 +2173,11 @@ impl Session {
                 "note: restored the parked autosave of `{doc}` (it was not open)"
             )));
         }
-        if crate::catalog::load_prefab_file(doc).is_ok() {
-            self.scene("open", Some(doc)).map_err(|e| e.to_string())?;
+        if crate::catalog::prefab_file_exists(doc) {
+            // Open it once and say why when it won't: a load error used to
+            // be swallowed here and reported as "not open".
+            self.scene("open", Some(doc))
+                .map_err(|e| format!("doc `{doc}` is closed, and reopening it failed: {e}"))?;
             if self.model.name != prev {
                 let _ = self.scene("switch", Some(&prev));
             }
@@ -2299,36 +2302,43 @@ impl Session {
                     )
                     .into());
                 }
-                let (incoming, how) =
-                    if let Some(i) = self.others.iter().position(|m| m.name == name) {
-                        (self.others.remove(i), "switched to")
-                    } else if action == "switch" {
-                        return Err(format!(
-                            "no open document `{name}` (open: {}); use action open",
-                            self.doc_names().join(", ")
-                        )
-                        .into());
-                    } else {
-                        match crate::catalog::load_prefab_file(name) {
-                            Ok(mut m) => {
-                                m.name = name.to_string();
-                                m.project = crate::catalog::project_root();
-                                if let Some(h) = crate::catalog::prefab_file_hash(name) {
-                                    self.catalog_base.insert(crate::catalog::sanitize(name), h);
-                                }
-                                self.saved_state.insert(
-                                    name.to_string(),
-                                    (m.history.nodes.len(), m.history.current),
-                                );
-                                (m, "opened catalog entry")
+                let (incoming, how) = if let Some(i) =
+                    self.others.iter().position(|m| m.name == name)
+                {
+                    (self.others.remove(i), "switched to")
+                } else if action == "switch" {
+                    return Err(format!(
+                        "no open document `{name}` (open: {}); use action open",
+                        self.doc_names().join(", ")
+                    )
+                    .into());
+                } else {
+                    match crate::catalog::load_prefab_file(name) {
+                        Ok(mut m) => {
+                            m.name = name.to_string();
+                            m.project = crate::catalog::project_root();
+                            if let Some(h) = crate::catalog::prefab_file_hash(name) {
+                                self.catalog_base.insert(crate::catalog::sanitize(name), h);
                             }
-                            Err(_) => {
-                                let mut m = Model::named(name);
-                                m.project = crate::catalog::project_root();
-                                (m, "opened new empty document")
-                            }
+                            self.saved_state.insert(
+                                name.to_string(),
+                                (m.history.nodes.len(), m.history.current),
+                            );
+                            (m, "opened catalog entry")
                         }
-                    };
+                        // Only a name with no catalog file starts empty: an
+                        // empty stand-in for a file that failed to load
+                        // would be saved over it.
+                        Err(e) if crate::catalog::prefab_file_exists(name) => {
+                            return Err(format!("catalog entry `{name}` didn't load: {e}").into());
+                        }
+                        Err(_) => {
+                            let mut m = Model::named(name);
+                            m.project = crate::catalog::project_root();
+                            (m, "opened new empty document")
+                        }
+                    }
+                };
                 let bump = self.model.version.max(incoming.version) + 1;
                 let outgoing = std::mem::replace(&mut self.model, incoming);
                 crate::catalog::set_open_doc(

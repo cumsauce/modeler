@@ -303,6 +303,10 @@ macro_rules! node_types {
 /// Appends the node type's field list (name: type, from its schema) to a
 /// field error, so a wrong field shows what the node takes.
 fn with_schema(e: String, ty: &str) -> String {
+    let e = match unknown_field(&e).and_then(|f| field_hint(ty, f)) {
+        Some(h) => format!("{e}\n  hint: {h}"),
+        None => e,
+    };
     let Some(schema) = schema(ty) else { return e };
     let v = schema.as_value();
     let Some(props) = v.get("properties").and_then(Value::as_object) else {
@@ -348,6 +352,26 @@ fn with_schema(e: String, ty: &str) -> String {
         fields.join(", "),
         ex.unwrap_or_default()
     )
+}
+
+/// The field serde named in an "unknown field `x`" error.
+fn unknown_field(e: &str) -> Option<&str> {
+    let rest = &e[e.find("unknown field `")? + 15..];
+    Some(&rest[..rest.find('`')?])
+}
+
+/// What an agent most likely meant by a field a node doesn't take (the
+/// ones the feedback log shows agents reaching for).
+fn field_hint(ty: &str, field: &str) -> Option<&'static str> {
+    Some(match (ty, field) {
+        ("noise" | "worley", "scale" | "frequency" | "freq") => {
+            "this node takes `size`: the feature size in meters (bigger = larger blobs)"
+        }
+        ("output", "input" | "color" | "albedo") => {
+            "output has no single input: wire nodes into its channels (base_color, roughness, metallic, height, emissive, opacity, ...)"
+        }
+        _ => return None,
+    })
 }
 
 fn de<T: serde::de::DeserializeOwned>(ctx: &str, body: &Value) -> Result<T, String> {
