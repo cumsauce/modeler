@@ -86,6 +86,23 @@ pub struct ComponentDef {
     /// What it means, for agents (`describe_op("components")`).
     #[serde(default)]
     pub doc: String,
+    /// In a Godot scene, also a child node running this script with the
+    /// fields as its properties.
+    #[serde(default)]
+    pub godot: Option<GodotComponent>,
+}
+
+/// A component's Godot side: `{"script": "res://components/place.gd",
+/// "node": "Node"}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GodotComponent {
+    /// The script (`res://...gd`) the component's node runs.
+    pub script: String,
+    /// The node type it's made as: the class the script extends (default
+    /// `Node`).
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 const FIELD_TYPES: [&str; 10] = [
@@ -111,6 +128,15 @@ pub fn load_vocabulary() -> Result<Option<Vocabulary>, String> {
     let v: Vocabulary =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     for (name, c) in &v.components {
+        if let Some(g) = &c.godot
+            && !g.script.starts_with("res://")
+        {
+            return Err(format!(
+                "{}: `{name}`: godot.script `{}` should be a res:// path",
+                path.display(),
+                g.script
+            ));
+        }
         if !c.type_path.is_empty() && c.type_path.split("::").count() < 2 {
             return Err(format!(
                 "{}: `{name}`: type `{}` should be a full Rust path (crate::module::Type)",
@@ -751,10 +777,14 @@ pub fn export_scene(
     check_refs(vocab.as_ref(), &entities)?;
     // Terrain heights.
     let mut terrains = Vec::new();
+    let mut grids = Vec::new();
     for op in &model.ops {
         if let Op::Terrain { name, def } = op {
             let file = dir.join(format!("{stem}.{name}.heights"));
-            let (nx, nz) = write_heights(def, &file)?;
+            let g = terrain_grid(def)?;
+            write_grid(&g, &file)?;
+            let (nx, nz) = (g.nx, g.nz);
+            grids.push((name.clone(), g));
             terrains.push(MapTerrain {
                 name: name.clone(),
                 heights: rel(&root, &file),
@@ -793,6 +823,7 @@ pub fn export_scene(
             map: model,
             owned: &owned,
             sources: &sources,
+            terrains: &grids,
             asset_root: &root,
             res_root: &crate::godot::res_root(path, &root),
         })?;
@@ -1022,6 +1053,60 @@ pub fn read_collision(bytes: &[u8]) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
 /// Magic at the start of a heights file.
 pub const HEIGHTS_MAGIC: &[u8; 4] = b"MHT1";
 
+/// A terrain's height grid in the map's frame (row-major by z, x fastest).
+#[derive(Debug, Clone)]
+pub struct Grid {
+    pub nx: usize,
+    pub nz: usize,
+    /// The first sample's x and z.
+    pub x0: f32,
+    pub z0: f32,
+    pub step_x: f32,
+    pub step_z: f32,
+    pub heights: Vec<f32>,
+    pub mask: Vec<u8>,
+}
+
+/// The terrain's height grid (refused for a rotated terrain).
+pub fn terrain_grid(t: &crate::terrain::Terrain) -> Result<Grid, ModelerError> {
+    if t.rotation
+        .is_some_and(|r| crate::quat_of(r).angle_between(Quat::IDENTITY) > 1e-4)
+    {
+        return Err(
+            "terrain heights: a rotated terrain can't be written as a grid; place it unrotated"
+                .into(),
+        );
+    }
+    let (cx, cz) = t.cells();
+    let (nx, nz) = (cx + 1, cz + 1);
+    let [w, d] = t.size;
+    let x0 = -w * 0.5;
+    let z0 = -d * 0.5;
+    let step_x = w / cx.max(1) as f32;
+    let step_z = d / cz.max(1) as f32;
+    let [tx, ty, tz] = t.translation;
+    let mut h = Vec::with_capacity(nx * nz);
+    let mut mask = Vec::with_capacity(nx * nz);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (x, z) = (x0 + i as f32 * step_x, z0 + j as f32 * step_z);
+            h.push(t.height_at(x, z) + ty);
+            let m = t.mask_at(x, z);
+            mask.push(m);
+        }
+    }
+    Ok(Grid {
+        nx,
+        nz,
+        x0: x0 + tx,
+        z0: z0 + tz,
+        step_x,
+        step_z,
+        heights: h,
+        mask,
+    })
+}
+
 /// Writes a terrain's top as a grid the game can read without the scene:
 ///
 /// ```text
@@ -1040,33 +1125,14 @@ pub fn write_heights(
     t: &crate::terrain::Terrain,
     path: &Path,
 ) -> Result<(usize, usize), ModelerError> {
-    if t.rotation
-        .is_some_and(|r| crate::quat_of(r).angle_between(Quat::IDENTITY) > 1e-4)
-    {
-        return Err(
-            "terrain heights: a rotated terrain can't be written as a grid; place it unrotated"
-                .into(),
-        );
-    }
-    let (cx, cz) = t.cells();
-    let (nx, nz) = (cx + 1, cz + 1);
-    let [w, d] = t.size;
-    let x0 = -w * 0.5;
-    let z0 = -d * 0.5;
-    let step_x = w / cx.max(1) as f32;
-    let step_z = d / cz.max(1) as f32;
-    let cell = step_x;
-    let [tx, ty, tz] = t.translation;
-    let mut h = Vec::with_capacity(nx * nz);
-    let mut mask = Vec::with_capacity(nx * nz);
-    for j in 0..nz {
-        for i in 0..nx {
-            let (x, z) = (x0 + i as f32 * step_x, z0 + j as f32 * step_z);
-            h.push(t.height_at(x, z) + ty);
-            let m = t.mask_at(x, z);
-            mask.push(m);
-        }
-    }
+    let g = terrain_grid(t)?;
+    write_grid(&g, path)?;
+    Ok((g.nx, g.nz))
+}
+
+fn write_grid(g: &Grid, path: &Path) -> Result<(), ModelerError> {
+    let (nx, nz, h, mask) = (g.nx, g.nz, &g.heights, &g.mask);
+    let cell = g.step_x;
     let lo = h.iter().copied().fold(f32::INFINITY, f32::min);
     let hi = h
         .iter()
@@ -1077,16 +1143,16 @@ pub fn write_heights(
     out.extend_from_slice(HEIGHTS_MAGIC);
     out.extend_from_slice(&(nx as u32).to_le_bytes());
     out.extend_from_slice(&(nz as u32).to_le_bytes());
-    for f in [x0 + tx, z0 + tz, cell, lo, hi] {
+    for f in [g.x0, g.z0, cell, lo, hi] {
         out.extend_from_slice(&f.to_le_bytes());
     }
-    for v in &h {
+    for v in h {
         let q = ((v - lo) / (hi - lo) * 65535.0).round().clamp(0.0, 65535.0) as u16;
         out.extend_from_slice(&q.to_le_bytes());
     }
-    out.extend_from_slice(&mask);
+    out.extend_from_slice(mask);
     crate::catalog::atomic_write(path, &out)?;
-    Ok((nx, nz))
+    Ok(())
 }
 
 /// Reads a heights file back: (nx, nz, x0, z0, cell, heights, mask).

@@ -72,6 +72,19 @@ map as a Godot 4 text scene (`src/godot.rs`), with the same glTFs, heights,
   project; a `.bsn` export of a component without one fails.
   `metadata/variant` names a prefab instance's variant (apply it in game
   code).
+- **Scripted components**: a vocabulary entry with `"godot": {"script":
+  "res://components/loot.gd", "node": "Node"}` (`node`: the class the
+  script extends, default `Node`) also becomes a child node of the entity
+  named after the component, running that script with each field set as a
+  property (`label = "gold"`, `weight = 2.5`, `at = Vector3(1, 2, 3)`,
+  `tags = PackedStringArray("a", "b")`): declare them `@export var` with
+  those types (`ref` / `refs` are node names: `String` /
+  `PackedStringArray`). A field named like a Node property (`name`,
+  `owner`, `position`, `visible`, ...) fails the export: rename it.
+- **Terrain** becomes a `<terrain>_heightmap` `StaticBody3D` with a
+  `HeightMapShape3D` (exact heights, cells scaled uniformly), replacing
+  any mesh collider on the terrain part, whether the terrain is shown or
+  hidden. Non-square cells get none (reported).
 - **Colliders** become physics nodes (Godot ignores `extras.collider`):
   per entity a `collision` `StaticBody3D` (`collision_kinematic`
   `AnimatableBody3D`, `sensor` `Area3D`) with one `CollisionShape3D` per

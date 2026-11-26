@@ -15,7 +15,9 @@
 //!   `ConcavePolygonShape3D` for the mesh colliders. A prefab's shapes are
 //!   shared sub-resources, its body a child of each instance. Dynamic
 //!   bodies are left out (a `RigidBody3D` has to own the mesh it moves) and
-//!   reported.
+//!   reported. Each terrain is a `HeightMapShape3D` body instead;
+//! - a component whose vocabulary entry has `godot.script` is also a child
+//!   node running that script, its fields set as properties.
 //!
 //! Paths are `res://` paths from the Godot project root: the nearest folder
 //! above the scene with a `project.godot`, else the asset folder.
@@ -42,6 +44,8 @@ pub struct Scene<'a> {
     pub owned: &'a [String],
     /// Each placed prefab's document.
     pub sources: &'a BTreeMap<String, Arc<Model>>,
+    /// Each terrain's height grid, by op name.
+    pub terrains: &'a [(String, crate::scene::Grid)],
     /// The asset folder entity glTF paths are relative to.
     pub asset_root: &'a Path,
     /// The folder `res://` stands for.
@@ -232,6 +236,7 @@ impl Subs {
 fn shapes(
     model: &Model,
     skip: &[String],
+    skip_parts: &[&str],
     key: &str,
     subs: &mut Subs,
 ) -> Result<(BTreeMap<Body, Vec<ShapeNode>>, usize), ModelerError> {
@@ -239,7 +244,9 @@ fn shapes(
     let mut soups: BTreeMap<Body, Vec<Vec3>> = BTreeMap::new();
     let mut dynamic = 0;
     for c in crate::game::colliders(model)? {
-        if skip.iter().any(|s| c.part.starts_with(s.as_str())) {
+        if skip.iter().any(|s| c.part.starts_with(s.as_str()))
+            || skip_parts.contains(&c.part.as_str())
+        {
             continue;
         }
         let body = if c.sensor {
@@ -356,6 +363,82 @@ fn body_nodes(
     }
 }
 
+fn godot_def<'v>(
+    vocab: Option<&'v Vocabulary>,
+    component: &str,
+) -> Option<&'v crate::scene::GodotComponent> {
+    vocab
+        .and_then(|v| v.components.get(component))
+        .and_then(|d| d.godot.as_ref())
+}
+
+/// Node properties a component field can't be (it would set the node's
+/// own instead).
+const RESERVED: [&str; 20] = [
+    "name",
+    "owner",
+    "script",
+    "process_mode",
+    "process_priority",
+    "process_physics_priority",
+    "process_thread_group",
+    "physics_interpolation_mode",
+    "auto_translate_mode",
+    "editor_description",
+    "unique_name_in_owner",
+    "scene_file_path",
+    "multiplayer",
+    "transform",
+    "position",
+    "rotation",
+    "scale",
+    "basis",
+    "quaternion",
+    "visible",
+];
+
+/// A child node per component that names a Godot script, with the fields
+/// as its properties.
+fn component_nodes(
+    out: &mut String,
+    vocab: Option<&Vocabulary>,
+    scripts: &BTreeMap<String, String>,
+    parent: &str,
+    entity: &str,
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ModelerError> {
+    for (comp, fields) in raw {
+        let Some(g) = godot_def(vocab, comp) else {
+            continue;
+        };
+        let def = vocab.and_then(|v| v.components.get(comp));
+        let ty = g.node.as_deref().unwrap_or("Node");
+        let _ = writeln!(
+            out,
+            "[node name={} type={} parent={}]",
+            quote(&node_name(comp)),
+            quote(ty),
+            quote(parent)
+        );
+        let id = scripts.get(&g.script).cloned().unwrap_or_default();
+        let _ = writeln!(out, "script = ExtResource(\"{id}\")");
+        if let Some(m) = fields.as_object() {
+            for (f, x) in m {
+                if RESERVED.contains(&f.as_str()) {
+                    return Err(format!(
+                        "`{entity}`: {comp}.{f} would set the Godot node's own `{f}`: rename the field in components.json, or drop the component's `godot` script"
+                    )
+                    .into());
+                }
+                let t = def.and_then(|d| d.fields.get(f)).map(String::as_str);
+                let _ = writeln!(out, "{f} = {}", value(t, x));
+            }
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
 /// The `.tscn` text for a map's entities.
 pub fn emit(s: &Scene) -> Result<Written, ModelerError> {
     let mut notes = Vec::new();
@@ -372,19 +455,65 @@ pub fn emit(s: &Scene) -> Result<Written, ModelerError> {
     for (i, id) in ext.values_mut().enumerate() {
         *id = format!("{}_gltf", i + 1);
     }
+    let mut scripts: BTreeMap<String, String> = BTreeMap::new();
+    for e in &es {
+        for c in e.raw.keys() {
+            if let Some(g) = godot_def(s.vocab, c) {
+                scripts.entry(g.script.clone()).or_default();
+            }
+        }
+    }
+    for (i, id) in scripts.values_mut().enumerate() {
+        *id = format!("{}_script", i + 1);
+    }
     // Shapes: each prefab's once, then the map's own.
     let mut subs = Subs::default();
     let mut dynamic = 0;
     let mut prefab_shapes = BTreeMap::new();
     for (name, src) in s.sources {
-        let (sh, d) = shapes(src, &[], name, &mut subs)?;
+        let (sh, d) = shapes(src, &[], &[], name, &mut subs)?;
         dynamic += d * es
             .iter()
             .filter(|e| e.prefab.as_deref() == Some(name))
             .count();
         prefab_shapes.insert(name.clone(), sh);
     }
-    let (own, d) = shapes(s.map, s.owned, s.stem, &mut subs)?;
+    // Terrains as height fields (square cells; their mesh colliders, if
+    // any, give way).
+    let mut fields = Vec::new();
+    for (name, g) in s.terrains {
+        if (g.step_x - g.step_z).abs() > 1e-4 * g.step_x.max(1.0) || g.nx < 2 || g.nz < 2 {
+            notes.push(format!(
+                "godot: terrain `{name}` has non-square cells ({} x {} m): no HeightMapShape3D",
+                g.step_x, g.step_z
+            ));
+            continue;
+        }
+        let c = g.step_x;
+        let data: Vec<String> = g.heights.iter().map(|h| float(h / c)).collect();
+        let sub = subs.add(
+            "HeightMapShape3D",
+            name,
+            format!(
+                "map_width = {}\nmap_depth = {}\nmap_data = PackedFloat32Array({})",
+                g.nx,
+                g.nz,
+                data.join(", ")
+            ),
+        );
+        let centre = Vec3::new(
+            g.x0 + (g.nx - 1) as f32 * c * 0.5,
+            0.0,
+            g.z0 + (g.nz - 1) as f32 * c * 0.5,
+        );
+        fields.push((
+            name.clone(),
+            Affine3A::from_scale_rotation_translation(Vec3::splat(c), Quat::IDENTITY, centre),
+            sub,
+        ));
+    }
+    let field_parts: Vec<&str> = fields.iter().map(|f| f.0.as_str()).collect();
+    let (own, d) = shapes(s.map, s.owned, &field_parts, s.stem, &mut subs)?;
     dynamic += d;
     if dynamic > 0 {
         notes.push(format!(
@@ -406,7 +535,14 @@ pub fn emit(s: &Scene) -> Result<Written, ModelerError> {
             quote(path)
         );
     }
-    if !ext.is_empty() {
+    for (path, id) in &scripts {
+        let _ = writeln!(
+            out,
+            "[ext_resource type=\"Script\" path={} id=\"{id}\"]",
+            quote(path)
+        );
+    }
+    if !ext.is_empty() || !scripts.is_empty() {
         out.push('\n');
     }
     for b in &subs.blocks {
@@ -466,11 +602,32 @@ pub fn emit(s: &Scene) -> Result<Written, ModelerError> {
             let _ = writeln!(out, "metadata/components = {}", components(s.vocab, &e.raw));
         }
         out.push('\n');
+        component_nodes(&mut out, s.vocab, &scripts, &name, &e.name, &e.raw)?;
         if let Some(sh) = e.prefab.as_ref().and_then(|p| prefab_shapes.get(p)) {
             body_nodes(&mut out, &name, "", sh);
         }
     }
     body_nodes(&mut out, ".", &format!("{root}_"), &own);
+    for (name, t, sub) in &fields {
+        let mut body = format!("{}_heightmap", node_name(name));
+        while used.contains(&body) {
+            body.push('_');
+        }
+        let _ = writeln!(
+            out,
+            "[node name={} type=\"StaticBody3D\" parent=\".\"]\n",
+            quote(&body)
+        );
+        let _ = writeln!(
+            out,
+            "[node name=\"shape\" type=\"CollisionShape3D\" parent={}]",
+            quote(&body)
+        );
+        if let Some(t) = transform(t) {
+            let _ = writeln!(out, "transform = {t}");
+        }
+        let _ = writeln!(out, "shape = SubResource(\"{sub}\")\n");
+    }
     while out.ends_with("\n\n") {
         out.pop();
     }

@@ -26,13 +26,26 @@ fn godot() -> Option<PathBuf> {
 
 const CHECK: &str = r#"extends SceneTree
 
-func _init():
-	var ps = load("res://assets/maps/commune.tscn")
-	var root = ps.instantiate()
+var scene
+var frames = 0
+
+func _initialize():
+	scene = load("res://assets/maps/commune.tscn").instantiate()
+	root.add_child(scene)
+
+func _physics_process(_delta):
+	frames += 1
+	if frames < 3:
+		return false
 	var out = {}
-	walk(root, root, out)
+	walk(scene, scene, out)
+	# The terrain's height field, by a ray down onto a grid point.
+	var space = scene.get_world_3d().direct_space_state
+	var q = PhysicsRayQueryParameters3D.create(Vector3(33, 100, -5), Vector3(33, -100, -5))
+	var hit = space.intersect_ray(q)
+	out["_ray"] = hit.position.y if hit else null
 	print("RESULT " + JSON.stringify(out))
-	quit()
+	return true
 
 func walk(n, root, out):
 	var d = {"type": n.get_class()}
@@ -44,6 +57,10 @@ func walk(n, root, out):
 		d["meta_" + k] = var_to_str(n.get_meta(k))
 	if n is CollisionShape3D and n.shape:
 		d["shape"] = n.shape.get_class()
+	if n.get_script():
+		for p in ["label", "weight", "at", "tags"]:
+			if p in n:
+				d[p] = var_to_str(n.get(p))
 	if n is MeshInstance3D and n.mesh:
 		var m = n.mesh.surface_get_material(0)
 		if m is BaseMaterial3D:
@@ -83,13 +100,21 @@ fn map_exports_as_a_godot_scene() {
                "components": {
                  "Place": {"fields": {"name": "string", "radius": "f32", "at": "vec3"}},
                  "Spawn": {},
-                 "Path": {"fields": {"to": "refs", "from": "ref"}}}})
+                 "Path": {"fields": {"to": "refs", "from": "ref"}},
+                 "Loot": {"fields": {"label": "string", "weight": "f32", "at": "vec3", "tags": "strings"},
+                          "godot": {"script": "res://components/loot.gd"}}}})
         .to_string(),
     )
     .unwrap();
     let game = tmp.join("game");
     std::fs::create_dir_all(&game).unwrap();
     std::fs::write(game.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::create_dir_all(game.join("components")).unwrap();
+    std::fs::write(
+        game.join("components/loot.gd"),
+        "extends Node\n@export var label: String\n@export var weight: float\n@export var at: Vector3\n@export var tags: PackedStringArray\n",
+    )
+    .unwrap();
 
     // A prefab with a box collider.
     let mut p = Session::default();
@@ -134,7 +159,11 @@ fn map_exports_as_a_godot_scene() {
             json!({"type": "collider", "name": "ball_c", "parts": ["ball"], "shape": "hull", "body": "dynamic"}),
             json!({"type": "prefab", "name": "crate1", "prefab": "crate", "translation": [2, 0, 1], "rotation": {"y": 90},
                    "components": {"Place": {"name": "depot", "radius": 4, "at": [1, 2, 3]}}}),
-            json!({"type": "prefab", "name": "crate2", "prefab": "crate", "translation": [-3, 0, -2]}),
+            json!({"type": "prefab", "name": "crate2", "prefab": "crate", "translation": [-3, 0, -2],
+                   "components": {"Loot": {"label": "gold", "weight": 2.5, "at": [1, 2, 3], "tags": ["a", "b"]}}}),
+            // Off to the side, with a mesh collider the height field replaces.
+            json!({"type": "terrain", "name": "hills", "size": [20, 20], "resolution": 1, "height": 3, "seed": 3, "translation": [40, 0, 0]}),
+            json!({"type": "collider", "name": "hills_c", "parts": ["hills"], "shape": "mesh"}),
             json!({"type": "marker", "name": "spawn", "kind": "spawn", "translation": [0, 1, 0], "yaw": 90,
                    "size": [1, 2, 1], "components": {"Spawn": {}}}),
             json!({"type": "marker", "name": "path", "kind": "path",
@@ -180,6 +209,24 @@ fn map_exports_as_a_godot_scene() {
         "{text}"
     );
     assert!(text.contains("ConcavePolygonShape3D"), "{text}");
+    assert_eq!(
+        text.matches("type=\"ConcavePolygonShape3D\"").count(),
+        1,
+        "the floor only"
+    );
+    assert!(
+        text.contains(r#"[node name="hills_heightmap" type="StaticBody3D" parent="."]"#),
+        "{text}"
+    );
+    assert!(text.contains("map_width = 21"), "{text}");
+    assert!(
+        text.contains(r#"[node name="Loot" type="Node" parent="crate2"]"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"tags = PackedStringArray("a", "b")"#),
+        "{text}"
+    );
     // One box shape shared by both crates.
     assert_eq!(text.matches("type=\"BoxShape3D\"").count(), 2, "{text}"); // crate + zone
     // PNG textures, not KTX2.
@@ -273,6 +320,44 @@ fn map_exports_as_a_godot_scene() {
         "ConcavePolygonShape3D"
     );
     assert_eq!(get("commune_sensor/zone")["shape"], "BoxShape3D");
+    // Scripted component nodes carry the fields as typed properties.
+    let loot = get("crate2/Loot");
+    assert_eq!(loot["label"], "\"gold\"", "{loot}");
+    assert_eq!(loot["weight"], "2.5", "{loot}");
+    assert_eq!(loot["at"], "Vector3(1, 2, 3)", "{loot}");
+    assert_eq!(loot["tags"], "PackedStringArray(\"a\", \"b\")", "{loot}");
+    // The height field stands where the terrain is: grid point (3, 5) of
+    // a 20 m terrain at x = 40 is (33, -5).
+    let want = s
+        .model
+        .ops
+        .iter()
+        .find_map(|o| match o {
+            modeler::Op::Terrain { def, .. } => Some(def.height_at(-7.0, -5.0)),
+            _ => None,
+        })
+        .unwrap();
+    let ray = nodes["_ray"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("the ray missed: {nodes:#}"));
+    assert!(
+        (ray as f32 - want).abs() < 1e-3,
+        "ray {ray} vs height {want}"
+    );
+    // (A transposed grid would read the height at (-5, -7) instead.)
+    let swapped = s
+        .model
+        .ops
+        .iter()
+        .find_map(|o| match o {
+            modeler::Op::Terrain { def, .. } => Some(def.height_at(-5.0, -7.0)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        (swapped - want).abs() > 0.02,
+        "{swapped} vs {want}: pick another point"
+    );
     // The map's own glTF, with its PNG albedo texture.
     let meshes: Vec<&serde_json::Value> = nodes
         .as_object()

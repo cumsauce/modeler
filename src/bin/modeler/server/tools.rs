@@ -932,7 +932,8 @@ Style::default()
     /// geometry as one glTF, a heights file per terrain, and `components`
     /// from the project's .modeler/components.json vocabulary. A path ending
     /// in `.tscn` writes the same map as a Godot 4 scene (instanced glTFs,
-    /// Marker3D markers, components as metadata, colliders as physics nodes;
+    /// Marker3D markers, components as metadata (and scripted child nodes),
+    /// colliders and terrain as physics nodes;
     /// PNG textures, no lods or ao).
     #[tool]
     async fn export_model(
@@ -2517,7 +2518,7 @@ impl rmcp::ServerHandler for Tools {
 - Every model gets materials, textured by default unless the user asks for a blockout or plain colours (flat: true). Shape first, then make materials with material_ops and assign them ({"type": "material", "name": part, "pbr": name}) in a later apply_ops; tile materials for anything repeated, object-domain ones (mesh_ao, mesh_curvature, svg / text on a project node) for hero parts, decals for stains and graffiti. Check with expect {"materials": "pbr"}. Materials follow lineage: copies and cuts inherit their source's material.
 - Verify numerically, render once: expect / verify (grounded, supported, rests, attached, collisions, bounds, validate, materials, walkable, symmetric, ...) and inspect (measure, section, mass, thickness) between steps, then one tiled agent_views (["front", "right", "top", "iso"]) at the end, and look at it.
 - Organic forms: start from body or silhouette (or sdf / skin), compare with agent_views reference, fix with local warps, check style "curvature", keep it light with tris. Interiors: carve rooms out of a mass with cutters, then verify walkable. Rig after shape and materials: skeleton / bind / clip / pose / mocap / sway, checked with verify animation.
-- Engines: export_model writes a model as .gltf / .glb, and a map (terrain, prefab instances, markers, colliders) as a level scene: .bsn for Bevy, .tscn for Godot 4 (use it in a project with a project.godot; PNG textures, no lods / ao). topic:bsn.
+- Engines: export_model writes a model as .gltf / .glb, and a map (terrain, prefab instances, markers, colliders) as a level scene: .bsn for Bevy, .tscn for Godot 4 (use it in a project with a project.godot: colliders and terrain become physics bodies, components with a godot script in components.json become scripted child nodes; PNG textures, no lods / ao). topic:bsn.
 - A timeout from your MCP client does not mean the call failed: the server keeps working, so check history or scene_summary before retrying an apply_ops.
 - Several agents may share one server: each keeps its own active document, results say what others changed in yours, undo refuses to revert another agent's step unless force: true.
 - Each apply_ops call is one undo step; undo / redo / jump move a history-tree cursor, diff shows what changed, cherry_pick replays ops from another branch. Every mutation autosaves; save_prefab names and indexes a model in the catalog.

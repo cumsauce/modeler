@@ -117,8 +117,9 @@ Three layers, read top to bottom:
 - **Engines**: `export_model` writes one model as `.gltf` / `.glb` (Bevy,
   Godot, anything), and a map (terrain, `prefab` instances, markers,
   colliders) as a level scene: `.bsn` for Bevy (jackdaw) or `.tscn` for
-  Godot 4 (instanced glTFs, `Marker3D`s, components as metadata, physics
-  bodies; PNG textures, no `lods` / `ao`). In a Godot project
+  Godot 4 (instanced glTFs, `Marker3D`s, components as metadata or
+  scripted child nodes, physics bodies, terrain as a `HeightMapShape3D`;
+  PNG textures, no `lods` / `ao`). In a Godot project
   (`project.godot`) export maps as `.tscn` and models as `.glb` / `.gltf`
   inside it. `topic:bsn` has both.
 - Humans: `add_annotation` / `list_annotations` / `delete_annotation`,
