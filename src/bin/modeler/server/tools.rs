@@ -930,7 +930,10 @@ Style::default()
     /// level scene (jackdaw's format): prefab instances by reference (each
     /// prefab exported once to models/prefabs/), markers, the document's own
     /// geometry as one glTF, a heights file per terrain, and `components`
-    /// from the project's .modeler/components.json vocabulary.
+    /// from the project's .modeler/components.json vocabulary. A path ending
+    /// in `.tscn` writes the same map as a Godot 4 scene (instanced glTFs,
+    /// Marker3D markers, components as metadata, colliders as physics nodes;
+    /// PNG textures, no lods or ao).
     #[tool]
     async fn export_model(
         &self,
@@ -948,9 +951,15 @@ Style::default()
             {
                 Some("glb") => "glb".into(),
                 Some("bsn") => "bsn".into(),
+                Some("tscn") => "tscn".into(),
                 _ => "gltf".into(),
             }
         });
+        let format = if format == "godot" {
+            "tscn".into()
+        } else {
+            format
+        };
         let mut path = PathBuf::from(path);
         if path.extension().is_none() {
             path.set_extension(&format);
@@ -964,8 +973,11 @@ Style::default()
                 &optimize.clone().unwrap_or(serde_json::Value::Null),
             )?;
             let report = match format.as_str() {
-                "bsn" => {
+                "bsn" | "tscn" => {
                     let mut so = modeler::scene::SceneOptions::default();
+                    if format == "tscn" {
+                        so.format = modeler::scene::SceneFormat::Godot;
+                    }
                     if optimize.is_some() {
                         so.optimize = opts;
                     }
@@ -984,7 +996,7 @@ Style::default()
                 }
                 other => {
                     return Err(format!(
-                        "unknown format `{other}` (use \"gltf\", \"glb\" or \"bsn\")"
+                        "unknown format `{other}` (use \"gltf\", \"glb\", \"bsn\" or \"tscn\")"
                     )
                     .into());
                 }

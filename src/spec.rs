@@ -2808,7 +2808,7 @@ pub struct PrefabSpec {
     #[schemars(with = "Option<serde_json::Value>")]
     style: Option<serde_json::Value>,
     /// Game components from the project's vocabulary (.modeler/components.json):
-    /// {"Place": {"name": "wendys"}}. Written by a .bsn scene export.
+    /// {"Place": {"name": "wendys"}}. Written by a .bsn / .tscn scene export.
     #[serde(default)]
     #[schemars(with = "Option<serde_json::Value>")]
     components: serde_json::Map<String, Value>,
@@ -2954,7 +2954,7 @@ pub struct MarkerSpec {
     #[serde(default)]
     preview: Option<String>,
     /// Game components from the project's vocabulary (.modeler/components.json):
-    /// {"Place": {"name": "wendys"}}. Written by a .bsn scene export.
+    /// {"Place": {"name": "wendys"}}. Written by a .bsn / .tscn scene export.
     #[serde(default)]
     #[schemars(with = "Option<serde_json::Value>")]
     components: serde_json::Map<String, Value>,

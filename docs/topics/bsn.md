@@ -1,4 +1,4 @@
-# Level scenes (.bsn)
+# Level scenes (.bsn, .tscn)
 
 **Level scenes (`.bsn`):** a map document (terrain, roads, `prefab`
 instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
@@ -48,3 +48,42 @@ instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
   terrains' heights files. Read it (serde_json) when code needs the layout
   before the game world exists, instead of parsing the BSN text. A
   marker's yaw is in both files' rotation, its size only in the JSON.
+
+## Godot scenes (.tscn)
+
+`export_model("maps/commune.tscn")` (or `format: "godot"`) writes the same
+map as a Godot 4 text scene (`src/godot.rs`), with the same glTFs, heights,
+`.collision` and `map.json` beside it:
+
+- `res://` paths start at the nearest folder above the scene holding
+  `project.godot`, else at the asset folder; export inside the Godot
+  project. Prefab instances and the `<stem>_ground` geometry are
+  instanced glTF `PackedScene`s (Godot imports the glTF itself); markers
+  are `Marker3D` with `metadata/kind` and `metadata/size`; the root has
+  `metadata/map_json`. Names Godot rejects (`. : @ / " %`) become `_` and
+  keep the original in `metadata/modeler_name`.
+- **Components** go into `metadata/components`, a dictionary by
+  vocabulary name (`{"Place": {"name": "depot", "radius": 4.0}}`): vec2 /
+  vec3 as `Vector2` / `Vector3`, strings / refs as `PackedStringArray`.
+  The vocabulary's `type` (the Rust path) is optional for a Godot-only
+  project; a `.bsn` export of a component without one fails.
+  `metadata/variant` names a prefab instance's variant (apply it in game
+  code).
+- **Colliders** become physics nodes (Godot ignores `extras.collider`):
+  per entity a `collision` `StaticBody3D` (`collision_kinematic`
+  `AnimatableBody3D`, `sensor` `Area3D`) with one `CollisionShape3D` per
+  collider (box `BoxShape3D`, hull `ConvexPolygonShape3D`, all mesh
+  colliders one `ConcavePolygonShape3D` named `mesh`). A prefab's shapes
+  are shared sub-resources and its bodies children of every instance; the
+  map's own are `<stem>_collision` / `<stem>_sensor` at the root. Dynamic
+  bodies are left out and reported (a `RigidBody3D` must own the mesh it
+  moves).
+- Textures are shared PNGs (`textures: "png"`; `embed` becomes
+  `embed_png`): Godot doesn't read KTX2 from a glTF `source` and
+  re-compresses on import. A prefab glTF still holding KTX2 from a `.bsn`
+  export is re-exported. `lods` is refused (Godot would draw every level;
+  it makes its own LODs when it imports), and so is `ao` (Godot 4.7's
+  importer ignores `texCoord: 1` and would sample the atlas on the first
+  uv set; use LightmapGI or SSAO in Godot).
+- A marker's yaw 0 faces +z, which is the back of a Godot node (its
+  forward is -z): the transform is the same, read `basis.z` for its facing.

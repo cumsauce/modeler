@@ -253,7 +253,7 @@ walls (`describe_op("carve")` has the details).
    `light` markers per room (the `room` markers have each room's centre and
    box), prefab props `place`d on the floor sheets.
 6. **Export** `.gltf` with `optimize: "game"` (add `ao` for baked occlusion:
-   merged quads make the atlas small), or a `.bsn` map: the room / opening
+   merged quads make the atlas small), or a `.bsn` (Godot: `.tscn`, no `ao`) map: the room / opening
    markers and colliders come along.
 
 ## Organic workflow
@@ -311,7 +311,7 @@ walks in `examples/`. Guides: `topic:animation`, `describe_op("clip")`,
 | `docs/topics/verify.md`, `inspect.md`, `views.md` | checks, numeric senses, renders and their image cost |
 | `docs/topics/materials.md`, `style.md` | procedural material graphs, style tokens |
 | `docs/topics/animation.md`, `motion-checks.md`, `human.md`, `runtime.md` | rigs, motion checks, the human template, `modeler_bevy` |
-| `docs/topics/export.md`, `game-data.md`, `bsn.md` | game export, colliders and markers, `.bsn` level scenes |
+| `docs/topics/export.md`, `game-data.md`, `bsn.md` | game export, colliders and markers, `.bsn` / Godot `.tscn` level scenes |
 | `docs/topics/scenes.md`, `catalog.md`, `history.md`, `session.md`, `daemon.md` | open documents, catalog, history tools, annotations and feedback, the daemon |
 | `docs/preview.md` | the preview window (human side): workbench layout, design system, panes |
 | `docs/dev.md` | server internals: multi-agent calls, off-thread slow calls, autosave lock, restart flow |

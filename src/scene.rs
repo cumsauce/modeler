@@ -1,6 +1,7 @@
 //! Level export: a map document becomes a `.bsn` scene (jackdaw's format,
 //! Bevy 0.20 syntax), a glTF per prefab it places, one glTF of its own
-//! geometry, and a heights file per terrain.
+//! geometry, and a heights file per terrain. [`SceneFormat::Godot`] writes
+//! the same entities as a Godot 4 `.tscn` instead ([`crate::godot`]).
 //!
 //! - **Entities.** Each `prefab` instance is an entity with a `GltfSource`
 //!   pointing at that prefab's glTF (exported once, re-exported when the
@@ -75,7 +76,8 @@ pub struct Vocabulary {
 #[serde(deny_unknown_fields)]
 pub struct ComponentDef {
     /// The Rust type path the game registers (`my_game::places::Place`).
-    #[serde(rename = "type")]
+    /// Optional for projects that only export Godot scenes.
+    #[serde(rename = "type", default)]
     pub type_path: String,
     /// Field name -> type (`string`, `f32`, `i32`, `u32`, `bool`, `vec2`,
     /// `vec3`). Empty for a marker component.
@@ -109,7 +111,7 @@ pub fn load_vocabulary() -> Result<Option<Vocabulary>, String> {
     let v: Vocabulary =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     for (name, c) in &v.components {
-        if c.type_path.split("::").count() < 2 {
+        if !c.type_path.is_empty() && c.type_path.split("::").count() < 2 {
             return Err(format!(
                 "{}: `{name}`: type `{}` should be a full Rust path (crate::module::Type)",
                 path.display(),
@@ -254,7 +256,7 @@ fn emit_value(t: &str, v: &serde_json::Value) -> Result<String, String> {
 }
 
 /// A float that always reads as one (`1.0`, not `1`).
-fn float(x: f32) -> String {
+pub(crate) fn float(x: f32) -> String {
     let x = if x == 0.0 { 0.0 } else { x };
     let s = format!("{x}");
     if s.contains(['.', 'e', 'E']) || !x.is_finite() {
@@ -319,6 +321,8 @@ pub struct Entity {
     pub components: Vec<(String, Vec<(String, String)>)>,
     /// A prefab instance's cosmetic variant (None: its default look).
     pub variant: Option<String>,
+    /// The catalog prefab a prefab instance places.
+    pub prefab: Option<String>,
 }
 
 fn transform_text(t: &Affine3A) -> String {
@@ -411,6 +415,7 @@ pub fn emit(scene: &str, header: &[String], entities: &[Entity]) -> String {
 fn resolve_components(
     vocab: Option<&Vocabulary>,
     components: &serde_json::Map<String, serde_json::Value>,
+    bsn: bool,
 ) -> Result<Vec<(String, Vec<(String, String)>)>, String> {
     if components.is_empty() {
         return Ok(Vec::new());
@@ -424,6 +429,11 @@ fn resolve_components(
         let Some(def) = v.components.get(name) else {
             continue;
         };
+        if def.type_path.is_empty() && bsn {
+            return Err(format!(
+                "component `{name}` has no `type` in components.json (the Rust path the game registers; a .bsn scene needs it)"
+            ));
+        }
         let mut fields = Vec::new();
         if let serde_json::Value::Object(m) = value {
             for (f, val) in m {
@@ -496,6 +506,18 @@ pub struct SceneOptions {
     pub refresh: bool,
     /// The export optimisation for every glTF (default `game`).
     pub optimize: crate::export_opt::Options,
+    /// Which scene file to write.
+    pub format: SceneFormat,
+}
+
+/// The scene file [`export_scene`] writes beside the glTFs and data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SceneFormat {
+    /// jackdaw's `.bsn` (Bevy).
+    #[default]
+    Bsn,
+    /// A Godot 4 text scene (`.tscn`), see [`crate::godot`].
+    Godot,
 }
 
 impl Default for SceneOptions {
@@ -504,6 +526,7 @@ impl Default for SceneOptions {
             prefab_dir: "models/prefabs".into(),
             refresh: false,
             optimize: crate::export_opt::Options::game(),
+            format: SceneFormat::Bsn,
         }
     }
 }
@@ -521,6 +544,28 @@ pub fn export_scene(
     opts: &SceneOptions,
 ) -> Result<String, ModelerError> {
     let vocab = load_vocabulary().map_err(ModelerError::from)?;
+    let bsn = opts.format == SceneFormat::Bsn;
+    let mut optimize = opts.optimize.clone();
+    if !bsn {
+        // Godot's glTF importer reads PNG / JPEG images, not KTX2 named by
+        // `source` (it re-compresses on import anyway), and draws every LOD
+        // node at once (it makes its own LODs on import).
+        if optimize.textures.is_none()
+            || optimize.textures == Some(crate::export_opt::TextureMode::Ktx2)
+        {
+            optimize.textures = Some(crate::export_opt::TextureMode::Png);
+        } else if optimize.textures == Some(crate::export_opt::TextureMode::Embed) {
+            optimize.textures = Some(crate::export_opt::TextureMode::EmbedPng);
+        }
+        if !optimize.lods.is_empty() {
+            return Err("optimize.lods: a Godot scene would draw every level at once; Godot makes its own LODs when it imports the glTF (drop `lods`)".to_string().into());
+        }
+        if optimize.ao.is_some() {
+            return Err("optimize.ao: Godot's glTF importer reads the occlusion texture on the first uv set, not the atlas's second one (drop `ao`; LightmapGI or SSAO in Godot instead)".to_string().into());
+        }
+    }
+    let png = !bsn;
+    let mut sources: BTreeMap<String, std::sync::Arc<Model>> = BTreeMap::new();
     let root = asset_root(path);
     let stem = path
         .file_stem()
@@ -559,7 +604,11 @@ pub fn export_scene(
                 let src_file = crate::catalog::catalog_dir()
                     .ok()
                     .map(|d| d.join(format!("{}.json", crate::catalog::sanitize(prefab))));
+                // A KTX2 glTF (from a .bsn export) doesn't load in Godot.
+                let ktx2 =
+                    png && std::fs::read_to_string(&file).is_ok_and(|t| t.contains("image/ktx2"));
                 let stale = opts.refresh
+                    || ktx2
                     || match (mtime(&file), src_file.as_deref().and_then(mtime)) {
                         (Some(out), Some(src)) => out < src,
                         (None, _) => true,
@@ -575,7 +624,7 @@ pub fn export_scene(
                     if let Some(d) = file.parent() {
                         std::fs::create_dir_all(d).map_err(|e| ModelerError::Io(e.to_string()))?;
                     }
-                    let r = crate::gltf::export_gltf_with(src, &file, &opts.optimize)?;
+                    let r = crate::gltf::export_gltf_with(src, &file, &optimize)?;
                     report.push(format!(
                         "exported prefab `{prefab}` -> {}",
                         rel(&root, &file)
@@ -592,6 +641,9 @@ pub fn export_scene(
                 r
             }
         };
+        if let Some(src) = &source {
+            sources.entry(prefab.clone()).or_insert_with(|| src.clone());
+        }
         let fallback = affine(
             *translation,
             rotation.unwrap_or([0.0, 0.0, 0.0, 1.0]),
@@ -605,7 +657,7 @@ pub fn export_scene(
             transform: instance_transform(model, name, source.as_deref(), fallback),
             gltf: Some(gltf),
             components: {
-                let mut c = resolve_components(vocab.as_ref(), components)
+                let mut c = resolve_components(vocab.as_ref(), components, bsn)
                     .map_err(|e| format!("instance `{name}`: {e}"))?;
                 if let Some(v) = variant {
                     c.push((
@@ -616,6 +668,7 @@ pub fn export_scene(
                 c
             },
             variant: variant.clone(),
+            prefab: Some(prefab.clone()),
         });
     }
     // Markers.
@@ -641,9 +694,10 @@ pub fn export_scene(
             raw: comps.clone(),
             transform: Affine3A::from_rotation_translation(m.rotation, m.position),
             gltf: None,
-            components: resolve_components(vocab.as_ref(), &comps)
+            components: resolve_components(vocab.as_ref(), &comps, bsn)
                 .map_err(|e| format!("marker `{}`: {e}", m.name))?,
             variant: None,
+            prefab: None,
         });
     }
     // The document's own geometry as one glTF.
@@ -670,7 +724,7 @@ pub fn export_scene(
     kept += crate::decal::collect(&area)?.len();
     if kept > 0 {
         let file = dir.join(format!("{stem}.gltf"));
-        let r = crate::gltf::export_gltf_with(&area, &file, &opts.optimize)?;
+        let r = crate::gltf::export_gltf_with(&area, &file, &optimize)?;
         report.push(format!(
             "exported the map's own geometry ({kept} part(s)) -> {}: {}",
             rel(&root, &file),
@@ -691,6 +745,7 @@ pub fn export_scene(
             gltf: Some(rel(&root, &file)),
             components: Vec::new(),
             variant: None,
+            prefab: None,
         });
     }
     check_refs(vocab.as_ref(), &entities)?;
@@ -727,7 +782,23 @@ pub fn export_scene(
         }
     };
     let header = vocab.as_ref().map(|v| v.header.clone()).unwrap_or_default();
-    let text = emit(&stem, &header, &entities);
+    let text = if bsn {
+        emit(&stem, &header, &entities)
+    } else {
+        let g = crate::godot::emit(&crate::godot::Scene {
+            stem: &stem,
+            header: &header,
+            entities: &entities,
+            vocab: vocab.as_ref(),
+            map: model,
+            owned: &owned,
+            sources: &sources,
+            asset_root: &root,
+            res_root: &crate::godot::res_root(path, &root),
+        })?;
+        report.extend(g.notes);
+        g.text
+    };
     crate::catalog::atomic_write(path, text.as_bytes())?;
     let mut data = map_file(&stem, &entities, terrains);
     data.collision = collision;

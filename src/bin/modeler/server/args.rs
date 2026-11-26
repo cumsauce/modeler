@@ -175,7 +175,8 @@ pub(crate) struct ExportModelArgs {
     /// File path to write, e.g. "models/chair.gltf".
     pub(crate) path: String,
     /// "gltf" (default, preferred: textures as shared KTX2 files) or "glb"
-    /// (one self-contained file, KTX2 textures inside). Omitted: from the
+    /// (one self-contained file, KTX2 textures inside), "bsn" (a Bevy level
+    /// scene) or "tscn" / "godot" (a Godot 4 level scene). Omitted: from the
     /// path's extension, else gltf.
     #[serde(default)]
     pub(crate) format: Option<String>,

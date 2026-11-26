@@ -90,6 +90,7 @@ pub mod feedback;
 pub mod game;
 pub mod garment;
 pub mod gltf;
+pub mod godot;
 pub mod graph;
 pub mod human;
 pub mod inspect;
