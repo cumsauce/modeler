@@ -104,9 +104,11 @@ modeler --offscreen
   instead of discarding.
 - **Prefab catalog**: non-destructive saves (op graph + history tree +
   annotations; procedural geometry re-derives on load; atomic writes).
-  In a game project (a `Cargo.toml` beside `assets/`, a `.modeler/` folder,
-  or `--project <dir>`) everything lives in `<project>/.modeler/`, outside
-  `assets/`, and relative exports land in `assets/`. Elsewhere it uses the
+  In a game project (a `Cargo.toml` beside `assets/`, a Godot
+  `project.godot`, a `.modeler/` folder, or `--project <dir>`) everything
+  lives in `<project>/.modeler/`, outside `assets/`, and relative exports
+  land in `assets/` (a Godot project without one: its root). Maps export
+  as Bevy `.bsn` or Godot `.tscn` level scenes. Elsewhere it uses the
   shared `~/Library/Application Support/friendslop/modeler/`.
 - **Senses for agents**: `verify` checks (closed meshes, bounds, grounded,
   stable), `inspect` (gaps/overlaps between parts, cross-sections, mass and

@@ -180,12 +180,13 @@ pub struct TextureOut {
 
 impl TextureOut {
     /// The shared texture folder for a model exported to `path`: the
-    /// `textures/` folder at the root of the `assets/` folder holding it (so
+    /// `textures/` folder at the root of the `assets/` folder (or Godot
+    /// project without one) holding it (so
     /// every model in a game shares one set), else `textures/` beside it.
     pub fn for_export(path: &Path) -> TextureOut {
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         for (up, a) in dir.ancestors().enumerate() {
-            if a.file_name().is_some_and(|n| n == "assets") {
+            if a.file_name().is_some_and(|n| n == "assets") || crate::catalog::is_bare_godot(a) {
                 return TextureOut {
                     dir: a.join("textures"),
                     uri_prefix: "../".repeat(up) + "textures/",

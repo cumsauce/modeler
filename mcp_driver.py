@@ -592,7 +592,8 @@ def daemon_mode(socket_path, mode):
 
 def find_project(start):
     """The game project a directory belongs to (the server's own rule): the
-    nearest ancestor with a .modeler/ folder, or a Cargo.toml beside assets/."""
+    nearest ancestor with a .modeler/ folder, a Cargo.toml beside assets/, or
+    a project.godot."""
     env = os.environ.get("MODELER_PROJECT")
     if env:
         return os.path.abspath(env)
@@ -600,7 +601,8 @@ def find_project(start):
     while True:
         if os.path.isdir(os.path.join(d, ".modeler")) or (
                 os.path.isfile(os.path.join(d, "Cargo.toml"))
-                and os.path.isdir(os.path.join(d, "assets"))):
+                and os.path.isdir(os.path.join(d, "assets"))) or os.path.isfile(
+                    os.path.join(d, "project.godot")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -623,8 +625,8 @@ def project_below(start, depth=3):
         return None
     found = []
     skip = {"target", "node_modules", "vendor", "dist", "build"}
-    for root, dirs, _ in os.walk(start):
-        if ".modeler" in dirs:
+    for root, dirs, files in os.walk(start):
+        if ".modeler" in dirs or "project.godot" in files:
             found.append(root)
         rel = os.path.relpath(root, start)
         level = 0 if rel == "." else rel.count(os.sep) + 1

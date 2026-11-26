@@ -215,6 +215,20 @@ fn map_exports_as_a_godot_scene() {
     .unwrap_err();
     assert!(err.to_string().contains("has no `type`"), "{err}");
 
+    // A Godot project with no assets/ folder: res:// is its root, textures
+    // shared in res://textures/.
+    let bare = tmp.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(bare.join("project.godot"), "config_version=5\n").unwrap();
+    let b = modeler::scene::export_scene(&s.model, &bare.join("maps/level.tscn"), &opts).unwrap();
+    let bt = std::fs::read_to_string(bare.join("maps/level.tscn")).unwrap();
+    assert!(
+        bt.contains(r#"path="res://models/prefabs/crate.gltf""#),
+        "{b}\n{bt}"
+    );
+    assert!(bt.contains(r#"path="res://maps/level.gltf""#), "{bt}");
+    assert!(bare.join("textures").is_dir(), "{b}");
+
     let Some(godot) = godot() else {
         eprintln!("no godot binary: skipping the Godot import check");
         return;

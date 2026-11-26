@@ -83,10 +83,11 @@ Three layers, read top to bottom:
      next to `assets/` and never inside it, so the editable sources (ops,
      history, styles) live in the game's repo but don't ship. The project is
      `--project <dir>` (or `MODELER_PROJECT`), else the nearest ancestor of
-     the server's working directory with a `.modeler/` folder or a
-     `Cargo.toml` beside an `assets/` folder. Relative `export_model` paths
-     land in `<project>/assets/` (`"models/crate.glb"` ->
-     `assets/models/crate.glb`; a leading `assets/` is not doubled). Outside a
+     the server's working directory with a `.modeler/` folder, a
+     `Cargo.toml` beside an `assets/` folder, or a `project.godot`. Relative
+     `export_model` paths land in `<project>/assets/` (`"models/crate.glb"`
+     -> `assets/models/crate.glb`; a leading `assets/` is not doubled), or
+     at a Godot project's root (`res://`) when it has no `assets/`. Outside a
      project a relative path lands in the shared library's `exports/`
      folder, never the daemon's cwd; the result prints the absolute path. `.modeler/.gitignore` is written once to
      keep the per-machine autosaves (`session.json`, `open_docs.json`) and the
@@ -113,6 +114,13 @@ Three layers, read top to bottom:
   `save_prefab`, `load_prefab`, `catalog_list`, `catalog_describe`,
   `material_catalog`, `export_model` (`topic:scenes`, `topic:catalog`,
   `topic:export`, `topic:bsn`).
+- **Engines**: `export_model` writes one model as `.gltf` / `.glb` (Bevy,
+  Godot, anything), and a map (terrain, `prefab` instances, markers,
+  colliders) as a level scene: `.bsn` for Bevy (jackdaw) or `.tscn` for
+  Godot 4 (instanced glTFs, `Marker3D`s, components as metadata, physics
+  bodies; PNG textures, no `lods` / `ao`). In a Godot project
+  (`project.godot`) export maps as `.tscn` and models as `.glb` / `.gltf`
+  inside it. `topic:bsn` has both.
 - Humans: `add_annotation` / `list_annotations` / `delete_annotation`,
   `set_camera`, `session_log` (`topic:session`).
 

@@ -80,7 +80,8 @@ pub const PROJECT_DIR: &str = ".modeler";
 /// The game project this server works in, if any: `MODELER_PROJECT` (set by
 /// `--project <dir>`), else the nearest ancestor of the working directory
 /// that has a `.modeler/` folder, or a `Cargo.toml` next to an `assets/`
-/// folder (a Bevy game). None = the shared library.
+/// folder (a Bevy game), or a `project.godot` (a Godot game). None = the
+/// shared library.
 pub fn project_root() -> Option<PathBuf> {
     if let Ok(g) = CALL_PROJECT.read()
         && let Some(p) = g.as_ref()
@@ -157,8 +158,24 @@ pub fn find_project(start: &std::path::Path) -> Option<PathBuf> {
         .find(|d| {
             d.join(PROJECT_DIR).is_dir()
                 || (d.join("Cargo.toml").is_file() && d.join("assets").is_dir())
+                || d.join("project.godot").is_file()
         })
         .map(PathBuf::from)
+}
+
+/// Where a project's exports live: its `assets/` folder, or a Godot
+/// project's root (`res://`) when it has no `assets/` folder.
+pub fn asset_dir(root: &std::path::Path) -> PathBuf {
+    if is_bare_godot(root) {
+        root.to_path_buf()
+    } else {
+        root.join("assets")
+    }
+}
+
+/// A Godot project root without an `assets/` folder: exports go in it as is.
+pub fn is_bare_godot(d: &std::path::Path) -> bool {
+    d.join("project.godot").is_file() && !d.join("assets").is_dir()
 }
 
 /// Where relative export paths land: the project's `assets/` (created on
@@ -174,6 +191,7 @@ fn resolve_export_path_in(path: &std::path::Path, project: Option<PathBuf>) -> P
         return path.to_path_buf();
     }
     match project {
+        Some(root) if is_bare_godot(&root) => root.join(path),
         Some(root) => {
             let rel = path.strip_prefix("assets").unwrap_or(path);
             root.join("assets").join(rel)
@@ -2195,6 +2213,20 @@ mod project_tests {
         let other = tmp.join("other");
         fs::create_dir_all(other.join(PROJECT_DIR)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(find_project(&other), Some(other.clone()));
+        // A Godot game: project.godot is enough, and with no assets/ folder
+        // relative exports land at its root (res://).
+        let godot = tmp.join("godot_game");
+        fs::create_dir_all(godot.join("scenes")).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(godot.join("project.godot"), "config_version=5\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(find_project(&godot.join("scenes")), Some(godot.clone()));
+        assert_eq!(
+            resolve_export_path_in(std::path::Path::new("maps/a.tscn"), Some(godot.clone())),
+            godot.join("maps/a.tscn")
+        );
+        assert_eq!(asset_dir(&godot), godot);
+        fs::create_dir_all(godot.join("assets")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(asset_dir(&godot), godot.join("assets"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }

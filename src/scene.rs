@@ -481,12 +481,12 @@ fn instance_transform(
 /// project's), for paths relative to it.
 fn asset_root(scene: &Path) -> PathBuf {
     for a in scene.ancestors() {
-        if a.file_name().is_some_and(|n| n == "assets") {
+        if a.file_name().is_some_and(|n| n == "assets") || crate::catalog::is_bare_godot(a) {
             return a.to_path_buf();
         }
     }
     crate::catalog::project_root()
-        .map(|r| r.join("assets"))
+        .map(|r| crate::catalog::asset_dir(&r))
         .unwrap_or_else(|| scene.parent().map(Path::to_path_buf).unwrap_or_default())
 }
 

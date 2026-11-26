@@ -57,7 +57,10 @@ map as a Godot 4 text scene (`src/godot.rs`), with the same glTFs, heights,
 
 - `res://` paths start at the nearest folder above the scene holding
   `project.godot`, else at the asset folder; export inside the Godot
-  project. Prefab instances and the `<stem>_ground` geometry are
+  project. A `project.godot` makes its folder a modeler project (the
+  catalog in `.modeler/`), and relative exports land in its `assets/`,
+  or at its root when it has none (`"maps/level1.tscn"` ->
+  `res://maps/level1.tscn`, shared textures in `res://textures/`). Prefab instances and the `<stem>_ground` geometry are
   instanced glTF `PackedScene`s (Godot imports the glTF itself); markers
   are `Marker3D` with `metadata/kind` and `metadata/size`; the root has
   `metadata/map_json`. Names Godot rejects (`. : @ / " %`) become `_` and
