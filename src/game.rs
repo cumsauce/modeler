@@ -396,7 +396,7 @@ pub fn colliders(model: &Model) -> Result<Vec<Collider>, ModelerError> {
     Ok(out)
 }
 
-fn world_verts(p: &Part) -> Vec<Vec3> {
+pub(crate) fn world_verts(p: &Part) -> Vec<Vec3> {
     let r = quat_of(p.rotation);
     let (s, t) = (Vec3::from(p.scale), Vec3::from(p.translation));
     p.verts

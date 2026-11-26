@@ -1742,8 +1742,16 @@ impl Annotation {
     /// One listing line: `#3 walls 'too tall'`, plus where it is pinned and,
     /// when resolved, the reply.
     pub fn line(&self) -> String {
+        // Where it's pinned, in world metres, for parts (a material comment
+        // has no place in the scene).
+        let at = if self.material.is_none() {
+            let [x, y, z] = self.position;
+            format!(" at [{x:.2}, {y:.2}, {z:.2}]")
+        } else {
+            String::new()
+        };
         let mut s = format!(
-            "#{} {} '{}'{}{}",
+            "#{} {} '{}'{}{}{}",
             self.id,
             self.target(),
             self.text,
@@ -1751,6 +1759,7 @@ impl Annotation {
             self.vertex
                 .map(|v| format!(" @vertex {v}"))
                 .unwrap_or_default(),
+            at,
         );
         if let Some(r) = &self.resolved {
             s += &format!(

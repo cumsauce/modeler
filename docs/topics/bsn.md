@@ -16,6 +16,14 @@ instances, `marker`s) exports as a scene with `export_model("maps/commune.bsn")`
   f32 x0, z0, cell, h_min, h_max; nx*nz u16 heights, row-major by z; nx*nz
   u8 mask, bit 0 path, bit 1 pad), so the game reads ground height without
   the scene (`scene::read_heights`).
+- every static `mesh` collider of the map's own parts (a `carve` with
+  `collider: "mesh"`, a `collider` rule with shape `mesh`) goes into one
+  `<stem>.collision` file (magic `MCL1`; u32 vertex and index counts; f32
+  x, y, z per vertex in the map's frame; u32 indices, three per triangle;
+  little-endian), named in `map.json` as `collision`, so the game builds an
+  exact collider for sloped and curved floors without loading the glTF
+  (`scene::read_collision`). No mesh colliders: no file (a stale one is
+  removed).
 - Entities are sorted by name with stable `SceneNodeId`s (a hash of scene
   and name), so re-exports diff cleanly.
 - **Components**: `prefab` and `marker` items take `components:

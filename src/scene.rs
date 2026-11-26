@@ -38,6 +38,11 @@
 //! - **Heights.** Each `terrain` op writes `<scene>.<terrain>.heights`
 //!   (see [`write_heights`]): a little-endian grid the game reads instead of
 //!   evaluating the scene.
+//! - **Collision.** Every static `mesh` collider of the map's own parts (a
+//!   `carve` with `collider: "mesh"`, a `collider` rule with shape `mesh`)
+//!   goes into one `<scene>.collision` file (see [`write_collision`]): the
+//!   triangles in the map's frame, so a game builds an exact collider for
+//!   sloped and curved floors without loading the glTF. `map.json` names it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -705,10 +710,27 @@ pub fn export_scene(
             ));
         }
     }
+    // Mesh colliders, as one triangle soup.
+    let collision_path = dir.join(format!("{stem}.collision"));
+    let collision = match write_collision(model, &collision_path)? {
+        0 => {
+            // No mesh colliders any more: don't leave a stale file behind.
+            let _ = std::fs::remove_file(&collision_path);
+            None
+        }
+        n => {
+            report.push(format!(
+                "collision: {n} triangle(s) -> {}",
+                rel(&root, &collision_path)
+            ));
+            Some(rel(&root, &collision_path))
+        }
+    };
     let header = vocab.as_ref().map(|v| v.header.clone()).unwrap_or_default();
     let text = emit(&stem, &header, &entities);
     crate::catalog::atomic_write(path, text.as_bytes())?;
-    let data = map_file(&stem, &entities, terrains);
+    let mut data = map_file(&stem, &entities, terrains);
+    data.collision = collision;
     let json = dir.join(format!("{stem}.map.json"));
     let body =
         serde_json::to_string_pretty(&data).map_err(|e| ModelerError::Parse(e.to_string()))?;
@@ -775,6 +797,10 @@ pub struct MapFile {
     /// Sorted by name, like the scene.
     pub entities: Vec<MapEntity>,
     pub terrains: Vec<MapTerrain>,
+    /// The map's mesh colliders (`<scene>.collision`, relative to the asset
+    /// folder), when it has any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -835,7 +861,91 @@ fn map_file(stem: &str, entities: &[Entity], terrains: Vec<MapTerrain>) -> MapFi
             })
             .collect(),
         terrains,
+        collision: None,
     }
+}
+
+/// Magic at the start of a collision file.
+pub const COLLISION_MAGIC: &[u8; 4] = b"MCL1";
+
+/// Every static mesh collider of the model's parts as one triangle soup in
+/// the model's frame: (vertices, indices, three per triangle).
+pub fn collision_triangles(model: &Model) -> Result<(Vec<[f32; 3]>, Vec<u32>), ModelerError> {
+    let mut verts = Vec::new();
+    let mut indices = Vec::new();
+    for c in crate::game::colliders(model)?
+        .iter()
+        .filter(|c| c.shape == "mesh" && c.body == "static" && !c.sensor)
+    {
+        let Some(p) = model.parts.iter().find(|p| p.name == c.part) else {
+            continue;
+        };
+        let base = verts.len() as u32;
+        verts.extend(crate::game::world_verts(p).iter().map(|v| v.to_array()));
+        indices.extend(p.indices.iter().map(|i| i + base));
+    }
+    Ok((verts, indices))
+}
+
+/// Writes the model's static mesh colliders (see [`collision_triangles`]):
+///
+/// ```text
+/// "MCL1"                       4 bytes
+/// verts, indices: u32          counts
+/// verts: verts * 3 f32         x, y, z in the map's frame
+/// indices: indices u32         three per triangle
+/// ```
+///
+/// All little-endian. Writes nothing when there are none. Returns the
+/// triangle count.
+pub fn write_collision(model: &Model, path: &Path) -> Result<usize, ModelerError> {
+    let (verts, indices) = collision_triangles(model)?;
+    if indices.is_empty() {
+        return Ok(0);
+    }
+    let mut out = Vec::with_capacity(12 + verts.len() * 12 + indices.len() * 4);
+    out.extend_from_slice(COLLISION_MAGIC);
+    out.extend_from_slice(&(verts.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+    for v in &verts {
+        for c in v {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    for i in &indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    crate::catalog::atomic_write(path, &out)?;
+    Ok(indices.len() / 3)
+}
+
+/// Reads a collision file back: (vertices, indices). `None` for one that
+/// isn't, or is cut short.
+pub fn read_collision(bytes: &[u8]) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
+    if bytes.get(..4)? != COLLISION_MAGIC {
+        return None;
+    }
+    let u32_at = |o: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(o..o + 4)?.try_into().ok()?))
+    };
+    let (nv, ni) = (u32_at(4)? as usize, u32_at(8)? as usize);
+    let mut verts = Vec::with_capacity(nv);
+    let mut o = 12;
+    for _ in 0..nv {
+        let f = |k: usize| Some(f32::from_le_bytes(bytes.get(k..k + 4)?.try_into().ok()?));
+        verts.push([f(o)?, f(o + 4)?, f(o + 8)?]);
+        o += 12;
+    }
+    let mut indices = Vec::with_capacity(ni);
+    for _ in 0..ni {
+        let i = u32_at(o)?;
+        if i as usize >= nv {
+            return None;
+        }
+        indices.push(i);
+        o += 4;
+    }
+    Some((verts, indices))
 }
 
 /// Magic at the start of a heights file.
