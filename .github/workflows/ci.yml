@@ -164,7 +164,7 @@ jobs:
             app=dist/modeler/modeler.app/Contents
             mkdir -p "$app/MacOS" "$app/Resources"
             cp target/release/modeler "$app/MacOS/modeler"
-            cp icons/app-icon.png "$app/Resources/"
+            cp icons/app-icon.png icons/app-icon.icns "$app/Resources/"
             cat > "$app/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -172,6 +172,7 @@ jobs:
             <key>CFBundleName</key><string>modeler</string>
             <key>CFBundleIdentifier</key><string>dev.modeler.app</string>
             <key>CFBundleExecutable</key><string>modeler</string>
+            <key>CFBundleIconFile</key><string>app-icon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>0.0.0</string>
             <key>NSHighResolutionCapable</key><true/>

@@ -1,4 +1,5 @@
-//! The app icon (`icons/app-icon.png`, drawn from `icons/app-icon.svg`):
+//! The app icon (`icons/app-icon.png`, drawn from `icons/app-icon.svg`, both
+//! made by the shared icon family in `../icon-family`):
 //! the Dock icon on macOS, the window icon elsewhere. Set once, on the main
 //! thread, after the window exists.
 
@@ -6,8 +7,7 @@ use crate::prelude::*;
 
 const PNG: &[u8] = include_bytes!("../../../../icons/app-icon.png");
 
-/// The icon as straight RGBA, with everything outside its rounded square
-/// made transparent (the PNG is rendered on white).
+/// The icon as straight RGBA (the PNG carries its own transparency).
 fn rgba() -> Option<(Vec<u8>, u32, u32)> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(PNG));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -15,33 +15,23 @@ fn rgba() -> Option<(Vec<u8>, u32, u32)> {
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     let (w, h) = (info.width, info.height);
-    let channels = info.color_type.samples();
-    let mut out = Vec::with_capacity((w * h * 4) as usize);
-    // The rounded square in the 1024 drawing: 100..924, corner radius 185.
-    let s = w as f32 / 1024.0;
-    let (lo, hi, r) = (100.0 * s, 924.0 * s, 185.0 * s);
-    for y in 0..h {
-        for x in 0..w {
-            let i = ((y * w + x) as usize) * channels;
-            let px = &buf[i..i + channels];
-            let (cr, cg, cb) = if channels >= 3 {
-                (px[0], px[1], px[2])
-            } else {
-                (px[0], px[0], px[0])
-            };
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let qx = (lo + r - fx).max(fx - (hi - r)).max(0.0);
-            let qy = (lo + r - fy).max(fy - (hi - r)).max(0.0);
-            let outside = (qx * qx + qy * qy).sqrt() - r;
-            let inside_box = fx >= lo && fx <= hi && fy >= lo && fy <= hi;
-            let a = if inside_box {
-                (0.5 - outside).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            out.extend_from_slice(&[cr, cg, cb, (a * 255.0) as u8]);
-        }
-    }
+    buf.truncate(info.buffer_size());
+    let out = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        _ => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+    };
     Some((out, w, h))
 }
 
