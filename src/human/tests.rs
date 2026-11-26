@@ -660,7 +660,7 @@ fn pose_sheet_stretch_report() {
 
 /// The everyday poses pass `verify animation` stretch 2.0 on the game rig
 /// (the deep folds, elbow 120, arms raised 90 over the A-pose, crouch and
-/// a 90 degree fist, don't yet: see AGENTS.md).
+/// a 90 degree fist, don't yet: see docs/topics/human.md).
 #[test]
 fn everyday_poses_stretch_under_two() {
     let Some(_) = asset_or_skip() else { return };
@@ -1254,7 +1254,7 @@ fn corrective_stretch_report() {
     for ((n, a, va), (_, b, vb)) in off.iter().zip(&on) {
         eprintln!("STRETCH {n:14} off {a:.2} on {b:.2}   volume off {va:.4} on {vb:.4}");
     }
-    // Targets met (see the AGENTS.md table): everything but the raised
+    // Targets met (see the table in docs/topics/human.md): everything but the raised
     // arms' armpit, the sitting groin and the jaw stays under 2.
     let got = |n: &str| on.iter().find(|x| x.0 == n).map_or(9.0, |x| x.1);
     for n in [

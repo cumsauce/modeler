@@ -2,7 +2,7 @@
 //! named points (`marker` items). Both are collected after the graph, from
 //! the model and its prefab instances, and follow moves; the glTF export
 //! writes them as node extras that a few lines of Bevy code turn into
-//! physics colliders and spawn points (see AGENTS.md, Game data).
+//! physics colliders and spawn points (see docs/topics/game-data.md).
 
 use bevy::math::{Quat, Vec3};
 use serde_json::Value;

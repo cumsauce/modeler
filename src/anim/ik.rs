@@ -656,7 +656,7 @@ mod tests {
         assert!((a - want).length() < 1e-3, "{a:?} vs {want:?}");
     }
 
-    /// The AGENTS.md walk: a body biped's ankles reach their targets.
+    /// The walk from docs/ops/clip.md: a body biped's ankles reach their targets.
     #[test]
     fn biped_walk_plants_the_ankles() {
         let s = session(json!([

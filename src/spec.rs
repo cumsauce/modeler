@@ -6274,6 +6274,134 @@ pub fn example(ty: &str) -> Option<Value> {
 
 /// `describe_op`: with a type, its example and JSON schema; without, one
 /// example line per type.
+/// The prose guide for an apply_ops item type: the `docs/ops` (and shared
+/// `docs/topics`) files that explain it, embedded at build time. One source
+/// for AGENTS.md readers and `describe_op`, which serves it on demand so the
+/// reference doesn't sit in every agent's context.
+pub fn op_guide(ty: &str) -> &'static [&'static str] {
+    match ty {
+        "repeat" => &[include_str!("../docs/ops/repeat.md")],
+        "light" => &[include_str!("../docs/ops/light.md")],
+        "decal" => &[include_str!("../docs/ops/decal.md")],
+        "collider" => &[include_str!("../docs/ops/../topics/game-data.md")],
+        "marker" => &[include_str!("../docs/ops/../topics/game-data.md")],
+        "variant" => &[include_str!("../docs/ops/variant.md")],
+        "skeleton" => &[include_str!("../docs/ops/skeleton.md")],
+        "bind" => &[include_str!("../docs/ops/bind.md")],
+        "clip" => &[include_str!("../docs/ops/clip.md")],
+        "mocap" => &[include_str!("../docs/ops/mocap.md")],
+        "pose" => &[include_str!("../docs/ops/clip.md")],
+        "sway" => &[include_str!("../docs/ops/sway.md")],
+        "primitive" => &[include_str!("../docs/ops/primitive.md")],
+        "extrude" => &[include_str!("../docs/ops/../topics/profiles.md")],
+        "revolve" => &[include_str!("../docs/ops/../topics/profiles.md")],
+        "group" => &[include_str!("../docs/ops/group.md")],
+        "sweep" => &[
+            include_str!("../docs/ops/sweep.md"),
+            include_str!("../docs/ops/../topics/profiles.md"),
+        ],
+        "loft" => &[include_str!("../docs/ops/loft.md")],
+        "path_array" => &[include_str!("../docs/ops/path_array.md")],
+        "lsystem" => &[include_str!("../docs/ops/lsystem.md")],
+        "text" => &[include_str!("../docs/ops/text.md")],
+        "terrain" => &[include_str!("../docs/ops/terrain.md")],
+        "hull" => &[include_str!("../docs/ops/hull.md")],
+        "blob" => &[include_str!("../docs/ops/blob.md")],
+        "split" => &[include_str!("../docs/ops/split.md")],
+        "scatter" => &[include_str!("../docs/ops/scatter.md")],
+        "round" => &[include_str!("../docs/ops/round.md")],
+        "deform" => &[include_str!("../docs/ops/deform.md")],
+        "sdf" => &[
+            include_str!("../docs/ops/sdf.md"),
+            include_str!("../docs/ops/../topics/sections.md"),
+        ],
+        "skin" => &[
+            include_str!("../docs/ops/skin.md"),
+            include_str!("../docs/ops/../topics/sections.md"),
+        ],
+        "body" => &[
+            include_str!("../docs/ops/body.md"),
+            include_str!("../docs/ops/../topics/sections.md"),
+        ],
+        "silhouette" => &[include_str!("../docs/ops/silhouette.md")],
+        "smooth" => &[include_str!("../docs/ops/smooth.md")],
+        "decimate" => &[include_str!("../docs/ops/decimate.md")],
+        "shell" => &[include_str!("../docs/ops/shell.md")],
+        "garment" => &[include_str!("../docs/ops/garment.md")],
+        "carve" => &[include_str!("../docs/ops/carve.md")],
+        "stairs" => &[include_str!("../docs/ops/stairs.md")],
+        "railing" => &[include_str!("../docs/ops/stairs.md")],
+        "panel" => &[include_str!("../docs/ops/panel.md")],
+        "transform" => &[include_str!("../docs/ops/transform.md")],
+        "move" => &[include_str!("../docs/ops/move.md")],
+        "place" => &[include_str!("../docs/ops/place.md")],
+        "boolean" => &[include_str!("../docs/ops/boolean.md")],
+        "radial_array" => &[include_str!("../docs/ops/radial_array.md")],
+        "linear_array" => &[include_str!("../docs/ops/linear_array.md")],
+        "mirror" => &[include_str!("../docs/ops/mirror.md")],
+        "material" => &[include_str!("../docs/ops/material.md")],
+        "hide_part" => &[include_str!("../docs/ops/edits.md")],
+        "show_part" => &[include_str!("../docs/ops/edits.md")],
+        "rename" => &[include_str!("../docs/ops/edits.md")],
+        "delete" => &[include_str!("../docs/ops/edits.md")],
+        "tri_mesh" => &[include_str!("../docs/ops/edits.md")],
+        "uvs" => &[include_str!("../docs/ops/edits.md")],
+        "prefab" => &[include_str!("../docs/ops/prefab.md")],
+        _ => &[],
+    }
+}
+
+/// Topics served as `describe_op("topic:<name>")`.
+pub const TOPICS: &[&str] = &[
+    "animation",
+    "apply-ops",
+    "bsn",
+    "catalog",
+    "daemon",
+    "export",
+    "game-data",
+    "history",
+    "human",
+    "inspect",
+    "materials",
+    "motion-checks",
+    "profiles",
+    "runtime",
+    "scenes",
+    "sections",
+    "session",
+    "style",
+    "verify",
+    "views",
+];
+
+/// A `docs/topics` file by name.
+pub fn topic(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "animation" => include_str!("../docs/topics/animation.md"),
+        "apply-ops" => include_str!("../docs/topics/apply-ops.md"),
+        "bsn" => include_str!("../docs/topics/bsn.md"),
+        "catalog" => include_str!("../docs/topics/catalog.md"),
+        "daemon" => include_str!("../docs/topics/daemon.md"),
+        "export" => include_str!("../docs/topics/export.md"),
+        "game-data" => include_str!("../docs/topics/game-data.md"),
+        "history" => include_str!("../docs/topics/history.md"),
+        "human" => include_str!("../docs/topics/human.md"),
+        "inspect" => include_str!("../docs/topics/inspect.md"),
+        "materials" => include_str!("../docs/topics/materials.md"),
+        "motion-checks" => include_str!("../docs/topics/motion-checks.md"),
+        "profiles" => include_str!("../docs/topics/profiles.md"),
+        "runtime" => include_str!("../docs/topics/runtime.md"),
+        "scenes" => include_str!("../docs/topics/scenes.md"),
+        "sections" => include_str!("../docs/topics/sections.md"),
+        "session" => include_str!("../docs/topics/session.md"),
+        "style" => include_str!("../docs/topics/style.md"),
+        "verify" => include_str!("../docs/topics/verify.md"),
+        "views" => include_str!("../docs/topics/views.md"),
+        _ => return None,
+    })
+}
+
 pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
     if let Some(t) = ty {
         if t == "nodes" {
@@ -6282,11 +6410,17 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         if let Some(n) = t.strip_prefix("node:") {
             return crate::material::node::describe(Some(n));
         }
+        if let Some(n) = t.strip_prefix("topic:") {
+            return topic(n)
+                .map(str::to_string)
+                .ok_or_else(|| format!("no topic `{n}` (topics: {})", TOPICS.join(", ")));
+        }
     }
     let Some(ty) = ty else {
         let mut out = vec![
-            "apply_ops item types (describe_op with a kind for its full schema; \"nodes\" lists material_ops node types, \"node:<type>\" gives one). Values may be \"$param\" or \"=expr\".".to_string(),
+            "apply_ops item types (describe_op with a kind for its full schema; \"nodes\" lists material_ops node types, \"node:<type>\" gives one; \"topic:<name>\" gives a guide). Values may be \"$param\" or \"=expr\".".to_string(),
         ];
+        out.push(format!("topics: {}", TOPICS.join(", ")));
         for t in OP_TYPES {
             if let Some(e) = example(t) {
                 out.push(format!("- {t}: {e}"));
@@ -6364,8 +6498,9 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         }
     };
     let example = example(ty).unwrap_or(Value::Null);
+    let guide = op_guide(ty).join("\n");
     Ok(format!(
-        "example:\n{}\n\nschema (plus \"type\": \"{ty}\"):\n{}",
+        "{guide}\nexample:\n{}\n\nschema (plus \"type\": \"{ty}\"):\n{}",
         serde_json::to_string_pretty(&example).unwrap_or_default(),
         serde_json::to_string_pretty(&schema).unwrap_or_default()
     ))
@@ -6547,5 +6682,42 @@ mod tests {
             describe_type(Some(t)).unwrap_or_else(|err| panic!("{t}: {err}"));
         }
         assert!(describe_type(None).is_ok_and(|s| s.contains("radial_array")));
+    }
+
+    #[test]
+    fn every_type_has_a_guide_and_every_named_topic_exists() {
+        for t in OP_TYPES {
+            assert!(!op_guide(t).is_empty(), "no docs/ops guide for {t}");
+        }
+        for t in TOPICS {
+            assert!(describe_type(Some(&format!("topic:{t}"))).is_ok(), "{t}");
+        }
+        // Every `topic:<name>` AGENTS.md or the MCP instructions point at
+        // must resolve, so a renamed file can't leave a dead pointer.
+        for text in [
+            include_str!("../AGENTS.md"),
+            include_str!("bin/modeler/server/tools.rs"),
+        ] {
+            for (i, _) in text.match_indices("topic:") {
+                let name: String = text[i + 6..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if !name.is_empty() && name != "name" {
+                    assert!(topic(&name).is_some(), "dead pointer topic:{name}");
+                }
+            }
+        }
+    }
+
+    /// AGENTS.md loads into every agent session in this repo: reference
+    /// prose belongs in docs/ops and docs/topics, served by describe_op.
+    #[test]
+    fn agents_md_stays_small() {
+        let n = include_str!("../AGENTS.md").len();
+        assert!(
+            n <= 32 * 1024,
+            "AGENTS.md is {n} bytes; move reference prose into docs/"
+        );
     }
 }
