@@ -1103,8 +1103,23 @@ pub(crate) fn part_bundle(
     images: &mut Assets<Image>,
     cache: &mut PbrCache,
 ) -> impl Bundle {
+    part_bundle_as(part, part, meshes, materials, images, cache)
+}
+
+/// [`part_bundle`] of `part`'s mesh wearing `look`'s material: a posed
+/// copy of a rigged part keeps its rest part's bake (the game skins a mesh
+/// textured at rest), so a filmstrip doesn't re-bake per-part materials
+/// (`mesh_ao`, curvature wear) for every frame's posed geometry.
+pub(crate) fn part_bundle_as(
+    part: &Part,
+    look: &Part,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    cache: &mut PbrCache,
+) -> impl Bundle {
     let mat_span = super::profile::span("part_bundle: material");
-    let textured = pbr_material(part, materials, images, cache);
+    let textured = pbr_material(look, materials, images, cache);
     drop(mat_span);
     let _mesh_span = super::profile::span("part_bundle: mesh");
     let tangents = wants_tangents(part);
@@ -1124,7 +1139,7 @@ pub(crate) fn part_bundle(
         }
         h
     });
-    let material = textured.unwrap_or_else(|| flat_material(part, materials, cache));
+    let material = textured.unwrap_or_else(|| flat_material(look, materials, cache));
     (
         Name::new(part.name.clone()),
         Mesh3d(mesh),

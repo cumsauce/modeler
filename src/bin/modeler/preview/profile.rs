@@ -51,6 +51,20 @@ impl Drop for Span {
     }
 }
 
+/// Adds `d` under `name`, for a duration that no one scope covers (a
+/// capture's request to its landing).
+pub(crate) fn record(name: &'static str, d: Duration) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut s) = stats().lock() {
+        let e = s.spans.entry(name).or_default();
+        e.0 += d;
+        e.1 = e.1.max(d);
+        e.2 += 1;
+    }
+}
+
 fn frame_start() {
     let Ok(mut s) = stats().lock() else {
         return;

@@ -504,6 +504,7 @@ pub(crate) fn process_agent_shot(
     let Some((view, width, height, focus, style, reply)) = agent_shots.0.pop() else {
         return;
     };
+    let _setup = super::profile::span("agent_shot: setup");
     let (Some(camera_entity), Some(image_handle)) = (rig.camera, rig.image.clone()) else {
         let _ = reply.send(Err("agent camera is not initialized".into()));
         return;
@@ -575,7 +576,9 @@ pub(crate) fn process_agent_shot(
             .map(|((h, t), b)| (h, t, b.radius))
             .collect();
         if let Some((c, t)) = &clip {
+            let _span = super::profile::span("agent_shot: pose parts");
             posed_parts = Some(modeler::anim::posed_parts(model, c, &skel, *t));
+            drop(_span);
             // Frame the whole clip's reach, so a filmstrip keeps one framing.
             if focus.is_none()
                 && let Some((mut lo, mut hi)) = bounds
@@ -713,12 +716,19 @@ pub(crate) fn process_agent_shot(
         || style.variant.is_some()
         || modeler.session.model.active_variant.is_some()
     {
+        // Each drawn part beside the rest part whose material it wears:
+        // posed copies keep the rest bake (one bake for every frame of a
+        // filmstrip, shared with the unposed views), as a skinned mesh in
+        // the game does. `posed_parts` keeps the model's part order.
         let source = posed_parts.as_ref().unwrap_or(&model.parts);
-        let drawable = source
+        let drawable: Vec<_> = source
             .iter()
-            .filter(|p| p.visible && !p.verts.is_empty() && !p.indices.is_empty());
-        let drawable: Vec<_> = drawable.collect();
-        modeler::material::pbr::prebake(drawable.iter().map(|p| &***p));
+            .zip(&model.parts)
+            .filter(|(p, _)| p.visible && !p.verts.is_empty() && !p.indices.is_empty())
+            .collect();
+        let span = super::profile::span("agent_shot: prebake");
+        modeler::material::pbr::prebake(drawable.iter().map(|(_, rest)| &***rest));
+        drop(span);
         let weight_bone = style.weights.as_ref().map(|b| {
             modeler::anim::skeletons(model)
                 .ok()
@@ -733,11 +743,11 @@ pub(crate) fn process_agent_shot(
         }
         let mut colored: Vec<Option<Mesh>> = Vec::new();
         let density = style.density.then(|| {
-            let refs: Vec<&modeler::Part> = drawable.iter().map(|p| &***p).collect();
+            let refs: Vec<&modeler::Part> = drawable.iter().map(|(p, _)| &***p).collect();
             modeler::organic::density_colors(&refs)
         });
         let mut flat_black = Vec::new();
-        for (i, part) in drawable.into_iter().enumerate() {
+        for (i, (part, rest)) in drawable.into_iter().enumerate() {
             if let Some(Some(bone)) = weight_bone {
                 colored.push(Some(weights_mesh(part, bone)));
             } else if let Some(d) = &density {
@@ -753,8 +763,9 @@ pub(crate) fn process_agent_shot(
                 legend.push((part.name.clone(), modeler::raster::id_color_u8(i)));
                 colored.push(None);
             }
-            let bundle = part_bundle(
+            let bundle = part_bundle_as(
                 part,
+                rest,
                 &mut meshes,
                 &mut materials,
                 &mut images,
@@ -968,6 +979,7 @@ pub(crate) fn process_agent_shot(
     }
     let capturing = Arc::clone(&capturing);
     capturing.store(true, Ordering::Release);
+    let requested = std::time::Instant::now();
     commands
         .spawn(Screenshot::image(image_handle))
         .observe(
@@ -1018,6 +1030,7 @@ pub(crate) fn process_agent_shot(
                         .entity(camera_entity)
                         .insert(RenderLayers::layer(0));
                 }
+                super::profile::record("agent_shot: capture", requested.elapsed());
                 capturing.store(false, Ordering::Release);
                 if let Ok(mut s) = slot.lock()
                     && let Some(reply) = s.take()

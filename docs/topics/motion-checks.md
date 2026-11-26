@@ -2,7 +2,10 @@
 
 - **Seeing motion**: `agent_views` with `clip` and `times: [0, 0.25, 0.5,
   0.75]` renders a **filmstrip**: each view at each time, tiled with labels.
-  This is how to judge a walk. `time` gives a single moment.
+  This is how to judge a walk. `time` gives a single moment. Posed parts
+  wear their rest-pose material bake, as the skinned mesh does in the
+  game: textures stay put on the skin, and frames after the first cost
+  about 0.1 s each (no per-frame re-bake).
   - `style: "bones"` overlays the skeleton.
   - `style: "weights"` with `bone` shows a heat map of that bone's weights.
   - `style: "trails"` (with `clip`; optional `bones`: names / `*` globs,
