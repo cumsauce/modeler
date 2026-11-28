@@ -32,5 +32,6 @@ own append-only journal (`session.history.<doc>.jsonl`, one node per line;
 `open_docs.json` holds the inactive documents without their nodes): a save
 appends only the new nodes, and rewrites a file only after undo branches
 or pruning, so the autosave stays small however long the session runs and
-however often agents switch documents. `save_prefab` only
+however often agents switch documents. A journal is capped at 64 MB: past
+it the oldest nodes are dropped (`topic:history`). `save_prefab` only
 names and indexes it.

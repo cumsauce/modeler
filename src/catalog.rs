@@ -547,11 +547,108 @@ pub fn save_session_journaled(
 /// the last write, or rewrites it when the history no longer extends it.
 /// A journal this process hasn't written yet (after a restart) is checked
 /// by its line count and last line, so it is appended to, not rewritten.
-fn append_journal(model: &Model, st: &mut JournalState) -> Result<(), ModelerError> {
+fn append_journal(model: &mut Model, st: &mut JournalState) -> Result<(), ModelerError> {
     let jpath = journal_path_for(&model.name)?;
+    write_journal(model, st, &jpath)?;
+    // Over the cap: drop the oldest nodes (the recent ones, and so undo of
+    // recent work, stay) and write it again.
+    if fs::metadata(&jpath).is_ok_and(|m| m.len() > journal_limits().0)
+        && trim_history_to_journal(model, &jpath) > 0
+    {
+        st.files.remove(&jpath);
+        let _ = fs::remove_file(&jpath);
+        write_journal(model, st, &jpath)?;
+    }
+    Ok(())
+}
+
+/// A document's history journal is kept under this size: past it the
+/// oldest nodes are dropped (from memory too) until it is under
+/// [`JOURNAL_TRIM_TO_BYTES`]. One journal once reached 438 MB.
+pub const JOURNAL_CAP_BYTES: u64 = 64 << 20;
+/// What an over-cap journal is cut back to (below the cap, so it is not
+/// rewritten on every save).
+pub const JOURNAL_TRIM_TO_BYTES: u64 = 48 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set small limits (cap, trim-to) for their own thread.
+    static JOURNAL_LIMITS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// (cap, trim-to) in bytes.
+fn journal_limits() -> (u64, u64) {
+    #[cfg(test)]
+    if let Some(l) = JOURNAL_LIMITS.with(|c| c.get()) {
+        return l;
+    }
+    (JOURNAL_CAP_BYTES, JOURNAL_TRIM_TO_BYTES)
+}
+
+/// The first node to keep of nodes whose journal lines are `lens` bytes
+/// long (newline included): the newest that fit in
+/// [`JOURNAL_TRIM_TO_BYTES`], at least the last one.
+fn first_kept(lens: &[u64]) -> usize {
+    let mut total = 0u64;
+    let mut k = lens.len();
+    let limit = journal_limits().1;
+    while k > 0 && total + lens[k - 1] <= limit {
+        total += lens[k - 1];
+        k -= 1;
+    }
+    k.min(lens.len().saturating_sub(1))
+}
+
+/// Drops `model`'s oldest history nodes so its journal at `path` (written
+/// from this history) fits in [`JOURNAL_TRIM_TO_BYTES`]; the cursor always
+/// stays. Returns how many nodes went.
+fn trim_history_to_journal(model: &mut Model, path: &std::path::Path) -> usize {
+    let n = model.history.nodes.len();
+    let lens: Vec<u64> = match fs::read(path) {
+        Ok(bytes) => bytes
+            .split_inclusive(|b| *b == b'\n')
+            .map(|l| l.len() as u64)
+            .collect(),
+        Err(_) => return 0,
+    };
+    if lens.len() != n {
+        return 0;
+    }
+    let k = first_kept(&lens);
+    if k == 0 {
+        return 0;
+    }
+    let mut kept = vec![false; n];
+    for f in kept.iter_mut().skip(k) {
+        *f = true;
+    }
+    if let Some(c) = model.history.current.filter(|&c| c < n) {
+        kept[c] = true;
+    }
+    let removed = model.history.keep_only(&kept);
+    if removed > 0 {
+        eprintln!(
+            "history journal of `{}` passed {} MB: dropped its {removed} oldest node(s)",
+            model.name,
+            journal_limits().0 >> 20
+        );
+    }
+    removed
+}
+
+fn write_journal(
+    model: &Model,
+    st: &mut JournalState,
+    jpath: &std::path::Path,
+) -> Result<(), ModelerError> {
+    let jpath = jpath.to_path_buf();
     let nodes = &model.history.nodes;
+    // A journal over the cap is rewritten (trimmed) rather than read whole
+    // to count its lines.
+    let too_big = fs::metadata(&jpath).is_ok_and(|m| m.len() > journal_limits().0);
     let known = match st.files.get(&jpath) {
         Some(k) => Some(k.clone()),
+        None if too_big => None,
         None => fs::read_to_string(&jpath).ok().map(|t| {
             let n = t.lines().count();
             let tail = t
@@ -609,8 +706,9 @@ fn append_journal(model: &Model, st: &mut JournalState) -> Result<(), ModelerErr
 }
 
 /// The nodes of `doc`'s journal, else (files from before per-document
-/// journals) the shared one when it belonged to the session model.
-fn journal_nodes(doc: &str, legacy: bool) -> Option<Vec<crate::Snapshot>> {
+/// journals) the shared one when it belonged to the session model, and how
+/// many of its oldest nodes were left out (see [`read_journal`]).
+fn journal_nodes(doc: &str, legacy: bool) -> Option<(Vec<crate::Snapshot>, usize)> {
     if let Ok(p) = journal_path_for(doc)
         && p.exists()
     {
@@ -630,16 +728,29 @@ fn journal_nodes(doc: &str, legacy: bool) -> Option<Vec<crate::Snapshot>> {
 }
 
 /// Reads the journal's nodes (children rebuilt from parents); a torn last
-/// line (a crash mid-append) is dropped.
-fn read_journal(path: &std::path::Path) -> Option<Vec<crate::Snapshot>> {
-    let text = fs::read_to_string(path).ok()?;
+/// line (a crash mid-append) is dropped. A journal over
+/// [`JOURNAL_CAP_BYTES`] (from before the cap) is read from its newest
+/// lines only, as much as [`JOURNAL_TRIM_TO_BYTES`] holds: returns the
+/// nodes and how many oldest ones were skipped (node ids shift by that).
+fn read_journal(path: &std::path::Path) -> Option<(Vec<crate::Snapshot>, usize)> {
+    let bytes = fs::read(path).ok()?;
+    let lines: Vec<&[u8]> = bytes.split_inclusive(|b| *b == b'\n').collect();
+    let skip = if bytes.len() as u64 > journal_limits().0 {
+        let lens: Vec<u64> = lines.iter().map(|l| l.len() as u64).collect();
+        first_kept(&lens)
+    } else {
+        0
+    };
     let mut nodes: Vec<crate::Snapshot> = Vec::new();
-    for l in text.lines() {
-        let Ok(j) = serde_json::from_str::<JournalLine>(l) else {
+    for l in &lines[skip..] {
+        let Ok(j) = serde_json::from_slice::<JournalLine>(l) else {
             break;
         };
         let id = nodes.len();
-        let parent = j.parent.filter(|&p| p < id);
+        let parent = j
+            .parent
+            .and_then(|p| p.checked_sub(skip))
+            .filter(|&p| p < id);
         if let Some(p) = parent {
             nodes[p].children.push(id);
         }
@@ -651,7 +762,7 @@ fn read_journal(path: &std::path::Path) -> Option<Vec<crate::Snapshot>> {
             author: j.author,
         });
     }
-    Some(nodes)
+    Some((nodes, skip))
 }
 
 /// The model as autosaved: without its cached parts when they all derive
@@ -765,7 +876,7 @@ pub fn save_open_docs(docs: &mut [Model], st: &mut JournalState) -> Result<(), M
     let dir = home_dir(Kind::Prefabs)?;
     fs::create_dir_all(&dir)
         .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
-    for d in docs.iter() {
+    for d in docs.iter_mut() {
         append_journal(d, st)?;
     }
     let taken: Vec<_> = docs
@@ -801,11 +912,12 @@ pub fn load_open_docs_with(derive: bool) -> Vec<Model> {
         .filter(|m| m.check_format().is_ok())
         .map(|mut m| {
             if m.history.nodes.is_empty()
-                && let Some(nodes) = journal_nodes(&m.name, false)
+                && let Some((nodes, skip)) = journal_nodes(&m.name, false)
             {
                 m.history.current = m
                     .history
                     .current
+                    .and_then(|c| c.checked_sub(skip))
                     .filter(|&c| c < nodes.len())
                     .or_else(|| nodes.len().checked_sub(1));
                 m.history.nodes = nodes;
@@ -973,11 +1085,12 @@ pub fn load_session_state_with(derive: bool) -> Option<Model> {
         return None;
     }
     if model.history.nodes.is_empty()
-        && let Some(nodes) = journal_nodes(&model.name, true)
+        && let Some((nodes, skip)) = journal_nodes(&model.name, true)
     {
         model.history.current = model
             .history
             .current
+            .and_then(|c| c.checked_sub(skip))
             .filter(|&c| c < nodes.len())
             .or_else(|| nodes.len().checked_sub(1));
         model.history.nodes = nodes;
@@ -1969,6 +2082,69 @@ mod tests {
         assert!(said.contains("from the archive"), "{said}");
         assert_eq!(again.model.name, "old");
         assert!(again.parked_archive.is_empty() && !file.exists());
+    }
+
+    /// A history journal over its cap drops its oldest nodes, in memory too
+    /// (undo of the recent ones keeps working), and a journal written over
+    /// the cap before is read from its newest lines only.
+    #[test]
+    fn history_journals_are_capped_by_size() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("journalcap")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("big")));
+        for i in 0..40 {
+            ok(s.apply_values(
+                None,
+                vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 1.0 + i as f32})],
+            ));
+        }
+        let mut st = JournalState::default();
+        // Uncapped first: the whole history on disk.
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        let path = journal_path_for("big").unwrap_or_else(|e| panic!("{e}"));
+        let full = fs::metadata(&path).map(|m| m.len()).unwrap_or_default();
+        let nodes = s.model.history.nodes.len();
+        // A journal from before the cap: read from its newest lines.
+        JOURNAL_LIMITS.with(|c| c.set(Some((full / 2, full / 4))));
+        let (read, skip) = read_journal(&path).unwrap_or_else(|| panic!("journal"));
+        assert!(
+            skip > 0 && read.len() + skip == nodes,
+            "{skip} + {}",
+            read.len()
+        );
+        assert!(read[0].parent.is_none());
+        assert!(
+            read.iter()
+                .enumerate()
+                .skip(1)
+                .all(|(i, n)| n.parent == Some(i - 1))
+        );
+        let back = load_session_state().unwrap_or_else(|| panic!("restored"));
+        assert_eq!(back.history.current, Some(read.len() - 1));
+        // One more edit: the save trims the live history and the file.
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 99})],
+        ));
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or_default();
+        assert!(size <= full / 2, "{size} > {}", full / 2);
+        let h = &s.model.history;
+        assert!(h.nodes.len() < nodes, "{} nodes", h.nodes.len());
+        assert_eq!(h.current, Some(h.nodes.len() - 1));
+        ok(s.undo());
+        let side = |m: &crate::Model| match m.ops.first() {
+            Some(crate::Op::Primitive { size, .. }) => size[0],
+            _ => 0.0,
+        };
+        assert!((side(&s.model) - 40.0).abs() < 1e-5);
+        // The next save appends, it does not rewrite or trim again.
+        ok(s.redo());
+        save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
+        JOURNAL_LIMITS.with(|c| c.set(None));
     }
 
     /// An old single `parked_docs.json` becomes one file per document on

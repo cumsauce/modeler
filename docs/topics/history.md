@@ -19,3 +19,10 @@
 - A parked document (a restart's unsaved work, `topic:scenes`) keeps only
   its last 5 history nodes; `undo` after `scene restore` steps back
   through those.
+- Each open document's history journal (`session.history.<doc>.jsonl`) is
+  capped at 64 MB (`JOURNAL_CAP_BYTES`): an autosave that takes it past
+  the cap drops the document's oldest nodes, in memory and on disk, until
+  the journal is under 48 MB (the cursor always stays), so undo of recent
+  work keeps working and the oldest steps go. A journal written over the cap
+  before is read from its newest 48 MB only. `history_prune` cuts history
+  by hand; save a prefab to keep a state for good.
