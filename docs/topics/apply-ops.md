@@ -7,6 +7,13 @@
   rename, uvs, move/place) run after every op in the order written, so
   `"*_raw"` sees every part the batch makes and a later `show_part` still
   wins: item order doesn't matter.
+- **Changing an op's type**: an item of another type under a name an op
+  already makes is refused ("already produced by another op"); add
+  `"replace": true` to the item and the old op (a `smooth` that is now a
+  `decimate`, a `boolean` now a `transform`) is dropped in the same atomic
+  batch. In-place edits of the name (material, visibility, transform)
+  stay and apply to the new part; the result says what was replaced. A
+  script that re-applies its whole file can leave the flag on.
 - **Parsing is strict but forgiving.** All items are parsed before anything
   is applied; errors name the item and field
   (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and

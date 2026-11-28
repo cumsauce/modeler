@@ -876,7 +876,7 @@ impl Session {
                             ": a decimate needs its own name: rename the dense source to `{n}_hi` (re-issue it as `{n}_hi`, or a `rename`), then decimate `{n}_hi` into `{n}`"
                         )
                     } else {
-                        "; choose a different name".to_string()
+                        "; choose a different name, or add \"replace\": true to the item to swap the old op for this one".to_string()
                     };
                     return Err(format!(
                         "`{n}` is already produced by another op ({}){hint}",
@@ -1732,6 +1732,9 @@ impl Session {
             .expand_material_globs(items, &style, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
+        // Items marked `replace: true`: an op of another type under the same
+        // name gives way to them.
+        let mut replacing: Vec<(String, &'static str)> = Vec::new();
         for (i, (raw, from)) in items.iter().enumerate() {
             let from = from
                 .as_ref()
@@ -1741,6 +1744,15 @@ impl Session {
                 .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             let mut item = crate::spec::parse_item(i, &resolved)
                 .map_err(|e| format!("{e}{from}\n(nothing was applied)"))?;
+            if resolved.get("replace").and_then(serde_json::Value::as_bool) == Some(true) {
+                let BatchItem::Op(op) = &item else {
+                    return Err(format!(
+                        "op #{i}{from}: replace: only for op items (it swaps the op that makes this name)\n(nothing was applied)"
+                    )
+                    .into());
+                };
+                replacing.push((graph::output(op).to_string(), graph::kind(op)));
+            }
             self.resolve_pbr(&mut item)
                 .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             if let BatchItem::Op(op) = &mut item {
@@ -1835,6 +1847,23 @@ impl Session {
                     taken.push(format!("`{k}` (by {other})"));
                 }
             }
+        }
+        // Ops of another type that make a `replace` item's name go first
+        // (in-place edits of the name stay: they apply to the new part).
+        let mut swapped = Vec::new();
+        for (out, kind) in &replacing {
+            self.model.ops.retain(|o| {
+                let gone = graph::output(o) == out.as_str()
+                    && graph::kind(o) != *kind
+                    && !graph::inputs(o).contains(&out.as_str());
+                if gone {
+                    swapped.push(format!("{} `{out}` -> {kind}", graph::kind(o)));
+                }
+                !gone
+            });
+        }
+        if !swapped.is_empty() {
+            lines.push(format!("replaced: {}", swapped.join(", ")));
         }
         let kept = self.model.material_patterns.clone();
         self.model.material_patterns.extend(patterns);
@@ -7947,5 +7976,45 @@ mod tests {
                 .any(|l| l.contains("difference `miss`") && l.contains("probably misses")),
             "{lints:?}"
         );
+    }
+
+    #[test]
+    fn replace_lets_an_upsert_change_an_ops_type() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "cage", "kind": "box", "size": 1}),
+                json!({"type": "smooth", "name": "body", "input": "cage", "mode": "subdiv", "levels": 3}),
+                json!({"type": "material", "name": "body", "color": "#ff0000"}),
+                json!({"type": "hide_part", "part": "cage"}),
+            ],
+        ));
+        let item = json!({"type": "decimate", "name": "body", "input": "cage", "ratio": 0.5});
+        let e = s.apply_values(None, vec![item.clone()]);
+        assert!(e.is_err_and(|e| e.to_string().contains("already produced")));
+        let mut with = item.clone();
+        with["replace"] = json!(true);
+        let r = ok(s.apply_values(None, vec![with]));
+        assert!(
+            r.to_string()
+                .contains("replaced: smooth `body` -> decimate"),
+            "{r}"
+        );
+        let kinds: Vec<&str> = s
+            .model
+            .ops
+            .iter()
+            .filter(|o| graph::output(o) == "body")
+            .map(graph::kind)
+            .collect();
+        assert!(
+            kinds.contains(&"decimate") && !kinds.contains(&"smooth"),
+            "{kinds:?}"
+        );
+        // The in-place material on the name stays.
+        assert!(kinds.contains(&"material"), "{kinds:?}");
+        let bad = json!({"type": "hide_part", "part": "body", "replace": true});
+        assert!(s.apply_values(None, vec![bad]).is_err());
     }
 }

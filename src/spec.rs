@@ -4480,6 +4480,16 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
     };
     let mut body = obj.clone();
     body.remove("type");
+    // `replace: true` (any op item) is read by the batch, not the op.
+    match body.remove("replace") {
+        None | Some(Value::Bool(_)) => {}
+        Some(other) => {
+            return Err(format!(
+                "{ctx}: replace: true or false, got {}",
+                describe_json(&other)
+            ));
+        }
+    }
     let body = Value::Object(body);
     Ok(match ty {
         "primitive" => {

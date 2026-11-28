@@ -193,7 +193,8 @@ memorise them.
 The full list, with the fine print, is `topic:apply-ops`.
 
 - **Upserts**: an item with the same name *and type* replaces the old one
-  and re-derives (the tweak path). Order doesn't matter: evaluation is
+  and re-derives (the tweak path); `"replace": true` lets it replace an
+  op of another type. Order doesn't matter: evaluation is
   dependency-ordered, and part edits (hide/show, rename, uvs, move/place)
   run after every op, in the order written.
 - **Batches are atomic**: all items are parsed first (errors name the item
