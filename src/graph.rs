@@ -1283,9 +1283,10 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             input,
             thickness,
             open,
+            method,
         } => {
             let src = lookup_shared(named, input)?;
-            let part = crate::csg::shell(name, &src, *thickness, open)?;
+            let part = crate::csg::shell(name, &src, *thickness, open, method.as_deref())?;
             upsert(named, name, part);
         }
         Op::Panel {
@@ -2551,7 +2552,11 @@ pub fn describe(ops: &[Op]) -> String {
                 input,
                 thickness,
                 open,
-            } => format!("#{i} shell `{name}` <- `{input}` thickness={thickness} open={open:?}"),
+                method,
+            } => format!(
+                "#{i} shell `{name}` <- `{input}` thickness={thickness} open={open:?}{}",
+                method.as_ref().map_or_else(String::new, |m| format!(" method={m}"))
+            ),
             Op::Group { name, inputs } => format!(
                 "#{i} group `{name}` = {}",
                 inputs

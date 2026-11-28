@@ -101,6 +101,7 @@ pub mod loft;
 pub mod lsystem;
 pub mod material;
 pub mod mocap;
+pub mod offset;
 pub mod organic;
 pub mod outline;
 pub mod params;
@@ -1338,6 +1339,10 @@ pub enum Op {
         thickness: f32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         open: Vec<String>,
+        /// "exact" (a ball erosion) or "offset" (every vertex moved in
+        /// along its normal: dense meshes); None picks by size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
     },
     /// Merges several parts into one without a boolean: their meshes are
     /// concatenated in world space (transforms baked). For arraying or moving

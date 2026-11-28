@@ -858,7 +858,13 @@ pub fn round(
 /// ball of radius `t` (every face moved in by exactly `t`; convex corners
 /// stay sharp), and each `open` face (top/bottom/left/right/front/back)
 /// has the cavity swept out through that wall, leaving an opening.
-pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, ModelerError> {
+pub fn shell(
+    name: &str,
+    part: &Part,
+    t: f32,
+    open: &[String],
+    method: Option<&str>,
+) -> Result<Part, ModelerError> {
     if t.is_nan() || t <= 0.0 {
         return Err(ModelerError::Csg(format!(
             "shell `{name}`: thickness must be > 0, got {t}"
@@ -882,9 +888,17 @@ pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, M
     }
     let m = part_to_manifold(part)?;
     let tris = m.num_tri();
-    if tris > 20_000 {
+    let offset = match method {
+        Some("offset") => true,
+        Some(_) => false,
+        None => tris > SHELL_EXACT_TRIS,
+    };
+    if offset {
+        return shell_offset(name, part, &m, t, open);
+    }
+    if tris > SHELL_EXACT_TRIS {
         return Err(ModelerError::Csg(format!(
-            "shell `{name}`: `{}` has {tris} triangles; shell simpler inputs (lower the segment count)",
+            "shell `{name}`: `{}` has {tris} triangles, too many for method exact (at most {SHELL_EXACT_TRIS}); use method offset, or a simpler input",
             part.name
         )));
     }
@@ -924,6 +938,61 @@ pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, M
         return Err(ModelerError::Csg(format!(
             "shell `{name}` produced nothing"
         )));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
+}
+
+/// Most triangles `shell` erodes exactly (a ball Minkowski difference).
+const SHELL_EXACT_TRIS: usize = 20_000;
+
+/// `shell` by an inward offset surface: the solid minus itself moved in by
+/// `t` along its vertex normals ([`crate::offset`]). Sharp convex edges
+/// round toward the inside; a bend tighter than `t` would fold the inner
+/// surface, which the wall's volume catches.
+fn shell_offset(
+    name: &str,
+    part: &Part,
+    m: &Manifold,
+    t: f32,
+    open: &[String],
+) -> Result<Part, ModelerError> {
+    let err = |s: String| ModelerError::Csg(format!("shell `{name}`: {s}"));
+    if !open.is_empty() {
+        return Err(err(
+            "open needs method exact; with offset, cut the opening with a boolean afterwards"
+                .into(),
+        ));
+    }
+    let mesh = m.to_meshgl64();
+    let n = mesh.num_prop().max(3);
+    let v: Vec<Vec3> = mesh
+        .vert_properties()
+        .chunks(n)
+        .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+        .collect();
+    let idx: Vec<u32> = mesh.tri_verts().iter().map(|&i| i as u32).collect();
+    let moved = crate::offset::offset_positions(&v, &idx, -t);
+    let mut inner = Part::new("inner");
+    inner.verts = moved.iter().map(|p| p.to_array()).collect();
+    inner.indices = idx;
+    let inner = part_to_manifold(&inner).map_err(|e| err(format!("the inner surface: {e}")))?;
+    let (outer_v, inner_v) = (m.volume(), inner.volume());
+    let want = m.surface_area() * f64::from(t);
+    let wall = outer_v - inner_v;
+    if inner_v <= 0.0 || wall < 0.5 * want || wall > 1.5 * want {
+        let (lo, hi) = part.bounds();
+        let d = hi - lo;
+        return Err(err(format!(
+            "thickness {t} folds the inner surface over itself (walls hold {:.3e} m3 where {:.3e} was expected): `{}` is {:.3} x {:.3} x {:.3} m and bends tighter than {t} somewhere; use a thinner wall",
+            wall, want, part.name, d.x, d.y, d.z
+        )));
+    }
+    let out = m.difference(&inner);
+    out.status().map_err(|e| err(format!("failed: {e}")))?;
+    if out.is_empty() {
+        return Err(err("produced nothing".into()));
     }
     let mut p = manifold_to_part(&out, name, part.material.clone());
     p.visible = true;

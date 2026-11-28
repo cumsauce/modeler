@@ -1818,8 +1818,11 @@ pub struct DeformSpec {
     /// "displace" (noise along the normals: rocks, cliffs, bark, dents),
     /// "bend" (curl the part along `axis` by `degrees` toward `toward`:
     /// horns, tusks, curved blades), "twist" (`degrees` about `axis`
-    /// over the part's length) or "taper" (cross-section from 1 to
-    /// `scale_end` along `axis`). Chain deforms for a horn: taper, then bend.
+    /// over the part's length), "taper" (cross-section from 1 to
+    /// `scale_end` along `axis`) or "offset" (every vertex moved `amount`
+    /// meters along its normal, + out, - in, even at bends: a pane standing
+    /// proud of its body, a skin inside it). Chain deforms for a horn:
+    /// taper, then bend.
     mode: String,
     /// bend/twist/taper: the axis the effect runs along, "x", "y" or "z"
     /// (default "y"); it spans the part's whole extent on that axis.
@@ -2466,6 +2469,12 @@ pub struct ShellSpec {
     /// front, back (world axes; front = +z). Default: closed all round.
     #[serde(default)]
     open: OneOrMany,
+    /// "exact": a ball erosion (corners stay sharp; inputs up to 20,000
+    /// triangles). "offset": every vertex moved in along its normal, even
+    /// at bends, for dense smooth meshes (a subdivided body); no `open`.
+    /// Default: exact up to 20,000 triangles, offset above.
+    #[serde(default)]
+    method: Option<String>,
 }
 
 /// A string or a list of strings.
@@ -5072,6 +5081,12 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 input: s.input,
                 thickness: s.thickness,
                 open,
+                method: match s.method {
+                    Some(m) if m != "exact" && m != "offset" => {
+                        return Err(format!("{ctx}: method: exact or offset, got `{m}`"));
+                    }
+                    m => m,
+                },
             })
         }
         "panel" => {

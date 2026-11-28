@@ -221,7 +221,7 @@ impl Deform {
     }
 }
 
-pub const MODES: &[&str] = &["displace", "bend", "twist", "taper", "material"];
+pub const MODES: &[&str] = &["displace", "bend", "twist", "taper", "material", "offset"];
 
 /// "x" / "+y" / "-z" or a direction word (right, left, up, down, front,
 /// back) as (axis index, sign).
@@ -262,7 +262,7 @@ impl Deform {
         }
         if !MODES.contains(&self.mode.as_str()) {
             return Err(format!(
-                "mode: must be displace, bend, twist, taper or material, got `{}`",
+                "mode: must be displace, bend, twist, taper, material or offset, got `{}`",
                 self.mode
             ));
         }
@@ -339,6 +339,9 @@ impl Deform {
             "bend" | "twist" if self.degrees.is_none() => {
                 Err(format!("degrees: {} needs an angle", self.mode))
             }
+            "offset" if self.amount.is_none() => {
+                Err("amount: offset needs a distance in meters (+ outward, - inward)".into())
+            }
             "taper" if self.scale_end.is_none() => Err(
                 "scale_end: taper needs the far end's scale (a number, or [a, b] per cross axis)"
                     .into(),
@@ -411,6 +414,8 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
     let detail = def.detail.unwrap_or(match def.mode.as_str() {
         "displace" => (scale / 8.0).min(size.max_element() / 32.0),
         "material" => material_detail(def, size),
+        // Every vertex moves along its normal: no refinement needed.
+        "offset" => size.max_element() * 4.0,
         _ => size[axis] / 32.0,
     });
 
@@ -454,6 +459,9 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
         "displace" => displace(&mut verts, &indices, def, scale, size),
         "material" => material_displace(&mut verts, &indices, def, size)
             .map_err(|e| ModelerError::Invalid(format!("deform `{name}`: {e}")))?,
+        "offset" => {
+            verts = crate::offset::offset_positions(&verts, &indices, def.amount.unwrap_or(0.0));
+        }
         mode => {
             let (lo, hi) = verts.iter().fold(
                 (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
@@ -513,7 +521,7 @@ pub fn deform(name: &str, part: &Part, def: &Deform) -> Result<Part, ModelerErro
     }
     // Displaced surfaces are smooth at the detail scale: crease only real
     // ridges. Bent/twisted boxes keep their edges hard.
-    let crease = if matches!(def.mode.as_str(), "displace" | "material") {
+    let crease = if matches!(def.mode.as_str(), "displace" | "material" | "offset") {
         60.0
     } else {
         40.0
