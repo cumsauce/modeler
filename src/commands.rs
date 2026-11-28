@@ -7886,4 +7886,35 @@ mod tests {
         // A crease of weight 10 keeps the bottom edge down at the cage.
         assert!((lo.y - 1.0).abs() < 1e-4, "{lo}");
     }
+
+    #[test]
+    fn split_by_a_cutter_makes_inside_and_outside() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "body", "kind": "box", "size": [1, 1, 2]}),
+                json!({"type": "primitive", "name": "cut", "kind": "box", "size": [0.4, 0.4, 0.8], "translation": [0.5, 0, 0]}),
+                json!({"type": "split", "name": "win", "input": "body", "cutter": "cut", "depth": 0.01, "lift": 0.002}),
+                json!({"type": "hide_part", "part": "body"}),
+                json!({"type": "hide_part", "part": "cut"}),
+            ],
+        ));
+        let names: Vec<&str> = s.model.parts.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.contains(&"win_inside") && names.contains(&"win_outside"),
+            "{names:?}"
+        );
+        // Re-issuing with keep inside drops the outside piece.
+        ok(s.apply_values(
+            None,
+            vec![json!({"type": "split", "name": "win", "input": "body", "cutter": "cut", "keep": "inside"})],
+        ));
+        assert!(!s.model.parts.iter().any(|p| p.name == "win_outside"));
+        let e = s.apply_values(
+            None,
+            vec![json!({"type": "split", "name": "w2", "input": "body", "cutter": "cut", "plane": {"normal": [0, 1, 0]}})],
+        );
+        assert!(e.is_err_and(|e| e.to_string().contains("not both")));
+    }
 }

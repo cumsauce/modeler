@@ -1734,18 +1734,36 @@ pub struct PlaneSpec {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SplitSpec {
-    /// Outputs `name_above` and `name_below`.
+    /// Outputs `name_above` and `name_below` (by a plane) or `name_inside`
+    /// and `name_outside` (by a cutter).
     name: String,
     /// A closed solid to cut; hide it.
     input: String,
     /// The cutting plane: {"normal": [0, 1, 0], "point": [0, 0.3, 0]}.
-    plane: PlaneSpec,
-    /// "both" (default), "above" or "below".
+    #[serde(default)]
+    plane: Option<PlaneSpec>,
+    /// Instead of a plane: a closed solid (hide it). The input splits
+    /// exactly into the part inside it and the rest, sharing one cut
+    /// boundary: glass, lamps, doors, hoods as their own parts.
+    #[serde(default)]
+    cutter: Option<String>,
+    /// "both" (default), "above" / "below" (plane) or "inside" /
+    /// "outside" (cutter).
     #[serde(default)]
     keep: Option<String>,
-    /// Meters between the halves (each moves half of it along the normal).
+    /// Plane: meters between the halves (each moves half of it along the
+    /// normal).
     #[serde(default)]
     gap: f32,
+    /// Cutter: only this many meters under the input's surface go inside
+    /// (an inlay of skin thickness, not the whole overlap; the inner
+    /// boundary is the surface offset inward). Default 0: all of it.
+    #[serde(default)]
+    depth: f32,
+    /// Cutter: move the inside piece this far out along the mean normal of
+    /// its outer surface (a lens or pane standing proud, meters).
+    #[serde(default)]
+    lift: f32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -4675,12 +4693,54 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         "split" => {
             let s: SplitSpec = de(&ctx, &body)?;
             let keep = s.keep.unwrap_or_else(|| "both".into());
+            if let Some(c) = s.cutter {
+                if s.plane.is_some() {
+                    return Err(format!("{ctx}: give plane or cutter, not both"));
+                }
+                if !["both", "inside", "outside"].contains(&keep.as_str()) {
+                    return Err(format!(
+                        "{ctx}: keep: with a cutter, both, inside or outside, got `{keep}`"
+                    ));
+                }
+                if s.gap != 0.0 {
+                    return Err(format!(
+                        "{ctx}: gap: only for a plane (a cutter's piece moves by lift)"
+                    ));
+                }
+                for (f, v) in [("depth", s.depth), ("lift", s.lift)] {
+                    if !v.is_finite() || (f == "depth" && v < 0.0) {
+                        return Err(format!(
+                            "{ctx}: {f}: must be a number of meters{}",
+                            if f == "depth" { " >= 0" } else { "" }
+                        ));
+                    }
+                }
+                return Ok(BatchItem::Op(Op::Split {
+                    name: s.name,
+                    input: s.input,
+                    normal: [0.0, 1.0, 0.0],
+                    point: [0.0; 3],
+                    keep,
+                    gap: 0.0,
+                    cutter: Some(c),
+                    depth: s.depth,
+                    lift: s.lift,
+                }));
+            }
+            if s.depth != 0.0 || s.lift != 0.0 {
+                return Err(format!("{ctx}: depth / lift: only with a cutter"));
+            }
+            let Some(plane) = s.plane else {
+                return Err(format!(
+                    "{ctx}: give plane {{normal, point}} or cutter (a closed solid)"
+                ));
+            };
             if !["both", "above", "below"].contains(&keep.as_str()) {
                 return Err(format!(
                     "{ctx}: keep: must be both, above or below, got `{keep}`"
                 ));
             }
-            let normal = s.plane.normal.unwrap_or([0.0, 1.0, 0.0]);
+            let normal = plane.normal.unwrap_or([0.0, 1.0, 0.0]);
             if normal.iter().all(|c| *c == 0.0) || normal.iter().any(|c| !c.is_finite()) {
                 return Err(format!("{ctx}: plane.normal: must be a non-zero direction"));
             }
@@ -4691,9 +4751,12 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 input: s.input,
                 normal,
-                point: s.plane.point.unwrap_or([0.0; 3]),
+                point: plane.point.unwrap_or([0.0; 3]),
                 keep,
                 gap: s.gap,
+                cutter: None,
+                depth: 0.0,
+                lift: 0.0,
             })
         }
         "scatter" => {

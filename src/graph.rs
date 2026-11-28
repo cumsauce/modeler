@@ -1240,8 +1240,22 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             point,
             keep,
             gap,
+            cutter,
+            depth,
+            lift,
         } => {
             let src = lookup_shared(named, input)?;
+            if let Some(c) = cutter {
+                let cut = lookup_shared(named, c)?;
+                let (inside, outside) = crate::csg::split_by(name, &src, &cut, *depth, *lift)?;
+                if keep != "outside" {
+                    upsert(named, &inside.name.clone(), inside);
+                }
+                if keep != "inside" {
+                    upsert(named, &outside.name.clone(), outside);
+                }
+                return Ok(());
+            }
             let (above, below) = crate::blob::split(name, &src, *normal, *point, *gap)?;
             if keep != "below" {
                 upsert(named, &above.name.clone(), above);
@@ -1824,11 +1838,17 @@ pub fn outputs(op: &Op) -> Vec<String> {
         }
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
         Op::Carve { name, def } => crate::carve::output_names(name, def),
-        Op::Split { name, keep, .. } => ["above", "below"]
-            .iter()
-            .filter(|side| keep == "both" || keep == *side)
-            .map(|side| format!("{name}_{side}"))
-            .collect(),
+        Op::Split {
+            name, keep, cutter, ..
+        } => if cutter.is_some() {
+            ["inside", "outside"]
+        } else {
+            ["above", "below"]
+        }
+        .iter()
+        .filter(|side| keep == "both" || keep == *side)
+        .map(|side| format!("{name}_{side}"))
+        .collect(),
         Op::Scatter {
             name, input, def, ..
         } => crate::scatter::output_names(name, input, def),
@@ -1953,6 +1973,11 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Body { def, .. } => crate::sdf::warp_reads(&def.warps),
         Op::Silhouette { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
+        Op::Split {
+            input,
+            cutter: Some(c),
+            ..
+        } => vec![input, c],
         Op::Shell { input, .. } | Op::Split { input, .. } | Op::Panel { input, .. } => {
             vec![input]
         }
@@ -2452,8 +2477,21 @@ pub fn describe(ops: &[Op]) -> String {
                 point,
                 keep,
                 gap,
+                cutter: None,
+                ..
             } => format!(
                 "#{i} split `{name}` <- `{input}` normal={normal:?} point={point:?} keep={keep} gap={gap}"
+            ),
+            Op::Split {
+                name,
+                input,
+                keep,
+                cutter: Some(c),
+                depth,
+                lift,
+                ..
+            } => format!(
+                "#{i} split `{name}` <- `{input}` by `{c}` keep={keep} depth={depth} lift={lift}"
             ),
             Op::Scatter {
                 name,

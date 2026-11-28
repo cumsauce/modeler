@@ -142,7 +142,7 @@ memorise them.
 | `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
 | `hull` | name, inputs |
 | `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
-| `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
+| `split` | name, input, plane {normal, point} or cutter, [keep], [gap] / [depth], [lift] (→ `name_above` / `name_below`, or `name_inside` / `name_outside`) |
 | `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights], [near + near_distance 0.5], [edge_bias 0], [clump {count, radius}], [mask path / pad / not_path / not_pad], [height [min, max]]; or `decal` {pbr, size, [aspect 1], [depth], [roll random / none], [kind], [params]} instead of input |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments], [edges all / top / bottom / vertical / horizontal or a list] (fillet) |
 | `deform` | name, input, mode (displace / bend / twist / taper / material / offset), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |

@@ -1272,6 +1272,18 @@ pub enum Op {
         keep: String,
         #[serde(default)]
         gap: f32,
+        /// Split by this closed solid instead of the plane: `name_inside`
+        /// and `name_outside` ([`crate::csg::split_by`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cutter: Option<String>,
+        /// With a cutter: only this deep under the input's surface goes
+        /// inside (meters; 0 = the whole overlap).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        depth: f32,
+        /// With a cutter: the inside piece moves this far out along the
+        /// mean normal of its outer surface (meters).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        lift: f32,
     },
     /// Rounds a solid's edges: `fillet` / `chamfer` by `radius`, or
     /// subdivision `smooth`.
