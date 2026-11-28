@@ -161,7 +161,8 @@ fn doc_popup(
     let matches = |name: &str| query.is_empty() || name.to_lowercase().contains(&query);
     let mut first = None;
     // Unsaved work a restart parked: reachable here, restored on a click.
-    let parked: Vec<&Model> = s.parked.iter().filter(|m| matches(&m.name)).collect();
+    let parked: Vec<&modeler::parked::ParkedDoc> =
+        s.parked.iter().filter(|m| matches(&m.name)).collect();
     if !parked.is_empty() {
         let head = row(&mut commands, list, None, false);
         text(
@@ -198,17 +199,17 @@ fn doc_popup(
                 &mut commands,
                 &assets,
                 r,
-                &project_label(m),
+                &m.project
+                    .as_deref()
+                    .map_or_else(|| "shared library".to_string(), catalog::project_name),
                 10.0,
                 false,
                 true,
             );
             spacer(&mut commands, r);
             let by = m
-                .history
-                .current
-                .and_then(|c| m.history.nodes.get(c))
-                .and_then(|n| n.author.clone())
+                .author
+                .as_deref()
                 .map(|a| a.chars().take(16).collect::<String>())
                 .unwrap_or_default();
             text(

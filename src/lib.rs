@@ -106,6 +106,7 @@ pub mod organic;
 pub mod outline;
 pub mod panel_line;
 pub mod params;
+pub mod parked;
 pub mod primitives;
 pub mod quality;
 pub mod raster;

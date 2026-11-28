@@ -431,7 +431,7 @@ pub fn autosave_slot() -> String {
 }
 
 /// `<stem>.json` for the autosave owner, `<stem>.<slot>.json` otherwise.
-fn autosave_file(stem: &str) -> String {
+pub(crate) fn autosave_file(stem: &str) -> String {
     match autosave_owner() {
         None => format!("{stem}.json"),
         Some(_) => format!("{stem}.{}.json", autosave_slot()),
@@ -782,78 +782,14 @@ pub fn save_open_docs(docs: &mut [Model], st: &mut JournalState) -> Result<(), M
     atomic_write(&dir.join(autosave_file("open_docs")), text?.as_bytes())
 }
 
-/// Autosaves the parked documents (`parked_docs.json`, see
-/// `Session::parked`) with their histories inline: a parked document's name
-/// may be reopened from the catalog meanwhile, whose journal would not
-/// match this history.
-pub fn save_parked_docs(docs: &[Model]) -> Result<(), ModelerError> {
-    let dir = home_dir(Kind::Prefabs)?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| ModelerError::Io(format!("creating {}: {e}", dir.display())))?;
-    let path = dir.join(autosave_file("parked_docs"));
-    if docs.is_empty() {
-        let _ = fs::remove_file(&path);
-        return Ok(());
-    }
-    let slim: Vec<Model> = docs
-        .iter()
-        .map(|d| {
-            let mut d = d.clone();
-            if d.parts_derive_from_ops() {
-                d.parts.clear();
-            }
-            d
-        })
-        .collect();
-    let text = serde_json::to_string(&slim).map_err(|e| ModelerError::Parse(e.to_string()))?;
-    atomic_write(&path, text.as_bytes())
-}
-
-/// The parked documents' autosave (empty when missing). A file that
-/// doesn't parse, or holds a document from a newer build, is moved aside to
-/// `parked_docs.bad.<time>.json` rather than read in part: the next save
-/// would otherwise overwrite it and lose every document in it. A slot
-/// server (a second daemon) reads only its own slot's file, never the main
-/// daemon's.
-pub fn load_parked_docs() -> Vec<Model> {
-    let Ok(dir) = home_dir(Kind::Prefabs) else {
-        return Vec::new();
-    };
-    let path = dir.join(autosave_file("parked_docs"));
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let docs: Option<Vec<Model>> = serde_json::from_str(&text).ok();
-    match docs {
-        Some(docs) if docs.iter().all(|m| m.check_format().is_ok()) => docs
-            .into_iter()
-            .map(|mut m| {
-                let _ = m.restore_parts();
-                m
-            })
-            .collect(),
-        _ => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
-            let aside = path.with_file_name(format!("parked_docs.bad.{stamp}.json"));
-            match fs::rename(&path, &aside) {
-                Ok(()) => eprintln!(
-                    "parked documents unreadable by this build; kept as {}",
-                    aside.display()
-                ),
-                Err(e) => {
-                    eprintln!("parked documents unreadable, and moving them aside failed: {e}")
-                }
-            }
-            Vec::new()
-        }
-    }
-}
-
 /// The autosaved inactive documents (empty when missing or unreadable).
 pub fn load_open_docs() -> Vec<Model> {
+    load_open_docs_with(true)
+}
+
+/// [`load_open_docs`]; `derive: false` leaves op-derived parts out (a
+/// restart parks every document, so deriving them would be wasted).
+pub fn load_open_docs_with(derive: bool) -> Vec<Model> {
     let Ok(dir) = home_dir(Kind::Prefabs) else {
         return Vec::new();
     };
@@ -874,7 +810,9 @@ pub fn load_open_docs() -> Vec<Model> {
                     .or_else(|| nodes.len().checked_sub(1));
                 m.history.nodes = nodes;
             }
-            let _ = m.restore_parts();
+            if derive {
+                let _ = m.restore_parts();
+            }
             m
         })
         .collect()
@@ -1023,6 +961,11 @@ pub fn release_session_lock() {
 /// The last autosaved session model, if one exists and parses. Missing or
 /// corrupt state just means a fresh session.
 pub fn load_session_state() -> Option<Model> {
+    load_session_state_with(true)
+}
+
+/// [`load_session_state`]; `derive: false` leaves op-derived parts out.
+pub fn load_session_state_with(derive: bool) -> Option<Model> {
     let text = read_autosave(&home_dir(Kind::Prefabs).ok()?, "session")?;
     let mut model: Model = serde_json::from_str(&text).ok()?;
     if let Err(e) = model.check_format() {
@@ -1039,7 +982,7 @@ pub fn load_session_state() -> Option<Model> {
             .or_else(|| nodes.len().checked_sub(1));
         model.history.nodes = nodes;
     }
-    if let Err(e) = model.restore_parts() {
+    if derive && let Err(e) = model.restore_parts() {
         eprintln!("session autosave: re-deriving parts failed: {e}");
     }
     Some(model)
@@ -1759,7 +1702,130 @@ mod tests {
         assert_eq!(again.model.name, "draft");
         assert_eq!(again.model.ops.len(), 1);
         assert!(again.parked.is_empty());
-        assert!(load_parked_docs().is_empty());
+        assert!(crate::parked::load_index().0.is_empty());
+    }
+
+    /// Parked documents are one file each, and startup reads only their
+    /// index lines: a body that no longer parses still lists, and only the
+    /// restore that needs it reads it (and says so).
+    #[test]
+    fn parked_documents_are_files_read_only_on_restore() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("parkfiles")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        for name in ["a", "b b"] {
+            ok(s.scene("open", Some(name)));
+            ok(s.apply_values(
+                None,
+                vec![
+                    serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 1}),
+                ],
+            ));
+        }
+        let mut fresh = crate::commands::Session::default();
+        fresh.model = s.model.clone();
+        fresh.others = s.others.clone();
+        fresh.close_saved_documents();
+        let mut names = fresh.park_restored();
+        names.sort();
+        assert_eq!(names, ["a", "b b"]);
+        let files: Vec<PathBuf> = fresh.parked.iter().map(|e| e.file.clone()).collect();
+        assert!(files.iter().all(|f| f.exists()), "{files:?}");
+        assert_ne!(files[0], files[1]);
+        // Parking another leaves the first file untouched.
+        let before = fs::read(&files[0]).unwrap_or_default();
+        let mut m = crate::Model::named("c");
+        m.ops = s.model.ops.clone();
+        crate::parked::park(&mut m, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fs::read(&files[0]).unwrap_or_default(), before);
+        // Break `a`'s body (line 2): the index still lists it.
+        let a = fresh.parked.iter().find(|e| e.name == "a").cloned();
+        let a = a.unwrap_or_else(|| panic!("a parked"));
+        let head = fs::read_to_string(&a.file).unwrap_or_default();
+        let head = head.lines().next().unwrap_or_default().to_string();
+        fs::write(&a.file, format!("{head}\n{{not json\n")).unwrap_or_else(|e| panic!("{e}"));
+        let mut again = crate::commands::Session::default();
+        again.park_restored();
+        let mut listed: Vec<String> = again.parked.iter().map(|e| e.name.clone()).collect();
+        listed.sort();
+        assert_eq!(listed, ["a", "b b", "c"]);
+        let entry = again.parked.iter().find(|e| e.name == "a").cloned();
+        assert_eq!(entry.map(|e| (e.ops, e.version)), Some((a.ops, a.version)));
+        let err = again.scene("restore", Some("a"));
+        assert!(err.is_err_and(|e| e.to_string().contains("reading")));
+        assert_eq!(again.parked.len(), 3, "a failed restore keeps it parked");
+        let said = ok(again.scene("restore", Some("b b")));
+        assert!(said.contains("restored"), "{said}");
+        assert_eq!(again.model.ops.len(), 1);
+        assert_eq!(again.model.parts.len(), 1, "parts re-derived on restore");
+        let bb = fresh
+            .parked
+            .iter()
+            .find(|e| e.name == "b b")
+            .map(|e| e.file.clone());
+        assert!(
+            bb.is_some_and(|f| !f.exists()),
+            "a restored document's file goes"
+        );
+    }
+
+    /// An old single `parked_docs.json` becomes one file per document on
+    /// first start, parked at the old file's time, and the old file is kept
+    /// whole in archive/; one that doesn't parse is moved aside as before.
+    #[test]
+    fn an_old_parked_docs_file_is_migrated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_root("parkmigrate");
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", &root) };
+        let dir = home_dir(Kind::Prefabs).unwrap_or_else(|e| panic!("{e}"));
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 1})],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut docs = Vec::new();
+        for (i, name) in ["one", "two"].iter().enumerate() {
+            let mut m = s.model.clone();
+            m.name = name.to_string();
+            m.version = 7 + i as u64;
+            m.parts.clear();
+            docs.push(m);
+        }
+        let legacy = dir.join("parked_docs.json");
+        let text = serde_json::to_string(&docs).unwrap_or_default();
+        fs::write(&legacy, &text).unwrap_or_else(|e| panic!("{e}"));
+        let (parked, archived) = crate::parked::load_index();
+        assert!(archived.is_empty());
+        let got: Vec<(String, u64)> = parked.iter().map(|e| (e.name.clone(), e.version)).collect();
+        assert_eq!(got, [("one".to_string(), 7), ("two".to_string(), 8)]);
+        assert!(parked.iter().all(|e| e.parked_at > 0));
+        assert!(!legacy.exists());
+        let kept = dir.join("archive").join("parked_docs.json");
+        assert_eq!(fs::read_to_string(&kept).unwrap_or_default(), text);
+        let body = crate::parked::load_body(&parked[1]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(body.ops.len(), 1);
+        // A second start finds nothing more to migrate.
+        assert_eq!(crate::parked::load_index().0.len(), 2);
+        // Unreadable: moved aside, nothing parked from it.
+        fs::write(&legacy, "[{\"name\": 3").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(crate::parked::migrate_legacy(), 0);
+        assert!(!legacy.exists());
+        let bad = fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("parked_docs.bad.")
+                })
+            })
+            .unwrap_or(false);
+        assert!(bad);
+        assert_eq!(crate::parked::load_index().0.len(), 2);
     }
 
     /// Calls name their project: the catalog follows it, and a document of

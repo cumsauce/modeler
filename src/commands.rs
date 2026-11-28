@@ -337,10 +337,13 @@ pub struct Session {
     /// Open documents other than the active `model` (see [`Session::scene`]).
     pub others: Vec<Model>,
     /// Unsaved documents a restarted server found in the autosave: kept
-    /// (`parked_docs.json`) but not open until an agent asks with
-    /// `scene restore`, so a restart never brings back stale copies on its
-    /// own.
-    pub parked: Vec<Model>,
+    /// on disk (one file each, see [`crate::parked`]) but not open until an
+    /// agent asks with `scene restore`, so a restart never brings back stale
+    /// copies on its own. Only their index entries are in memory.
+    pub parked: Vec<crate::parked::ParkedDoc>,
+    /// Parked documents moved to `archive/` (old ones): `scene restore`
+    /// lists them separately and restores one by name.
+    pub parked_archive: Vec<crate::parked::ParkedDoc>,
     /// The document the human picked in the window (popup, grid, outliner).
     /// Agent calls switch to their own documents and back to this one when
     /// they end, so agents never change what the human is looking at.
@@ -477,6 +480,7 @@ impl Default for Session {
             batch_labels: Vec::new(),
             others: Vec::new(),
             parked: Vec::new(),
+            parked_archive: Vec::new(),
             viewer_doc: None,
             in_flight: 0,
             call_doc: HashMap::new(),
@@ -2194,9 +2198,12 @@ impl Session {
         };
         let prev = self.model.name.clone();
         if let Ok(i) = self.parked_index(doc) {
-            let m = self.parked.remove(i);
+            let e = self.parked[i].clone();
+            let m = crate::parked::load_body(&e)
+                .map_err(|err| format!("doc `{doc}` is parked, and reading it failed: {err}"))?;
+            self.parked.remove(i);
+            crate::parked::remove(&e);
             self.others.push(m);
-            self.save_parked();
             self.mark_autosave(true, true, false);
             return Ok(Some(format!(
                 "note: restored the parked autosave of `{doc}` (it was not open)"
@@ -2423,8 +2430,8 @@ impl Session {
                     let Some(i) = self.others.iter().position(|m| m.name == name) else {
                         if self.parked.iter().any(|m| m.name == name) {
                             let i = self.parked_index(name)?;
-                            self.parked.remove(i);
-                            self.save_parked();
+                            let e = self.parked.remove(i);
+                            crate::parked::remove(&e);
                             return Ok(format!(
                                 "dropped the parked autosave of `{name}` (it was not open)"
                             ));
@@ -2441,32 +2448,57 @@ impl Session {
             }
             "restore" => {
                 let Some(name) = name else {
-                    return Ok(if self.parked.is_empty() {
-                        "no parked documents: nothing unsaved was left in the autosave".into()
+                    let mut s = if self.parked.is_empty() {
+                        "no parked documents: nothing unsaved was left in the autosave\n".into()
                     } else {
                         self.parked_note()
-                    });
+                    };
+                    if !self.parked_archive.is_empty() {
+                        s += &self.archived_note();
+                    }
+                    return Ok(s);
                 };
-                let i = self.parked_index(name)?;
+                // A parked document, else an archived one.
+                let (archived, i) = match self.parked_index(name) {
+                    Ok(i) => (false, i),
+                    Err(e) => match Self::parked_index_in(&self.parked_archive, name) {
+                        Ok(i) => (true, i),
+                        Err(_) => return Err(e.into()),
+                    },
+                };
                 if self.model.name == name || self.others.iter().any(|m| m.name == name) {
                     return Err(format!(
                         "`{name}` is open already (from the catalog or new); close it first (scene close) to restore the autosaved copy"
                     )
                     .into());
                 }
-                let m = self.parked.remove(i);
+                let entry = if archived {
+                    self.parked_archive[i].clone()
+                } else {
+                    self.parked[i].clone()
+                };
+                let m = crate::parked::load_body(&entry)
+                    .map_err(|e| format!("reading the parked `{name}` failed: {e}"))?;
                 let v = m.version;
                 self.others.push(m);
                 match self.scene("switch", Some(name)) {
                     Ok(r) => {
-                        self.save_parked();
-                        Ok(format!("restored the autosaved `{name}` (v{v}); {r}"))
+                        if archived {
+                            self.parked_archive.remove(i);
+                        } else {
+                            self.parked.remove(i);
+                        }
+                        crate::parked::remove(&entry);
+                        self.mark_autosave(true, true, false);
+                        Ok(format!(
+                            "restored the autosaved `{name}` (v{v}{}); {r}",
+                            if archived { ", from the archive" } else { "" }
+                        ))
                     }
                     Err(e) => {
-                        // Back to parked: nothing half-restored.
+                        // Still parked: nothing half-restored.
                         if let Some(k) = self.others.iter().rposition(|m| m.name == name) {
-                            let m = self.others.remove(k);
-                            self.parked.insert(i.min(self.parked.len()), m);
+                            self.others.remove(k);
                         }
                         Err(e)
                     }
@@ -2720,14 +2752,16 @@ impl Session {
     /// project when the call names one, else the only one of that name
     /// (two projects' documents of one name are refused, listing both).
     fn parked_index(&self, name: &str) -> Result<usize, String> {
-        let all: Vec<usize> = (0..self.parked.len())
-            .filter(|&i| self.parked[i].name == name)
-            .collect();
+        Self::parked_index_in(&self.parked, name)
+    }
+
+    fn parked_index_in(list: &[crate::parked::ParkedDoc], name: &str) -> Result<usize, String> {
+        let all: Vec<usize> = (0..list.len()).filter(|&i| list[i].name == name).collect();
         let pick: Vec<usize> = match crate::catalog::call_project() {
             Some(want) => all
                 .iter()
                 .copied()
-                .filter(|&i| self.parked[i].project == want)
+                .filter(|&i| list[i].project == want)
                 .collect(),
             None => all.clone(),
         };
@@ -2735,11 +2769,10 @@ impl Session {
             ([i], _) => Ok(*i),
             (_, true) => Err(format!(
                 "no parked document `{name}` ({})",
-                if self.parked.is_empty() {
+                if list.is_empty() {
                     "none are parked".to_string()
                 } else {
-                    self.parked
-                        .iter()
+                    list.iter()
                         .map(|m| m.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -2748,11 +2781,24 @@ impl Session {
             _ => Err(format!(
                 "parked documents named `{name}` exist in {}; call from that project's folder",
                 all.iter()
-                    .map(|&i| project_label(self.parked[i].project.as_deref()))
+                    .map(|&i| project_label(list[i].project.as_deref()))
                     .collect::<Vec<_>>()
                     .join(" and ")
             )),
         }
+    }
+
+    fn parked_line(m: &crate::parked::ParkedDoc) -> String {
+        format!(
+            "  {} ({} ops, v{}{})\n",
+            m.name,
+            m.ops,
+            m.version,
+            m.author
+                .as_deref()
+                .map(|a| format!(", last edit by {a}"))
+                .unwrap_or_default()
+        )
     }
 
     /// The parked documents, one line each, with how to bring one back.
@@ -2761,34 +2807,29 @@ impl Session {
             "parked (unsaved work from before the last restart, not open; `scene restore` NAME opens one, `scene close` NAME drops it):\n",
         );
         for m in &self.parked {
-            s += &format!(
-                "  {} ({} ops, v{}{})\n",
-                m.name,
-                m.ops.len(),
-                m.version,
-                m.history
-                    .current
-                    .and_then(|c| m.history.nodes.get(c))
-                    .and_then(|n| n.author.as_deref())
-                    .map(|a| format!(", last edit by {a}"))
-                    .unwrap_or_default()
-            );
+            s += &Self::parked_line(m);
         }
         s
     }
 
-    /// Writes the parked documents' autosave.
-    pub fn save_parked(&self) {
-        if let Err(e) = crate::catalog::save_parked_docs(&self.parked) {
-            eprintln!("parked docs autosave failed: {e}");
+    /// The archived parked documents (parked long ago), one line each.
+    pub fn archived_note(&self) -> String {
+        let mut s = String::from(
+            "archived (parked more than a week ago, kept in archive/; `scene restore` NAME still opens one):\n",
+        );
+        for m in &self.parked_archive {
+            s += &Self::parked_line(m);
         }
+        s
     }
 
     /// At startup (`--restore`): every unsaved document the autosave held
-    /// is parked instead of opened, and the server starts on an empty
-    /// document. Returns the parked names.
+    /// is parked instead of opened (written to its own file, see
+    /// [`crate::parked`]), and the server starts on an empty document.
+    /// Documents parked before are listed from their files' index lines,
+    /// not read. Returns the newly parked names.
     pub fn park_restored(&mut self) -> Vec<String> {
-        let mut parked = crate::catalog::load_parked_docs();
+        let (mut parked, archived) = crate::parked::load_index();
         let version = self.model.version + 1;
         let active = std::mem::replace(&mut self.model, Model::named("model"));
         self.model.version = version;
@@ -2796,17 +2837,27 @@ impl Session {
         if !(active.ops.is_empty() && active.parts.is_empty()) {
             fresh.insert(0, active);
         }
-        let names: Vec<String> = fresh.iter().map(|m| m.name.clone()).collect();
-        for n in &names {
-            crate::catalog::set_open_doc(n, None);
-            self.saved_state.remove(n);
-        }
-        for m in fresh {
-            parked.retain(|p| !(p.name == m.name && p.project == m.project));
-            parked.push(m);
+        let mut names = Vec::new();
+        for mut m in fresh {
+            let name = m.name.clone();
+            crate::catalog::set_open_doc(&name, None);
+            self.saved_state.remove(&name);
+            match crate::parked::park(&mut m, None) {
+                Ok(e) => {
+                    parked.retain(|p| !(p.name == e.name && p.project == e.project));
+                    parked.push(e);
+                    names.push(name);
+                }
+                Err(err) => {
+                    // Never lose it: it stays open.
+                    eprintln!("parking `{name}` failed ({err}); it stays open");
+                    let _ = m.restore_parts();
+                    self.others.push(m);
+                }
+            }
         }
         self.parked = parked;
-        self.save_parked();
+        self.parked_archive = archived;
         self.mark_autosave(true, true, false);
         names
     }

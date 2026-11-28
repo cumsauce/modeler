@@ -172,8 +172,9 @@ fn main() -> AppExit {
             eprintln!("reclaimed the previous autosave from {n} *.prev.* file(s)");
         }
         // Read the last session's autosave so unsaved WIP (ops, parts,
-        // history tree, annotations) survives a restart, parked below.
-        if let Some(model) = catalog::load_session_state() {
+        // history tree, annotations) survives a restart, parked below
+        // (so its parts are not derived here: a restore derives them).
+        if let Some(model) = catalog::load_session_state_with(false) {
             eprintln!(
                 "restored session model `{}` (v{}) from autosave",
                 model.name, model.version
@@ -181,7 +182,7 @@ fn main() -> AppExit {
             session.model = model;
         }
         let active = session.model.name.clone();
-        session.others = catalog::load_open_docs()
+        session.others = catalog::load_open_docs_with(false)
             .into_iter()
             .filter(|m| m.name != active)
             .collect();

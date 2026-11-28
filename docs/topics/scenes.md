@@ -20,10 +20,18 @@ items that read tokens (`@color`, presets) follow. The inactive docs
 autosave to `open_docs.json`. On `--restore` **no document reopens by
 itself**: one that matches its catalog file is dropped
 (`Session::close_saved_documents`; it opens from the catalog on demand) and
-every unsaved one is **parked** (`Session::park_restored`, kept in
-`parked_docs.json` with its history, across further restarts) while the
-server starts on an empty document, so a restart never puts a stale copy in
-front of agents. `scene list` / `scene restore` show the parked ones,
+every unsaved one is **parked** (`Session::park_restored`, `src/parked.rs`)
+while the server starts on an empty document, so a restart never puts a
+stale copy in front of agents. A parked document is its own file,
+`parked/<project>-<hash>/<name>.jsonl` next to the prefabs (`library/` for
+the shared library; `parked.<slot>/` for a slot server): its first line is
+the index entry (name, project, op count, version, last editor, when it was
+parked), its second the model. Startup reads only the first lines; the body
+is read, and its parts derived, only by `scene restore` NAME or a `doc` that
+names it, and parking or dropping one writes or removes only its own file.
+An older single `parked_docs.json` is split into these files on first start
+and kept whole in `archive/` (one that does not parse is moved aside to
+`parked_docs.bad.<time>.json`). `scene list` / `scene restore` show the parked ones,
 `scene restore` NAME opens one (refused while a document of that name is
 open: close it first), `scene close` NAME drops it. Humans find them in the
 document popup (⌘K) under "Recovered after restart"; a click restores one
