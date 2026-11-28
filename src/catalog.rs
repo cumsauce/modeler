@@ -1274,6 +1274,74 @@ pub fn matches_prefab_file(model: &Model) -> bool {
         && same("params", serde_json::to_value(&model.params))
 }
 
+/// A stable fingerprint of a document's `ops` and `params` as JSON values
+/// (object keys in sorted order; an empty or missing `params` counts as
+/// none), as [`matches_prefab_file`] compares them.
+pub fn ops_fingerprint(ops: Option<&serde_json::Value>, params: Option<&serde_json::Value>) -> u64 {
+    fn canon(v: &serde_json::Value, out: &mut String) {
+        use serde_json::Value;
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String((*k).clone()).to_string());
+                    out.push(':');
+                    if let Some(x) = m.get(*k) {
+                        canon(x, out);
+                    }
+                }
+                out.push('}');
+            }
+            Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    canon(x, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let none = |v: Option<&serde_json::Value>| {
+        v.filter(|v| !(v.is_null() || v.as_object().is_some_and(|o| o.is_empty())))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let mut text = String::new();
+    canon(&ops.cloned().unwrap_or(serde_json::Value::Null), &mut text);
+    text.push('|');
+    canon(&none(params), &mut text);
+    crate::parked::fnv(text.as_bytes())
+}
+
+/// [`ops_fingerprint`] of a model, through its JSON text (so numbers read
+/// back exactly as a saved file's do).
+pub fn model_fingerprint(model: &Model) -> Option<u64> {
+    let v = |t: serde_json::Result<String>| {
+        t.ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    };
+    let ops = v(serde_json::to_string(&model.ops))?;
+    let params = v(serde_json::to_string(&model.params))?;
+    Some(ops_fingerprint(Some(&ops), Some(&params)))
+}
+
+/// [`ops_fingerprint`] of the catalog file of prefab `name` (None: no file).
+pub fn prefab_file_fingerprint(name: &str) -> Option<u64> {
+    let path = catalog_dir().ok()?.join(format!("{}.json", sanitize(name)));
+    let file: serde_json::Value =
+        serde_json::from_reader(std::io::BufReader::new(fs::File::open(path).ok()?)).ok()?;
+    Some(ops_fingerprint(file.get("ops"), file.get("params")))
+}
+
 /// A prefab's undo tree, beside it: `<name>.history.json` (git-ignored in a
 /// project; per machine, like the session autosave).
 pub fn history_path(dir: &Path, name: &str) -> PathBuf {
@@ -1805,6 +1873,48 @@ mod tests {
             (size(&fresh.model) - 11.0).abs() < 1e-5,
             "undo steps back one edit"
         );
+    }
+
+    /// A parked document that equals its catalog file (saved meanwhile, by
+    /// fingerprint, the body unread) is dropped at the next start; one that
+    /// differs stays.
+    #[test]
+    fn parked_documents_matching_their_catalog_file_are_dropped() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("parksaved")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let box_ = |size: f32| {
+            vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": size})]
+        };
+        let mut s = crate::commands::Session::default();
+        for name in ["same", "differs"] {
+            ok(s.scene("open", Some(name)));
+            ok(s.apply_values(None, box_(1.5)));
+        }
+        let mut fresh = crate::commands::Session::default();
+        fresh.model = s.model.clone();
+        fresh.others = s.others.clone();
+        fresh.close_saved_documents();
+        assert_eq!(fresh.park_restored().len(), 2);
+        // Saved meanwhile (from the open copies): one as parked, one edited.
+        for (name, size) in [("same", 1.5), ("differs", 2.5)] {
+            ok(s.scene("switch", Some(name)));
+            ok(s.apply_values(None, box_(size)));
+            s.save_prefab_checked("x", &[], "x", false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let gone = fresh
+            .parked
+            .iter()
+            .find(|e| e.name == "same")
+            .map(|e| e.file.clone())
+            .unwrap_or_default();
+        let mut again = crate::commands::Session::default();
+        again.park_restored();
+        let left: Vec<&str> = again.parked.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(left, ["differs"]);
+        assert!(!gone.exists());
     }
 
     /// An old single `parked_docs.json` becomes one file per document on

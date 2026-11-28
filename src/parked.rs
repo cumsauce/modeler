@@ -47,6 +47,10 @@ pub struct ParkedDoc {
     /// History nodes kept in the file.
     #[serde(default)]
     pub history: usize,
+    /// [`catalog::ops_fingerprint`] of its ops and params, so a restart can
+    /// tell, without reading the body, that it equals its catalog file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// The file holding it (not stored: where it was read from or written).
     #[serde(skip)]
     pub file: PathBuf,
@@ -149,6 +153,7 @@ fn park_in(
             .and_then(|n| n.author.clone()),
         parked_at: parked_at.unwrap_or_else(now_secs),
         history: model.history.nodes.len(),
+        fingerprint: catalog::model_fingerprint(model).map(|h| format!("{h:016x}")),
         file: file.clone(),
     };
     if let Some(dir) = file.parent() {
@@ -215,6 +220,19 @@ fn scan(dir: &Path, out: &mut Vec<ParkedDoc>) {
             None => eprintln!("parked document unreadable, left as is: {}", path.display()),
         }
     }
+}
+
+/// Whether a parked document equals its catalog file (same ops and params,
+/// as `Session::close_saved_documents` decides for open ones): dropping it
+/// loses nothing. Compared by fingerprint, so the body is not read.
+pub fn matches_catalog(entry: &ParkedDoc) -> bool {
+    let Some(fp) = entry.fingerprint.as_deref() else {
+        return false;
+    };
+    catalog::with_project(entry.project.clone(), || {
+        catalog::prefab_file_fingerprint(&entry.name)
+    })
+    .is_some_and(|h| format!("{h:016x}") == fp)
 }
 
 /// Reads a parked document's body and re-derives its parts.

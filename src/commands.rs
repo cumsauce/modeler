@@ -2856,6 +2856,17 @@ impl Session {
                 }
             }
         }
+        // Parked documents that equal their catalog file lose nothing by
+        // going (as open ones do in `close_saved_documents`).
+        parked.retain(|e| {
+            let same = crate::parked::matches_catalog(e);
+            if same {
+                eprintln!("dropped parked `{}`: it matches its catalog file", e.name);
+                crate::parked::remove(e);
+                names.retain(|n| *n != e.name);
+            }
+            !same
+        });
         self.parked = parked;
         self.parked_archive = archived;
         self.mark_autosave(true, true, false);
