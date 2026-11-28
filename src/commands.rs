@@ -2867,6 +2867,24 @@ impl Session {
             }
             !same
         });
+        // Parked more than a week ago: into archive/, listed apart.
+        let now = crate::parked::now_secs();
+        let mut archived = archived;
+        parked.retain(|e| {
+            if !crate::parked::is_stale(e, now) {
+                return true;
+            }
+            match crate::parked::archive(e) {
+                Ok(a) => {
+                    archived.push(a);
+                    false
+                }
+                Err(err) => {
+                    eprintln!("archiving parked `{}` failed: {err}", e.name);
+                    true
+                }
+            }
+        });
         self.parked = parked;
         self.parked_archive = archived;
         self.mark_autosave(true, true, false);

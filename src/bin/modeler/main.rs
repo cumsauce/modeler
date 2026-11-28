@@ -203,9 +203,18 @@ fn main() -> AppExit {
         session.register_docs();
         if !session.parked.is_empty() {
             eprintln!(
-                "parked {} unsaved document(s) ({}): scene restore opens one",
+                "parked {} unsaved document(s){}{}: scene restore opens one",
                 session.parked.len(),
-                parked.join(", ")
+                if parked.is_empty() {
+                    String::new()
+                } else {
+                    format!(", new since the last start: {}", parked.join(", "))
+                },
+                if session.parked_archive.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} more archived)", session.parked_archive.len())
+                }
             );
         }
         session.materials = modeler::material::Library::restore();

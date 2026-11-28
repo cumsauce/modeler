@@ -406,7 +406,8 @@ pub(crate) struct MaterialCatalogArgs {
 pub(crate) struct SceneArgs {
     /// list, reset (clear the active document in place), open (an open doc, a catalog entry, or a new empty one), switch
     /// (open docs only), close (also drops a parked autosave) or restore
-    /// (no name: list the parked unsaved documents; a name: open it).
+    /// (no name: list the parked unsaved documents, and apart the archived
+    /// ones parked over a week ago; a name: open it, parked or archived).
     pub(crate) action: String,
     /// The document (= model / prefab name).
     #[serde(default)]

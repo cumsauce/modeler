@@ -1917,6 +1917,60 @@ mod tests {
         assert!(!gone.exists());
     }
 
+    /// A document parked more than a week ago moves to archive/ at startup:
+    /// listed apart by `scene restore`, and still restorable by name.
+    #[test]
+    fn old_parked_documents_move_to_the_archive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("parkold")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.apply_values(
+            None,
+            vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 1})],
+        ));
+        let now = crate::parked::now_secs();
+        for (name, age) in [
+            ("old", crate::parked::ARCHIVE_AFTER_SECS + 60),
+            ("recent", 60),
+        ] {
+            let mut m = s.model.clone();
+            m.name = name.into();
+            crate::parked::park(&mut m, Some(now - age)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let mut fresh = crate::commands::Session::default();
+        fresh.park_restored();
+        let names = |v: &[crate::parked::ParkedDoc]| -> Vec<String> {
+            v.iter().map(|e| e.name.clone()).collect()
+        };
+        assert_eq!(names(&fresh.parked), ["recent"]);
+        assert_eq!(names(&fresh.parked_archive), ["old"]);
+        let file = fresh.parked_archive[0].file.clone();
+        assert!(file.exists());
+        assert_eq!(
+            file.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string()),
+            Some("archive".into())
+        );
+        // Another start finds it in the archive, not parked.
+        let mut again = crate::commands::Session::default();
+        again.park_restored();
+        assert_eq!(names(&again.parked_archive), ["old"]);
+        let list = ok(again.scene("restore", None));
+        assert!(
+            list.contains("archived") && list.contains("  old ("),
+            "{list}"
+        );
+        let parked_part = list.split("archived").next().unwrap_or_default();
+        assert!(!parked_part.contains("  old ("), "{list}");
+        let said = ok(again.scene("restore", Some("old")));
+        assert!(said.contains("from the archive"), "{said}");
+        assert_eq!(again.model.name, "old");
+        assert!(again.parked_archive.is_empty() && !file.exists());
+    }
+
     /// An old single `parked_docs.json` becomes one file per document on
     /// first start, parked at the old file's time, and the old file is kept
     /// whole in archive/; one that doesn't parse is moved aside as before.

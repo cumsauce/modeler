@@ -33,7 +33,11 @@ A parked document keeps only its last 5 history nodes (`PARKED_HISTORY`:
 the cursor and the steps `undo` walks back through), not its whole tree.
 At each start, a parked document that now equals its catalog file (same ops
 and params, compared by a fingerprint in its index line, so the body is not
-read) is dropped, as an open one is.
+read) is dropped, as an open one is. One parked more than 7 days ago (`ARCHIVE_AFTER_SECS`, by
+the time it was parked; a migrated one by the old file's modification time)
+moves to its folder's `archive/`, never deleted: `scene restore` with no
+name lists the archived ones under their own heading, and `scene restore`
+NAME restores one from there too.
 An older single `parked_docs.json` is split into these files on first start
 and kept whole in `archive/` (one that does not parse is moved aside to
 `parked_docs.bad.<time>.json`). `scene list` / `scene restore` show the parked ones,

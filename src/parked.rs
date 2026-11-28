@@ -27,6 +27,11 @@ use crate::{Model, ModelerError};
 /// (one terrain scene: 555 MB in 30 nodes).
 pub const PARKED_HISTORY: usize = 5;
 
+/// Parked documents older than this (by when they were parked) move to
+/// their folder's `archive/` at startup: kept, listed apart by `scene
+/// restore`, never deleted.
+pub const ARCHIVE_AFTER_SECS: u64 = 7 * 24 * 3600;
+
 /// One parked document's index entry: the first line of its file.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ParkedDoc {
@@ -66,7 +71,7 @@ pub(crate) fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
-pub(crate) fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -174,6 +179,9 @@ pub fn read_entry(path: &Path) -> Option<ParkedDoc> {
     let mut line = String::new();
     std::io::BufReader::new(f).read_line(&mut line).ok()?;
     let mut e: ParkedDoc = serde_json::from_str(line.trim_end()).ok()?;
+    if e.parked_at == 0 {
+        e.parked_at = mtime_secs(path).unwrap_or_default();
+    }
     e.file = path.to_path_buf();
     Some(e)
 }
@@ -257,6 +265,25 @@ pub fn remove(entry: &ParkedDoc) {
     {
         eprintln!("removing parked {}: {e}", entry.file.display());
     }
+}
+
+/// Whether `entry` was parked more than [`ARCHIVE_AFTER_SECS`] before `now`.
+pub fn is_stale(entry: &ParkedDoc, now: u64) -> bool {
+    entry.parked_at.saturating_add(ARCHIVE_AFTER_SECS) < now
+}
+
+/// Moves a parked document's file into its folder's `archive/`.
+pub fn archive(entry: &ParkedDoc) -> Result<ParkedDoc, ModelerError> {
+    let dir = entry
+        .file
+        .parent()
+        .map(|p| p.join("archive"))
+        .ok_or_else(|| ModelerError::Io(format!("no folder for {}", entry.file.display())))?;
+    let to = move_into(&entry.file, &dir)?;
+    Ok(ParkedDoc {
+        file: to,
+        ..entry.clone()
+    })
 }
 
 /// `<home>/archive/`: where files this server moves aside go (never deleted).
