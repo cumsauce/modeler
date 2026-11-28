@@ -7917,4 +7917,35 @@ mod tests {
         );
         assert!(e.is_err_and(|e| e.to_string().contains("not both")));
     }
+
+    #[test]
+    fn a_thin_cutter_that_cuts_is_not_called_a_miss() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "body", "kind": "box", "size": [4, 1, 2]}),
+                // An 8 mm slot 0.5 mm into the top: a few millionths of the volume.
+                json!({"type": "primitive", "name": "slot", "kind": "box", "size": [3, 0.002, 0.008], "translation": [0, 0.4995, 0]}),
+                json!({"type": "boolean", "name": "cut", "op": "difference", "a": "body", "b": "slot"}),
+                json!({"type": "primitive", "name": "far", "kind": "box", "size": [0.1, 0.1, 0.1], "translation": [9, 0, 0]}),
+                json!({"type": "boolean", "name": "miss", "op": "difference", "a": "body", "b": "far"}),
+                json!({"type": "hide_part", "part": "body"}),
+                json!({"type": "hide_part", "part": "slot"}),
+                json!({"type": "hide_part", "part": "far"}),
+                json!({"type": "hide_part", "part": "cut"}),
+            ],
+        ));
+        let lints = s.lints();
+        assert!(
+            !lints.iter().any(|l| l.contains("difference `cut`")),
+            "{lints:?}"
+        );
+        assert!(
+            lints
+                .iter()
+                .any(|l| l.contains("difference `miss`") && l.contains("probably misses")),
+            "{lints:?}"
+        );
+    }
 }

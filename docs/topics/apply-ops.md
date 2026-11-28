@@ -120,8 +120,9 @@ source (only with `include_source: false`), visible parts still wearing the
 default material, parts with identical world bounds (z-fighting; when one
 is an input of the op making the other, the warning names it and says to
 hide it), boolean
-volume sanity (a difference that didn't shrink its input = the cutter
-misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
+volume sanity (a difference that changed neither its input's volume nor
+its surface area = the cutter misses; a thin groove or inlay that cut adds
+the walls of its cut, so it stays quiet; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
 outputs are closed), and **floating parts** (off the ground and touching no
 other part, e.g. a copy transformed instead of its neighbour). **Quality
