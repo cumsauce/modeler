@@ -1199,6 +1199,28 @@ pub struct LoftSpec {
     /// curved cage subdivides without the lumps of a triangulated one.
     #[serde(default)]
     quads: bool,
+    /// Fit the rings to outlines (a straight loft along z, sections at
+    /// z stations): {side: [[z, y]...], top: [[x, z]...], levels?}. Each
+    /// ring keeps its shape and is scaled and moved so it spans the side
+    /// outline's height and the plan's width at its z (a plan of the +
+    /// half only is mirrored). levels (with quads): fit the surface
+    /// subdiv makes at that many levels instead of the cage.
+    #[serde(default)]
+    fit: Option<LoftFitSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoftFitSpec {
+    /// Side outline, [[z, y], ...] (seen from +x, front = +z).
+    #[serde(default)]
+    side: Vec<[f32; 2]>,
+    /// Plan outline, [[x, z], ...].
+    #[serde(default)]
+    top: Vec<[f32; 2]>,
+    /// Subdivision levels to fit through (needs quads; 0 = fit the cage).
+    #[serde(default)]
+    levels: u32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -4606,6 +4628,24 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 steps: s.steps,
                 round: s.round,
                 quads: s.quads,
+                fit: match s.fit {
+                    Some(f) => {
+                        if f.side.len() < 3 && f.top.len() < 3 {
+                            return Err(format!(
+                                "{ctx}: fit: give a side outline [[z, y]...] and / or a top outline [[x, z]...] (3+ points each)"
+                            ));
+                        }
+                        if f.levels > 5 {
+                            return Err(format!("{ctx}: fit.levels: 0..5, got {}", f.levels));
+                        }
+                        Some(Box::new(crate::loft::LoftFit {
+                            side: f.side,
+                            top: f.top,
+                            levels: f.levels,
+                        }))
+                    }
+                    None => None,
+                },
             })
         }
         "panel_line" => {

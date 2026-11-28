@@ -1111,6 +1111,8 @@ pub enum Op {
         round: f32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         quads: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fit: Option<Box<crate::loft::LoftFit>>,
     },
     /// Copies of `input` along a path, `name_0..`: count, or spacing.
     PathArray {

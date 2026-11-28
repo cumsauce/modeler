@@ -1012,6 +1012,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             steps,
             round,
             quads,
+            fit,
         } => {
             let o = crate::loft::LoftOpts {
                 path,
@@ -1020,6 +1021,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 steps: *steps,
                 round: *round,
                 quads: *quads,
+                fit: fit.as_deref(),
             };
             upsert(named, name, crate::loft::loft(name, sections, &o)?);
         }
@@ -2410,8 +2412,9 @@ pub fn describe(ops: &[Op]) -> String {
                 steps,
                 round,
                 quads,
+                fit,
             } => format!(
-                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}{}",
+                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}{}{}",
                 sections
                     .iter()
                     .map(|s| format!(
@@ -2424,7 +2427,13 @@ pub fn describe(ops: &[Op]) -> String {
                     .collect::<Vec<_>>()
                     .join(", "),
                 if path.is_empty() { String::new() } else { format!(" path={path:?}") },
-                if *quads { " quads" } else { "" }
+                if *quads { " quads" } else { "" },
+                fit.as_ref().map_or_else(String::new, |f| format!(
+                    " fit(side {} pts, top {} pts, levels {})",
+                    f.side.len(),
+                    f.top.len(),
+                    f.levels
+                ))
             ),
             Op::PathArray {
                 name,

@@ -27,3 +27,15 @@
   shoulder, crown) and the same number on every station. A car body:
   stations along z (`at: [0, 0, z]`, `rotation: {x: -90}`: profile [x, y] is world x, y), then
   `{"type": "smooth", "mode": "subdiv", "levels": 2, "input": ...}`.
+- **`fit: {side, top, levels?}`** fits a straight loft along z (sections
+  at z stations, square to z) to blueprint outlines: `side` `[[z, y],
+  ...]` (seen from +x) sets each ring's bottom and top at its z, `top`
+  `[[x, z], ...]` (the plan; a + half, x >= 0, is mirrored) its width.
+  Each ring keeps its own shape (the section's profile says where the
+  shoulder and crown sit) and is scaled and moved in x and y, so the
+  stations only need their shapes, not their sizes. Subdivision pulls the
+  surface inside the cage (a few cm at a car's ends); with `quads: true`
+  and `levels: 2` the cage is pushed out until the surface `smooth subdiv
+  levels 2` makes spans the outlines at every station (iterated to
+  0.2 mm). A ring outside an outline errors with its z. Check the result
+  against the same outlines as images with `agent_views reference`.

@@ -522,6 +522,15 @@ fn crease_edges(v: &[Vec3], faces: &[Vec<u32>], crease: Option<f32>) -> HashSet<
     out
 }
 
+/// Where a cage's own vertices land after `levels` of Catmull-Clark (no
+/// creases), in the cage's vertex order: what a fit compares with.
+pub(crate) fn cage_images(v: Vec<Vec3>, faces: Vec<Vec<u32>>, levels: u32) -> Vec<Vec3> {
+    let n = v.len();
+    let (mut out, _) = catmull_clark(v, faces, Sharpness::new(), levels);
+    out.truncate(n);
+    out
+}
+
 /// Edge sharpness by (low, high) vertex: levels it stays sharp, infinite
 /// for a hard crease.
 type Sharpness = HashMap<(u32, u32), f32>;
@@ -1034,6 +1043,73 @@ mod tests {
     }
 
     #[test]
+    fn a_fitted_quad_loft_spans_its_outlines_after_subdiv() {
+        let ring: Vec<[f32; 2]> = (0..12)
+            .map(|i| {
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                [0.3 * a.cos(), 0.2 * a.sin()]
+            })
+            .collect();
+        // Sections square to z: profile [x, y] is world x, y.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let sec = |z: f32| crate::loft::LoftSection {
+            profile: ring.clone(),
+            at: [0.0, 0.0, z],
+            t: None,
+            rotation: Some([-h, 0.0, 0.0, h]),
+            scale: [1.0, 1.0],
+        };
+        let secs: Vec<_> = [-1.2, -0.6, 0.0, 0.6, 1.2].into_iter().map(sec).collect();
+        let fit = crate::loft::LoftFit {
+            side: vec![[-1.5, 0.2], [1.5, 0.2], [1.5, 1.2], [-1.5, 1.2]],
+            top: vec![[0.0, -1.5], [0.9, -1.5], [0.9, 1.5], [0.0, 1.5]],
+            levels: 2,
+        };
+        let o = crate::loft::LoftOpts {
+            path: &[],
+            smooth: false,
+            samples: 0,
+            steps: 0,
+            round: 0.0,
+            quads: true,
+            fit: Some(&fit),
+        };
+        let p = crate::loft::loft("body", &secs, &o).unwrap_or_else(|e| panic!("{e}"));
+        let s = subdiv(&p, 2);
+        closed(&s);
+        // The middle station's subdivided ring spans the outlines.
+        let mid: Vec<Vec3> = s
+            .verts
+            .iter()
+            .map(|v| Vec3::from(*v))
+            .filter(|v| v.z.abs() < 0.02)
+            .collect();
+        let (lo, hi) = mid
+            .iter()
+            .fold((Vec3::MAX, Vec3::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        for (got, want) in [(lo.x, -0.9), (hi.x, 0.9), (lo.y, 0.2), (hi.y, 1.2)] {
+            assert!((got - want).abs() < 0.003, "{lo} {hi}");
+        }
+        // Without levels the cage itself spans them (the surface sits inside).
+        let fit0 = crate::loft::LoftFit {
+            levels: 0,
+            ..fit.clone()
+        };
+        let o0 = crate::loft::LoftOpts {
+            fit: Some(&fit0),
+            ..o
+        };
+        let c = crate::loft::loft("body", &secs, &o0).unwrap_or_else(|e| panic!("{e}"));
+        let (clo, chi) = c.bounds();
+        assert!(
+            (chi.x - 0.9).abs() < 1e-4 && (clo.y - 0.2).abs() < 1e-4,
+            "{clo} {chi}"
+        );
+        let s0 = subdiv(&c, 2);
+        assert!(s0.bounds().1.x < 0.9 - 0.005, "subdivision pulls in");
+    }
+
+    #[test]
     fn a_quad_loft_hands_its_rings_to_subdiv() {
         let ring = |r: f32| -> Vec<[f32; 2]> {
             (0..8)
@@ -1058,6 +1134,7 @@ mod tests {
             steps: 0,
             round: 0.0,
             quads: true,
+            fit: None,
         };
         let p = crate::loft::loft("l", &secs, &o).unwrap_or_else(|e| panic!("{e}"));
         let c = p.cage.as_ref().map(|c| (c.verts.len(), c.faces.len()));
