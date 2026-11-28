@@ -613,6 +613,41 @@ mod tests {
     }
 
     #[test]
+    fn skipped_copies_share_one_mesh_in_the_gltf() {
+        let mut model = crate::Model {
+            name: "room".into(),
+            ..Default::default()
+        };
+        for p in room() {
+            model.parts.push(p.into());
+        }
+        for i in 0..4 {
+            let mut n = crate::primitives::primitive(crate::PrimitiveKind::Box, [0.05; 3], "n")
+                .unwrap_or_else(|e| panic!("{e}"));
+            n.name = format!("nut_{i}");
+            n.translation = [0.2 * i as f32, 0.5, 0.0];
+            model.parts.push(n.into());
+        }
+        let mut o = crate::export_opt::Options::game();
+        o.ao = Some(Ao {
+            resolution: 256,
+            samples: 16,
+            skip: vec!["nut_*".into()],
+            ..Ao::default()
+        });
+        let (doc, _, report) = crate::gltf::build_with(&model, None, &o, None, false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(report.contains("ambient occlusion"), "{report}");
+        let nodes = doc["nodes"].as_array().cloned().unwrap_or_default();
+        let nut_meshes: std::collections::HashSet<u64> = nodes
+            .iter()
+            .filter(|n| n["name"].as_str().is_some_and(|s| s.starts_with("nut_")))
+            .filter_map(|n| n["mesh"].as_u64())
+            .collect();
+        assert_eq!(nut_meshes.len(), 1, "four nuts, one mesh: {nodes:?}");
+    }
+
+    #[test]
     fn parse_ao() {
         assert_eq!(Ao::parse(&Value::Bool(true)), Ok(Some(Ao::default())));
         assert_eq!(Ao::parse(&Value::Null), Ok(None));

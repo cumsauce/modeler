@@ -55,9 +55,12 @@ batches, bytes):
   `<gltf stem>-ao-<hash>` in the shared `textures/` folder, and **every
   material** gets `occlusionTexture: {index, texCoord: 1}` (replacing the
   tile AO an `orm` texture carried; Bevy applies it to indirect light only).
-  Instancing is off with `ao` (each copy needs its own patch). `skip`
-  (part-name globs: terrain, huge ground) and rigged parts still occlude but
-  get no islands, reading a white texel, as do LOD copies and decal quads.
+  Baked copies lose instancing with `ao` (each needs its own patch). `skip`
+  (part-name globs: terrain, huge ground, or a car's lug nuts and spokes)
+  and rigged parts still occlude but get no islands, reading a white
+  texel, as do LOD copies and decal quads; copies among them keep sharing
+  one mesh (a copy and its source both skipped), so skipping the many
+  small repeated parts keeps most of a model's instancing.
   Parts without a texture get uv0 = uv1 (glTF wants uv sets from 0). A
   `.bsn` export bakes the map's own geometry as one atlas and each prefab
   glTF from itself alone. The report gives atlas size, islands, texels,
