@@ -150,7 +150,7 @@ memorise them.
 | `skin` | name, chains [[[x, y, z, r] or [x, y, z, [rx, ry], roll?] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution], [tris], [bake] (a skeleton with radii as one smooth skin) |
 | `body` | name, preset (biped / quadruped / bird / fish / serpent / car), [height], [head_ratio], [build], [leg_length], [tail], [snout], [joints {name: {scale, offset}}], [blend], [resolution], [tris], [bake], [rig true], [warps] (a parametric creature or car with a `<name>_rig` skeleton) |
 | `silhouette` | name, side [[z, y]...], top [[x, z]...], [front [[x, y]...]], [smooth], [round], [blend], [from_reference {image, view, height / size}], [resolution], [tris], [bake], [translation], [rotation] (a solid carved from orthographic outlines) |
-| `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
+| `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2] or [tris], [crease], [symmetric] |
 | `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60], [symmetric x] (fewer triangles; bake the dense surface into normal + height maps) |
 | `shell` | name, input, thickness, [open: face or [faces]], [method exact / offset (dense meshes)] (hollow a solid) |
 | `carve` | [solid], cutters, [rooms [{name, footprint [[x, z]...], height, base}]], [slabs [{footprint [[[x, z]...]...], top, thickness 0.3}]], [wall 0.3], [keep inner / outer / both], [merge true], [split_by none / facing / cutter / both], [markers], [collider none / mesh / blocks] (interiors by subtraction: only the faces looking into the rooms, as one-sided sheets) |

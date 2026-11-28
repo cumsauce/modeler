@@ -206,6 +206,14 @@ pub struct Smooth {
     pub levels: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crease: Option<f32>,
+    /// subdiv: a triangle budget instead of `levels`: subdivide just past
+    /// it, then decimate to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tris: Option<u32>,
+    /// subdiv with tris: decimate symmetrically about this axis' zero
+    /// plane (see `decimate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symmetric: Option<String>,
 }
 
 impl Smooth {
@@ -230,6 +238,21 @@ impl Smooth {
         only("edge", self.edge.is_some(), &["remesh"])?;
         only("levels", self.levels.is_some(), &["subdiv"])?;
         only("crease", self.crease.is_some(), &["subdiv"])?;
+        only("tris", self.tris.is_some(), &["subdiv"])?;
+        if self.tris.is_some() && self.levels.is_some() {
+            return Err("give levels or tris, not both".into());
+        }
+        if self.tris.is_some_and(|t| t < 8) {
+            return Err("tris: at least 8".into());
+        }
+        if let Some(s) = &self.symmetric {
+            if self.tris.is_none() {
+                return Err("symmetric: only with tris (it applies to the decimation)".into());
+            }
+            if !["x", "y", "z"].contains(&s.as_str()) {
+                return Err(format!("symmetric: x, y or z, got `{s}`"));
+            }
+        }
         if let Some(s) = self.strength
             && !(s > 0.0 && s <= 1.0)
         {
@@ -270,6 +293,8 @@ impl Smooth {
         f("edge", self.edge.map(|v| v.to_string()));
         f("levels", self.levels.map(|v| v.to_string()));
         f("crease", self.crease.map(|v| v.to_string()));
+        f("tris", self.tris.map(|v| v.to_string()));
+        f("symmetric", self.symmetric.clone());
         s
     }
 }
@@ -352,7 +377,6 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
             ))
         }
         _ => {
-            let levels = def.levels.unwrap_or(2);
             let (v, faces, mut sharp) = match &part.cage {
                 // A cage carries its own polygons and crease weights.
                 Some(c) => {
@@ -377,7 +401,15 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
                 }
             };
             let corners: usize = faces.iter().map(Vec::len).sum();
-            let est = corners * 2 * 4usize.pow(levels - 1);
+            let est_of = |l: u32| corners * 2 * 4usize.pow(l - 1);
+            // A budget: the fewest levels that reach it (within the limit).
+            let levels = match def.tris {
+                Some(t) => (1..=5)
+                    .find(|&l| est_of(l) >= t as usize || l == 5 || est_of(l + 1) > MAX_TRIS)
+                    .unwrap_or(1),
+                None => def.levels.unwrap_or(2),
+            };
+            let est = est_of(levels);
             if est > MAX_TRIS {
                 return Err(err(format!(
                     "{levels} level(s) of a {}-face cage make about {est} triangles (limit {MAX_TRIS}); use fewer levels or a coarser cage",
@@ -390,7 +422,20 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
             let (v, f) = catmull_clark(v, faces, sharp, levels);
             let t = triangulate(&v, &f);
             let crease = def.crease.map_or(60.0, |c| c.clamp(20.0, 60.0));
-            Ok(to_part(name, part, &v, &t, crease))
+            let out = to_part(name, part, &v, &t, crease);
+            match def.tris {
+                Some(tr) if out.tri_count() as f32 > tr as f32 * 1.02 => {
+                    let d = crate::decimate::Decimate {
+                        tris: Some(tr),
+                        symmetric: def.symmetric.clone(),
+                        ..Default::default()
+                    };
+                    let mut low = crate::decimate::decimate(name, &out, &d).map_err(err)?;
+                    low.material = part.material.clone();
+                    Ok(low)
+                }
+                _ => Ok(out),
+            }
         }
     }
 }
@@ -899,6 +944,24 @@ mod tests {
         let mut def = sm("subdiv");
         def.levels = Some(levels);
         smooth("s", p, &def).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn subdiv_meets_a_triangle_budget() {
+        let mut def = sm("subdiv");
+        def.tris = Some(1000);
+        def.symmetric = Some("x".into());
+        let s = smooth("s", &cube(), &def).unwrap_or_else(|e| panic!("{e}"));
+        closed(&s);
+        let n = s.tri_count();
+        assert!((900..=1100).contains(&n), "{n} triangles");
+        // Already under budget: no decimation, the level that fits.
+        def.tris = Some(768);
+        def.symmetric = None;
+        let s = smooth("s", &cube(), &def).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.tri_count(), 768);
+        def.levels = Some(2);
+        assert!(def.validate().is_err(), "levels and tris");
     }
 
     #[test]

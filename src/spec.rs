@@ -2425,6 +2425,15 @@ pub struct SmoothSpec {
     /// sharp (default: none, everything rounds).
     #[serde(default)]
     crease: Option<f32>,
+    /// subdiv: a triangle budget instead of `levels`: subdivides to the
+    /// first level at or past it, then decimates to it (one op instead of
+    /// subdiv + decimate).
+    #[serde(default)]
+    tris: Option<u32>,
+    /// subdiv with tris: "x" / "y" / "z" decimates symmetrically about
+    /// that zero plane (as decimate's `symmetric`).
+    #[serde(default)]
+    symmetric: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -4964,6 +4973,8 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 edge: s.edge,
                 levels: s.levels,
                 crease: s.crease,
+                tris: s.tris,
+                symmetric: s.symmetric,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Smooth {

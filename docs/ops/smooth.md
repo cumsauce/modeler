@@ -16,3 +16,7 @@
     sharp too. A part made by `cage` or by a `loft` with `quads: true`
     hands over its own polygons instead (no merging: curved quads stay
     quads) and its per-edge crease weights.
+    `tris: N` replaces `levels` with a budget: subdivide to the first level
+    at or past N, then decimate to N (crease-preserving, with
+    `symmetric: "x"` mirror-exact as in `decimate`): one op instead of
+    subdiv, relax and decimate.
