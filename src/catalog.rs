@@ -1035,9 +1035,113 @@ pub fn release_lock_at(path: &std::path::Path, pid: u32) {
 pub fn acquire_session_lock() -> Result<LockOutcome, ModelerError> {
     let path = session_lock_path()?;
     let outcome = acquire_lock_at(&path, std::process::id())?;
+    if outcome != LockOutcome::Owner {
+        // A slot server says it is alive (`session.<slot>.lock`), so the
+        // main daemon never archives a live slot's autosaves.
+        let _ = acquire_lock_at(&slot_lock_path(&autosave_slot())?, std::process::id());
+    }
     let mut g = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some((path, outcome));
     Ok(outcome)
+}
+
+/// `session.<slot>.lock`: the pid of the live server autosaving to `slot`.
+fn slot_lock_path(slot: &str) -> Result<PathBuf, ModelerError> {
+    Ok(home_dir(Kind::Prefabs)?.join(format!("session.{slot}.lock")))
+}
+
+/// The slot of a slot server's autosave file name (`session.<slot>.json`,
+/// `session.<slot>.history.<doc>.jsonl`, `open_docs.<slot>.json`,
+/// `parked_docs.<slot>.json`, `parked.<slot>/`, `session.<slot>.lock`,
+/// their `.prev` copies), or None for the main server's own files.
+fn slot_of(file: &str) -> Option<&str> {
+    let rest = ["session.", "open_docs.", "parked_docs.", "parked."]
+        .iter()
+        .find_map(|p| file.strip_prefix(p))?;
+    let slot = rest.split('.').next()?;
+    let reserved = ["json", "jsonl", "history", "prev", "lock", "bad", "tmp"];
+    (!slot.is_empty()
+        && !reserved.contains(&slot)
+        && slot
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(slot)
+}
+
+/// A slot whose files were written this recently counts as alive even with
+/// no lock (a slot server of an older build writes none).
+pub const SLOT_IDLE_SECS: u64 = 24 * 3600;
+
+/// Startup of the main daemon (the session lock's owner): moves the
+/// autosaves of slot servers that are gone (no live `session.<slot>.lock`,
+/// a `pid<N>` slot whose pid is dead, or with no lock, files untouched for
+/// [`SLOT_IDLE_SECS`]) into `archive/slot-<slot>/` beside them (the
+/// materials' too), never deleting them. Returns the archived slots.
+pub fn archive_dead_slots() -> Vec<String> {
+    if autosave_owner().is_some() {
+        return Vec::new();
+    }
+    let (Ok(prefabs), Ok(materials)) = (home_dir(Kind::Prefabs), home_dir(Kind::Materials)) else {
+        return Vec::new();
+    };
+    let mine = autosave_slot();
+    let now = crate::parked::now_secs();
+    let mut by_slot: std::collections::BTreeMap<String, Vec<(PathBuf, PathBuf)>> =
+        Default::default();
+    for dir in [&prefabs, &materials] {
+        let Ok(rd) = fs::read_dir(dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            // The materials folder holds only `session.<slot>.json` of ours.
+            if dir == &materials && !name.starts_with("session.") {
+                continue;
+            }
+            if let Some(slot) = slot_of(&name)
+                && slot != mine
+            {
+                by_slot
+                    .entry(slot.to_string())
+                    .or_default()
+                    .push((e.path(), dir.join("archive").join(format!("slot-{slot}"))));
+            }
+        }
+    }
+    let mut gone = Vec::new();
+    for (slot, files) in by_slot {
+        let lock = prefabs.join(format!("session.{slot}.lock"));
+        let alive = match lock_holder(&lock) {
+            Some(pid) => pid_alive(pid),
+            None => match slot.strip_prefix("pid").and_then(|p| p.parse::<u32>().ok()) {
+                Some(pid) => pid_alive(pid),
+                None => files.iter().any(|(f, _)| {
+                    fs::metadata(f)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_some_and(|t| t.as_secs() + SLOT_IDLE_SECS > now)
+                }),
+            },
+        };
+        if alive {
+            continue;
+        }
+        let mut moved = 0;
+        for (f, to) in &files {
+            match crate::parked::move_into(f, to) {
+                Ok(_) => moved += 1,
+                Err(e) => eprintln!("archiving {}: {e}", f.display()),
+            }
+        }
+        if moved > 0 {
+            eprintln!(
+                "archived {moved} autosave file(s) of the gone slot server `{slot}` to archive/slot-{slot}/"
+            );
+            gone.push(slot);
+        }
+    }
+    gone
 }
 
 /// The other live server's pid when it owns the autosave and this one does
@@ -1062,11 +1166,15 @@ pub fn autosave_owner() -> Option<u32> {
     }
 }
 
-/// Clean exit: removes `session.lock` if this process holds it.
+/// Clean exit: removes `session.lock` (or this slot's lock) if this
+/// process holds it.
 pub fn release_session_lock() {
     let g = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((path, LockOutcome::Owner)) = g.as_ref() {
         release_lock_at(path, std::process::id());
+    }
+    if let Ok(p) = slot_lock_path(&autosave_slot()) {
+        release_lock_at(&p, std::process::id());
     }
 }
 
@@ -2145,6 +2253,104 @@ mod tests {
         ok(s.redo());
         save_session_journaled(&mut s.model, &mut st).unwrap_or_else(|e| panic!("{e}"));
         JOURNAL_LIMITS.with(|c| c.set(None));
+    }
+
+    /// The main daemon archives the autosaves of slot servers that are gone
+    /// (dead pid, dead lock holder, or no lock and idle a day) and leaves
+    /// live slots and its own files alone.
+    #[test]
+    fn autosaves_of_gone_slot_servers_are_archived() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("slots")) };
+        let dir = home_dir(Kind::Prefabs).unwrap_or_else(|e| panic!("{e}"));
+        let mats = home_dir(Kind::Materials).unwrap_or_else(|e| panic!("{e}"));
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        fs::create_dir_all(&mats).unwrap_or_else(|e| panic!("{e}"));
+        let dead = std::process::Command::new("true")
+            .spawn()
+            .and_then(|mut c| {
+                let id = c.id();
+                c.wait().map(|_| id)
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let write = |p: PathBuf| fs::write(p, "{}").unwrap_or_else(|e| panic!("{e}"));
+        let ours = [
+            "session.json",
+            "session.history.doc.jsonl",
+            "open_docs.json",
+            "parked_docs.bad.12.json",
+            "session.prev.json",
+        ];
+        for f in ours {
+            write(dir.join(f));
+        }
+        let dead_slot = format!("pid{dead}");
+        for f in [
+            format!("session.{dead_slot}.json"),
+            format!("session.{dead_slot}.history.doc.jsonl"),
+            format!("open_docs.{dead_slot}.json"),
+            format!("parked_docs.{dead_slot}.json"),
+        ] {
+            write(dir.join(f));
+        }
+        write(mats.join(format!("session.{dead_slot}.json")));
+        fs::create_dir_all(dir.join(format!("parked.{dead_slot}")).join("library"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // A named slot with no lock, untouched for two days.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        for f in ["session.dold.json", "open_docs.dold.json"] {
+            write(dir.join(f));
+            fs::File::options()
+                .write(true)
+                .open(dir.join(f))
+                .and_then(|h| h.set_modified(old))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // A named slot whose lock a live process holds, and a fresh one.
+        write(dir.join("session.dlive.json"));
+        fs::write(
+            dir.join("session.dlive.lock"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        write(dir.join("session.dfresh.json"));
+        // A dead lock holder: gone however fresh its files are.
+        write(dir.join("session.dlocked.json"));
+        fs::write(dir.join("session.dlocked.lock"), format!("{dead}\n"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut gone = archive_dead_slots();
+        gone.sort();
+        let mut want = vec!["dlocked".to_string(), "dold".into(), dead_slot.clone()];
+        want.sort();
+        assert_eq!(gone, want);
+        for f in ours {
+            assert!(dir.join(f).exists(), "{f}");
+        }
+        assert!(dir.join("session.dlive.json").exists());
+        assert!(dir.join("session.dfresh.json").exists());
+        let a = dir.join("archive").join(format!("slot-{dead_slot}"));
+        assert!(
+            a.join(format!("session.{dead_slot}.history.doc.jsonl"))
+                .exists()
+        );
+        assert!(a.join(format!("parked_docs.{dead_slot}.json")).exists());
+        assert!(!dir.join(format!("session.{dead_slot}.json")).exists());
+        let ma = mats.join("archive").join(format!("slot-{dead_slot}"));
+        assert!(ma.join(format!("session.{dead_slot}.json")).exists());
+        assert!(a.join(format!("parked.{dead_slot}")).is_dir());
+        assert!(
+            dir.join("archive")
+                .join("slot-dold")
+                .join("open_docs.dold.json")
+                .exists()
+        );
+        assert!(
+            dir.join("archive")
+                .join("slot-dlocked")
+                .join("session.dlocked.lock")
+                .exists()
+        );
     }
 
     /// An old single `parked_docs.json` becomes one file per document on

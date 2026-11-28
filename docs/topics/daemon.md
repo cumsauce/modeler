@@ -36,7 +36,13 @@ short, Unix sockets are limited to ~100 bytes). Each socket gets its own
 daemon, server, log (`daemon.<slot>.log`) and autosave slot
 (`session.<slot>.json`; the first server in a catalog dir holds the main
 `session.lock`), and the catalog is shared, with `save_prefab`'s
-changed-file check guarding writes. Caveat: separate windows and separate
+changed-file check guarding writes. When a slot's server is gone, the
+main daemon's next start moves that slot's autosaves (session, journals,
+open and parked documents, working materials) into
+`archive/slot-<slot>/`; they are never deleted, so a slot's work can still
+be copied back by hand. A slot server restarted before the main daemon next
+starts gets its slot back as before; a live slot server holds
+`session.<slot>.lock`, so its files are never moved. Caveat: separate windows and separate
 open documents, so a `prefab` item only sees the other daemon's work once
 it is saved to the catalog. `MODELER_BINARY` overrides the server binary
 (default `target/debug/modeler` beside `mcp_driver.py`).

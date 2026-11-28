@@ -65,7 +65,17 @@
   SLOT", `scene_summary` has an `autosave:` line, and the driver tells each
   client once in its first result. A dead holder's lock is taken over, also
   mid-session (from then on it writes the main files); a clean exit removes
-  it.
+  it. A slot server also holds `session.<slot>.lock`. At startup the main
+  daemon (the lock's owner) moves the autosaves of slot servers that are
+  gone (`catalog::archive_dead_slots`: the slot lock's pid is dead, a
+  `pid<N>` slot's pid is dead, or, with no lock, none of its files changed
+  for a day) into `archive/slot-<slot>/` beside them (prefabs and
+  materials), never deleting them; its own files and live slots stay.
+- **Parked documents** (`src/parked.rs`, `topic:scenes`): one file per
+  document under `parked/<project>-<hash>/`, line 1 the index entry, line 2
+  the body; startup reads line 1s only, keeps 5 history nodes, drops ones
+  equal to their catalog file and archives ones parked over 7 days ago.
+  History journals are capped at 64 MB (`topic:history`).
 - rmcp 1.8 server runs a tokio current-thread on a spawned thread; the Bevy
   app owns the main thread (winit on macOS). Bridge = tokio mpsc + oneshot.
 - `--headless` uses MinimalPlugins — don't add ScheduleRunnerPlugin again.

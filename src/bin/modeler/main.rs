@@ -127,7 +127,11 @@ fn main() -> AppExit {
     // One autosaving server per catalog dir: a second live server would
     // clobber the first's session.json, so it runs without autosave.
     match catalog::acquire_session_lock() {
-        Ok(catalog::LockOutcome::Owner) => {}
+        // The main daemon moves the autosaves of slot servers that are gone
+        // into archive/ (never deleted), so they stop piling up beside its own.
+        Ok(catalog::LockOutcome::Owner) => {
+            catalog::archive_dead_slots();
+        }
         Ok(catalog::LockOutcome::HeldBy(pid)) => eprintln!(
             "modeler: autosave SLOT {}: server pid {pid} holds the session lock in this catalog dir, \
              so this server autosaves to session.{}.json instead",
