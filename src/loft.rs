@@ -379,6 +379,9 @@ pub struct LoftOpts<'a> {
     pub samples: u32,
     pub steps: u32,
     pub round: f32,
+    /// Keep the rings' own points (no resampling) and carry the walls
+    /// along as quads (caps as one polygon each) for `smooth subdiv`.
+    pub quads: bool,
 }
 
 /// A closed solid skinned through `sections` (see [`LoftSection`]).
@@ -420,7 +423,23 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         rings2.push(r);
     }
     let max_n = rings2.iter().map(Vec::len).max().unwrap_or(3);
-    let m = if o.samples > 0 {
+    if o.quads {
+        if o.samples > 0 {
+            return Err(err(
+                "quads keeps each section's own points: drop samples".into()
+            ));
+        }
+        if let Some(k) = rings2.iter().position(|r| r.len() != rings2[0].len()) {
+            return Err(err(format!(
+                "quads: every section needs the same number of points (section 0 has {}, section {k} has {})",
+                rings2[0].len(),
+                rings2[k].len()
+            )));
+        }
+    }
+    let m = if o.quads {
+        max_n
+    } else if o.samples > 0 {
         o.samples as usize
     } else {
         max_n.max(32)
@@ -432,7 +451,7 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         .iter()
         .zip(sections)
         .map(|(r, s)| {
-            resample(r, m)
+            if o.quads { r.clone() } else { resample(r, m) }
                 .into_iter()
                 .map(|p| p * Vec2::from(s.scale))
                 .collect()
@@ -440,7 +459,7 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         .collect();
     let steps = if o.steps > 0 {
         o.steps
-    } else if o.smooth {
+    } else if o.smooth && !o.quads {
         12
     } else {
         1
@@ -459,7 +478,15 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
     };
     let first = (!apex[0]).then(|| rings2[0].clone());
     let last = (!apex[apex.len() - 1]).then(|| rings2[rings2.len() - 1].clone());
-    skin(name, &rings3, first.as_deref(), last.as_deref(), dirs).map_err(err)
+    skin(
+        name,
+        &rings3,
+        first.as_deref(),
+        last.as_deref(),
+        dirs,
+        o.quads,
+    )
+    .map_err(err)
 }
 
 type Rings = (Vec<Vec<Vec3>>, (Vec3, Vec3));
@@ -655,6 +682,7 @@ fn skin(
     first: Option<&[Vec2]>,
     last: Option<&[Vec2]>,
     (d0, d1): (Vec3, Vec3),
+    quads: bool,
 ) -> Result<Part, String> {
     let r = rings.len();
     let m = rings[0].len();
@@ -698,11 +726,27 @@ fn skin(
             part.indices.extend([a, b, c]);
         }
     };
+    let mut polys: Vec<Vec<u32>> = Vec::new();
     for i in 0..r - 1 {
         for j in 0..m {
             let (p0, p1, p2, p3) = (idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j));
             tri(&mut part, p0, p1, p2);
             tri(&mut part, p0, p2, p3);
+            if quads {
+                let mut q = if flip {
+                    vec![p0, p3, p2, p1]
+                } else {
+                    vec![p0, p1, p2, p3]
+                };
+                // An apex row's quads are triangles.
+                q.dedup();
+                if q.first() == q.last() {
+                    q.pop();
+                }
+                if q.len() >= 3 {
+                    polys.push(q);
+                }
+            }
         }
     }
     // Caps, each facing away from the loft.
@@ -728,6 +772,13 @@ fn skin(
             .map(|t| (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])))
             .sum();
         let rev = nsum.dot(out) < 0.0;
+        if quads {
+            let mut cap: Vec<u32> = (0..m as u32).map(|k| base[i] + k).collect();
+            if ccw == rev {
+                cap.reverse();
+            }
+            polys.push(cap);
+        }
         for t in &tris {
             let [a, b, c] = t.map(|k| base[i] + k);
             if rev {
@@ -739,9 +790,16 @@ fn skin(
     }
     let man = crate::csg::part_to_manifold(&part)
         .map_err(|e| format!("{e} (do sections cross each other, or the path itself?)"))?;
-    let out = crate::csg::manifold_to_part(&man, name, crate::Material::default());
+    let mut out = crate::csg::manifold_to_part(&man, name, crate::Material::default());
     if out.indices.is_empty() {
         return Err("the skin came out empty".into());
+    }
+    if quads {
+        out.cage = Some(std::sync::Arc::new(crate::cage::Cage {
+            verts: part.verts.clone(),
+            faces: polys,
+            creases: Vec::new(),
+        }));
     }
     Ok(out)
 }
@@ -776,6 +834,7 @@ mod tests {
             samples: 0,
             steps: 0,
             round: 0.0,
+            quads: false,
         }
     }
 

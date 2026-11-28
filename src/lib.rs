@@ -76,6 +76,7 @@ pub mod ao;
 pub mod ao_gpu;
 pub mod blob;
 pub mod body;
+pub mod cage;
 pub mod carve;
 pub mod catalog;
 pub mod commands;
@@ -245,6 +246,12 @@ pub struct Part {
     /// after `morphs`. Derived after the graph; never saved.
     #[serde(skip)]
     pub correctives: Option<std::sync::Arc<Vec<crate::anim::skin::Corrective>>>,
+    /// The polygons a `cage` (or a `loft` with `quads`) built this part
+    /// from, with their crease weights, for `smooth subdiv`. Derived by the
+    /// op; kept through moves and materials, dropped by anything that
+    /// changes the mesh; never saved.
+    #[serde(skip)]
+    pub cage: Option<std::sync::Arc<crate::cage::Cage>>,
 }
 
 fn one() -> f32 {
@@ -1100,6 +1107,8 @@ pub enum Op {
         steps: u32,
         #[serde(default, skip_serializing_if = "is_zero")]
         round: f32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quads: bool,
     },
     /// Copies of `input` along a path, `name_0..`: count, or spacing.
     PathArray {
@@ -1224,6 +1233,13 @@ pub enum Op {
         input: String,
         #[serde(flatten)]
         def: Box<crate::decimate::Decimate>,
+    },
+    /// A polygon cage (vertices and quad faces, crease weights per edge)
+    /// for `smooth subdiv` ([`crate::cage`]).
+    Cage {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::cage::CageDef>,
     },
     /// Taubin relax, isotropic remesh or Catmull-Clark subdivision.
     Smooth {

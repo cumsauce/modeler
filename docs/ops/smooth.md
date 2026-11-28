@@ -13,4 +13,6 @@
     triangle pairs are merged back into quads first, and edges whose faces
     meet at more than `crease` degrees stay sharp (`crease: 60` on a
     cylinder cage keeps the rims, smooths the sides); open borders stay
-    sharp too.
+    sharp too. A part made by `cage` or by a `loft` with `quads: true`
+    hands over its own polygons instead (no merging: curved quads stay
+    quads) and its per-edge crease weights.

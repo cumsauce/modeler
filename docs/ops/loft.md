@@ -19,3 +19,11 @@
   "profile": [{"arc": {"center": [0, 0], "radius": 0.035, "from": 0, "to":
   360}}]}, {"y": 0.16, ...r 0.037}, {"y": 0.22, ...r 0.014}, {"y": 0.28,
   ...r 0.013}]}`; hollow it with a smaller loft and a `difference`.
+- **`quads: true`** makes the loft a cage for `smooth` `subdiv`: every
+  section keeps its own points (all sections need the same count; no
+  `samples`), `steps` is 1 unless given, and `subdiv` reads the walls as
+  quads and each cap as one polygon. Point i of every ring is one line
+  along the body, so put the points where the shape needs them (sill,
+  shoulder, crown) and the same number on every station. A car body:
+  stations along z (`at: [0, 0, z]`, `rotation: {x: -90}`: profile [x, y] is world x, y), then
+  `{"type": "smooth", "mode": "subdiv", "levels": 2, "input": ...}`.

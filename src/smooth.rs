@@ -352,9 +352,30 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
             ))
         }
         _ => {
-            let m = welded(part)?;
             let levels = def.levels.unwrap_or(2);
-            let faces = merge_quads(&m.v, &m.t);
+            let (v, faces, mut sharp) = match &part.cage {
+                // A cage carries its own polygons and crease weights.
+                Some(c) => {
+                    let rot = quat_of(part.rotation);
+                    let (sc, tr) = (Vec3::from(part.scale), Vec3::from(part.translation));
+                    let v: Vec<Vec3> = c
+                        .verts
+                        .iter()
+                        .map(|p| rot * (Vec3::from(*p) * sc) + tr)
+                        .collect();
+                    let sharp: Sharpness = c
+                        .creases
+                        .iter()
+                        .map(|&(a, b, w)| ((a.min(b), a.max(b)), weight(w)))
+                        .collect();
+                    (v, c.faces.clone(), sharp)
+                }
+                None => {
+                    let m = welded(part)?;
+                    let faces = merge_quads(&m.v, &m.t);
+                    (m.v, faces, Sharpness::new())
+                }
+            };
             let corners: usize = faces.iter().map(Vec::len).sum();
             let est = corners * 2 * 4usize.pow(levels - 1);
             if est > MAX_TRIS {
@@ -363,8 +384,10 @@ pub fn smooth(name: &str, part: &Part, def: &Smooth) -> Result<Part, ModelerErro
                     faces.len()
                 )));
             }
-            let sharp = crease_edges(&m.v, &faces, def.crease);
-            let (v, f) = catmull_clark(m.v, faces, sharp, levels);
+            for e in crease_edges(&v, &faces, def.crease) {
+                sharp.insert(e, f32::INFINITY);
+            }
+            let (v, f) = catmull_clark(v, faces, sharp, levels);
             let t = triangulate(&v, &f);
             let crease = def.crease.map_or(60.0, |c| c.clamp(20.0, 60.0));
             Ok(to_part(name, part, &v, &t, crease))
@@ -454,13 +477,30 @@ fn crease_edges(v: &[Vec3], faces: &[Vec<u32>], crease: Option<f32>) -> HashSet<
     out
 }
 
+/// Edge sharpness by (low, high) vertex: levels it stays sharp, infinite
+/// for a hard crease.
+type Sharpness = HashMap<(u32, u32), f32>;
+
+/// A cage crease weight as a sharpness: [`crate::cage::SHARP`] and above
+/// is sharp at every level.
+fn weight(w: f32) -> f32 {
+    if w >= crate::cage::SHARP {
+        f32::INFINITY
+    } else {
+        w.max(0.0)
+    }
+}
+
 /// Catmull-Clark with sharp edges (`sharp`, plus open borders and
 /// non-manifold edges): sharp edges subdivide as curves, a vertex on two
-/// sharp edges follows them, on three or more it stays a corner.
+/// sharp edges follows them, on three or more it stays a corner. A
+/// finite sharpness s is sharp for s levels and smooth after (semi-sharp
+/// creases: a fraction blends the smooth and sharp rules, and each level
+/// takes 1 off the edges it makes).
 fn catmull_clark(
     mut v: Vec<Vec3>,
     mut faces: Vec<Vec<u32>>,
-    mut sharp: HashSet<(u32, u32)>,
+    mut sharp: Sharpness,
     levels: u32,
 ) -> (Vec<Vec3>, Vec<Vec<u32>>) {
     for _ in 0..levels {
@@ -481,9 +521,16 @@ fn catmull_clark(
                 efaces[id].push(fi);
             }
         }
-        let is_sharp: Vec<bool> = (0..ends.len())
-            .map(|e| efaces[e].len() != 2 || sharp.contains(&ends[e]))
+        let sharpness: Vec<f32> = (0..ends.len())
+            .map(|e| {
+                if efaces[e].len() != 2 {
+                    f32::INFINITY
+                } else {
+                    sharp.get(&ends[e]).copied().unwrap_or(0.0)
+                }
+            })
             .collect();
+        let is_sharp: Vec<bool> = sharpness.iter().map(|s| *s > 0.0).collect();
         let fp: Vec<Vec3> = faces
             .iter()
             .map(|f| f.iter().map(|&i| v[i as usize]).sum::<Vec3>() / f.len() as f32)
@@ -491,10 +538,12 @@ fn catmull_clark(
         let ep: Vec<Vec3> = (0..ends.len())
             .map(|e| {
                 let (a, b) = (v[ends[e].0 as usize], v[ends[e].1 as usize]);
-                if is_sharp[e] {
+                let s = sharpness[e];
+                if s >= 1.0 {
                     (a + b) * 0.5
                 } else {
-                    (a + b + fp[efaces[e][0]] + fp[efaces[e][1]]) * 0.25
+                    let smooth = (a + b + fp[efaces[e][0]] + fp[efaces[e][1]]) * 0.25;
+                    smooth.lerp((a + b) * 0.5, s)
                 }
             })
             .collect();
@@ -518,19 +567,30 @@ fn catmull_clark(
                     let (a, b) = ends[e];
                     v[if a as usize == i { b } else { a } as usize]
                 };
-                match sharp_e.len() {
-                    0 | 1 if !vf[i].is_empty() && !ve[i].is_empty() => {
-                        let n = ve[i].len() as f32;
-                        let f = vf[i].iter().map(|&fi| fp[fi]).sum::<Vec3>() / vf[i].len() as f32;
-                        let r = ve[i]
-                            .iter()
-                            .map(|&e| (v[ends[e].0 as usize] + v[ends[e].1 as usize]) * 0.5)
-                            .sum::<Vec3>()
-                            / n;
-                        (f + 2.0 * r + (n - 3.0) * p) / n
-                    }
+                let smooth = || {
+                    let n = ve[i].len() as f32;
+                    let f = vf[i].iter().map(|&fi| fp[fi]).sum::<Vec3>() / vf[i].len() as f32;
+                    let r = ve[i]
+                        .iter()
+                        .map(|&e| (v[ends[e].0 as usize] + v[ends[e].1 as usize]) * 0.5)
+                        .sum::<Vec3>()
+                        / n;
+                    (f + 2.0 * r + (n - 3.0) * p) / n
+                };
+                let has_faces = !vf[i].is_empty() && !ve[i].is_empty();
+                let hard = match sharp_e.len() {
+                    0 | 1 if has_faces => return smooth(),
+                    0 | 1 => return p,
                     2 => (other(sharp_e[0]) + 6.0 * p + other(sharp_e[1])) / 8.0,
                     _ => p,
+                };
+                // Semi-sharp: the mean sharpness of its creases blends the
+                // smooth rule into the crease or corner rule.
+                let s = sharp_e.iter().map(|&e| sharpness[e]).sum::<f32>() / sharp_e.len() as f32;
+                if s >= 1.0 || !has_faces {
+                    hard
+                } else {
+                    smooth().lerp(hard, s)
                 }
             })
             .collect();
@@ -539,7 +599,7 @@ fn catmull_clark(
         nvtx.extend(&fp);
         let e_of = |a: u32, b: u32| (nv + eid[&(a.min(b), a.max(b))]) as u32;
         let mut nf = Vec::with_capacity(faces.len() * 4);
-        let mut nsharp = HashSet::new();
+        let mut nsharp = Sharpness::new();
         for (fi, f) in faces.iter().enumerate() {
             let c = (nv + ends.len() + fi) as u32;
             let n = f.len();
@@ -549,10 +609,11 @@ fn catmull_clark(
             }
         }
         for (e, &(a, b)) in ends.iter().enumerate() {
-            if is_sharp[e] && efaces[e].len() == 2 {
+            let s = sharpness[e] - 1.0;
+            if s > 0.0 && efaces[e].len() == 2 {
                 let m = (nv + e) as u32;
-                nsharp.insert((a.min(m), a.max(m)));
-                nsharp.insert((b.min(m), b.max(m)));
+                nsharp.insert((a.min(m), a.max(m)), s);
+                nsharp.insert((b.min(m), b.max(m)), s);
             }
         }
         v = nvtx;
@@ -806,6 +867,152 @@ mod tests {
             mode: mode.into(),
             ..Smooth::default()
         }
+    }
+
+    fn cage_cube(creases: Vec<[f32; 3]>) -> Part {
+        let mut d = crate::cage::CageDef {
+            verts: vec![
+                [-0.1, -0.1, -0.1],
+                [0.1, -0.1, -0.1],
+                [0.1, 0.1, -0.1],
+                [-0.1, 0.1, -0.1],
+                [-0.1, -0.1, 0.1],
+                [0.1, -0.1, 0.1],
+                [0.1, 0.1, 0.1],
+                [-0.1, 0.1, 0.1],
+            ],
+            faces: vec![
+                vec![0, 3, 2, 1],
+                vec![4, 5, 6, 7],
+                vec![0, 1, 5, 4],
+                vec![2, 3, 7, 6],
+                vec![1, 2, 6, 5],
+                vec![0, 4, 7, 3],
+            ],
+            ..Default::default()
+        };
+        d.creases = creases;
+        crate::cage::build("cc", &d).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn subdiv(p: &Part, levels: u32) -> Part {
+        let mut def = sm("subdiv");
+        def.levels = Some(levels);
+        smooth("s", p, &def).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn a_cage_subdivides_its_own_quads() {
+        // The cage op's cube is the box primitive's subdivision exactly.
+        let a = subdiv(&cage_cube(Vec::new()), 3);
+        let b = subdiv(&cube(), 3);
+        closed(&a);
+        assert_eq!(a.tri_count(), b.tri_count());
+        assert!(
+            (volume(&a) - volume(&b)).abs() < 1e-7,
+            "{} vs {}",
+            volume(&a),
+            volume(&b)
+        );
+        // A twisted (non-planar) quad cage: as triangles each quad would be
+        // two faces, so the quad count shows the polygons were used.
+        let mut c = cage_cube(Vec::new());
+        let cg = c.cage.as_ref().map(|c| (**c).clone()).unwrap_or_default();
+        let mut cg = cg;
+        cg.verts[6] = [0.13, 0.12, 0.1];
+        c.verts = cg.verts.clone();
+        c.cage = Some(std::sync::Arc::new(cg));
+        let t = subdiv(&c, 2);
+        closed(&t);
+        assert_eq!(t.tri_count(), 6 * 16 * 2, "six quads, two levels");
+    }
+
+    #[test]
+    fn crease_weights_sharpen_one_edge_by_degree() {
+        // The cube's bottom ring creased: hard (10), one level (1), none.
+        let ring = |w: f32| vec![[0.0, 1.0, w], [1.0, 5.0, w], [5.0, 4.0, w], [4.0, 0.0, w]];
+        let low = |p: &Part| p.bounds().0.y;
+        let hard = subdiv(&cage_cube(ring(10.0)), 3);
+        let semi = subdiv(&cage_cube(ring(1.0)), 3);
+        let soft = subdiv(&cage_cube(Vec::new()), 3);
+        closed(&hard);
+        // A hard crease keeps the bottom face flat on its cage plane; the
+        // corner vertices sit on three creased edges... here two (the ring)
+        // plus none vertical, so the ring follows its own curve.
+        assert!((low(&hard) + 0.1).abs() < 1e-4, "hard {}", low(&hard));
+        assert!(
+            low(&soft) > low(&semi) + 1e-3,
+            "soft {} semi {}",
+            low(&soft),
+            low(&semi)
+        );
+        assert!(
+            low(&semi) > low(&hard) - 1e-6,
+            "semi {} hard {}",
+            low(&semi),
+            low(&hard)
+        );
+        // Every edge hard: the cube stays a cube.
+        let mut all = ring(10.0);
+        all.extend([
+            [2.0, 3.0, 10.0],
+            [3.0, 7.0, 10.0],
+            [7.0, 6.0, 10.0],
+            [6.0, 2.0, 10.0],
+        ]);
+        all.extend([
+            [0.0, 3.0, 10.0],
+            [1.0, 2.0, 10.0],
+            [5.0, 6.0, 10.0],
+            [4.0, 7.0, 10.0],
+        ]);
+        let box_ = subdiv(&cage_cube(all), 2);
+        assert!((volume(&box_) - 0.008).abs() < 1e-6, "{}", volume(&box_));
+    }
+
+    #[test]
+    fn a_quad_loft_hands_its_rings_to_subdiv() {
+        let ring = |r: f32| -> Vec<[f32; 2]> {
+            (0..8)
+                .map(|i| {
+                    let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                    [r * a.cos(), 0.7 * r * a.sin()]
+                })
+                .collect()
+        };
+        let sec = |r: f32, y: f32| crate::loft::LoftSection {
+            profile: ring(r),
+            at: [0.0, y, 0.0],
+            t: None,
+            rotation: None,
+            scale: [1.0, 1.0],
+        };
+        let secs = [sec(0.3, 0.0), sec(0.5, 0.5), sec(0.25, 1.0)];
+        let mut o = crate::loft::LoftOpts {
+            path: &[],
+            smooth: false,
+            samples: 0,
+            steps: 0,
+            round: 0.0,
+            quads: true,
+        };
+        let p = crate::loft::loft("l", &secs, &o).unwrap_or_else(|e| panic!("{e}"));
+        let c = p.cage.as_ref().map(|c| (c.verts.len(), c.faces.len()));
+        assert_eq!(c, Some((24, 16 + 2)), "two spans of 8 quads, two caps");
+        let s = subdiv(&p, 2);
+        closed(&s);
+        // 16 quads -> 16 x 16 quads; each 8-gon cap -> 8 x 4 quads.
+        assert_eq!(s.tri_count(), (16 * 16 + 2 * 8 * 4) * 2);
+        // Sections of different point counts are refused.
+        let mut bad = secs.clone();
+        bad[1].profile.pop();
+        let e = crate::loft::loft("l", &bad, &o)
+            .err()
+            .map(|e| e.to_string());
+        assert!(e.is_some_and(|e| e.contains("same number of points")));
+        o.quads = false;
+        let p = crate::loft::loft("l", &secs, &o).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.cage.is_none());
     }
 
     #[test]

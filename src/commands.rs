@@ -7862,4 +7862,28 @@ mod tests {
         assert!(s.model.annotations[1].is_on(&m) && !s.model.annotations[0].is_on(&m));
         assert!(s.model.annotations[0].is_on(&g));
     }
+
+    #[test]
+    fn a_cage_item_feeds_subdiv_through_a_move() {
+        let mut s = Session::default();
+        let ex = crate::spec::example("cage").unwrap_or_default();
+        ok(s.apply_values(
+            None,
+            vec![
+                ex,
+                json!({"type": "transform", "name": "pod_cage", "input": "pod_cage", "translation": [0, 1, 0]}),
+                json!({"type": "smooth", "name": "pod", "input": "pod_cage", "mode": "subdiv", "levels": 2}),
+                json!({"type": "hide_part", "part": "pod_cage"}),
+            ],
+        ));
+        let pod = s.model.parts.iter().find(|p| p.name == "pod");
+        let pod = pod.unwrap_or_else(|| panic!("no pod"));
+        // Ten quads (five a side), two levels: 160 quads.
+        assert_eq!(pod.tri_count(), 10 * 16 * 2);
+        let (lo, hi) = pod.bounds();
+        assert!(lo.y > 0.99 && hi.y < 1.71, "{lo} {hi}");
+        assert!((lo.x + hi.x).abs() < 1e-5, "mirrored: {lo} {hi}");
+        // A crease of weight 10 keeps the bottom edge down at the cage.
+        assert!((lo.y - 1.0).abs() < 1e-4, "{lo}");
+    }
 }

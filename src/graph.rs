@@ -111,6 +111,20 @@ fn keeps_detail(op: &Op) -> bool {
     )
 }
 
+/// Ops whose outputs keep the input's vertices as they are (moves,
+/// materials, visibility), so a `cage`'s polygons still index them.
+fn keeps_cage(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Cage { .. }
+            | Op::Loft { .. }
+            | Op::Transform { .. }
+            | Op::Material { .. }
+            | Op::Visibility { .. }
+            | Op::Rename { .. }
+    )
+}
+
 fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -280,6 +294,9 @@ fn prefetch(ops: &[Op], rest: &[usize], named: &Named, hashes: &HashMap<String, 
                     if !keeps_detail(op) && p.detail.is_some() {
                         Arc::make_mut(&mut p).detail = None;
                     }
+                    if !keeps_cage(op) && p.cage.is_some() {
+                        Arc::make_mut(&mut p).cage = None;
+                    }
                     (m, p)
                 })
                 .collect();
@@ -369,6 +386,15 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 run_op(op, &mut named)?;
                 // A baked dense surface only stays valid through ops that
                 // keep the part's mesh (moves, copies, materials).
+                if !keeps_cage(op) {
+                    for n in &outs {
+                        if let Some((_, p)) = named.iter_mut().find(|(m, _)| m == n)
+                            && p.cage.is_some()
+                        {
+                            Arc::make_mut(p).cage = None;
+                        }
+                    }
+                }
                 if !keeps_detail(op) {
                     for n in &outs {
                         if let Some((_, p)) = named.iter_mut().find(|(m, _)| m == n)
@@ -984,6 +1010,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             samples,
             steps,
             round,
+            quads,
         } => {
             let o = crate::loft::LoftOpts {
                 path,
@@ -991,6 +1018,7 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 samples: *samples,
                 steps: *steps,
                 round: *round,
+                quads: *quads,
             };
             upsert(named, name, crate::loft::loft(name, sections, &o)?);
         }
@@ -1172,6 +1200,9 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 o => o,
             })?;
             upsert(named, name, part);
+        }
+        Op::Cage { name, def } => {
+            upsert(named, name, crate::cage::build(name, def)?);
         }
         Op::Smooth { name, input, def } => {
             let src = lookup_shared(named, input)?;
@@ -1709,6 +1740,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Body { name, .. }
         | Op::Silhouette { name, .. }
         | Op::Smooth { name, .. }
+        | Op::Cage { name, .. }
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
         | Op::Carve { name, .. }
@@ -1841,6 +1873,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Body { .. } => "body",
         Op::Silhouette { .. } => "silhouette",
         Op::Smooth { .. } => "smooth",
+        Op::Cage { .. } => "cage",
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
         Op::Carve { .. } => "carve",
@@ -1887,6 +1920,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Revolve { .. }
         | Op::Sweep { .. }
         | Op::Loft { .. }
+        | Op::Cage { .. }
         | Op::LSystem { .. }
         | Op::Text { .. }
         | Op::Terrain { .. }
@@ -2341,8 +2375,9 @@ pub fn describe(ops: &[Op]) -> String {
                 samples,
                 steps,
                 round,
+                quads,
             } => format!(
-                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}",
+                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}{}",
                 sections
                     .iter()
                     .map(|s| format!(
@@ -2354,7 +2389,8 @@ pub fn describe(ops: &[Op]) -> String {
                     ))
                     .collect::<Vec<_>>()
                     .join(", "),
-                if path.is_empty() { String::new() } else { format!(" path={path:?}") }
+                if path.is_empty() { String::new() } else { format!(" path={path:?}") },
+                if *quads { " quads" } else { "" }
             ),
             Op::PathArray {
                 name,
@@ -2503,6 +2539,7 @@ pub fn describe(ops: &[Op]) -> String {
             Op::Silhouette { name, def } => {
                 format!("#{i} silhouette `{name}` {}", def.summary())
             }
+            Op::Cage { name, def } => format!("#{i} cage `{name}` {}", def.summary()),
             Op::Smooth { name, input, def } => {
                 format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
             }

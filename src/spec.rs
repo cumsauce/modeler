@@ -1193,6 +1193,34 @@ pub struct LoftSpec {
     /// Round every profile's corners with this radius.
     #[serde(default)]
     round: f32,
+    /// A cage for `smooth subdiv`: keep each section's own points (every
+    /// section the same count, no resampling, `steps` 1 unless given) and
+    /// hand the walls to subdiv as quads and each cap as one polygon, so a
+    /// curved cage subdivides without the lumps of a triangulated one.
+    #[serde(default)]
+    quads: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CageSpec {
+    name: String,
+    /// Cage vertices [[x, y, z], ...] in model space.
+    verts: Vec<[f32; 3]>,
+    /// Polygons as vertex indices, mostly quads ([a, b, c, d]), each wound
+    /// counter-clockwise seen from outside; triangles and larger polygons
+    /// work too. Shared edges run opposite ways in their two faces.
+    faces: Vec<Vec<u32>>,
+    /// Per-edge crease weights [[a, b, weight], ...]: the edge a-b stays
+    /// sharp for `weight` subdivision levels (1.5 = sharp one level, half
+    /// way the next), 10 or more = sharp at every level. Default: none.
+    #[serde(default)]
+    creases: Vec<[f32; 3]>,
+    /// "x", "y" or "z": give one half (every vertex on the + side or on
+    /// the plane); it is mirrored across that zero plane and joined along
+    /// it (vertices on the plane are shared).
+    #[serde(default)]
+    mirror: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -3870,6 +3898,7 @@ pub const OP_TYPES: &[&str] = &[
     "group",
     "sweep",
     "loft",
+    "cage",
     "path_array",
     "lsystem",
     "text",
@@ -4497,6 +4526,21 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 samples: s.samples,
                 steps: s.steps,
                 round: s.round,
+                quads: s.quads,
+            })
+        }
+        "cage" => {
+            let s: CageSpec = de(&ctx, &body)?;
+            let def = crate::cage::CageDef {
+                verts: s.verts,
+                faces: s.faces,
+                creases: s.creases,
+                mirror: s.mirror,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Cage {
+                name: s.name,
+                def: Box::new(def),
             })
         }
         "path_array" => {
@@ -6182,6 +6226,12 @@ pub fn example(ty: &str) -> Option<Value> {
                 {"y": 0.22, "profile": [{"arc": {"center": [0, 0], "radius": 0.014, "from": 0, "to": 360}}]},
                 {"y": 0.28, "profile": [{"arc": {"center": [0, 0], "radius": 0.013, "from": 0, "to": 360}}]}]})
         }
+        "cage" => {
+            json!({"type": "cage", "name": "pod_cage", "mirror": "x",
+                "verts": [[0, 0, -1], [0.5, 0, -1], [0.5, 0.6, -1], [0, 0.7, -1], [0, 0, 1], [0.4, 0, 1], [0.4, 0.5, 1], [0, 0.55, 1]],
+                "faces": [[0, 3, 2, 1], [4, 5, 6, 7], [1, 2, 6, 5], [2, 3, 7, 6], [0, 1, 5, 4]],
+                "creases": [[1, 5, 10], [0, 1, 2]]})
+        }
         "path_array" => {
             json!({"type": "path_array", "name": "posts", "input": "post", "path": [[0, 0, 0], [2, 0, 1], [4, 0, 0]], "smooth": true, "spacing": 0.8})
         }
@@ -6375,6 +6425,7 @@ pub fn op_guide(ty: &str) -> &'static [&'static str] {
             include_str!("../docs/ops/../topics/profiles.md"),
         ],
         "loft" => &[include_str!("../docs/ops/loft.md")],
+        "cage" => &[include_str!("../docs/ops/cage.md")],
         "path_array" => &[include_str!("../docs/ops/path_array.md")],
         "lsystem" => &[include_str!("../docs/ops/lsystem.md")],
         "text" => &[include_str!("../docs/ops/text.md")],
@@ -6509,6 +6560,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "group" => schemars::schema_for!(GroupSpec),
         "sweep" => schemars::schema_for!(SweepSpec),
         "loft" => schemars::schema_for!(LoftSpec),
+        "cage" => schemars::schema_for!(CageSpec),
         "path_array" => schemars::schema_for!(PathArraySpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "text" => schemars::schema_for!(TextSpec),
