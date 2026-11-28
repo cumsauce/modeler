@@ -1,5 +1,10 @@
 use crate::prelude::*;
 
+/// How long the auto-drift turns the camera after the shown document
+/// changes; after that an untouched window stops drawing (it drifted, and
+/// so redrew, forever: 55-65% of a core while idle).
+pub(crate) const DRIFT_FOR: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The orbit camera: angles in a resource, mouse drag / arrow keys to steer.
 /// `user` is set once the human takes over, which stops the slow auto-drift.
 #[derive(Resource)]
@@ -9,6 +14,9 @@ pub(crate) struct Orbit {
     pub(crate) dist: f32,
     pub(crate) target: Vec3,
     pub(crate) user: bool,
+    /// The auto-drift runs until then (set for [`DRIFT_FOR`] by each change
+    /// to the shown document; None: still). An idle window draws nothing.
+    pub(crate) drift_until: Option<std::time::Instant>,
     /// Half the model's bounding diagonal: a floor for pan speed, so panning
     /// stays useful after zooming in close on a large scene.
     pub(crate) scene_radius: f32,
@@ -31,6 +39,7 @@ impl Default for Orbit {
             dist: 6.0,
             target: Vec3::ZERO,
             user: false,
+            drift_until: None,
             scene_radius: 1.0,
         }
     }
@@ -149,7 +158,12 @@ pub(crate) fn orbit_camera(
     }
 
     // Gentle auto-orbit only until the user steers the camera themselves.
-    if !orbit.user && drag.button.is_none() {
+    if !orbit.user
+        && drag.button.is_none()
+        && orbit
+            .drift_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+    {
         orbit.yaw += time.delta_secs() * 0.25;
     }
     let spin = 1.5 * time.delta_secs();

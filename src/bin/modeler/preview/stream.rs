@@ -75,6 +75,17 @@ pub(crate) struct Streams {
     pub(crate) pending_grid: usize,
 }
 
+impl Streams {
+    /// Jobs still running or grid tiles still to draw: the window keeps
+    /// drawing until they land (a finished task wakes nothing by itself).
+    pub(crate) fn busy(&self) -> bool {
+        !self.prep_jobs.is_empty()
+            || !self.bake_jobs.is_empty()
+            || !self.lod_jobs.is_empty()
+            || self.pending_grid > 0
+    }
+}
+
 /// A streamed part's assets once its mesh exists.
 pub(crate) struct Built {
     pub(crate) mesh: Handle<Mesh>,

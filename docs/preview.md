@@ -10,6 +10,18 @@ Auto-drift stops once the human steers; a new model re-frames the camera
 around true world bounds (bounds include part transforms), while edits to
 the same model keep a camera the human steered.
 
+**Idle costs nothing** (`grid::update_mode`): the window draws every frame
+only while something changes (the document, the camera, input, playback,
+a typed comment, agent shots or screenshots waiting, streaming jobs) and
+for 2 s after (`SETTLE`, so TAA and SSR settle); then it switches to
+winit's low-power reactive mode and draws nothing until window input, a
+server call (`install_wake` wakes the loop on every command) or 1 s
+(`IDLE_WAIT`, for the pane clocks). The auto-drift turns the camera for
+20 s after each change to the shown document (`DRIFT_FOR`), not forever:
+it used to keep an untouched window drawing at full rate, 55-65% of a core
+with one empty document open. Offscreen and headless servers have no
+winit loop, so agent renders are unaffected.
+
 **Design system** (`preview/ds.rs`): every pane builds from its tokens
 (IBM Plex Sans and Mono from `fonts/`, loaded once as `ds::Face`; the concept's colours `BG` / `PANEL` / `RAISE` / `LINE` / `FG` / `DIM` /
 `FAINT` / `ACCENT`, type scale `ds::Type`, `ds::theme()` retuning Feathers'

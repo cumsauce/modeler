@@ -250,29 +250,53 @@ pub(crate) struct GridFeedRow(String);
 #[derive(Component)]
 pub(crate) struct GridTileCamera;
 
-/// How often the app loop runs. While the grid is up nothing animates
-/// (tiles render only on change): ~30 fps. Otherwise full rate while
-/// anything moves (input, the camera, a model change, playback, agent
-/// shots) and for two seconds after, so TAA and SSR settle; then the loop
-/// idles at 4 fps. Input and server calls wake it at once.
+/// How often the app loop runs: full rate while anything moves (input,
+/// the camera and its auto-drift, a model change, playback, agent shots and
+/// screenshots, streaming jobs) and for [`SETTLE`] after, so TAA and SSR
+/// settle (the grid at ~30 fps: nothing in it animates); then the loop
+/// draws nothing until window input, a server call or [`IDLE_WAIT`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_mode(
     grid: Res<Grid>,
-    orbit: Res<crate::preview::camera::Orbit>,
+    mut orbit: ResMut<crate::preview::camera::Orbit>,
     playback: Res<crate::preview::playback::Playback>,
     modeler: Res<Modeler>,
-    shots: Res<crate::preview::agent_rig::PendingAgentShots>,
+    (shots, screenshots, streams): (
+        Res<crate::preview::agent_rig::PendingAgentShots>,
+        Res<crate::preview::capture::PendingShots>,
+        Option<Res<crate::preview::stream::Streams>>,
+    ),
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<bevy::input::mouse::AccumulatedMouseMotion>,
     scroll: Res<bevy::input::mouse::AccumulatedMouseScroll>,
-    mut last: Local<(Option<Instant>, Option<(u64, [u32; 6])>)>,
+    mut last: Local<(
+        Option<Instant>,
+        Option<(u64, [u32; 6])>,
+        Option<(String, u64)>,
+    )>,
     winit: Option<ResMut<bevy::winit::WinitSettings>>,
     typing: Res<PinTyping>,
 ) {
     let Some(mut w) = winit else {
         return;
     };
+    // A change to the shown document starts the auto-drift for a while
+    // (nothing to turn around in an empty one).
+    let doc = (
+        modeler.session.model.name.clone(),
+        modeler.session.model.version,
+    );
+    if last.2.as_ref() != Some(&doc) {
+        last.2 = Some(doc);
+        orbit.drift_until = modeler
+            .session
+            .model
+            .parts
+            .iter()
+            .any(|p| p.visible)
+            .then(|| Instant::now() + crate::preview::camera::DRIFT_FOR);
+    }
     let stamp = (
         modeler.session.model.version,
         [
@@ -285,12 +309,15 @@ pub(crate) fn update_mode(
         ]
         .map(f32::to_bits),
     );
+    let drifting = !orbit.user && orbit.drift_until.is_some_and(|t| Instant::now() < t);
     let active = last.1 != Some(stamp)
-        || !orbit.user
+        || drifting
         || playback.playing
         // A comment being typed: the caret and each key show at once.
         || typing.open
         || !shots.0.is_empty()
+        || !screenshots.0.is_empty()
+        || streams.is_some_and(|s| s.busy())
         || keys.get_pressed().next().is_some()
         || mouse.get_pressed().next().is_some()
         || motion.delta != Vec2::ZERO
@@ -299,19 +326,31 @@ pub(crate) fn update_mode(
     if active {
         last.0 = Some(Instant::now());
     }
-    let busy = last
-        .0
-        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
-    let want = if grid.on {
-        bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(33))
-    } else if busy {
-        bevy::winit::UpdateMode::Continuous
-    } else {
-        bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(250))
-    };
+    let busy = last.0.is_some_and(|t| t.elapsed() < SETTLE);
+    let want = update_mode_for(grid.on, busy);
     if w.focused_mode != want {
         w.focused_mode = want;
         w.unfocused_mode = want;
+    }
+}
+
+/// How long the window keeps drawing every frame after the last change
+/// (TAA and SSR settle).
+pub(crate) const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The window's longest wait between frames while nothing changes: clocks
+/// in the panes ("2 min ago", live agents) tick at this rate.
+pub(crate) const IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The winit update mode: every frame while busy (the grid at 30 fps),
+/// else low-power reactive, which wakes only for window input, a server
+/// call (`install_wake`) or [`IDLE_WAIT`]. Device events (mouse motion
+/// over other apps) no longer wake it.
+pub(crate) fn update_mode_for(grid: bool, busy: bool) -> bevy::winit::UpdateMode {
+    match (busy, grid) {
+        (true, true) => bevy::winit::UpdateMode::reactive(std::time::Duration::from_millis(33)),
+        (true, false) => bevy::winit::UpdateMode::Continuous,
+        (false, _) => bevy::winit::UpdateMode::reactive_low_power(IDLE_WAIT),
     }
 }
 
@@ -1717,6 +1756,35 @@ fn on_feed_click(
         if open {
             switch_to(&mut modeler, &name);
             grid.on = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    /// An idle window waits (low power) instead of drawing every frame;
+    /// busy windows draw every frame (the grid at ~30 fps).
+    #[test]
+    fn an_idle_window_waits_instead_of_drawing() {
+        use bevy::winit::UpdateMode;
+        assert_eq!(update_mode_for(false, true), UpdateMode::Continuous);
+        assert_eq!(
+            update_mode_for(true, true),
+            UpdateMode::reactive(std::time::Duration::from_millis(33))
+        );
+        for grid in [false, true] {
+            let idle = update_mode_for(grid, false);
+            assert_eq!(idle, UpdateMode::reactive_low_power(IDLE_WAIT));
+            let UpdateMode::Reactive {
+                react_to_device_events,
+                ..
+            } = idle
+            else {
+                panic!("{idle:?}")
+            };
+            assert!(!react_to_device_events);
         }
     }
 }
