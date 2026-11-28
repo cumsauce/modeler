@@ -6103,6 +6103,50 @@ mod tests {
         assert_eq!(s.history_prune(1000).map(|_| ()), Ok(()));
     }
 
+    /// `keep_recent` keeps the cursor's undo chain only: after a jump back,
+    /// the abandoned branch goes and undo / redo still work.
+    #[test]
+    fn keep_recent_keeps_the_cursors_undo_chain() {
+        let mut s = op_session();
+        for i in 0..10 {
+            s.op_primitive(
+                "q",
+                crate::PrimitiveKind::Box,
+                [1.0 + i as f32; 3],
+                [0.0; 3],
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let cur = s.model.history.current.unwrap_or_default();
+        let labels = |h: &crate::History| -> Vec<String> {
+            let mut v = Vec::new();
+            let mut c = h.current;
+            while let Some(i) = c {
+                v.push(h.nodes[i].label.clone());
+                c = h.nodes[i].parent;
+            }
+            v
+        };
+        let want: Vec<String> = labels(&s.model.history).into_iter().take(4).collect();
+        let removed = s.model.history.keep_recent(4);
+        let h = &s.model.history;
+        assert_eq!(h.nodes.len(), 4);
+        assert_eq!(removed, cur + 1 - 4);
+        assert_eq!(labels(h), want);
+        assert_eq!(h.current, Some(3));
+        assert!(h.nodes[0].parent.is_none());
+        for (i, n) in h.nodes.iter().enumerate() {
+            if let Some(p) = n.parent {
+                assert!(h.nodes[p].children.contains(&i));
+            }
+        }
+        s.undo().unwrap_or_else(|e| panic!("{e}"));
+        s.redo().unwrap_or_else(|e| panic!("{e}"));
+        // Fewer nodes than asked for: nothing goes.
+        assert_eq!(s.model.history.keep_recent(50), 0);
+    }
+
     #[test]
     fn errors_are_typed_so_tests_can_match_variants() {
         use crate::ModelerError;

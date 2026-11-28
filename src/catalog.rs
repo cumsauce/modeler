@@ -1771,6 +1771,42 @@ mod tests {
         );
     }
 
+    /// A parked document keeps only its last few history nodes: what undo
+    /// needs after a restore, not the whole tree.
+    #[test]
+    fn parked_documents_keep_only_their_last_history_nodes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: test-only, under ENV_LOCK.
+        unsafe { std::env::set_var("FRIENDSLOP_DATA_DIR", temp_root("parkhist")) };
+        let ok = |r: crate::commands::CmdResult| r.unwrap_or_else(|e| panic!("{e}"));
+        let mut s = crate::commands::Session::default();
+        ok(s.scene("open", Some("long")));
+        for i in 0..12 {
+            ok(s.apply_values(
+                None,
+                vec![serde_json::json!({"type": "primitive", "name": "p", "kind": "box", "size": 1.0 + i as f32})],
+            ));
+        }
+        assert!(s.model.history.nodes.len() > crate::parked::PARKED_HISTORY);
+        let mut fresh = crate::commands::Session::default();
+        fresh.model = s.model.clone();
+        fresh.park_restored();
+        assert_eq!(fresh.parked[0].history, crate::parked::PARKED_HISTORY);
+        ok(fresh.scene("restore", Some("long")));
+        let h = &fresh.model.history;
+        assert_eq!(h.nodes.len(), crate::parked::PARKED_HISTORY);
+        assert_eq!(h.current, Some(crate::parked::PARKED_HISTORY - 1));
+        ok(fresh.undo());
+        let size = |m: &crate::Model| match m.ops.first() {
+            Some(crate::Op::Primitive { size, .. }) => size[0],
+            _ => 0.0,
+        };
+        assert!(
+            (size(&fresh.model) - 11.0).abs() < 1e-5,
+            "undo steps back one edit"
+        );
+    }
+
     /// An old single `parked_docs.json` becomes one file per document on
     /// first start, parked at the old file's time, and the old file is kept
     /// whole in archive/; one that doesn't parse is moved aside as before.

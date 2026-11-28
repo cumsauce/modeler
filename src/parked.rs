@@ -9,7 +9,8 @@
 //! or removes only its own file. The older single `parked_docs.json` (every
 //! document with its whole history inline: 866 MB once, parsed and
 //! re-derived at every start) is migrated on first start and kept in
-//! `archive/`.
+//! `archive/`. A parked document keeps only its last [`PARKED_HISTORY`]
+//! history nodes.
 
 use std::fs;
 use std::io::BufRead;
@@ -19,6 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, Kind};
 use crate::{Model, ModelerError};
+
+/// History nodes a parked document keeps: the cursor and its nearest
+/// ancestors, so `undo` still steps back through the last few edits after a
+/// restore. A whole history inline was most of the 866 MB `parked_docs.json`
+/// (one terrain scene: 555 MB in 30 nodes).
+pub const PARKED_HISTORY: usize = 5;
 
 /// One parked document's index entry: the first line of its file.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -128,6 +135,7 @@ fn park_in(
     if model.parts_derive_from_ops() {
         model.parts.clear();
     }
+    model.history.keep_recent(PARKED_HISTORY);
     let file = file_for(root, &model.name, model.project.as_deref());
     let entry = ParkedDoc {
         name: model.name.clone(),

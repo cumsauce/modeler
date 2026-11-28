@@ -29,6 +29,8 @@ the index entry (name, project, op count, version, last editor, when it was
 parked), its second the model. Startup reads only the first lines; the body
 is read, and its parts derived, only by `scene restore` NAME or a `doc` that
 names it, and parking or dropping one writes or removes only its own file.
+A parked document keeps only its last 5 history nodes (`PARKED_HISTORY`:
+the cursor and the steps `undo` walks back through), not its whole tree.
 An older single `parked_docs.json` is split into these files on first start
 and kept whole in `archive/` (one that does not parse is moved aside to
 `parked_docs.bad.<time>.json`). `scene list` / `scene restore` show the parked ones,

@@ -16,3 +16,6 @@
   (all new or changed ops and params, or just the named ops/params). A
   picked op brings the param values it was built with, so the graph stays
   consistent. After a jump, this replaces re-issuing the old branch by hand.
+- A parked document (a restart's unsaved work, `topic:scenes`) keeps only
+  its last 5 history nodes; `undo` after `scene restore` steps back
+  through those.

@@ -786,18 +786,55 @@ impl<T: Doc> History<T> {
         if let Some(c) = self.current {
             kept[c] = true;
         }
+        self.keep_only(&kept)
+    }
+
+    /// Keeps only the cursor and its `keep - 1` nearest ancestors (the
+    /// steps `undo` walks back through), renumbered oldest first. What a
+    /// parked document keeps. Returns how many nodes were removed.
+    pub fn keep_recent(&mut self, keep: usize) -> usize {
+        let n = self.nodes.len();
+        let Some(mut c) = self.current.filter(|&c| c < n) else {
+            let k = keep.min(n);
+            let mut kept = vec![false; n];
+            for f in kept.iter_mut().skip(n - k) {
+                *f = true;
+            }
+            return self.keep_only(&kept);
+        };
+        let mut kept = vec![false; n];
+        for _ in 0..keep.max(1) {
+            kept[c] = true;
+            match self.nodes[c].parent {
+                Some(p) if p < n => c = p,
+                _ => break,
+            }
+        }
+        self.keep_only(&kept)
+    }
+
+    /// Drops every node not marked in `kept`, relinking each survivor to its
+    /// nearest surviving ancestor (none: it becomes a root) and renumbering
+    /// oldest first; the cursor moves to its nearest surviving ancestor.
+    /// Returns how many nodes were removed.
+    pub fn keep_only(&mut self, kept: &[bool]) -> usize {
+        let n = self.nodes.len();
+        let kept = |i: usize| kept.get(i).copied().unwrap_or(false);
         // New index for each survivor.
         let mut remap = vec![usize::MAX; n];
         let mut next = 0;
-        for i in 0..n {
-            if kept[i] {
-                remap[i] = next;
+        for (i, r) in remap.iter_mut().enumerate() {
+            if kept(i) {
+                *r = next;
                 next += 1;
             }
         }
+        if next == n {
+            return 0;
+        }
         let nearest_kept = |mut i: usize, nodes: &[Snapshot<T>]| -> Option<usize> {
             while let Some(p) = nodes[i].parent {
-                if kept[p] {
+                if kept(p) {
                     return Some(remap[p]);
                 }
                 i = p;
@@ -806,17 +843,25 @@ impl<T: Doc> History<T> {
         };
         let parents: Vec<Option<usize>> = (0..n)
             .map(|i| {
-                if kept[i] {
+                if kept(i) {
                     nearest_kept(i, &self.nodes)
                 } else {
                     None
                 }
             })
             .collect();
+        let had_cursor = self.current.is_some();
+        let cursor = self.current.filter(|&c| c < n).and_then(|c| {
+            if kept(c) {
+                Some(remap[c])
+            } else {
+                nearest_kept(c, &self.nodes)
+            }
+        });
         let old = std::mem::take(&mut self.nodes);
         let mut nodes: Vec<Snapshot<T>> = Vec::with_capacity(next);
         for (i, mut node) in old.into_iter().enumerate() {
-            if kept[i] {
+            if kept(i) {
                 node.parent = parents[i];
                 node.children.clear();
                 nodes.push(node);
@@ -827,7 +872,11 @@ impl<T: Doc> History<T> {
                 nodes[p].children.push(i);
             }
         }
-        self.current = self.current.map(|c| remap[c]);
+        self.current = if had_cursor {
+            cursor.or_else(|| nodes.len().checked_sub(1))
+        } else {
+            None
+        };
         self.nodes = nodes;
         n - next
     }
