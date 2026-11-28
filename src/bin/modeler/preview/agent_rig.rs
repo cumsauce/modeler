@@ -42,6 +42,10 @@ pub(crate) struct ShotStyle {
     /// Parts painted by mean curvature (white flat, red convex, blue
     /// concave), lit, on the stand-in layer like `ids`.
     pub(crate) curvature: bool,
+    /// Zebra stripes: bands of the surface normal's tilt (isophotes, as a
+    /// row of strip lights reflected), unlit, on the stand-in layer like
+    /// `curvature`. Lumps and creases kink them.
+    pub(crate) zebra: bool,
     /// Flat black parts on a white background, no shading (a silhouette
     /// to compare outlines, or with a reference image).
     pub(crate) silhouette: bool,
@@ -708,6 +712,7 @@ pub(crate) fn process_agent_shot(
         || built.pending > 0;
     if style.ids
         || style.curvature
+        || style.zebra
         || style.silhouette
         || style.density
         || rig_shot
@@ -754,6 +759,8 @@ pub(crate) fn process_agent_shot(
                 colored.push(Some(colored_mesh(part, &d[i])));
             } else if style.curvature {
                 colored.push(Some(curvature_mesh(part)));
+            } else if style.zebra {
+                colored.push(Some(zebra_mesh(part)));
             } else if style.silhouette {
                 flat_black.push(i);
                 colored.push(None);
@@ -774,7 +781,7 @@ pub(crate) fn process_agent_shot(
             let e = commands.spawn((bundle, RenderLayers::layer(ID_LAYER))).id();
             stand_ins.push(e);
         }
-        if !style.ids && !style.curvature && !style.silhouette && !style.density {
+        if !style.ids && !style.curvature && !style.zebra && !style.silhouette && !style.density {
             stand_ins.extend(super::decals::spawn_decals(
                 &mut commands,
                 model,
@@ -805,13 +812,28 @@ pub(crate) fn process_agent_shot(
             legend.push(("flat".into(), [250, 250, 250, 255]));
             legend.push(("concave (hollow, crease)".into(), [30, 110, 240, 255]));
         }
+        if style.zebra {
+            legend.push((
+                "stripes: bands of normal tilt; smooth = even, lumps kink them".into(),
+                [250, 250, 250, 255],
+            ));
+        }
+        let stripes = style.zebra.then(|| images.add(zebra_stripes()));
         // Unlit: swap the materials the bundle made for flat ones.
         for (k, e) in stand_ins.iter().enumerate() {
             if let Some(Some(mesh)) = colored.get_mut(k).map(Option::take) {
-                let m = materials.add(StandardMaterial {
-                    base_color: Color::WHITE,
-                    perceptual_roughness: 0.7,
-                    ..default()
+                let m = materials.add(match &stripes {
+                    Some(tex) => StandardMaterial {
+                        base_color: Color::WHITE,
+                        base_color_texture: Some(tex.clone()),
+                        unlit: true,
+                        ..default()
+                    },
+                    None => StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: 0.7,
+                        ..default()
+                    },
                 });
                 commands
                     .entity(*e)
@@ -931,6 +953,7 @@ pub(crate) fn process_agent_shot(
     let silhouette = style.silhouette;
     let ids = style.ids
         || style.curvature
+        || style.zebra
         || style.silhouette
         || style.density
         || rig_shot
@@ -949,6 +972,7 @@ pub(crate) fn process_agent_shot(
     let relit = ids
         && !(style.ids
             || style.curvature
+            || style.zebra
             || style.silhouette
             || style.density
             || style.weights.is_some());
@@ -1193,6 +1217,76 @@ fn curvature_mesh(part: &modeler::Part) -> Mesh {
         mesh.compute_normals();
     }
     mesh
+}
+
+/// Stripes a zebra view gets per radian of the normal's tilt: 16 over the
+/// half turn from straight down to straight up (11.25 degrees each).
+const ZEBRA_STRIPES: f32 = 16.0 / std::f32::consts::PI;
+
+/// A part's mesh with u = the world normal's elevation in stripes, so a
+/// repeating black and white texture draws isophotes per pixel.
+fn zebra_mesh(part: &modeler::Part) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.verts.clone())
+    .with_inserted_indices(Indices::U32(part.indices.clone()));
+    if part.normals.len() == part.verts.len() {
+        mesh = mesh.with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals.clone());
+    } else {
+        mesh.compute_normals();
+    }
+    let normals: Vec<[f32; 3]> = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(bevy::mesh::VertexAttributeValues::Float32x3(n)) => n.clone(),
+        _ => vec![[0.0, 1.0, 0.0]; part.verts.len()],
+    };
+    let rot = modeler::quat_of(part.rotation);
+    let inv = Vec3::ONE / Vec3::from(part.scale).max(Vec3::splat(1e-9));
+    let uvs: Vec<[f32; 2]> = normals
+        .iter()
+        .map(|n| {
+            let w = (rot * (Vec3::from(*n) * inv)).normalize_or(Vec3::Y);
+            [w.y.clamp(-1.0, 1.0).asin() * ZEBRA_STRIPES, 0.5]
+        })
+        .collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh
+}
+
+/// One black and one white stripe, repeating along u.
+fn zebra_stripes() -> Image {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension};
+    let w = 64usize;
+    let px: Vec<u8> = (0..w)
+        .flat_map(|i| {
+            let c = if i < w / 2 { 20 } else { 245 };
+            [c, c, c, 255]
+        })
+        .collect();
+    let mut img = Image::new(
+        Extent3d {
+            width: w as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        px,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    img
 }
 
 /// A part's mesh with the given per-vertex colours (linear RGB).

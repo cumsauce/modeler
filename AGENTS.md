@@ -287,7 +287,7 @@ details: `describe_op` of `body`, `sdf`, `skin`, `silhouette`, and
    push / pinch / flatten / smooth, at: a joint name or point, radius,
    amount}]`) or joint overrides, not by adding shapes; re-check the bands.
 4. **Check the surface and proportions**: `agent_views style:
-   "curvature"` (lumps, pinches, creases), `inspect proportions` (bone-chain
+   "curvature"` (lumps, pinches, creases; `"zebra"` for car bodies), `inspect proportions` (bone-chain
    ratios: biped head / height ~0.133), `verify self_intersections` /
    `thickness`.
 5. **Make it light last**: `tris: N` on the item (plus `bake: true` to keep

@@ -1641,7 +1641,8 @@ Style::default()
     /// view} compares the silhouette with a PNG in the project (overlay +
     /// IoU). style "ids" paints each part a flat colour with a legend; "curvature"
     /// paints mean curvature (red convex, blue concave: lumps, pinches,
-    /// creases) to judge organic surfaces; dims overlays
+    /// creases) to judge organic surfaces; "zebra" draws stripes of the
+    /// normal's tilt (the car-body reflection check); dims overlays
     /// sizes and a scale bar; diff highlights what changed since the previous
     /// render of the same views. Windowed preview only.
     #[tool]
@@ -1711,12 +1712,13 @@ Style::default()
             }
             Some("ids") => (true, false, false, false),
             Some("curvature") => (false, true, false, false),
+            Some("zebra") => (false, false, false, false),
             Some("bones") => (false, false, true, false),
             Some("weights") => (false, false, false, true),
             Some(other) => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "style must be \"shaded\", \"silhouette\", \"density\", \"ids\", \"curvature\", \"bones\", \"weights\" or \"trails\", got `{other}`"
+                        "style must be \"shaded\", \"silhouette\", \"density\", \"ids\", \"curvature\", \"zebra\", \"bones\", \"weights\" or \"trails\", got `{other}`"
                     ),
                     None,
                 ));
@@ -1788,6 +1790,7 @@ Style::default()
             weights: if weights { bone.clone() } else { None },
             ids,
             curvature,
+            zebra: style.as_deref() == Some("zebra"),
             silhouette,
             density,
             frame: None,

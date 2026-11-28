@@ -54,6 +54,13 @@
     red convex, blue concave, saturated where the radius of curvature is a
     sixteenth of the part or tighter): lumps, pinches, dents and creases on
     organic surfaces stand out where shading hides them.
+  - `style: "zebra"`: black and white stripes of the surface normal's
+    tilt (isophotes, 11.25 degrees a stripe, the same in every view, like a
+    row of strip lights reflected in the paint): the car-body check. A
+    fair surface shows even stripes flowing smoothly across panels; a lump
+    kinks them, a flat spot widens one, a crease breaks them. Unlit, per
+    pixel, so it works on dense subdivided bodies; look at a side and an
+    iso view.
   - `style: "silhouette"`: flat black parts on white, no shading, no
     decals: compare outlines and proportions at a glance.
   - `style: "density"`: each surface tinted by how much geometry is near
