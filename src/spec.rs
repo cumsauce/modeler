@@ -2455,6 +2455,11 @@ pub struct DecimateSpec {
     /// Normals crease where faces meet at more than this (default 60).
     #[serde(default)]
     crease: Option<f32>,
+    /// "x", "y" or "z": keep mirror symmetry exactly: the + half is
+    /// decimated and mirrored across that zero plane (the part must be
+    /// centred on it; its - half is replaced by the mirror image).
+    #[serde(default)]
+    symmetric: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -4941,6 +4946,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 resolution: s.resolution,
                 cage: s.cage,
                 crease: s.crease,
+                symmetric: s.symmetric,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Decimate {

@@ -26,3 +26,11 @@
   op that reshapes the mesh (deform, boolean, round, ...) drops it, so
   decimate last. Exports write the bake as the part's textures (per-part
   KTX2); export `lods` then simplify the light mesh further and reuse them.
+- **`symmetric: "x"`** (or y / z) keeps mirror symmetry exactly: the + half
+  is cut off along the zero plane (in the part's own coordinates: model
+  space for an op's output), decimated with the cut held as a border, and
+  mirrored, so inlays and cutouts on the two sides stay mirror images
+  (plain decimation drifts them apart by centimetres). The part must be
+  centred on the plane; its - half is replaced by the mirror of the +
+  half. The seam keeps every vertex it had, so the count lands a little
+  over `tris` on very dense seams.
