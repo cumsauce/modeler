@@ -157,6 +157,7 @@ memorise them.
 | `stairs` | name, from [x, y, z], toward (+x / -x / +z / -z or degrees), rise, [width 1.2], [steps], [run 0.3], [collider none / blocks] (a flight as one closed solid, a `block` marker per step) |
 | `railing` | name, path [[x, y, z]...], [height 1], [post_spacing 1.5], [thickness 0.06], [mid_rail true], [collider none / blocks] (rails and posts as one part) |
 | `garment` | name, on, [preset], [region {zones, arms, legs, neck, above, below, planes, boxes}], [offset 0.006], [thickness 0.003], [ease], [hem {flare, length}], [fit tight / regular / loose / baggy], [skirt {top, hem, length, profile, folds, flare}], [hide_skin true], [bind] (binds itself) (clothing cut from a body's surface) |
+| `panel_line` | name, input, view, points [[u, v]...], width, depth, [closed], [smooth], [fill], [cut true] (a line drawn in a view, cut into the surface as a groove; `fill`: an outline as a cutter) |
 | `panel` | name, input, face, [rows 1], [cols 1], [inset / border 0.01], [depth 0.005], [gap / seam 0.01] (recessed panels in a face) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |

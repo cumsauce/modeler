@@ -1203,6 +1203,43 @@ pub struct LoftSpec {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct PanelLineSpec {
+    /// The cut part (or with cut: false, the cutter).
+    name: String,
+    /// The part to cut; hide it.
+    input: String,
+    /// The view the line is drawn in: right / left (points [z, y]), front /
+    /// back ([x, y]), top / bottom ([x, z]); it lands on the first surface
+    /// seen from there (right looks along -x, front along -z, top down).
+    view: String,
+    /// The line in that view's coordinates, meters.
+    points: Vec<[f32; 2]>,
+    /// The line closes back to its first point (a door outline).
+    #[serde(default)]
+    closed: bool,
+    /// A smooth curve through the points (Catmull-Rom) instead of straight
+    /// segments.
+    #[serde(default)]
+    smooth: bool,
+    /// Groove width, meters (a shut line: 0.004..0.008).
+    #[serde(default)]
+    width: f32,
+    /// Groove depth under the surface; with fill, how far under the
+    /// deepest surface point inside the outline the cutter reaches.
+    depth: f32,
+    /// false: output the cutter itself (hide it; for split or boolean).
+    /// Default true: the input with the groove cut.
+    #[serde(default)]
+    cut: Option<bool>,
+    /// A closed outline's whole area as one cutter (a prism along the
+    /// view, from above the surface to `depth` under it): a window or lamp
+    /// drawn in the view it is seen in. No width.
+    #[serde(default)]
+    fill: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CageSpec {
     name: String,
     /// Cage vertices [[x, y, z], ...] in model space.
@@ -3962,6 +3999,7 @@ pub const OP_TYPES: &[&str] = &[
     "stairs",
     "railing",
     "panel",
+    "panel_line",
     "transform",
     "move",
     "place",
@@ -4568,6 +4606,25 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 steps: s.steps,
                 round: s.round,
                 quads: s.quads,
+            })
+        }
+        "panel_line" => {
+            let s: PanelLineSpec = de(&ctx, &body)?;
+            let def = crate::panel_line::PanelLineDef {
+                input: s.input,
+                view: s.view,
+                points: s.points,
+                closed: s.closed,
+                smooth: s.smooth,
+                width: s.width,
+                depth: s.depth,
+                cut: s.cut.unwrap_or(true),
+                fill: s.fill,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::PanelLine {
+                name: s.name,
+                def: Box::new(def),
             })
         }
         "cage" => {
@@ -6321,6 +6378,10 @@ pub fn example(ty: &str) -> Option<Value> {
                 {"y": 0.22, "profile": [{"arc": {"center": [0, 0], "radius": 0.014, "from": 0, "to": 360}}]},
                 {"y": 0.28, "profile": [{"arc": {"center": [0, 0], "radius": 0.013, "from": 0, "to": 360}}]}]})
         }
+        "panel_line" => {
+            json!({"type": "panel_line", "name": "body_shut", "input": "body", "view": "right",
+                "points": [[1.1, 0.35], [1.15, 0.8], [0.6, 1.05]], "smooth": true, "width": 0.006, "depth": 0.004})
+        }
         "cage" => {
             json!({"type": "cage", "name": "pod_cage", "mirror": "x",
                 "verts": [[0, 0, -1], [0.5, 0, -1], [0.5, 0.6, -1], [0, 0.7, -1], [0, 0, 1], [0.4, 0, 1], [0.4, 0.5, 1], [0, 0.55, 1]],
@@ -6521,6 +6582,7 @@ pub fn op_guide(ty: &str) -> &'static [&'static str] {
         ],
         "loft" => &[include_str!("../docs/ops/loft.md")],
         "cage" => &[include_str!("../docs/ops/cage.md")],
+        "panel_line" => &[include_str!("../docs/ops/panel_line.md")],
         "path_array" => &[include_str!("../docs/ops/path_array.md")],
         "lsystem" => &[include_str!("../docs/ops/lsystem.md")],
         "text" => &[include_str!("../docs/ops/text.md")],
@@ -6656,6 +6718,7 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "sweep" => schemars::schema_for!(SweepSpec),
         "loft" => schemars::schema_for!(LoftSpec),
         "cage" => schemars::schema_for!(CageSpec),
+        "panel_line" => schemars::schema_for!(PanelLineSpec),
         "path_array" => schemars::schema_for!(PathArraySpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "text" => schemars::schema_for!(TextSpec),

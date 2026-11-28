@@ -104,6 +104,7 @@ pub mod mocap;
 pub mod offset;
 pub mod organic;
 pub mod outline;
+pub mod panel_line;
 pub mod params;
 pub mod primitives;
 pub mod quality;
@@ -1234,6 +1235,13 @@ pub enum Op {
         input: String,
         #[serde(flatten)]
         def: Box<crate::decimate::Decimate>,
+    },
+    /// A line drawn in a view, projected onto `input` and cut as a groove
+    /// (or a filled outline as a cutter) ([`crate::panel_line`]).
+    PanelLine {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::panel_line::PanelLineDef>,
     },
     /// A polygon cage (vertices and quad faces, crease weights per edge)
     /// for `smooth subdiv` ([`crate::cage`]).

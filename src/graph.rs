@@ -244,6 +244,7 @@ fn slow(op: &Op) -> bool {
             | Op::Smooth { .. }
             | Op::Round { .. }
             | Op::Shell { .. }
+            | Op::PanelLine { .. }
             | Op::Garment { .. }
             | Op::Carve { .. }
             | Op::Panel { .. }
@@ -1204,6 +1205,10 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
         Op::Cage { name, def } => {
             upsert(named, name, crate::cage::build(name, def)?);
         }
+        Op::PanelLine { name, def } => {
+            let src = lookup_shared(named, &def.input)?;
+            upsert(named, name, crate::panel_line::build(name, &src, def)?);
+        }
         Op::Smooth { name, input, def } => {
             let src = lookup_shared(named, input)?;
             let part = crate::smooth::smooth(name, &src, def)?;
@@ -1756,6 +1761,7 @@ pub fn output(op: &Op) -> &str {
         | Op::Silhouette { name, .. }
         | Op::Smooth { name, .. }
         | Op::Cage { name, .. }
+        | Op::PanelLine { name, .. }
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
         | Op::Carve { name, .. }
@@ -1895,6 +1901,7 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Silhouette { .. } => "silhouette",
         Op::Smooth { .. } => "smooth",
         Op::Cage { .. } => "cage",
+        Op::PanelLine { .. } => "panel_line",
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
         Op::Carve { .. } => "carve",
@@ -1973,6 +1980,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Body { def, .. } => crate::sdf::warp_reads(&def.warps),
         Op::Silhouette { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
+        Op::PanelLine { def, .. } => vec![def.input.as_str()],
         Op::Split {
             input,
             cutter: Some(c),
@@ -2579,6 +2587,7 @@ pub fn describe(ops: &[Op]) -> String {
                 format!("#{i} silhouette `{name}` {}", def.summary())
             }
             Op::Cage { name, def } => format!("#{i} cage `{name}` {}", def.summary()),
+            Op::PanelLine { name, def } => format!("#{i} panel_line `{name}` {}", def.summary()),
             Op::Smooth { name, input, def } => {
                 format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
             }
