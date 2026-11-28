@@ -8,9 +8,16 @@
     90 = from +x/right).
   - Several views come back tiled into ONE labelled image (`grid: false` for
     separate images), so `["front", "right", "top", "iso"]` is one read.
-  - The top view is a plan: +x right, -z up. Orthographic top / bottom
-    views frame at least half the model's largest extent, so a tall
-    model's plan is not a close-up.
+  - Which way each orthographic image faces (the same for a `reference`
+    image and for `silhouette from_reference`): `front` (from +z) right =
+    +x, up = +y; `back` right = -x; `right` (from +x) right = -z, so a car
+    whose nose is +z points left; `left` right = +z; `top` is the plan
+    seen from above with right = +x and up = -z, so a car's nose (+z)
+    points down the image and its right side (+x) is on the right;
+    `bottom` right = +x, up = +z. Draw or rotate reference PNGs to match
+    (a plan blueprint with the nose up needs turning 180 degrees).
+    Orthographic top / bottom views frame at least half the model's
+    largest extent, so a tall model's plan is not a close-up.
   - `focus: [parts]` frames just those (`*` globs work: `"bike.*"`), and framing works at any scale.
   - A shadowed key light makes openings read even in orthographic views.
   - Both the window and agent cameras are lit by a procedural photo
@@ -47,6 +54,13 @@
     red convex, blue concave, saturated where the radius of curvature is a
     sixteenth of the part or tighter): lumps, pinches, dents and creases on
     organic surfaces stand out where shading hides them.
+  - `style: "zebra"`: black and white stripes of the surface normal's
+    tilt (isophotes, 11.25 degrees a stripe, the same in every view, like a
+    row of strip lights reflected in the paint): the car-body check. A
+    fair surface shows even stripes flowing smoothly across panels; a lump
+    kinks them, a flat spot widens one, a crease breaks them. Unlit, per
+    pixel, so it works on dense subdivided bodies; look at a side and an
+    iso view.
   - `style: "silhouette"`: flat black parts on white, no shading, no
     decals: compare outlines and proportions at a glance.
   - `style: "density"`: each surface tinted by how much geometry is near

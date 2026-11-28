@@ -685,7 +685,10 @@ pub(crate) struct AgentViewsArgs {
     /// level), "ids" (every part a flat distinct colour with a
     /// legend, to tell which shape is which part) or "curvature" (mean
     /// curvature heat map: red convex, white flat, blue concave; lumps,
-    /// pinches and creases on organic surfaces stand out), "bones" (the
+    /// pinches and creases on organic surfaces stand out), "zebra" (black
+    /// and white stripes of the surface normal's tilt, like strip lights
+    /// reflected in a car body: smooth surfaces give even, flowing
+    /// stripes, lumps and flat spots kink or widen them), "bones" (the
     /// skeleton over see-through parts), "weights" (one `bone`'s skin
     /// weights: red 1, blue 0) or "trails" (needs `clip`: the model
     /// see-through at `time`, and for each bone of `bones` the 3D path its

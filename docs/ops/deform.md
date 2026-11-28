@@ -38,5 +38,13 @@
     few relief-depths of sharp creases (a cylinder's rim, a box edge) so
     the edge doesn't fold. Editing the material with `material_ops`
     re-derives the relief.
+  - `offset`: every vertex moves `amount` meters along its normal (+ out,
+    - in), kept even at bends (the move grows where faces lean off the
+    vertex normal, up to 2.5x at a sharp edge), seams moving together; no
+    refinement, so a 50k-triangle body offsets in milliseconds. A glass
+    pane 3 mm proud of the body it was cut from: `{"type": "deform",
+    "name": "glass", "input": "glass_cut", "mode": "offset", "amount":
+    0.003}`. A bend tighter than `amount` (inward) folds the surface;
+    `shell` with `method: "offset"` checks that for you.
   Every number takes params (`"degrees": "$curl"`), and chains of deforms
   re-derive like any op.

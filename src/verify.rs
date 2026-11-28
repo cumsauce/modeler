@@ -21,6 +21,23 @@ fn world_signed_volume(p: &Part) -> f64 {
     vol
 }
 
+/// Surface area of a part's mesh in world space (transform applied).
+fn world_area(p: &Part) -> f64 {
+    let rot = quat_of(p.rotation);
+    let scale = Vec3::from(p.scale);
+    let t = Vec3::from(p.translation);
+    let world = |i: u32| -> Vec3 { rot * (Vec3::from(p.verts[i as usize]) * scale) + t };
+    p.indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|tri| {
+            let (a, b, c) = (world(tri[0]), world(tri[1]), world(tri[2]));
+            (b - a).cross(c - a).length() as f64 * 0.5
+        })
+        .sum()
+}
+
 /// Re-derives the whole graph into a scratch copy and compares the
 /// geometry against the cached parts (names, verts, indices, transforms).
 /// Catches a stale parts cache or a non-deterministic op. Baked edits
@@ -524,7 +541,12 @@ pub fn lints(model: &Model) -> Vec<String> {
             .max(1e-15);
         match kind.as_str() {
             "difference" => {
-                if vo > va - tol {
+                // A thin cutter (a groove, an inlay a few mm deep) takes
+                // little volume but always adds the walls of its cut: only
+                // both unchanged means it missed.
+                let (aa, ao) = (world_area(pa), world_area(po));
+                let same_area = (ao - aa).abs() <= (aa * 1e-5).max(1e-12);
+                if vo > va - tol && same_area {
                     out.push(format!(
                         "difference `{name}` left `{a}` at its original volume ({} vs {}) — the cutter `{b}` probably misses it",
                         fmt_vol(vo),

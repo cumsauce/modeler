@@ -135,27 +135,29 @@ memorise them.
 | `extrude` | name, profile, height, [twist], [scale_top [1,1]], [slices], [round], [translation], [rotation] |
 | `revolve` | name, profile, [degrees 360], [segments 48], [round], [translation], [rotation] |
 | `sweep` | name, profile (one ring), path [[x,y,z]...], [closed], [round], [smooth], [samples], [twist], [scale_end] |
-| `loft` | name, sections [{profile, y / at, [rotation], [scale]} or {profile, t}...], [path], [smooth], [samples], [steps], [round] |
+| `loft` | name, sections [{profile, y / at, [rotation], [scale]} or {profile, t}...], [path], [smooth], [samples], [steps], [round], [quads] (a subdiv cage), [fit {side, top, levels}] (rings fitted to outlines) |
+| `cage` | name, verts, faces (quads), [creases [[a, b, w]]], [mirror x] (a polygon cage `smooth subdiv` reads as quads) |
 | `lsystem` | name, preset (tree / pine / bush / fern / weed / roots) or axiom + rules, [iterations], [angle], [length], [radius], [seed], [tropism], [leaf_size], [leaf_mode card / solid], [leaf_cross], ... (branching growth: wood in `name`, leaves in `name_leaves`, cards for an alpha-cutout leaf material) |
 | `text` | name, text, size (capital height), [depth size/8], [font sans / bold / mono / path.ttf], [align center], [line_spacing], [letter_spacing], [translation], [rotation] |
 | `terrain` | name, [size [60, 60]], [resolution 0.5], [height 6], [scale 20], [octaves 5], [style hills / ridges / dunes / mesa / flat], [seed], [base -1], [flatten], [paths], [edge_falloff], [terraces], [wind], [gain], [translation], [rotation] (noise ground, a closed slab) |
 | `hull` | name, inputs |
 | `blob` | name, inputs, [op union / subtract / intersect], [blend], [resolution] (smooth-blended solids) |
-| `split` | name, input, plane {normal, point}, [keep both / above / below], [gap] (→ `name_above`, `name_below`) |
+| `split` | name, input, plane {normal, point} or cutter, [keep], [gap] / [depth], [lift] (→ `name_above` / `name_below`, or `name_inside` / `name_outside`) |
 | `scatter` | name, input (part, list = one picked per copy, `[a, b]` = a set moved as one, `"inst.*"`), on, count or density, [seed], [scale [min, max]], [rotate random_y], [align 0], [min_spacing], [max_slope], [sink], [region], [faces up], [weights], [near + near_distance 0.5], [edge_bias 0], [clump {count, radius}], [mask path / pad / not_path / not_pad], [height [min, max]]; or `decal` {pbr, size, [aspect 1], [depth], [roll random / none], [kind], [params]} instead of input |
 | `round` | name, input, mode (fillet / chamfer / smooth), [radius], [segments], [edges all / top / bottom / vertical / horizontal or a list] (fillet) |
-| `deform` | name, input, mode (displace / bend / twist / taper / material), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
+| `deform` | name, input, mode (displace / bend / twist / taper / material / offset), [axis y], [degrees], [toward], [scale_end], [power], [amount], [scale], [octaves], [seed], [noise], [detail], [pbr], [params] |
 | `sdf` | name, shapes [{shape sphere / ellipsoid / box / capsule / cylinder / torus / chain / part / group, [op], [blend], ...}], [blend], [mirror x / z / xz], [warps], [resolution], [tris], [bake] (analytic distance-field modeling) |
 | `skin` | name, chains [[[x, y, z, r] or [x, y, z, [rx, ry], roll?] or joint, ...], ...], [joints {name: [x, y, z, r]}], [smooth true], [blend], [mirror], [warps], [resolution], [tris], [bake] (a skeleton with radii as one smooth skin) |
 | `body` | name, preset (biped / quadruped / bird / fish / serpent / car), [height], [head_ratio], [build], [leg_length], [tail], [snout], [joints {name: {scale, offset}}], [blend], [resolution], [tris], [bake], [rig true], [warps] (a parametric creature or car with a `<name>_rig` skeleton) |
 | `silhouette` | name, side [[z, y]...], top [[x, z]...], [front [[x, y]...]], [smooth], [round], [blend], [from_reference {image, view, height / size}], [resolution], [tris], [bake], [translation], [rotation] (a solid carved from orthographic outlines) |
-| `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2], [crease] |
-| `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60] (fewer triangles; bake the dense surface into normal + height maps) |
-| `shell` | name, input, thickness, [open: face or [faces]] (hollow a solid) |
+| `smooth` | name, input, mode (relax / remesh / subdiv), [iterations], [strength], [edge], [levels 2] or [tris], [crease], [symmetric] |
+| `decimate` | name, input, ratio or tris, [bake], [resolution 1024], [cage], [crease 60], [symmetric x] (fewer triangles; bake the dense surface into normal + height maps) |
+| `shell` | name, input, thickness, [open: face or [faces]], [method exact / offset (dense meshes)] (hollow a solid) |
 | `carve` | [solid], cutters, [rooms [{name, footprint [[x, z]...], height, base}]], [slabs [{footprint [[[x, z]...]...], top, thickness 0.3}]], [wall 0.3], [keep inner / outer / both], [merge true], [split_by none / facing / cutter / both], [markers], [collider none / mesh / blocks] (interiors by subtraction: only the faces looking into the rooms, as one-sided sheets) |
 | `stairs` | name, from [x, y, z], toward (+x / -x / +z / -z or degrees), rise, [width 1.2], [steps], [run 0.3], [collider none / blocks] (a flight as one closed solid, a `block` marker per step) |
 | `railing` | name, path [[x, y, z]...], [height 1], [post_spacing 1.5], [thickness 0.06], [mid_rail true], [collider none / blocks] (rails and posts as one part) |
 | `garment` | name, on, [preset], [region {zones, arms, legs, neck, above, below, planes, boxes}], [offset 0.006], [thickness 0.003], [ease], [hem {flare, length}], [fit tight / regular / loose / baggy], [skirt {top, hem, length, profile, folds, flare}], [hide_skin true], [bind] (binds itself) (clothing cut from a body's surface) |
+| `panel_line` | name, input, view, points [[u, v]...], width, depth, [closed], [smooth], [fill], [cut true] (a line drawn in a view, cut into the surface as a groove; `fill`: an outline as a cutter) |
 | `panel` | name, input, face, [rows 1], [cols 1], [inset / border 0.01], [depth 0.005], [gap / seam 0.01] (recessed panels in a face) |
 | `group` | name, inputs |
 | `transform` | name, input, [translation], [rotation], [scale], [relative], [pivot] |
@@ -191,7 +193,8 @@ memorise them.
 The full list, with the fine print, is `topic:apply-ops`.
 
 - **Upserts**: an item with the same name *and type* replaces the old one
-  and re-derives (the tweak path). Order doesn't matter: evaluation is
+  and re-derives (the tweak path); `"replace": true` lets it replace an
+  op of another type. Order doesn't matter: evaluation is
   dependency-ordered, and part edits (hide/show, rename, uvs, move/place)
   run after every op, in the order written.
 - **Batches are atomic**: all items are parsed first (errors name the item
@@ -285,7 +288,7 @@ details: `describe_op` of `body`, `sdf`, `skin`, `silhouette`, and
    push / pinch / flatten / smooth, at: a joint name or point, radius,
    amount}]`) or joint overrides, not by adding shapes; re-check the bands.
 4. **Check the surface and proportions**: `agent_views style:
-   "curvature"` (lumps, pinches, creases), `inspect proportions` (bone-chain
+   "curvature"` (lumps, pinches, creases; `"zebra"` for car bodies), `inspect proportions` (bone-chain
    ratios: biped head / height ~0.133), `verify self_intersections` /
    `thickness`.
 5. **Make it light last**: `tris: N` on the item (plus `bake: true` to keep

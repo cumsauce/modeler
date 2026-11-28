@@ -379,6 +379,113 @@ pub struct LoftOpts<'a> {
     pub samples: u32,
     pub steps: u32,
     pub round: f32,
+    /// Keep the rings' own points (no resampling) and carry the walls
+    /// along as quads (caps as one polygon each) for `smooth subdiv`.
+    pub quads: bool,
+    /// Scale every ring to side / top outlines ([`LoftFit`]).
+    pub fit: Option<&'a LoftFit>,
+}
+
+/// Outlines a straight loft along z is fitted to: every ring keeps its
+/// shape and is scaled and moved in x and y so it spans the outlines at
+/// its own z.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LoftFit {
+    /// The side view, `[[z, y], ...]` (seen from +x): sets each ring's
+    /// bottom and top.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub side: Vec<[f32; 2]>,
+    /// The plan, `[[x, z], ...]`: sets each ring's width (an outline of
+    /// the + half only, x >= 0, is mirrored).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<[f32; 2]>,
+    /// With `quads`: fit the surface `smooth subdiv` makes at this many
+    /// levels, not the cage (subdivision pulls the surface in; the cage is
+    /// pushed out until its subdivided rings span the outlines).
+    #[serde(default, skip_serializing_if = "crate::is_zero_u32")]
+    pub levels: u32,
+}
+
+/// The range of coordinate `other` where the closed outline `poly` crosses
+/// coordinate `at` = `c`.
+fn crossings(poly: &[[f32; 2]], at: usize, c: f32) -> Option<(f32, f32)> {
+    let other = 1 - at;
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    let n = poly.len();
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        let (ca, cb) = (a[at], b[at]);
+        if (ca - c) * (cb - c) > 0.0 || ca == cb && ca != c {
+            continue;
+        }
+        let vals = if ca == cb {
+            vec![a[other], b[other]]
+        } else {
+            let f = (c - ca) / (cb - ca);
+            vec![a[other] + (b[other] - a[other]) * f]
+        };
+        for v in vals {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// Each ring's (x0, x1, y0, y1) goal from the outlines (None where an
+/// outline is not given: the ring keeps that extent).
+type Spans = Vec<[Option<(f32, f32)>; 2]>;
+
+fn goals(rings: &[Vec<Vec3>], f: &LoftFit) -> Result<Spans, String> {
+    let mut out = Vec::with_capacity(rings.len());
+    for (k, r) in rings.iter().enumerate() {
+        let z = r.iter().map(|p| p.z).sum::<f32>() / r.len() as f32;
+        let miss = |w: &str| format!("fit: ring {k} at z = {z:.4} is outside the {w} outline");
+        let x = if f.top.len() >= 3 {
+            let (a, b) = crossings(&f.top, 1, z).ok_or_else(|| miss("top"))?;
+            // A half outline (x >= 0) stands for both sides.
+            Some(if a >= -1e-6 * (b.abs() + 1.0) {
+                (-b, b)
+            } else {
+                (a, b)
+            })
+        } else {
+            None
+        };
+        let y = if f.side.len() >= 3 {
+            Some(crossings(&f.side, 0, z).ok_or_else(|| miss("side"))?)
+        } else {
+            None
+        };
+        out.push([x, y]);
+    }
+    Ok(out)
+}
+
+/// The rings moved so ring k spans `aims[k]` in x and y.
+fn fitted(rings: &[Vec<Vec3>], aims: &Spans) -> Vec<Vec<Vec3>> {
+    rings
+        .iter()
+        .zip(aims)
+        .map(|(r, aim)| {
+            let mut r = r.clone();
+            for (axis, span) in aim.iter().enumerate() {
+                let Some((t0, t1)) = *span else { continue };
+                let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(a, b), p| {
+                    (a.min(p[axis]), b.max(p[axis]))
+                });
+                let s = if hi - lo > 1e-9 {
+                    (t1 - t0) / (hi - lo)
+                } else {
+                    1.0
+                };
+                for p in &mut r {
+                    p[axis] = t0 + (p[axis] - lo) * s;
+                }
+            }
+            r
+        })
+        .collect()
 }
 
 /// A closed solid skinned through `sections` (see [`LoftSection`]).
@@ -420,7 +527,23 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         rings2.push(r);
     }
     let max_n = rings2.iter().map(Vec::len).max().unwrap_or(3);
-    let m = if o.samples > 0 {
+    if o.quads {
+        if o.samples > 0 {
+            return Err(err(
+                "quads keeps each section's own points: drop samples".into()
+            ));
+        }
+        if let Some(k) = rings2.iter().position(|r| r.len() != rings2[0].len()) {
+            return Err(err(format!(
+                "quads: every section needs the same number of points (section 0 has {}, section {k} has {})",
+                rings2[0].len(),
+                rings2[k].len()
+            )));
+        }
+    }
+    let m = if o.quads {
+        max_n
+    } else if o.samples > 0 {
         o.samples as usize
     } else {
         max_n.max(32)
@@ -432,7 +555,7 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         .iter()
         .zip(sections)
         .map(|(r, s)| {
-            resample(r, m)
+            if o.quads { r.clone() } else { resample(r, m) }
                 .into_iter()
                 .map(|p| p * Vec2::from(s.scale))
                 .collect()
@@ -440,7 +563,7 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
         .collect();
     let steps = if o.steps > 0 {
         o.steps
-    } else if o.smooth {
+    } else if o.smooth && !o.quads {
         12
     } else {
         1
@@ -459,7 +582,76 @@ pub fn loft(name: &str, sections: &[LoftSection], o: &LoftOpts) -> Result<Part, 
     };
     let first = (!apex[0]).then(|| rings2[0].clone());
     let last = (!apex[apex.len() - 1]).then(|| rings2[rings2.len() - 1].clone());
-    skin(name, &rings3, first.as_deref(), last.as_deref(), dirs).map_err(err)
+    if let Some(f) = o.fit {
+        if !o.path.is_empty() {
+            return Err(err("fit: only for a straight loft along z (no path)".into()));
+        }
+        if f.levels > 0 && !o.quads {
+            return Err(err(
+                "fit.levels: needs quads: true (it fits the subdivided cage)".into(),
+            ));
+        }
+        let goal = goals(&rings3, f).map_err(err)?;
+        let mut aim = goal.clone();
+        let mut rings = fitted(&rings3, &aim);
+        if f.levels > 0 {
+            let r = rings.len();
+            let solo = |i: usize| (i == 0 && first.is_none()) || (i == r - 1 && last.is_none());
+            for _ in 0..12 {
+                let part = skin(name, &rings, first.as_deref(), last.as_deref(), dirs, true)
+                    .map_err(err)?;
+                let Some(cage) = part.cage.as_ref() else {
+                    break;
+                };
+                let v: Vec<Vec3> = cage.verts.iter().map(|p| Vec3::from(*p)).collect();
+                let img = crate::smooth::cage_images(v, cage.faces.clone(), f.levels);
+                let mut worst = 0.0f32;
+                let mut base = 0usize;
+                for i in 0..r {
+                    let n = if solo(i) { 1 } else { rings[i].len() };
+                    let pts = &img[base..base + n];
+                    base += n;
+                    if solo(i) {
+                        continue;
+                    }
+                    for axis in 0..2 {
+                        let (Some(g), Some(a)) = (goal[i][axis], aim[i][axis].as_mut()) else {
+                            continue;
+                        };
+                        let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |(x, y), p| {
+                            (x.min(p[axis]), y.max(p[axis]))
+                        });
+                        let (e0, e1) = (g.0 - lo, g.1 - hi);
+                        worst = worst.max(e0.abs()).max(e1.abs());
+                        a.0 += e0;
+                        a.1 += e1;
+                    }
+                }
+                if worst < 2e-4 {
+                    break;
+                }
+                rings = fitted(&rings3, &aim);
+            }
+        }
+        return skin(
+            name,
+            &rings,
+            first.as_deref(),
+            last.as_deref(),
+            dirs,
+            o.quads,
+        )
+        .map_err(err);
+    }
+    skin(
+        name,
+        &rings3,
+        first.as_deref(),
+        last.as_deref(),
+        dirs,
+        o.quads,
+    )
+    .map_err(err)
 }
 
 type Rings = (Vec<Vec<Vec3>>, (Vec3, Vec3));
@@ -655,6 +847,7 @@ fn skin(
     first: Option<&[Vec2]>,
     last: Option<&[Vec2]>,
     (d0, d1): (Vec3, Vec3),
+    quads: bool,
 ) -> Result<Part, String> {
     let r = rings.len();
     let m = rings[0].len();
@@ -698,11 +891,27 @@ fn skin(
             part.indices.extend([a, b, c]);
         }
     };
+    let mut polys: Vec<Vec<u32>> = Vec::new();
     for i in 0..r - 1 {
         for j in 0..m {
             let (p0, p1, p2, p3) = (idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j));
             tri(&mut part, p0, p1, p2);
             tri(&mut part, p0, p2, p3);
+            if quads {
+                let mut q = if flip {
+                    vec![p0, p3, p2, p1]
+                } else {
+                    vec![p0, p1, p2, p3]
+                };
+                // An apex row's quads are triangles.
+                q.dedup();
+                if q.first() == q.last() {
+                    q.pop();
+                }
+                if q.len() >= 3 {
+                    polys.push(q);
+                }
+            }
         }
     }
     // Caps, each facing away from the loft.
@@ -728,6 +937,13 @@ fn skin(
             .map(|t| (v(t[1]) - v(t[0])).cross(v(t[2]) - v(t[0])))
             .sum();
         let rev = nsum.dot(out) < 0.0;
+        if quads {
+            let mut cap: Vec<u32> = (0..m as u32).map(|k| base[i] + k).collect();
+            if ccw == rev {
+                cap.reverse();
+            }
+            polys.push(cap);
+        }
         for t in &tris {
             let [a, b, c] = t.map(|k| base[i] + k);
             if rev {
@@ -739,9 +955,16 @@ fn skin(
     }
     let man = crate::csg::part_to_manifold(&part)
         .map_err(|e| format!("{e} (do sections cross each other, or the path itself?)"))?;
-    let out = crate::csg::manifold_to_part(&man, name, crate::Material::default());
+    let mut out = crate::csg::manifold_to_part(&man, name, crate::Material::default());
     if out.indices.is_empty() {
         return Err("the skin came out empty".into());
+    }
+    if quads {
+        out.cage = Some(std::sync::Arc::new(crate::cage::Cage {
+            verts: part.verts.clone(),
+            faces: polys,
+            creases: Vec::new(),
+        }));
     }
     Ok(out)
 }
@@ -776,6 +999,8 @@ mod tests {
             samples: 0,
             steps: 0,
             round: 0.0,
+            quads: false,
+            fit: None,
         }
     }
 

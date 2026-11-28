@@ -111,6 +111,20 @@ fn keeps_detail(op: &Op) -> bool {
     )
 }
 
+/// Ops whose outputs keep the input's vertices as they are (moves,
+/// materials, visibility), so a `cage`'s polygons still index them.
+fn keeps_cage(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Cage { .. }
+            | Op::Loft { .. }
+            | Op::Transform { .. }
+            | Op::Material { .. }
+            | Op::Visibility { .. }
+            | Op::Rename { .. }
+    )
+}
+
 fn hash_of(bytes: &[u8], inputs: &[u64]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -230,6 +244,7 @@ fn slow(op: &Op) -> bool {
             | Op::Smooth { .. }
             | Op::Round { .. }
             | Op::Shell { .. }
+            | Op::PanelLine { .. }
             | Op::Garment { .. }
             | Op::Carve { .. }
             | Op::Panel { .. }
@@ -279,6 +294,9 @@ fn prefetch(ops: &[Op], rest: &[usize], named: &Named, hashes: &HashMap<String, 
                 .map(|(m, mut p)| {
                     if !keeps_detail(op) && p.detail.is_some() {
                         Arc::make_mut(&mut p).detail = None;
+                    }
+                    if !keeps_cage(op) && p.cage.is_some() {
+                        Arc::make_mut(&mut p).cage = None;
                     }
                     (m, p)
                 })
@@ -369,6 +387,15 @@ fn evaluate_with(ops: &[Op], use_cache: bool) -> Result<Vec<Arc<Part>>, ModelerE
                 run_op(op, &mut named)?;
                 // A baked dense surface only stays valid through ops that
                 // keep the part's mesh (moves, copies, materials).
+                if !keeps_cage(op) {
+                    for n in &outs {
+                        if let Some((_, p)) = named.iter_mut().find(|(m, _)| m == n)
+                            && p.cage.is_some()
+                        {
+                            Arc::make_mut(p).cage = None;
+                        }
+                    }
+                }
                 if !keeps_detail(op) {
                     for n in &outs {
                         if let Some((_, p)) = named.iter_mut().find(|(m, _)| m == n)
@@ -984,6 +1011,8 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             samples,
             steps,
             round,
+            quads,
+            fit,
         } => {
             let o = crate::loft::LoftOpts {
                 path,
@@ -991,6 +1020,8 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
                 samples: *samples,
                 steps: *steps,
                 round: *round,
+                quads: *quads,
+                fit: fit.as_deref(),
             };
             upsert(named, name, crate::loft::loft(name, sections, &o)?);
         }
@@ -1173,6 +1204,13 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             })?;
             upsert(named, name, part);
         }
+        Op::Cage { name, def } => {
+            upsert(named, name, crate::cage::build(name, def)?);
+        }
+        Op::PanelLine { name, def } => {
+            let src = lookup_shared(named, &def.input)?;
+            upsert(named, name, crate::panel_line::build(name, &src, def)?);
+        }
         Op::Smooth { name, input, def } => {
             let src = lookup_shared(named, input)?;
             let part = crate::smooth::smooth(name, &src, def)?;
@@ -1209,8 +1247,22 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             point,
             keep,
             gap,
+            cutter,
+            depth,
+            lift,
         } => {
             let src = lookup_shared(named, input)?;
+            if let Some(c) = cutter {
+                let cut = lookup_shared(named, c)?;
+                let (inside, outside) = crate::csg::split_by(name, &src, &cut, *depth, *lift)?;
+                if keep != "outside" {
+                    upsert(named, &inside.name.clone(), inside);
+                }
+                if keep != "inside" {
+                    upsert(named, &outside.name.clone(), outside);
+                }
+                return Ok(());
+            }
             let (above, below) = crate::blob::split(name, &src, *normal, *point, *gap)?;
             if keep != "below" {
                 upsert(named, &above.name.clone(), above);
@@ -1252,9 +1304,10 @@ fn run_op(op: &Op, named: &mut Named) -> Result<(), ModelerError> {
             input,
             thickness,
             open,
+            method,
         } => {
             let src = lookup_shared(named, input)?;
-            let part = crate::csg::shell(name, &src, *thickness, open)?;
+            let part = crate::csg::shell(name, &src, *thickness, open, method.as_deref())?;
             upsert(named, name, part);
         }
         Op::Panel {
@@ -1709,6 +1762,8 @@ pub fn output(op: &Op) -> &str {
         | Op::Body { name, .. }
         | Op::Silhouette { name, .. }
         | Op::Smooth { name, .. }
+        | Op::Cage { name, .. }
+        | Op::PanelLine { name, .. }
         | Op::Decimate { name, .. }
         | Op::Split { name, .. }
         | Op::Carve { name, .. }
@@ -1791,11 +1846,17 @@ pub fn outputs(op: &Op) -> Vec<String> {
         }
         Op::Prefab { name, parts, .. } => parts.iter().map(|p| format!("{name}.{p}")).collect(),
         Op::Carve { name, def } => crate::carve::output_names(name, def),
-        Op::Split { name, keep, .. } => ["above", "below"]
-            .iter()
-            .filter(|side| keep == "both" || keep == *side)
-            .map(|side| format!("{name}_{side}"))
-            .collect(),
+        Op::Split {
+            name, keep, cutter, ..
+        } => if cutter.is_some() {
+            ["inside", "outside"]
+        } else {
+            ["above", "below"]
+        }
+        .iter()
+        .filter(|side| keep == "both" || keep == *side)
+        .map(|side| format!("{name}_{side}"))
+        .collect(),
         Op::Scatter {
             name, input, def, ..
         } => crate::scatter::output_names(name, input, def),
@@ -1841,6 +1902,8 @@ pub fn kind(op: &Op) -> &'static str {
         Op::Body { .. } => "body",
         Op::Silhouette { .. } => "silhouette",
         Op::Smooth { .. } => "smooth",
+        Op::Cage { .. } => "cage",
+        Op::PanelLine { .. } => "panel_line",
         Op::Decimate { .. } => "decimate",
         Op::Split { .. } => "split",
         Op::Carve { .. } => "carve",
@@ -1887,6 +1950,7 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         | Op::Revolve { .. }
         | Op::Sweep { .. }
         | Op::Loft { .. }
+        | Op::Cage { .. }
         | Op::LSystem { .. }
         | Op::Text { .. }
         | Op::Terrain { .. }
@@ -1918,6 +1982,12 @@ pub fn inputs(op: &Op) -> Vec<&str> {
         Op::Body { def, .. } => crate::sdf::warp_reads(&def.warps),
         Op::Silhouette { .. } => Vec::new(),
         Op::Smooth { input, .. } | Op::Decimate { input, .. } => vec![input],
+        Op::PanelLine { def, .. } => vec![def.input.as_str()],
+        Op::Split {
+            input,
+            cutter: Some(c),
+            ..
+        } => vec![input, c],
         Op::Shell { input, .. } | Op::Split { input, .. } | Op::Panel { input, .. } => {
             vec![input]
         }
@@ -2341,8 +2411,10 @@ pub fn describe(ops: &[Op]) -> String {
                 samples,
                 steps,
                 round,
+                quads,
+                fit,
             } => format!(
-                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}",
+                "#{i} loft `{name}` sections=[{}]{} smooth={smooth} samples={samples} steps={steps} round={round}{}{}",
                 sections
                     .iter()
                     .map(|s| format!(
@@ -2354,7 +2426,14 @@ pub fn describe(ops: &[Op]) -> String {
                     ))
                     .collect::<Vec<_>>()
                     .join(", "),
-                if path.is_empty() { String::new() } else { format!(" path={path:?}") }
+                if path.is_empty() { String::new() } else { format!(" path={path:?}") },
+                if *quads { " quads" } else { "" },
+                fit.as_ref().map_or_else(String::new, |f| format!(
+                    " fit(side {} pts, top {} pts, levels {})",
+                    f.side.len(),
+                    f.top.len(),
+                    f.levels
+                ))
             ),
             Op::PathArray {
                 name,
@@ -2415,8 +2494,21 @@ pub fn describe(ops: &[Op]) -> String {
                 point,
                 keep,
                 gap,
+                cutter: None,
+                ..
             } => format!(
                 "#{i} split `{name}` <- `{input}` normal={normal:?} point={point:?} keep={keep} gap={gap}"
+            ),
+            Op::Split {
+                name,
+                input,
+                keep,
+                cutter: Some(c),
+                depth,
+                lift,
+                ..
+            } => format!(
+                "#{i} split `{name}` <- `{input}` by `{c}` keep={keep} depth={depth} lift={lift}"
             ),
             Op::Scatter {
                 name,
@@ -2503,6 +2595,8 @@ pub fn describe(ops: &[Op]) -> String {
             Op::Silhouette { name, def } => {
                 format!("#{i} silhouette `{name}` {}", def.summary())
             }
+            Op::Cage { name, def } => format!("#{i} cage `{name}` {}", def.summary()),
+            Op::PanelLine { name, def } => format!("#{i} panel_line `{name}` {}", def.summary()),
             Op::Smooth { name, input, def } => {
                 format!("#{i} smooth `{name}` <- `{input}` {}", def.summary())
             }
@@ -2514,7 +2608,11 @@ pub fn describe(ops: &[Op]) -> String {
                 input,
                 thickness,
                 open,
-            } => format!("#{i} shell `{name}` <- `{input}` thickness={thickness} open={open:?}"),
+                method,
+            } => format!(
+                "#{i} shell `{name}` <- `{input}` thickness={thickness} open={open:?}{}",
+                method.as_ref().map_or_else(String::new, |m| format!(" method={m}"))
+            ),
             Op::Group { name, inputs } => format!(
                 "#{i} group `{name}` = {}",
                 inputs

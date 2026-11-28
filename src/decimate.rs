@@ -38,6 +38,10 @@ pub struct Decimate {
     /// Normals crease where faces meet at more than this (default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crease: Option<f32>,
+    /// "x", "y" or "z": decimate the + half and mirror it across that zero
+    /// plane, so the result is exactly symmetric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symmetric: Option<String>,
 }
 
 impl Decimate {
@@ -69,6 +73,11 @@ impl Decimate {
         {
             return Err(format!("crease: {c} is not in 0..180 degrees"));
         }
+        if let Some(s) = &self.symmetric
+            && axis_of(s).is_none()
+        {
+            return Err(format!("symmetric: x, y or z, got `{s}`"));
+        }
         Ok(())
     }
 
@@ -78,6 +87,9 @@ impl Decimate {
             (Some(r), _) => format!("ratio={r}"),
             _ => String::new(),
         };
+        if let Some(a) = &self.symmetric {
+            s.push_str(&format!(" symmetric={a}"));
+        }
         if self.bake {
             s.push_str(&format!(" bake res={}", self.resolution.unwrap_or(1024)));
             if let Some(c) = self.cage {
@@ -193,7 +205,10 @@ pub fn decimate(name: &str, src: &Part, def: &Decimate) -> Result<Part, String> 
     // The same crease angle guards the collapses (feature-edge quadrics)
     // and splits the normals afterwards.
     let crease = def.crease.unwrap_or(60.0);
-    let mut out = crate::simplify::simplify_creased(&bare, ratio.max(1e-5), Some(crease));
+    let mut out = match def.symmetric.as_deref().and_then(axis_of) {
+        Some(ax) => symmetric(&bare, ax, ratio, crease)?,
+        None => crate::simplify::simplify_creased(&bare, ratio.max(1e-5), Some(crease)),
+    };
     out.name = name.to_string();
     out.visible = true;
     crate::uv::crease_normals(&mut out, crease);
@@ -214,6 +229,126 @@ pub fn decimate(name: &str, src: &Part, def: &Decimate) -> Result<Part, String> 
         )));
     }
     Ok(out)
+}
+
+fn axis_of(s: &str) -> Option<usize> {
+    ["x", "y", "z"].iter().position(|a| *a == s)
+}
+
+/// Decimates the + half of `p` (welded, no attributes) across its own axis
+/// `ax` (the part's vertex space: model space for an op's output) and
+/// mirrors it: the cut along the plane is a border, which simplification
+/// keeps exactly, so the halves join again vertex for vertex.
+fn symmetric(p: &Part, ax: usize, ratio: f32, crease: f32) -> Result<Part, String> {
+    let name = ["x", "y", "z"][ax];
+    let v: Vec<Vec3> = p.verts.iter().map(|q| Vec3::from(*q)).collect();
+    let (lo, hi) = v.iter().fold(
+        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        |(a, b), q| (a.min(*q), b.max(*q)),
+    );
+    let size = (hi - lo).max_element().max(1e-9);
+    if (lo[ax] + hi[ax]).abs() > 1e-3 * size {
+        return Err(format!(
+            "symmetric {name}: `{}` spans {name} = {:.4}..{:.4}, not centred on {name} = 0 (its + half is kept and mirrored)",
+            p.name, lo[ax], hi[ax]
+        ));
+    }
+    let eps = size * 1e-6;
+    let (hv, ht) = clip_half(&v, &p.indices, ax, eps);
+    if ht.is_empty() {
+        return Err(format!("symmetric {name}: nothing on the + side"));
+    }
+    let mut half = p.clone();
+    half.verts = hv.iter().map(|q| q.to_array()).collect();
+    half.indices = ht;
+    let mut out = crate::simplify::simplify_creased(&half, ratio.max(1e-5), Some(crease));
+    // Mirror: vertices on the plane are shared, the rest get a twin.
+    let n = out.verts.len();
+    let mut twin = vec![0u32; n];
+    for i in 0..n {
+        if out.verts[i][ax] == 0.0 {
+            twin[i] = i as u32;
+        } else {
+            let mut m = out.verts[i];
+            m[ax] = -m[ax];
+            twin[i] = out.verts.len() as u32;
+            out.verts.push(m);
+        }
+    }
+    let tris: Vec<[u32; 3]> = out.indices.as_chunks::<3>().0.to_vec();
+    for t in tris {
+        out.indices.extend([
+            twin[t[0] as usize],
+            twin[t[2] as usize],
+            twin[t[1] as usize],
+        ]);
+    }
+    out.normals.clear();
+    out.uvs.clear();
+    Ok(out)
+}
+
+/// The triangles of a mesh on the + side of axis `ax`, cut exactly along
+/// the zero plane (new vertices on it have that coordinate exactly 0).
+fn clip_half(v: &[Vec3], idx: &[u32], ax: usize, eps: f32) -> (Vec<Vec3>, Vec<u32>) {
+    let side = |p: Vec3| {
+        if p[ax].abs() <= eps { 0.0 } else { p[ax] }
+    };
+    let mut out: Vec<Vec3> = Vec::new();
+    let mut kept: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut cut: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    let mut tris = Vec::new();
+    let mut keep = |out: &mut Vec<Vec3>, i: u32| -> u32 {
+        *kept.entry(i).or_insert_with(|| {
+            let mut p = v[i as usize];
+            if side(p) == 0.0 {
+                p[ax] = 0.0;
+            }
+            out.push(p);
+            (out.len() - 1) as u32
+        })
+    };
+    for t in idx.as_chunks::<3>().0 {
+        if t.iter().any(|&i| i as usize >= v.len()) {
+            continue;
+        }
+        let s = t.map(|i| side(v[i as usize]));
+        if s.iter().all(|x| *x >= 0.0) {
+            if s.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            let k = t.map(|i| keep(&mut out, i));
+            tris.extend(k);
+            continue;
+        }
+        if s.iter().all(|x| *x <= 0.0) {
+            continue;
+        }
+        let mut poly: Vec<u32> = Vec::with_capacity(4);
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let (sa, sb) = (s[k], s[(k + 1) % 3]);
+            if sa >= 0.0 {
+                poly.push(keep(&mut out, a));
+            }
+            if (sa > 0.0 && sb < 0.0) || (sa < 0.0 && sb > 0.0) {
+                let key = (a.min(b), a.max(b));
+                let id = *cut.entry(key).or_insert_with(|| {
+                    let (pa, pb) = (v[a as usize], v[b as usize]);
+                    let f = pa[ax] / (pa[ax] - pb[ax]);
+                    let mut p = pa + (pb - pa) * f;
+                    p[ax] = 0.0;
+                    out.push(p);
+                    (out.len() - 1) as u32
+                });
+                poly.push(id);
+            }
+        }
+        for k in 1..poly.len().saturating_sub(1) {
+            tris.extend([poly[0], poly[k], poly[k + 1]]);
+        }
+    }
+    (out, tris)
 }
 
 /// Welds positions closer than a millionth of the part's size.
@@ -619,6 +754,51 @@ pub fn plain_graph() -> crate::material::MatGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symmetric_decimate_mirrors_the_kept_half() {
+        let b = crate::primitives::primitive(crate::PrimitiveKind::Box, [1.0, 0.6, 2.0], "b")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let sm = crate::smooth::Smooth {
+            mode: "subdiv".into(),
+            levels: Some(4),
+            ..Default::default()
+        };
+        let mut hi = crate::smooth::smooth("hi", &b, &sm).unwrap_or_else(|e| panic!("{e}"));
+        // Nudge one -x vertex so the plain result can't be symmetric.
+        if let Some(v) = hi.verts.iter_mut().find(|v| v[0] < -0.3) {
+            v[1] += 0.01;
+        }
+        let def = Decimate {
+            tris: Some(800),
+            symmetric: Some("x".into()),
+            ..Default::default()
+        };
+        let lo = decimate("lo", &hi, &def).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            crate::verify::open_edge_count(&lo),
+            0,
+            "joined along the plane"
+        );
+        let n = lo.tri_count();
+        assert!((600..=1100).contains(&n), "{n} triangles");
+        for v in &lo.verts {
+            let m = [-v[0], v[1], v[2]];
+            assert!(
+                lo.verts
+                    .iter()
+                    .any(|w| (0..3).all(|k| (w[k] - m[k]).abs() < 1e-6)),
+                "no mirror for {v:?}"
+            );
+        }
+        // Off centre is refused.
+        let mut off = hi.clone();
+        for v in &mut off.verts {
+            v[0] += 0.2;
+        }
+        let e = decimate("lo", &off, &def).err().unwrap_or_default();
+        assert!(e.contains("not centred"), "{e}");
+    }
 
     fn tri_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
         // Distance from p to triangle abc (Ericson's closest point).

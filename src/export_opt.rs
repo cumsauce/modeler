@@ -401,14 +401,28 @@ pub fn prepare(parts: Vec<Part>, o: &Options) -> Prepared {
             parts.len()
         ));
     }
-    if o.instance && o.ao.is_some() {
-        report.lines.push(
-            "instancing off: baked AO gives every copy its own mesh (its own patch of the atlas)"
-                .into(),
-        );
-    }
-    let mut meshes = if o.instance && !o.merge && o.ao.is_none() {
-        let m = find_instances(&parts);
+    let mut meshes = if o.instance && !o.merge {
+        let mut m = find_instances(&parts);
+        if let Some(ao) = &o.ao {
+            // A baked copy needs its own patch of the atlas, so its own
+            // mesh; parts the bake skips (`skip` patterns, rigged parts)
+            // read one white texel and keep sharing.
+            let skipped = |p: &Part| p.rig.is_some() || ao.skip.iter().any(|g| glob(g, &p.name));
+            let mut dropped = 0;
+            for (i, r) in m.iter_mut().enumerate() {
+                if let MeshRef::CopyOf { source, .. } = r
+                    && !(skipped(&parts[i]) && skipped(&parts[*source]))
+                {
+                    *r = MeshRef::Own;
+                    dropped += 1;
+                }
+            }
+            if dropped > 0 {
+                report.lines.push(format!(
+                    "instancing off for {dropped} baked copies: baked AO gives each its own mesh (its own patch of the atlas); copies in ao.skip keep sharing"
+                ));
+            }
+        }
         let copies = m.iter().filter(|r| **r != MeshRef::Own).count();
         report.lines.push(format!(
             "instancing: {copies} part(s) reuse another part's mesh"
@@ -1185,6 +1199,34 @@ mod tests {
         let out = prepare(room, &o);
         assert_eq!(outward(&out.parts[0]), 0);
         assert!(tri_count(&out.parts) >= 12);
+    }
+
+    #[test]
+    fn ao_keeps_instancing_for_skipped_copies() {
+        let s = session(json!([
+            {"type": "primitive", "name": "body", "kind": "box", "size": [2, 0.5, 1], "translation": [0, 0.5, 0]},
+            {"type": "primitive", "name": "nut", "kind": "cylinder", "size": [0.02, 0.02], "translation": [0, 1, 0]},
+            {"type": "linear_array", "name": "nut", "input": "nut", "count": 4, "offset": [0.1, 0, 0]},
+            {"type": "primitive", "name": "post", "kind": "box", "size": [0.05, 0.3, 0.05], "translation": [0, 1, 0.3]},
+            {"type": "linear_array", "name": "post", "input": "post", "count": 3, "offset": [0.2, 0, 0]}
+        ]));
+        let o = Options {
+            ao: Some(crate::ao::Ao {
+                skip: vec!["nut*".into()],
+                ..Default::default()
+            }),
+            ..Options::game()
+        };
+        let out = prepare(visible(&s), &o);
+        let copy = |n: &str| {
+            out.parts
+                .iter()
+                .zip(&out.meshes)
+                .filter(|(p, m)| p.name.starts_with(n) && **m != MeshRef::Own)
+                .count()
+        };
+        assert_eq!(copy("nut"), 3, "skipped copies share: {:?}", out.meshes);
+        assert_eq!(copy("post"), 0, "baked copies get their own mesh");
     }
 
     #[test]

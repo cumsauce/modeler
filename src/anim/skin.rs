@@ -269,6 +269,7 @@ pub fn pose_part(part: &Part, b: &Binding, mats: &[Mat4]) -> Part {
         skin: part.skin.clone(),
         morphs: None,
         correctives: None,
+        cage: None,
     }
 }
 

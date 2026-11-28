@@ -1193,6 +1193,93 @@ pub struct LoftSpec {
     /// Round every profile's corners with this radius.
     #[serde(default)]
     round: f32,
+    /// A cage for `smooth subdiv`: keep each section's own points (every
+    /// section the same count, no resampling, `steps` 1 unless given) and
+    /// hand the walls to subdiv as quads and each cap as one polygon, so a
+    /// curved cage subdivides without the lumps of a triangulated one.
+    #[serde(default)]
+    quads: bool,
+    /// Fit the rings to outlines (a straight loft along z, sections at
+    /// z stations): {side: [[z, y]...], top: [[x, z]...], levels?}. Each
+    /// ring keeps its shape and is scaled and moved so it spans the side
+    /// outline's height and the plan's width at its z (a plan of the +
+    /// half only is mirrored). levels (with quads): fit the surface
+    /// subdiv makes at that many levels instead of the cage.
+    #[serde(default)]
+    fit: Option<LoftFitSpec>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoftFitSpec {
+    /// Side outline, [[z, y], ...] (seen from +x, front = +z).
+    #[serde(default)]
+    side: Vec<[f32; 2]>,
+    /// Plan outline, [[x, z], ...].
+    #[serde(default)]
+    top: Vec<[f32; 2]>,
+    /// Subdivision levels to fit through (needs quads; 0 = fit the cage).
+    #[serde(default)]
+    levels: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PanelLineSpec {
+    /// The cut part (or with cut: false, the cutter).
+    name: String,
+    /// The part to cut; hide it.
+    input: String,
+    /// The view the line is drawn in: right / left (points [z, y]), front /
+    /// back ([x, y]), top / bottom ([x, z]); it lands on the first surface
+    /// seen from there (right looks along -x, front along -z, top down).
+    view: String,
+    /// The line in that view's coordinates, meters.
+    points: Vec<[f32; 2]>,
+    /// The line closes back to its first point (a door outline).
+    #[serde(default)]
+    closed: bool,
+    /// A smooth curve through the points (Catmull-Rom) instead of straight
+    /// segments.
+    #[serde(default)]
+    smooth: bool,
+    /// Groove width, meters (a shut line: 0.004..0.008).
+    #[serde(default)]
+    width: f32,
+    /// Groove depth under the surface; with fill, how far under the
+    /// deepest surface point inside the outline the cutter reaches.
+    depth: f32,
+    /// false: output the cutter itself (hide it; for split or boolean).
+    /// Default true: the input with the groove cut.
+    #[serde(default)]
+    cut: Option<bool>,
+    /// A closed outline's whole area as one cutter (a prism along the
+    /// view, from above the surface to `depth` under it): a window or lamp
+    /// drawn in the view it is seen in. No width.
+    #[serde(default)]
+    fill: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CageSpec {
+    name: String,
+    /// Cage vertices [[x, y, z], ...] in model space.
+    verts: Vec<[f32; 3]>,
+    /// Polygons as vertex indices, mostly quads ([a, b, c, d]), each wound
+    /// counter-clockwise seen from outside; triangles and larger polygons
+    /// work too. Shared edges run opposite ways in their two faces.
+    faces: Vec<Vec<u32>>,
+    /// Per-edge crease weights [[a, b, weight], ...]: the edge a-b stays
+    /// sharp for `weight` subdivision levels (1.5 = sharp one level, half
+    /// way the next), 10 or more = sharp at every level. Default: none.
+    #[serde(default)]
+    creases: Vec<[f32; 3]>,
+    /// "x", "y" or "z": give one half (every vertex on the + side or on
+    /// the plane); it is mirrored across that zero plane and joined along
+    /// it (vertices on the plane are shared).
+    #[serde(default)]
+    mirror: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1706,18 +1793,36 @@ pub struct PlaneSpec {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SplitSpec {
-    /// Outputs `name_above` and `name_below`.
+    /// Outputs `name_above` and `name_below` (by a plane) or `name_inside`
+    /// and `name_outside` (by a cutter).
     name: String,
     /// A closed solid to cut; hide it.
     input: String,
     /// The cutting plane: {"normal": [0, 1, 0], "point": [0, 0.3, 0]}.
-    plane: PlaneSpec,
-    /// "both" (default), "above" or "below".
+    #[serde(default)]
+    plane: Option<PlaneSpec>,
+    /// Instead of a plane: a closed solid (hide it). The input splits
+    /// exactly into the part inside it and the rest, sharing one cut
+    /// boundary: glass, lamps, doors, hoods as their own parts.
+    #[serde(default)]
+    cutter: Option<String>,
+    /// "both" (default), "above" / "below" (plane) or "inside" /
+    /// "outside" (cutter).
     #[serde(default)]
     keep: Option<String>,
-    /// Meters between the halves (each moves half of it along the normal).
+    /// Plane: meters between the halves (each moves half of it along the
+    /// normal).
     #[serde(default)]
     gap: f32,
+    /// Cutter: only this many meters under the input's surface go inside
+    /// (an inlay of skin thickness, not the whole overlap; the inner
+    /// boundary is the surface offset inward). Default 0: all of it.
+    #[serde(default)]
+    depth: f32,
+    /// Cutter: move the inside piece this far out along the mean normal of
+    /// its outer surface (a lens or pane standing proud, meters).
+    #[serde(default)]
+    lift: f32,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1790,8 +1895,11 @@ pub struct DeformSpec {
     /// "displace" (noise along the normals: rocks, cliffs, bark, dents),
     /// "bend" (curl the part along `axis` by `degrees` toward `toward`:
     /// horns, tusks, curved blades), "twist" (`degrees` about `axis`
-    /// over the part's length) or "taper" (cross-section from 1 to
-    /// `scale_end` along `axis`). Chain deforms for a horn: taper, then bend.
+    /// over the part's length), "taper" (cross-section from 1 to
+    /// `scale_end` along `axis`) or "offset" (every vertex moved `amount`
+    /// meters along its normal, + out, - in, even at bends: a pane standing
+    /// proud of its body, a skin inside it). Chain deforms for a horn:
+    /// taper, then bend.
     mode: String,
     /// bend/twist/taper: the axis the effect runs along, "x", "y" or "z"
     /// (default "y"); it spans the part's whole extent on that axis.
@@ -2394,6 +2502,15 @@ pub struct SmoothSpec {
     /// sharp (default: none, everything rounds).
     #[serde(default)]
     crease: Option<f32>,
+    /// subdiv: a triangle budget instead of `levels`: subdivides to the
+    /// first level at or past it, then decimates to it (one op instead of
+    /// subdiv + decimate).
+    #[serde(default)]
+    tris: Option<u32>,
+    /// subdiv with tris: "x" / "y" / "z" decimates symmetrically about
+    /// that zero plane (as decimate's `symmetric`).
+    #[serde(default)]
+    symmetric: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2424,6 +2541,11 @@ pub struct DecimateSpec {
     /// Normals crease where faces meet at more than this (default 60).
     #[serde(default)]
     crease: Option<f32>,
+    /// "x", "y" or "z": keep mirror symmetry exactly: the + half is
+    /// decimated and mirrored across that zero plane (the part must be
+    /// centred on it; its - half is replaced by the mirror image).
+    #[serde(default)]
+    symmetric: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -2438,6 +2560,12 @@ pub struct ShellSpec {
     /// front, back (world axes; front = +z). Default: closed all round.
     #[serde(default)]
     open: OneOrMany,
+    /// "exact": a ball erosion (corners stay sharp; inputs up to 20,000
+    /// triangles). "offset": every vertex moved in along its normal, even
+    /// at bends, for dense smooth meshes (a subdivided body); no `open`.
+    /// Default: exact up to 20,000 triangles, offset above.
+    #[serde(default)]
+    method: Option<String>,
 }
 
 /// A string or a list of strings.
@@ -3870,6 +3998,7 @@ pub const OP_TYPES: &[&str] = &[
     "group",
     "sweep",
     "loft",
+    "cage",
     "path_array",
     "lsystem",
     "text",
@@ -3892,6 +4021,7 @@ pub const OP_TYPES: &[&str] = &[
     "stairs",
     "railing",
     "panel",
+    "panel_line",
     "transform",
     "move",
     "place",
@@ -4350,6 +4480,16 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
     };
     let mut body = obj.clone();
     body.remove("type");
+    // `replace: true` (any op item) is read by the batch, not the op.
+    match body.remove("replace") {
+        None | Some(Value::Bool(_)) => {}
+        Some(other) => {
+            return Err(format!(
+                "{ctx}: replace: true or false, got {}",
+                describe_json(&other)
+            ));
+        }
+    }
     let body = Value::Object(body);
     Ok(match ty {
         "primitive" => {
@@ -4497,6 +4637,58 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 samples: s.samples,
                 steps: s.steps,
                 round: s.round,
+                quads: s.quads,
+                fit: match s.fit {
+                    Some(f) => {
+                        if f.side.len() < 3 && f.top.len() < 3 {
+                            return Err(format!(
+                                "{ctx}: fit: give a side outline [[z, y]...] and / or a top outline [[x, z]...] (3+ points each)"
+                            ));
+                        }
+                        if f.levels > 5 {
+                            return Err(format!("{ctx}: fit.levels: 0..5, got {}", f.levels));
+                        }
+                        Some(Box::new(crate::loft::LoftFit {
+                            side: f.side,
+                            top: f.top,
+                            levels: f.levels,
+                        }))
+                    }
+                    None => None,
+                },
+            })
+        }
+        "panel_line" => {
+            let s: PanelLineSpec = de(&ctx, &body)?;
+            let def = crate::panel_line::PanelLineDef {
+                input: s.input,
+                view: s.view,
+                points: s.points,
+                closed: s.closed,
+                smooth: s.smooth,
+                width: s.width,
+                depth: s.depth,
+                cut: s.cut.unwrap_or(true),
+                fill: s.fill,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::PanelLine {
+                name: s.name,
+                def: Box::new(def),
+            })
+        }
+        "cage" => {
+            let s: CageSpec = de(&ctx, &body)?;
+            let def = crate::cage::CageDef {
+                verts: s.verts,
+                faces: s.faces,
+                creases: s.creases,
+                mirror: s.mirror,
+            };
+            def.validate().map_err(|e| format!("{ctx}: {e}"))?;
+            BatchItem::Op(Op::Cage {
+                name: s.name,
+                def: Box::new(def),
             })
         }
         "path_array" => {
@@ -4608,12 +4800,54 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
         "split" => {
             let s: SplitSpec = de(&ctx, &body)?;
             let keep = s.keep.unwrap_or_else(|| "both".into());
+            if let Some(c) = s.cutter {
+                if s.plane.is_some() {
+                    return Err(format!("{ctx}: give plane or cutter, not both"));
+                }
+                if !["both", "inside", "outside"].contains(&keep.as_str()) {
+                    return Err(format!(
+                        "{ctx}: keep: with a cutter, both, inside or outside, got `{keep}`"
+                    ));
+                }
+                if s.gap != 0.0 {
+                    return Err(format!(
+                        "{ctx}: gap: only for a plane (a cutter's piece moves by lift)"
+                    ));
+                }
+                for (f, v) in [("depth", s.depth), ("lift", s.lift)] {
+                    if !v.is_finite() || (f == "depth" && v < 0.0) {
+                        return Err(format!(
+                            "{ctx}: {f}: must be a number of meters{}",
+                            if f == "depth" { " >= 0" } else { "" }
+                        ));
+                    }
+                }
+                return Ok(BatchItem::Op(Op::Split {
+                    name: s.name,
+                    input: s.input,
+                    normal: [0.0, 1.0, 0.0],
+                    point: [0.0; 3],
+                    keep,
+                    gap: 0.0,
+                    cutter: Some(c),
+                    depth: s.depth,
+                    lift: s.lift,
+                }));
+            }
+            if s.depth != 0.0 || s.lift != 0.0 {
+                return Err(format!("{ctx}: depth / lift: only with a cutter"));
+            }
+            let Some(plane) = s.plane else {
+                return Err(format!(
+                    "{ctx}: give plane {{normal, point}} or cutter (a closed solid)"
+                ));
+            };
             if !["both", "above", "below"].contains(&keep.as_str()) {
                 return Err(format!(
                     "{ctx}: keep: must be both, above or below, got `{keep}`"
                 ));
             }
-            let normal = s.plane.normal.unwrap_or([0.0, 1.0, 0.0]);
+            let normal = plane.normal.unwrap_or([0.0, 1.0, 0.0]);
             if normal.iter().all(|c| *c == 0.0) || normal.iter().any(|c| !c.is_finite()) {
                 return Err(format!("{ctx}: plane.normal: must be a non-zero direction"));
             }
@@ -4624,9 +4858,12 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 name: s.name,
                 input: s.input,
                 normal,
-                point: s.plane.point.unwrap_or([0.0; 3]),
+                point: plane.point.unwrap_or([0.0; 3]),
                 keep,
                 gap: s.gap,
+                cutter: None,
+                depth: 0.0,
+                lift: 0.0,
             })
         }
         "scatter" => {
@@ -4888,6 +5125,7 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 resolution: s.resolution,
                 cage: s.cage,
                 crease: s.crease,
+                symmetric: s.symmetric,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Decimate {
@@ -4905,6 +5143,8 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 edge: s.edge,
                 levels: s.levels,
                 crease: s.crease,
+                tris: s.tris,
+                symmetric: s.symmetric,
             };
             def.validate().map_err(|e| format!("{ctx}: {e}"))?;
             BatchItem::Op(Op::Smooth {
@@ -5028,6 +5268,12 @@ pub fn parse_item(i: usize, v: &Value) -> Result<BatchItem, String> {
                 input: s.input,
                 thickness: s.thickness,
                 open,
+                method: match s.method {
+                    Some(m) if m != "exact" && m != "offset" => {
+                        return Err(format!("{ctx}: method: exact or offset, got `{m}`"));
+                    }
+                    m => m,
+                },
             })
         }
         "panel" => {
@@ -6182,6 +6428,16 @@ pub fn example(ty: &str) -> Option<Value> {
                 {"y": 0.22, "profile": [{"arc": {"center": [0, 0], "radius": 0.014, "from": 0, "to": 360}}]},
                 {"y": 0.28, "profile": [{"arc": {"center": [0, 0], "radius": 0.013, "from": 0, "to": 360}}]}]})
         }
+        "panel_line" => {
+            json!({"type": "panel_line", "name": "body_shut", "input": "body", "view": "right",
+                "points": [[1.1, 0.35], [1.15, 0.8], [0.6, 1.05]], "smooth": true, "width": 0.006, "depth": 0.004})
+        }
+        "cage" => {
+            json!({"type": "cage", "name": "pod_cage", "mirror": "x",
+                "verts": [[0, 0, -1], [0.5, 0, -1], [0.5, 0.6, -1], [0, 0.7, -1], [0, 0, 1], [0.4, 0, 1], [0.4, 0.5, 1], [0, 0.55, 1]],
+                "faces": [[0, 3, 2, 1], [4, 5, 6, 7], [1, 2, 6, 5], [2, 3, 7, 6], [0, 1, 5, 4]],
+                "creases": [[1, 5, 10], [0, 1, 2]]})
+        }
         "path_array" => {
             json!({"type": "path_array", "name": "posts", "input": "post", "path": [[0, 0, 0], [2, 0, 1], [4, 0, 0]], "smooth": true, "spacing": 0.8})
         }
@@ -6375,6 +6631,8 @@ pub fn op_guide(ty: &str) -> &'static [&'static str] {
             include_str!("../docs/ops/../topics/profiles.md"),
         ],
         "loft" => &[include_str!("../docs/ops/loft.md")],
+        "cage" => &[include_str!("../docs/ops/cage.md")],
+        "panel_line" => &[include_str!("../docs/ops/panel_line.md")],
         "path_array" => &[include_str!("../docs/ops/path_array.md")],
         "lsystem" => &[include_str!("../docs/ops/lsystem.md")],
         "text" => &[include_str!("../docs/ops/text.md")],
@@ -6509,6 +6767,8 @@ pub fn describe_type(ty: Option<&str>) -> Result<String, String> {
         "group" => schemars::schema_for!(GroupSpec),
         "sweep" => schemars::schema_for!(SweepSpec),
         "loft" => schemars::schema_for!(LoftSpec),
+        "cage" => schemars::schema_for!(CageSpec),
+        "panel_line" => schemars::schema_for!(PanelLineSpec),
         "path_array" => schemars::schema_for!(PathArraySpec),
         "lsystem" => schemars::schema_for!(LSystemSpec),
         "text" => schemars::schema_for!(TextSpec),

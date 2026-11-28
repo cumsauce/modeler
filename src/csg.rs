@@ -858,7 +858,13 @@ pub fn round(
 /// ball of radius `t` (every face moved in by exactly `t`; convex corners
 /// stay sharp), and each `open` face (top/bottom/left/right/front/back)
 /// has the cavity swept out through that wall, leaving an opening.
-pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, ModelerError> {
+pub fn shell(
+    name: &str,
+    part: &Part,
+    t: f32,
+    open: &[String],
+    method: Option<&str>,
+) -> Result<Part, ModelerError> {
     if t.is_nan() || t <= 0.0 {
         return Err(ModelerError::Csg(format!(
             "shell `{name}`: thickness must be > 0, got {t}"
@@ -882,9 +888,17 @@ pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, M
     }
     let m = part_to_manifold(part)?;
     let tris = m.num_tri();
-    if tris > 20_000 {
+    let offset = match method {
+        Some("offset") => true,
+        Some(_) => false,
+        None => tris > SHELL_EXACT_TRIS,
+    };
+    if offset {
+        return shell_offset(name, part, &m, t, open);
+    }
+    if tris > SHELL_EXACT_TRIS {
         return Err(ModelerError::Csg(format!(
-            "shell `{name}`: `{}` has {tris} triangles; shell simpler inputs (lower the segment count)",
+            "shell `{name}`: `{}` has {tris} triangles, too many for method exact (at most {SHELL_EXACT_TRIS}); use method offset, or a simpler input",
             part.name
         )));
     }
@@ -928,6 +942,144 @@ pub fn shell(name: &str, part: &Part, t: f32, open: &[String]) -> Result<Part, M
     let mut p = manifold_to_part(&out, name, part.material.clone());
     p.visible = true;
     Ok(p)
+}
+
+/// Most triangles `shell` erodes exactly (a ball Minkowski difference).
+const SHELL_EXACT_TRIS: usize = 20_000;
+
+/// `shell` by an inward offset surface: the solid minus itself moved in by
+/// `t` along its vertex normals ([`crate::offset`]). Sharp convex edges
+/// round toward the inside; a bend tighter than `t` would fold the inner
+/// surface, which the wall's volume catches.
+fn shell_offset(
+    name: &str,
+    part: &Part,
+    m: &Manifold,
+    t: f32,
+    open: &[String],
+) -> Result<Part, ModelerError> {
+    let err = |s: String| ModelerError::Csg(format!("shell `{name}`: {s}"));
+    if !open.is_empty() {
+        return Err(err(
+            "open needs method exact; with offset, cut the opening with a boolean afterwards"
+                .into(),
+        ));
+    }
+    let inner = inner_offset(m, t).map_err(|e| {
+        let (lo, hi) = part.bounds();
+        let d = hi - lo;
+        err(format!(
+            "{e}: `{}` is {:.3} x {:.3} x {:.3} m and bends tighter than {t} somewhere; use a thinner wall",
+            part.name, d.x, d.y, d.z
+        ))
+    })?;
+    let out = m.difference(&inner);
+    out.status().map_err(|e| err(format!("failed: {e}")))?;
+    if out.is_empty() {
+        return Err(err("produced nothing".into()));
+    }
+    let mut p = manifold_to_part(&out, name, part.material.clone());
+    p.visible = true;
+    Ok(p)
+}
+
+/// The solid `m` moved in by `t` along its vertex normals, checked: a wall
+/// whose volume is far from area x t means the inner surface folded.
+fn inner_offset(m: &Manifold, t: f32) -> Result<Manifold, String> {
+    let mesh = m.to_meshgl64();
+    let n = mesh.num_prop().max(3);
+    let v: Vec<Vec3> = mesh
+        .vert_properties()
+        .chunks(n)
+        .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+        .collect();
+    let idx: Vec<u32> = mesh.tri_verts().iter().map(|&i| i as u32).collect();
+    let moved = crate::offset::offset_positions(&v, &idx, -t);
+    let mut inner = Part::new("inner");
+    inner.verts = moved.iter().map(|p| p.to_array()).collect();
+    inner.indices = idx;
+    let inner = part_to_manifold(&inner).map_err(|e| format!("the inner surface: {e}"))?;
+    let (outer_v, inner_v) = (m.volume(), inner.volume());
+    let want = m.surface_area() * f64::from(t);
+    let wall = outer_v - inner_v;
+    if inner_v <= 0.0 || wall < 0.5 * want || wall > 1.5 * want {
+        return Err(format!(
+            "thickness {t} folds the inner surface over itself (walls hold {wall:.3e} m3 where {want:.3e} was expected)"
+        ));
+    }
+    Ok(inner)
+}
+
+/// Splits `part` by the closed solid `cutter` into `name_inside` and
+/// `name_outside` in one Manifold split, so the two share one cut boundary
+/// and no surface of either lies on the other. `depth` > 0 keeps only that
+/// skin under the input's surface inside; `lift` moves the inside piece
+/// out along the mean normal of its outer surface (the input's own
+/// triangles in it).
+pub fn split_by(
+    name: &str,
+    part: &Part,
+    cutter: &Part,
+    depth: f32,
+    lift: f32,
+) -> Result<(Part, Part), ModelerError> {
+    let err = |s: String| ModelerError::Csg(format!("split `{name}`: {s}"));
+    let a = part_to_manifold(part)?.as_original();
+    let id = a.original_id();
+    let mut c =
+        part_to_manifold(cutter).map_err(|e| err(format!("cutter `{}`: {e}", cutter.name)))?;
+    if depth > 0.0 {
+        let inner = inner_offset(&a, depth).map_err(|e| err(format!("depth: {e}")))?;
+        c = c.difference(&inner);
+    }
+    let (ins, outs) = a.split(&c);
+    ins.status().map_err(|e| err(format!("failed: {e}")))?;
+    if ins.is_empty() || ins.volume().abs() < 1e-15 {
+        return Err(err(format!(
+            "the cutter `{}` misses `{}` (nothing inside it)",
+            cutter.name, part.name
+        )));
+    }
+    if outs.is_empty() || outs.volume().abs() < 1e-15 {
+        return Err(err(format!(
+            "the cutter `{}` swallows all of `{}` (nothing outside it)",
+            cutter.name, part.name
+        )));
+    }
+    let mut inside = manifold_to_part(&ins, &format!("{name}_inside"), part.material.clone());
+    let mut outside = manifold_to_part(&outs, &format!("{name}_outside"), part.material.clone());
+    inside.visible = true;
+    outside.visible = true;
+    if lift != 0.0 {
+        let mesh = ins.to_meshgl64();
+        let n = mesh.num_prop().max(3);
+        let vp = mesh.vert_properties();
+        let pt = |i: u64| {
+            let k = i as usize * n;
+            bevy::math::DVec3::new(vp[k], vp[k + 1], vp[k + 2])
+        };
+        let tv = mesh.tri_verts();
+        let (runs, ids) = (mesh.run_index(), mesh.run_original_id());
+        let mut dir = bevy::math::DVec3::ZERO;
+        for r in 0..ids.len().min(runs.len().saturating_sub(1)) {
+            if ids[r] as i32 != id {
+                continue;
+            }
+            let (s0, s1) = (runs[r] as usize, runs[r + 1] as usize);
+            for t in tv[s0..s1.min(tv.len())].as_chunks::<3>().0 {
+                let (p0, p1, p2) = (pt(t[0]), pt(t[1]), pt(t[2]));
+                dir += (p1 - p0).cross(p2 - p0);
+            }
+        }
+        let dir = dir.normalize_or_zero().as_vec3();
+        if dir == Vec3::ZERO {
+            return Err(err(
+                "lift: the inside piece has none of the input's surface to lift along".into(),
+            ));
+        }
+        inside.translation = (Vec3::from(inside.translation) + dir * lift).to_array();
+    }
+    Ok((inside, outside))
 }
 
 /// Points on a sphere of radius `r` about `c` (`n` arc steps per quarter).
@@ -1298,6 +1450,38 @@ mod shaping_tests {
     fn cube(n: &str, s: [f32; 3]) -> Part {
         crate::primitives::primitive(crate::PrimitiveKind::Box, s, n)
             .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn split_by_a_cutter_shares_one_boundary() {
+        // A body and a window cutter through its +x face.
+        let body = cube("body", [1.0, 1.0, 2.0]);
+        let mut cut = cube("win", [0.4, 0.4, 0.8]);
+        cut.translation = [0.5, 0.1, 0.0];
+        let (ins, outs) = split_by("b", &body, &cut, 0.0, 0.0).unwrap_or_else(|e| panic!("{e}"));
+        let (mi, mo) = (closed(&ins), closed(&outs));
+        assert!((mi.volume() + mo.volume() - 2.0).abs() < 1e-6);
+        assert!(
+            (mi.volume() - 0.2 * 0.4 * 0.8).abs() < 1e-6,
+            "{}",
+            mi.volume()
+        );
+        // Exactly partitioned: their union is the body again, and nothing
+        // of one is inside the other.
+        assert!(mi.intersection(&mo).volume().abs() < 1e-9);
+        assert!((mi.union(&mo).volume() - 2.0).abs() < 1e-6);
+        // depth: a skin 2 cm deep under the face; lift moves it out along +x.
+        let (ins, _) = split_by("b", &body, &cut, 0.02, 0.003).unwrap_or_else(|e| panic!("{e}"));
+        let v = closed(&ins).volume();
+        assert!((v - 0.4 * 0.8 * 0.02).abs() < 0.4 * 0.8 * 0.02 * 0.1, "{v}");
+        let t = Vec3::from(ins.translation);
+        assert!((t - Vec3::new(0.003, 0.0, 0.0)).length() < 1e-5, "{t}");
+        // A cutter that misses is an error.
+        cut.translation = [3.0, 0.0, 0.0];
+        let e = split_by("b", &body, &cut, 0.0, 0.0)
+            .err()
+            .map(|e| e.to_string());
+        assert!(e.is_some_and(|e| e.contains("misses")));
     }
 
     #[test]

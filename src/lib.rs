@@ -76,6 +76,7 @@ pub mod ao;
 pub mod ao_gpu;
 pub mod blob;
 pub mod body;
+pub mod cage;
 pub mod carve;
 pub mod catalog;
 pub mod commands;
@@ -100,8 +101,10 @@ pub mod loft;
 pub mod lsystem;
 pub mod material;
 pub mod mocap;
+pub mod offset;
 pub mod organic;
 pub mod outline;
+pub mod panel_line;
 pub mod params;
 pub mod primitives;
 pub mod quality;
@@ -245,6 +248,12 @@ pub struct Part {
     /// after `morphs`. Derived after the graph; never saved.
     #[serde(skip)]
     pub correctives: Option<std::sync::Arc<Vec<crate::anim::skin::Corrective>>>,
+    /// The polygons a `cage` (or a `loft` with `quads`) built this part
+    /// from, with their crease weights, for `smooth subdiv`. Derived by the
+    /// op; kept through moves and materials, dropped by anything that
+    /// changes the mesh; never saved.
+    #[serde(skip)]
+    pub cage: Option<std::sync::Arc<crate::cage::Cage>>,
 }
 
 fn one() -> f32 {
@@ -1100,6 +1109,10 @@ pub enum Op {
         steps: u32,
         #[serde(default, skip_serializing_if = "is_zero")]
         round: f32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quads: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fit: Option<Box<crate::loft::LoftFit>>,
     },
     /// Copies of `input` along a path, `name_0..`: count, or spacing.
     PathArray {
@@ -1225,6 +1238,20 @@ pub enum Op {
         #[serde(flatten)]
         def: Box<crate::decimate::Decimate>,
     },
+    /// A line drawn in a view, projected onto `input` and cut as a groove
+    /// (or a filled outline as a cutter) ([`crate::panel_line`]).
+    PanelLine {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::panel_line::PanelLineDef>,
+    },
+    /// A polygon cage (vertices and quad faces, crease weights per edge)
+    /// for `smooth subdiv` ([`crate::cage`]).
+    Cage {
+        name: String,
+        #[serde(flatten)]
+        def: Box<crate::cage::CageDef>,
+    },
     /// Taubin relax, isotropic remesh or Catmull-Clark subdivision.
     Smooth {
         name: String,
@@ -1255,6 +1282,18 @@ pub enum Op {
         keep: String,
         #[serde(default)]
         gap: f32,
+        /// Split by this closed solid instead of the plane: `name_inside`
+        /// and `name_outside` ([`crate::csg::split_by`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cutter: Option<String>,
+        /// With a cutter: only this deep under the input's surface goes
+        /// inside (meters; 0 = the whole overlap).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        depth: f32,
+        /// With a cutter: the inside piece moves this far out along the
+        /// mean normal of its outer surface (meters).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        lift: f32,
     },
     /// Rounds a solid's edges: `fillet` / `chamfer` by `radius`, or
     /// subdivision `smooth`.
@@ -1322,6 +1361,10 @@ pub enum Op {
         thickness: f32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         open: Vec<String>,
+        /// "exact" (a ball erosion) or "offset" (every vertex moved in
+        /// along its normal: dense meshes); None picks by size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
     },
     /// Merges several parts into one without a boolean: their meshes are
     /// concatenated in world space (transforms baked). For arraying or moving

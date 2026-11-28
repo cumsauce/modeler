@@ -876,7 +876,7 @@ impl Session {
                             ": a decimate needs its own name: rename the dense source to `{n}_hi` (re-issue it as `{n}_hi`, or a `rename`), then decimate `{n}_hi` into `{n}`"
                         )
                     } else {
-                        "; choose a different name".to_string()
+                        "; choose a different name, or add \"replace\": true to the item to swap the old op for this one".to_string()
                     };
                     return Err(format!(
                         "`{n}` is already produced by another op ({}){hint}",
@@ -1732,6 +1732,9 @@ impl Session {
             .expand_material_globs(items, &style, &full)
             .map_err(|e| format!("{e}\n(nothing was applied)"))?;
         let mut parsed = Vec::with_capacity(items.len());
+        // Items marked `replace: true`: an op of another type under the same
+        // name gives way to them.
+        let mut replacing: Vec<(String, &'static str)> = Vec::new();
         for (i, (raw, from)) in items.iter().enumerate() {
             let from = from
                 .as_ref()
@@ -1741,6 +1744,15 @@ impl Session {
                 .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             let mut item = crate::spec::parse_item(i, &resolved)
                 .map_err(|e| format!("{e}{from}\n(nothing was applied)"))?;
+            if resolved.get("replace").and_then(serde_json::Value::as_bool) == Some(true) {
+                let BatchItem::Op(op) = &item else {
+                    return Err(format!(
+                        "op #{i}{from}: replace: only for op items (it swaps the op that makes this name)\n(nothing was applied)"
+                    )
+                    .into());
+                };
+                replacing.push((graph::output(op).to_string(), graph::kind(op)));
+            }
             self.resolve_pbr(&mut item)
                 .map_err(|e| format!("op #{i}{from}: {e}\n(nothing was applied)"))?;
             if let BatchItem::Op(op) = &mut item {
@@ -1835,6 +1847,23 @@ impl Session {
                     taken.push(format!("`{k}` (by {other})"));
                 }
             }
+        }
+        // Ops of another type that make a `replace` item's name go first
+        // (in-place edits of the name stay: they apply to the new part).
+        let mut swapped = Vec::new();
+        for (out, kind) in &replacing {
+            self.model.ops.retain(|o| {
+                let gone = graph::output(o) == out.as_str()
+                    && graph::kind(o) != *kind
+                    && !graph::inputs(o).contains(&out.as_str());
+                if gone {
+                    swapped.push(format!("{} `{out}` -> {kind}", graph::kind(o)));
+                }
+                !gone
+            });
+        }
+        if !swapped.is_empty() {
+            lines.push(format!("replaced: {}", swapped.join(", ")));
         }
         let kept = self.model.material_patterns.clone();
         self.model.material_patterns.extend(patterns);
@@ -7861,5 +7890,131 @@ mod tests {
         );
         assert!(s.model.annotations[1].is_on(&m) && !s.model.annotations[0].is_on(&m));
         assert!(s.model.annotations[0].is_on(&g));
+    }
+
+    #[test]
+    fn a_cage_item_feeds_subdiv_through_a_move() {
+        let mut s = Session::default();
+        let ex = crate::spec::example("cage").unwrap_or_default();
+        ok(s.apply_values(
+            None,
+            vec![
+                ex,
+                json!({"type": "transform", "name": "pod_cage", "input": "pod_cage", "translation": [0, 1, 0]}),
+                json!({"type": "smooth", "name": "pod", "input": "pod_cage", "mode": "subdiv", "levels": 2}),
+                json!({"type": "hide_part", "part": "pod_cage"}),
+            ],
+        ));
+        let pod = s.model.parts.iter().find(|p| p.name == "pod");
+        let pod = pod.unwrap_or_else(|| panic!("no pod"));
+        // Ten quads (five a side), two levels: 160 quads.
+        assert_eq!(pod.tri_count(), 10 * 16 * 2);
+        let (lo, hi) = pod.bounds();
+        assert!(lo.y > 0.99 && hi.y < 1.71, "{lo} {hi}");
+        assert!((lo.x + hi.x).abs() < 1e-5, "mirrored: {lo} {hi}");
+        // A crease of weight 10 keeps the bottom edge down at the cage.
+        assert!((lo.y - 1.0).abs() < 1e-4, "{lo}");
+    }
+
+    #[test]
+    fn split_by_a_cutter_makes_inside_and_outside() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "body", "kind": "box", "size": [1, 1, 2]}),
+                json!({"type": "primitive", "name": "cut", "kind": "box", "size": [0.4, 0.4, 0.8], "translation": [0.5, 0, 0]}),
+                json!({"type": "split", "name": "win", "input": "body", "cutter": "cut", "depth": 0.01, "lift": 0.002}),
+                json!({"type": "hide_part", "part": "body"}),
+                json!({"type": "hide_part", "part": "cut"}),
+            ],
+        ));
+        let names: Vec<&str> = s.model.parts.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.contains(&"win_inside") && names.contains(&"win_outside"),
+            "{names:?}"
+        );
+        // Re-issuing with keep inside drops the outside piece.
+        ok(s.apply_values(
+            None,
+            vec![json!({"type": "split", "name": "win", "input": "body", "cutter": "cut", "keep": "inside"})],
+        ));
+        assert!(!s.model.parts.iter().any(|p| p.name == "win_outside"));
+        let e = s.apply_values(
+            None,
+            vec![json!({"type": "split", "name": "w2", "input": "body", "cutter": "cut", "plane": {"normal": [0, 1, 0]}})],
+        );
+        assert!(e.is_err_and(|e| e.to_string().contains("not both")));
+    }
+
+    #[test]
+    fn a_thin_cutter_that_cuts_is_not_called_a_miss() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "body", "kind": "box", "size": [4, 1, 2]}),
+                // An 8 mm slot 0.5 mm into the top: a few millionths of the volume.
+                json!({"type": "primitive", "name": "slot", "kind": "box", "size": [3, 0.002, 0.008], "translation": [0, 0.4995, 0]}),
+                json!({"type": "boolean", "name": "cut", "op": "difference", "a": "body", "b": "slot"}),
+                json!({"type": "primitive", "name": "far", "kind": "box", "size": [0.1, 0.1, 0.1], "translation": [9, 0, 0]}),
+                json!({"type": "boolean", "name": "miss", "op": "difference", "a": "body", "b": "far"}),
+                json!({"type": "hide_part", "part": "body"}),
+                json!({"type": "hide_part", "part": "slot"}),
+                json!({"type": "hide_part", "part": "far"}),
+                json!({"type": "hide_part", "part": "cut"}),
+            ],
+        ));
+        let lints = s.lints();
+        assert!(
+            !lints.iter().any(|l| l.contains("difference `cut`")),
+            "{lints:?}"
+        );
+        assert!(
+            lints
+                .iter()
+                .any(|l| l.contains("difference `miss`") && l.contains("probably misses")),
+            "{lints:?}"
+        );
+    }
+
+    #[test]
+    fn replace_lets_an_upsert_change_an_ops_type() {
+        let mut s = Session::default();
+        ok(s.apply_values(
+            None,
+            vec![
+                json!({"type": "primitive", "name": "cage", "kind": "box", "size": 1}),
+                json!({"type": "smooth", "name": "body", "input": "cage", "mode": "subdiv", "levels": 3}),
+                json!({"type": "material", "name": "body", "color": "#ff0000"}),
+                json!({"type": "hide_part", "part": "cage"}),
+            ],
+        ));
+        let item = json!({"type": "decimate", "name": "body", "input": "cage", "ratio": 0.5});
+        let e = s.apply_values(None, vec![item.clone()]);
+        assert!(e.is_err_and(|e| e.to_string().contains("already produced")));
+        let mut with = item.clone();
+        with["replace"] = json!(true);
+        let r = ok(s.apply_values(None, vec![with]));
+        assert!(
+            r.to_string()
+                .contains("replaced: smooth `body` -> decimate"),
+            "{r}"
+        );
+        let kinds: Vec<&str> = s
+            .model
+            .ops
+            .iter()
+            .filter(|o| graph::output(o) == "body")
+            .map(graph::kind)
+            .collect();
+        assert!(
+            kinds.contains(&"decimate") && !kinds.contains(&"smooth"),
+            "{kinds:?}"
+        );
+        // The in-place material on the name stays.
+        assert!(kinds.contains(&"material"), "{kinds:?}");
+        let bad = json!({"type": "hide_part", "part": "body", "replace": true});
+        assert!(s.apply_values(None, vec![bad]).is_err());
     }
 }

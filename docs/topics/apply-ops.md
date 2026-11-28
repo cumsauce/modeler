@@ -7,6 +7,13 @@
   rename, uvs, move/place) run after every op in the order written, so
   `"*_raw"` sees every part the batch makes and a later `show_part` still
   wins: item order doesn't matter.
+- **Changing an op's type**: an item of another type under a name an op
+  already makes is refused ("already produced by another op"); add
+  `"replace": true` to the item and the old op (a `smooth` that is now a
+  `decimate`, a `boolean` now a `transform`) is dropped in the same atomic
+  batch. In-place edits of the name (material, visibility, transform)
+  stay and apply to the new part; the result says what was replaced. A
+  script that re-applies its whole file can leave the flag on.
 - **Parsing is strict but forgiving.** All items are parsed before anything
   is applied; errors name the item and field
   (`op #3 (primitive "roof"): size: cone size is [radius, height]...`), and
@@ -120,8 +127,9 @@ source (only with `include_source: false`), visible parts still wearing the
 default material, parts with identical world bounds (z-fighting; when one
 is an input of the op making the other, the warning names it and says to
 hide it), boolean
-volume sanity (a difference that didn't shrink its input = the cutter
-misses; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
+volume sanity (a difference that changed neither its input's volume nor
+its surface area = the cutter misses; a thin groove or inlay that cut adds
+the walls of its cut, so it stays quiet; a union whose volume exactly sums its inputs = no overlap, unless the union is a cutter fed to a difference) and
 boolean outputs with open edges enclosing real area (a safety net; Manifold
 outputs are closed), and **floating parts** (off the ground and touching no
 other part, e.g. a copy transformed instead of its neighbour). **Quality
